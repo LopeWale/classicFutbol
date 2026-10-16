@@ -1,8 +1,10 @@
 # Parallel Season FC — System Architecture
 
-Status: proposal v0.1 · Companion to `01-requirements-review.md`
+Status: proposal v0.2 · Companion to `01-requirements-review.md` · Decisions recorded in `docs/adr/`
 
 This document turns the product requirements into a buildable architecture: components, contracts, data model, key flows, technology choices with trade-offs, deployment, testing, and a phased build order. Assumptions A1–A7 from the requirements review apply throughout.
+
+**Changes from v0.1.** The simulation core moves from C# to Rust and the host services from ASP.NET Core to Python. The only reason v0.1 coupled the host language to the client language was so the host could replay matches with the same simulation code; packaging the replay verifier as a standalone Rust binary removes that coupling and lets each side use the language that suits it. The DigitalOcean droplet becomes the primary world host because a public address simplifies online play. Raspberry Pi 5 is promoted from "host only" to a constrained living-room console client, subject to a measured render budget in phase 1. Chromebooks are a best-effort client tier. See ADR-0001 and ADR-0002.
 
 ---
 
@@ -13,7 +15,8 @@ This document turns the product requirements into a buildable architecture: comp
 3. **The host is the only authority on the record.** Clients produce input streams and evidence; the host produces accepted results. A cartridge is a signed cache of the host's view plus a revocable credential.
 4. **External data is quarantined at the edge.** Provider payloads become normalised, provenance-stamped *proposals*. A separate step decides whether a proposal is allowed to become a world event. Imports can never touch a fixture that is `played`, `accepted` or `in_session`.
 5. **Real and parallel are separate columns, never merged.** Every identifier, statistic and fixture carries which side of the takeover boundary it belongs to.
-6. **Correctness over scale.** Twenty participants, a handful of concurrent matches. Prefer simple, replayable, auditable mechanisms to distributed ones.
+6. **Each language stays in its lane.** Rust for anything that must be deterministic or real-time (simulation, rollback, replay verification). Python for records, rules, data wrangling and administration. GDScript only as presentation glue inside Godot. No business logic in the engine.
+7. **Correctness over scale.** Twenty participants, a handful of concurrent matches. Prefer simple, replayable, auditable mechanisms to distributed ones.
 
 ---
 
@@ -26,24 +29,24 @@ flowchart LR
         CART[Profile cartridge<br/>USB mass storage]
     end
 
-    subgraph Client["Game client (PC, Godot 4 + C#)"]
-        UI[Menus & pages]
-        REND[3D match renderer]
-        SIM1[Sim core<br/>deterministic]
-        NET[Rollback netcode]
+    subgraph Client["Game client (Godot 4 + Rust GDExtension)<br/>Tier A: PC · Tier B: Raspberry Pi 5 console · Tier C: Chromebook"]
+        UI[Menus & pages<br/>GDScript]
+        REND[3D match renderer<br/>Godot]
+        SIM1[psfc-sim<br/>Rust, deterministic]
+        NET[psfc-rollback<br/>Rust]
         PCM[Cartridge manager]
         CIF[Controller interface]
     end
 
-    subgraph Host["World host (Raspberry Pi 5 / Linux)"]
-        API[World API]
-        MSS[Match-session service<br/>lobby · relay · validator]
-        SIM2[Sim core<br/>headless replay]
-        CE[Competition engine]
-        RS[Results & statistics<br/>ledger + projections]
-        ING[Football-data ingestion]
+    subgraph Host["World host (DigitalOcean droplet; Raspberry Pi as alternative)"]
+        API[World API<br/>Python · FastAPI]
+        MSS[Match-session service<br/>lobby · relay · validator<br/>Python]
+        SIM2[psfc-replay<br/>Rust binary]
+        CE[Competition engine<br/>Python]
+        RS[Results & statistics<br/>ledger + projections<br/>Python]
+        ING[Football-data ingestion<br/>Python]
         DB[(PostgreSQL)]
-        BK[(Backups)]
+        BK[(Backups → home Pi / object storage)]
     end
 
     PROV[External football-data provider]
@@ -60,15 +63,16 @@ flowchart LR
     DB --> BK
 ```
 
-Two deployable programs plus firmware:
+Three deployables plus firmware:
 
 | Deployable | Runs on | Contains |
 |------------|---------|----------|
-| **Game client** | Participant PCs | Godot 4 app: UI, renderer, controller interface, cartridge manager, sim core, netcode, sync client |
-| **World host** | Raspberry Pi 5 or any Linux server | ASP.NET Core service(s): world API, match-session service, competition engine, results/statistics, ingestion workers, headless sim verifier; PostgreSQL; backup jobs |
+| **Game client** | Participant PCs (tier A); Raspberry Pi 5 in a printed console shell (tier B); Chromebooks via the Linux container (tier C, best effort) | Godot 4 project: UI, renderer, controller interface, cartridge manager, sync client; Rust GDExtension carrying the simulation and rollback netcode |
+| **World host** | DigitalOcean droplet (primary) or a Raspberry Pi 5 at home | Python services: world API, match-session service, competition engine, results/statistics, ingestion workers, community/admin; PostgreSQL; the Rust `psfc-replay` verifier binary; backup jobs |
+| **Rust workspace** | Compiled into both of the above | `psfc-sim` (deterministic core), `psfc-rollback` (prediction and re-simulation), `psfc-godot` (GDExtension bindings), `psfc-replay` (headless CLI used by the host and by CI) |
 | **Controller firmware** | RP2040 in each controller | USB HID gamepad, calibration storage, debounce, optional rumble/battery |
 
-The **sim core** is one C# library compiled into both the client and the host. It has no dependency on Godot.
+The simulation has no dependency on Godot, Python, or any network library. It is a Rust crate with a `tick` function.
 
 ---
 
@@ -76,19 +80,20 @@ The **sim core** is one C# library compiled into both the client and the host. I
 
 | Concern | Choice | Alternatives considered | Why |
 |---------|--------|-------------------------|-----|
-| Game engine | **Godot 4.x (C#/.NET)** | Unity (licence volatility, closed), Unreal (heavy, C++ only sharing, far beyond need), custom engine (too much work) | Open source, exports to Windows/Linux/macOS, C# lets the sim core be shared with the .NET host verbatim, light enough for mid-range PCs, good gamepad support |
-| Sim core language | **C# class library**, no engine types | C++ shared lib with P/Invoke | Same language on both sides; zero marshalling; easier testing |
-| Determinism strategy | **Fixed-point arithmetic (Q32.32) + own trig/sqrt tables + fixed 60 Hz tick + seeded xoshiro PRNG**; no engine physics | IEEE float with strict compiler flags | .NET floats are mostly stable on x64 but `Math.*` differs across libm implementations and ARM vs x64; the host verifier runs on ARM. Fixed-point removes the question entirely |
-| Host runtime | **ASP.NET Core (.NET 8 LTS)** minimal APIs + WebSockets; background workers | Node/TypeScript, Go, Python | Shares sim core and domain types with client; first-class on linux-arm64 |
-| Database | **PostgreSQL 16** | SQLite (fine for single host, weaker concurrency/backup story), event store products (overkill) | Mature, runs on Pi, logical backups, JSONB for event payloads, advisory locks for session acceptance |
-| Ledger style | **Event-sourced world log in Postgres** (`world_events` table) with projection tables | Pure CRUD with audit columns | Requirements §5, §7, §12, §16 are literally event-sourcing requirements |
-| Netcode | **Deterministic lockstep with rollback (GGPO-style)**, P2P UDP with host relay fallback; inputs mirrored to host | Server-authoritative with client prediction | 2 players, small state, deterministic sim → rollback gives best feel and lets host validate by replay |
-| Transport | UDP (inputs), WebSocket (lobby/session control), HTTPS (world API) | WebRTC data channels | Simpler; NAT traversal via host-assisted hole punching, relay fallback through the host |
-| Cartridge medium | **USB mass storage** (flash PCB in Game Boy-style shell) | SD card read by controller MCU; smart card / secure element | Zero driver work, works on any PC, readable by a "borrowed" hub unit |
+| Game engine | **Godot 4.3+**, GDScript for presentation glue only, simulation via GDExtension | Unity (licence volatility, closed), Unreal (heavy, far beyond need), browser client with Three.js and a WASM sim (see ADR-0002), custom engine | Open source; official Windows, Linux x86-64, Linux arm64 and macOS builds; the Compatibility renderer runs on Raspberry Pi 5; the editor is the productivity win for scenes, animation state machines and UI |
+| Simulation language | **Rust** (`psfc-sim`), `#![forbid(unsafe_code)]`, no floating point in simulation state (clippy `float_arithmetic` denied) | C# (v0.1; ties host to .NET and blocks Godot web export), C++ GDExtension (same performance, weaker safety), GDScript (too slow for 60 Hz rollback re-simulation, no numeric control) | Compiles identically to x86-64, aarch64 and wasm32; no garbage collector pauses; explicit integer semantics for determinism; one crate serves client, host and CI |
+| Determinism strategy | **Fixed-point arithmetic (i64, Q32.32) + table-based trig and sqrt + fixed 60 Hz tick + seeded xoshiro256** PRNG; single-threaded sim; no engine physics | IEEE float with strict flags | Removes every cross-platform numeric question; WASM and ARM replays match x86 bit for bit |
+| Host runtime | **Python 3.12, FastAPI, SQLAlchemy 2 (async) + asyncpg, Pydantic v2, Alembic, httpx**; asyncio `DatagramProtocol` for the UDP relay | Go (single static binary, better raw concurrency; see ADR-0001), Rust (one language everywhere, slow iteration on CRUD and rules code), ASP.NET Core (v0.1), TypeScript | The host is records, rules, provider data wrangling and admin tooling, which is Python's strongest territory; online load at this scale is trivial for any of these runtimes; the only compute-heavy host job, replay verification, is delegated to the Rust binary |
+| Replay verification | **`psfc-replay` CLI** invoked by the match-session worker as a subprocess | PyO3 extension module (in-process), separate verifier microservice | Zero FFI, crash isolation, identical binary used in CI determinism tests |
+| Database | **PostgreSQL 16** | SQLite (fine on one box, weaker backup and concurrency story), event-store products (overkill) | Mature, runs on a small droplet and on a Pi, logical backups, JSONB payloads, advisory locks for acceptance |
+| Ledger style | **Event-sourced world log in Postgres** (`world_event` table) with projection tables | CRUD with audit columns | Requirements §5, §7, §12 and §16 are event-sourcing requirements stated in plain language |
+| Netcode | **Deterministic lockstep with rollback (GGPO-style)** in `psfc-rollback`; transport behind a trait; P2P UDP first, relay through the host as fallback; inputs mirrored to the host | Server-authoritative with client prediction | Two players and a small state make rollback the best-feeling option, and it lets the host validate by replay |
+| Transport | UDP for inputs, WebSocket for lobby and session control, HTTPS for the world API | WebRTC data channels (needed only if a browser client is built) | Simple; host-assisted hole punching with relay fallback on the public droplet |
+| Cartridge medium | **USB mass storage** (flash PCB in a Game Boy-style shell) | SD card read by the controller MCU; secure element | Zero driver work on every client tier including ChromeOS; readable by a "borrowed" hub unit |
 | Cartridge data format | Directory bundle: `manifest.json`, `profile.json`, `career.sqlite`, `settings.json`, `credential.bin`, `signature`; A/B generations | Single encrypted blob | Readable, repairable, partially upgradable; SQLite gives a queryable local career for offline browsing |
-| Controller MCU | **RP2040** (TinyUSB composite HID) + USB 2.0 hub IC (e.g. Microchip USB2514B or FE1.1s) | ESP32-S3, STM32 | Cheap, excellent USB stack, the hub makes the cartridge slot an ordinary USB port |
-| Deployment | Docker Compose on the Pi: `host-api`, `match-session`, `ingest`, `postgres`, `backup` | systemd units, Kubernetes | Reproducible, trivial to move to the "other servers" |
-| Observability | OpenTelemetry → Prometheus + Grafana (optional), structured logs | — | Required by §16 performance measurements |
+| Controller MCU | **RP2040** (TinyUSB composite HID) + USB 2.0 hub IC (Microchip USB2514B or FE1.1s) | ESP32-S3, STM32 | Cheap, excellent USB stack; the hub makes the cartridge slot an ordinary USB port |
+| Deployment | Docker Compose on the droplet: `postgres`, `api`, `match`, `ingest`, `caddy`, `backup`; same Compose file runs on a Pi | systemd units, Kubernetes | Reproducible; host location is a one-line change |
+| Observability | OpenTelemetry → Prometheus + Grafana (optional), structured JSON logs | — | Required by §16 performance measurements |
 
 ---
 
@@ -98,72 +103,77 @@ Each component has an owner module in the repository, a published interface, and
 
 ### 4.1 Client-side
 
-**Controller interface** (`ParallelSeason.Client.Input`)
-- Reads raw HID state via Godot `Input`; applies per-device calibration (dead zones, inversion, curves) and the participant's mapping to produce `GameAction` frames at 60 Hz.
-- Binds a physical device (by USB serial) to a loaded participant; survives disconnect/reconnect; blocks a reconnecting device from taking the other team.
-- Exposes the calibration/test page.
+**Controller interface** (`client/scripts/input/`, GDScript over Godot `Input`)
+- Reads raw HID state; applies per-device calibration (dead zones, inversion, curves) and the participant's mapping to produce `InputFrame`s at 60 Hz for the simulation.
+- Binds a physical device (by USB serial) to a loaded participant; survives disconnect and reconnect; blocks a reconnecting device from taking the other team.
+- Exposes the calibration and test page.
 
-**Profile-cartridge manager** (`ParallelSeason.Client.Cartridge`)
+**Profile-cartridge manager** (`client/scripts/cartridge/`)
 - Watches removable volumes; recognises a cartridge by `manifest.json` schema and signature.
 - States: `Detected → Validating → Loading → Synchronising → Ready → Saving → SafeToRemove`, plus `Rejected(reason)`.
 - Performs the sync protocol (§6.6) and safe writes (write to inactive generation, fsync, flip `manifest.active`).
 - Never executes anything from the cartridge. Validates every file against a schema and the host-signed revision.
 
-**Game client shell** (Godot scenes)
+**Game client shell** (Godot scenes, GDScript)
 - Pages from requirements §14. Pure presentation over the World API and the local cartridge SQLite.
-- Match scene: drives `SimCore` at a fixed 60 Hz, renders interpolated state at display rate, broadcast camera, HUD, radar, replays from the recorded event/state stream.
+- Match scene: calls `psfc-godot` at a fixed 60 Hz, renders interpolated state at display rate, broadcast camera, HUD, radar, replays from the recorded event and state stream.
+- Three render tiers selected at startup (§9.2).
 
-**Sim core** (`ParallelSeason.Sim`) — shared
-- Input: `MatchSetup` (two `TeamSnapshot`s, `RuleSet`, `Seed`, duration), then `Tick(InputFrame[2])`.
-- Output: `MatchState` (positions, ball, clock, score, possession, phase), `MatchEvent`s (goal, assist, shot, save, foul, card, substitution, offside, kick-off, etc.), `StateHash` per tick.
-- Contains: movement/dribbling, ball physics (3D flight, spin, bounce), passing/shooting models, tackling, goalkeeper model, team AI (roles, support, marking, transitions), referee/rules engine, CPU opponent controller with difficulty profiles.
-- Deterministic by construction; unit tests assert replay equality on x64 and arm64.
+**Simulation core** (`sim/psfc-sim`, Rust) — shared with the host
+- Input: `MatchSetup` (two `TeamSnapshot`s, `RuleSet`, `seed`, duration), then `tick(&[InputFrame; 2])`.
+- Output: `MatchState` (positions, ball, clock, score, possession, phase), `MatchEvent`s (goal, assist, shot, save, foul, card, substitution, offside, kick-off and so on), `state_hash()` per tick, `save_state()` and `load_state()` for rollback.
+- Contains: movement and dribbling, ball physics (3D flight, spin, bounce), passing and shooting models, tackling, goalkeeper model, team AI (roles, support, marking, transitions), referee and rules engine, CPU opponent controller with difficulty profiles.
+- Deterministic by construction; CI asserts replay equality on x86-64, aarch64 and wasm32.
 
-**Netcode** (`ParallelSeason.Client.Net`)
-- Rollback lockstep: predicts remote input, re-simulates up to N frames (N = 8 at 60 Hz ≈ 133 ms) when the real input arrives. Beyond N, stalls with "waiting for opponent".
-- Sends every local `InputFrame` to the peer and to the match-session service (reliable, batched). Periodic `StateHash` exchange; divergence → pause, resync from host-held authoritative hash position, log desync.
+**Rollback netcode** (`sim/psfc-rollback`, Rust)
+- Predicts remote input, re-simulates up to 8 frames (about 133 ms at 60 Hz) when the real input arrives. Beyond that, stalls with "waiting for opponent".
+- Sends every local `InputFrame` to the peer and to the match-session service (reliable, batched). Periodic `state_hash` exchange; divergence pauses the match, resynchronises from the host-held authoritative hash position, and logs the desync.
+- Transport is a trait. Native builds use a UDP socket owned by the extension; a WebRTC implementation would be added for a browser build.
 
-### 4.2 Host-side
+**GDExtension bindings** (`sim/psfc-godot`, Rust via `gdext`)
+- Exposes `MatchSimulation` and `RollbackSession` classes to Godot. State crosses the boundary as packed arrays (positions, orientations, animation cues), events as dictionaries. Pinned to the Godot minor version in use.
 
-**World API** (`ParallelSeason.Host.Api`)
+### 4.2 Host-side (Python unless stated)
+
+**World API** (`host/psfc_host/api/`)
 - Authentication: participant credential (from cartridge or login) → short-lived JWT scoped to `participant_id`, `world_id`, `device_id`. Devices are revocable (§12 recovery).
 - Resources: worlds, memberships, club assignments, clubs, footballers, squads, fixtures, playing windows, appointments, results, standings, statistics, honours, settings versions, admin operations, cartridge revisions.
-- All reads of projections; all writes become **commands** that are validated and appended as events.
+- Reads serve projections; writes become **commands** that are validated and appended as events.
 
-**Match-session service** (`ParallelSeason.Host.Match`)
-- Lobby: verifies both participants' tokens, club assignments, that the fixture is `open` and assigned source `played_vs_friend`/`played_vs_cpu`, that gameplay version + rule set + settings version match, and freezes the **fixture snapshot** (team snapshots, rules, seed) at `in_session`.
-- Relay: UDP endpoint; forwards inputs when P2P fails; always records the authoritative **input log** (`session_id, tick, side, input`).
-- Validator: on completion, replays the input log with the headless sim core from the frozen snapshot; the resulting `MatchEvent`s and final score are the only accepted outcome. Clients' reported scores are compared and logged but never trusted.
-- Idempotent completion: `(fixture_id)` has at most one `accepted_result`; duplicate completion messages return the existing result.
+**Match-session service** (`host/psfc_host/match/`)
+- Lobby: verifies both participants' tokens, club assignments, that the fixture is `open` and assigned source `played_vs_friend` or `played_vs_cpu`, that gameplay version, rule set and settings version match, and freezes the **fixture snapshot** (team snapshots, rules, seed) at `in_session`.
+- Relay: asyncio UDP endpoint; forwards inputs when P2P fails; always records the authoritative **input log** (`session_id, tick, side, input`).
+- Validator: on completion, runs `psfc-replay --snapshot … --inputs …` and accepts only the score and `MatchEvent`s the replay produces. Clients' reported scores are compared and logged but never trusted.
+- Idempotent completion: `fixture_id` has at most one `accepted_result`; duplicate completion messages return the existing result.
 - Session lifecycle: `created → ready_check → running → paused(reason, budget) → completed | abandoned(reason)`; reconnection window and pause budget from season settings; abandonment produces an `admin_resolution_required` event, never an automatic real-world substitution.
 
-**Competition engine** (`ParallelSeason.Host.Competition`)
+**Competition engine** (`host/psfc_host/competition/`)
 - Owns competition definitions (format, rules, tiebreakers, dates) per season.
 - Builds the combined calendar for a club; maps **real fixtures** to **parallel fixtures** (1:1 while the worlds agree, 1:0 or 0:1 once they diverge).
-- Assigns result sources in advance according to representation at window-open time (§6.3).
+- Assigns result sources in advance according to representation at window-open time (§6.2).
 - Produces playing windows from season timezone and group rules.
-- Progression: reads accepted results, decides who advances; reuses real later-round fixtures when both entrants and conditions still match, otherwise runs the **format-driven generator** (draw with seeded RNG, scheduling onto available match dates).
+- Progression: reads accepted results, decides who advances; reuses real later-round fixtures when both entrants and conditions still match, otherwise runs the **format-driven generator** (seeded draw, scheduling onto declared match dates).
 - Season completion and rollover (final tables, awards, qualification → next season entries).
 
-**Results & statistics** (`ParallelSeason.Host.Ledger`)
-- The append-only `world_events` log and its projections: results, standings, footballer statistics (split `inherited / earned / combined`), form, discipline, honours, head-to-head.
-- Corrections: `result_corrected` event references the superseded event; projections are rebuilt from the log for the affected competition/season (not patched).
+**Results & statistics** (`host/psfc_host/ledger/`)
+- The append-only `world_event` log and its projections: results, standings, footballer statistics split into inherited, earned and combined, form, discipline, honours, head-to-head.
+- Corrections: a `result_corrected` event references the superseded event; projections for the affected competition and season are rebuilt from the log, not patched.
 
-**Football-data ingestion** (`ParallelSeason.Host.Ingest`)
-- Provider adapters implement `IFootballDataSource` (clubs, squads, fixtures, results, events, transfers). Each payload stored raw with `provider, endpoint, retrieved_at, coverage`.
-- Normaliser maps provider IDs to internal IDs via `external_identity` table; unresolved → `identity_resolution_required` queue (admin page).
+**Football-data ingestion** (`host/psfc_host/ingest/`)
+- Provider adapters implement the `FootballDataSource` protocol (clubs, squads, fixtures, results, events, transfers). Each payload is stored raw with `provider, endpoint, retrieved_at, coverage`.
+- Normaliser maps provider IDs to internal IDs via `external_identity`; unresolved → `identity_resolution_required` queue (admin page).
 - Proposal gate: converts normalised data to **import proposals**; the gate applies the takeover and fixture-state rules and either appends `imported_*` events or parks the proposal with a reason. Never writes projections directly.
 
-**Club & player catalogue / Squad & attribute system** (`ParallelSeason.Host.Catalogue`)
+**Club & player catalogue / squad & attribute system** (`host/psfc_host/catalogue/`)
 - Stable `club_id`, `footballer_id`; biographical and physical data; squad membership intervals with effective dates and source.
-- Attribute model: `attribute_profile` versions per footballer with `basis` (`imported_model_v1`, `earned_adjustment`) so initial vs developed attributes stay separable.
+- Attribute model: `attribute_profile` versions per footballer with `basis` (`imported_model_v1`, `earned_adjustment`) so initial and developed attributes stay separable.
 - `TeamSnapshot` builder: for a fixture's reference instant, resolves eligible squad, attributes, numbers, suspensions, and freezes it.
 
-**Community & administration** (`ParallelSeason.Host.Community`)
-- Invitations, roles (`participant`, `commissioner`, `host_admin`), appointments between participants, notifications (in-app first; email/push optional), disputes, admin audit trail.
+**Community & administration** (`host/psfc_host/community/`)
+- Invitations, roles (`participant`, `commissioner`, `host_admin`), appointments between participants, notifications (in-app first; email or push optional), disputes, admin audit trail.
 
 **Hosting & operations**
-- Compose stack, nightly `pg_dump` + raw-payload archive to the second server, restore drill script, health endpoints, metrics.
+- Compose stack, nightly `pg_dump` plus raw-payload archive to the home Pi or object storage, restore drill script, health endpoints, metrics.
 
 ---
 
@@ -216,7 +226,7 @@ admin_action(id, actor_id, kind, target, reason, event_seq)
 | Competition | `competition_defined`, `entries_set`, `fixture_created`, `fixture_linked_to_real`, `fixture_rescheduled`, `fixture_voided`, `draw_generated`, `window_assigned`, `result_source_assigned` |
 | Match | `session_opened`, `snapshot_frozen`, `session_completed`, `session_abandoned`, `result_accepted`, `match_events_recorded` |
 | Import | `imported_result_accepted`, `imported_match_events_recorded`, `import_parked` |
-| Generation | `generated_result_accepted` (with model version + seed) |
+| Generation | `generated_result_accepted` (with model version and seed) |
 | Admin | `result_corrected`, `fixture_admin_resolved`, `settings_version_published`, `identity_mapping_resolved` |
 | Season | `season_completed`, `honours_awarded`, `qualification_determined`, `season_rolled_over` |
 
@@ -228,11 +238,11 @@ A `TeamSnapshot` (frozen at `in_session`) contains for each footballer: `footbal
 
 Footballer statistics are computed as:
 
-- **inherited** = sum of imported match events for fixtures dated before the club's takeover (or for fixtures the world never replaced),
+- **inherited** = sum of imported match events for fixtures dated before the club's takeover, or for fixtures the world never replaced,
 - **earned** = sum of match events whose fixture `result_source ∈ {played_vs_friend, played_vs_cpu}` (and `generated` for unrepresented sides when the group so configures),
 - **combined** = inherited + earned.
 
-Because the real version of a replaced fixture is never ingested as `imported_match_events_recorded` (the proposal gate rejects it: fixture is `played/accepted` with a non-import source), later real goals can never leak into totals.
+Because the real version of a replaced fixture is never ingested as `imported_match_events_recorded` (the proposal gate rejects it: fixture is `played` or `accepted` with a non-import source), later real goals can never leak into totals.
 
 ---
 
@@ -240,23 +250,23 @@ Because the real version of a replaced fixture is never ingested as `imported_ma
 
 ### 6.1 Takeover (profile creation and club selection)
 
-1. Client → World API: `POST /worlds/{w}/assignments {club_id}`; host checks club has no active assignment (unless shared control enabled).
-2. Ingestion fetches club identity, history, current season fixtures/results, squad, footballer profiles (jobs; progress visible on the Create/Join page with coverage status per information area).
-3. **Proposal gate** applies each item: anything about a fixture the world already holds in `played/accepted` state is **parked** with reason `world_precedence`; everything else appends `imported_*` events.
+1. Client → World API: `POST /worlds/{w}/assignments {club_id}`; host checks the club has no active assignment (unless shared control is enabled).
+2. Ingestion fetches club identity, history, current-season fixtures and results, squad, footballer profiles (background jobs; progress visible on the Create/Join page with coverage status per information area).
+3. **Proposal gate** applies each item: anything about a fixture the world already holds in `played` or `accepted` state is **parked** with reason `world_precedence`; everything else appends `imported_*` events.
 4. `takeover_snapshot_recorded` captures the as-of baseline (inherited totals, position, honours) and the `effective_from` instant.
 5. Competition engine builds the club's calendar; fixtures from `effective_from` onward get windows and result sources.
-6. Cartridge revision issued; cartridge manager writes profile + career view.
+6. Cartridge revision issued; cartridge manager writes profile and career view.
 
 ### 6.2 Result-source assignment (in advance)
 
-At `window_open_utc - lead_time` (season setting, e.g. 24 h) the engine appends `result_source_assigned`:
+At `window_open_utc - lead_time` (season setting, for example 24 h) the engine appends `result_source_assigned`:
 
 | Home represented | Away represented | Source |
 |------------------|------------------|--------|
 | yes | yes | `played_vs_friend` |
 | yes | no  | `played_vs_cpu` (home participant plays) |
 | no  | yes | `played_vs_cpu` (away participant plays) |
-| no  | no  | `imported` if `real_fixture_id` present else `generated` |
+| no  | no  | `imported` if `real_fixture_id` present, else `generated` |
 
 A participant's temporary unavailability does not change the source; a missed window becomes `awaiting_admin`, never a silent fallback.
 
@@ -286,7 +296,7 @@ sequenceDiagram
     end
     A->>H: completed(final hash, claimed score)
     B->>H: completed(final hash, claimed score)
-    H->>H: replay input log headlessly from snapshot
+    H->>H: psfc-replay from snapshot + input log
     H->>H: compare hashes; append result_accepted + match_events_recorded (idempotent on fixture_id)
     H-->>A: accepted result + new cartridge revision
     H-->>B: accepted result + new cartridge revision
@@ -298,7 +308,7 @@ Pause budget, reconnection window and abandonment behaviour come from the frozen
 
 ### 6.4 CPU match
 
-Single client; the CPU side's inputs are produced by the sim core's CPU controller **inside the deterministic simulation** from the seed, so the host's replay reproduces the CPU's decisions too. Only the human side's inputs are logged.
+Single client; the CPU side's inputs are produced by the simulation's CPU controller **inside the deterministic simulation** from the seed, so the host's replay reproduces the CPU's decisions too. Only the human side's inputs are logged.
 
 ### 6.5 Background import of an unrepresented fixture
 
@@ -311,23 +321,23 @@ Single client; the CPU side's inputs are produced by the sim core's CPU controll
 
 Cartridge `manifest.json` carries `world_id`, `participant_id`, `device_id`, `revision.last_event_seq`, `revision.signature` (host-signed). On insertion:
 
-1. Validate schema and signature; refuse unsigned or mismatched worlds; refuse a `device_id` that the host reports revoked.
+1. Validate schema and signature; refuse unsigned or mismatched worlds; refuse a `device_id` the host reports revoked.
 2. Ask host: `GET /sync?since={last_event_seq}`; receive the event delta and new signed revision. The cartridge is **never** a source of world events, so an older cartridge cannot reverse anything; it simply fast-forwards.
 3. Pending local-only data (settings, lineups, tactics) is pushed as commands; conflicts resolve last-writer-wins on *personal* data only.
 4. Rebuild `career.sqlite` view locally; write to inactive generation; fsync; flip `manifest.active`.
-5. If the host is unreachable: load the cached view read-only for browsing/practice; official fixtures are unavailable (A3).
+5. If the host is unreachable: load the cached view read-only for browsing and practice; official fixtures are unavailable (assumption A3).
 
-Duplicate cartridges: the host's refresh-token rotation detects two devices presenting the same `device_id` family and marks the second as `suspect`; a commissioner resolves. Replacement: new `device_id` registered to the participant, old revoked, full career view written from the ledger.
+Duplicate cartridges: refresh-token rotation detects two devices presenting the same `device_id` family and marks the second `suspect`; a commissioner resolves. Replacement: new `device_id` registered to the participant, old revoked, full career view written from the ledger.
 
 ### 6.7 Cup divergence and generation
 
 1. After `result_accepted` for a knockout tie, progression computes the winner from the parallel record (aggregate, away goals if the competition's rules say so, extra time, penalties).
-2. Engine looks for the real next-round fixture: if its two entrants equal the parallel entrants, it links (`fixture_linked_to_real`), otherwise it appends `draw_generated` for the affected ties using the competition's draw rules and seeded RNG, schedules onto the competition's declared match dates, and assigns sources.
-3. Unrepresented-vs-unrepresented generated fixtures resolve at window close via the **generated-result model** (`model_version`, `seed`, team strength from attribute profiles → expected goals → Poisson → scorer sampling weighted by position/finishing). Recorded as `generated_result_accepted` and shown with the label "generated".
+2. The engine looks for the real next-round fixture: if its two entrants equal the parallel entrants, it links (`fixture_linked_to_real`); otherwise it appends `draw_generated` for the affected ties using the competition's draw rules and seeded RNG, schedules onto the competition's declared match dates, and assigns sources.
+3. Unrepresented-versus-unrepresented generated fixtures resolve at window close via the **generated-result model** (`model_version`, `seed`, team strength from attribute profiles → expected goals → Poisson → scorer sampling weighted by position and finishing). Recorded as `generated_result_accepted` and shown with the label "generated".
 
 ### 6.8 Correction
 
-Commissioner → `POST /admin/results/{fixture}/correct {new outcome, reason}` → `result_corrected(supersedes_seq)`. Projection rebuild for the fixture's competition and season runs from the log, treating superseded events as inert. Original stays visible in history with its reason.
+Commissioner → `POST /admin/results/{fixture}/correct {new outcome, reason}` → `result_corrected(supersedes_seq)`. Projection rebuild for the fixture's competition and season runs from the log, treating superseded events as inert. The original stays visible in history with its reason.
 
 ---
 
@@ -356,29 +366,43 @@ POST /admin/...                          corrections, rescheduling, identity res
 
 Control: `Join`, `LobbyState`, `Ready`, `Start`, `Pause`, `Resume`, `Reconnect`, `Complete`, `Abandon`, `Accepted`. Data: `InputBatch{session, side, first_tick, inputs[]}`, `StateHash{tick, hash}`, `Ping`. Input frames are 8 bytes (two sticks × 2 axes as int8, 16 button bits, 2 reserved); a match played as two 6-minute halves runs about 43 k ticks at 60 Hz, roughly 350 KB of input per side, trivially storable.
 
-### 7.3 Sim core API
+### 7.3 Simulation API (Rust)
 
-```csharp
-var sim = new MatchSimulation(setup);          // MatchSetup: snapshots, RuleSet, seed, duration
-sim.Tick(new InputFrame[] { home, away });     // 60 Hz
-MatchState s = sim.State;                      // for rendering/interpolation
-IReadOnlyList<MatchEvent> ev = sim.DrainEvents();
-ulong h = sim.StateHash();
-byte[] save = sim.Serialize(); sim.Restore(save); // rollback
+```rust
+let mut sim = MatchSimulation::new(&setup);        // MatchSetup: snapshots, RuleSet, seed, duration
+sim.tick(&[home_input, away_input]);               // 60 Hz, deterministic
+let state: &MatchState = sim.state();              // for rendering and interpolation
+let events: Vec<MatchEvent> = sim.drain_events();
+let hash: u64 = sim.state_hash();
+let saved: Vec<u8> = sim.save_state(); sim.load_state(&saved);   // rollback
 ```
 
-### 7.4 Football-data adapter
+`psfc-replay` wraps the same crate:
 
-```csharp
-interface IFootballDataSource {
-  Task<Payload<ClubDto>>        GetClub(string extId);
-  Task<Payload<SquadDto>>       GetSquad(string extClubId, DateOnly asOf);
-  Task<Payload<FixtureDto[]>>   GetFixtures(string extCompetitionId, string season);
-  Task<Payload<ResultDto>>      GetResult(string extFixtureId);
-  Task<Payload<MatchEventDto[]>> GetEvents(string extFixtureId);     // coverage flagged
-  Task<Payload<TransferDto[]>>  GetTransfers(string extClubId, DateOnly since);
-}
-record Payload<T>(T Data, string Provider, string Endpoint, DateTimeOffset RetrievedAt, Coverage Coverage);
+```
+psfc-replay --snapshot fixture_snapshot.json --inputs session.log --out result.json
+```
+
+and prints the per-tick hash series used by both the host validator and the CI determinism tests.
+
+### 7.4 Football-data adapter (Python)
+
+```python
+class FootballDataSource(Protocol):
+    async def get_club(self, ext_id: str) -> Payload[ClubDto]: ...
+    async def get_squad(self, ext_club_id: str, as_of: date) -> Payload[SquadDto]: ...
+    async def get_fixtures(self, ext_competition_id: str, season: str) -> Payload[list[FixtureDto]]: ...
+    async def get_result(self, ext_fixture_id: str) -> Payload[ResultDto]: ...
+    async def get_events(self, ext_fixture_id: str) -> Payload[list[MatchEventDto]]: ...   # coverage flagged
+    async def get_transfers(self, ext_club_id: str, since: date) -> Payload[list[TransferDto]]: ...
+
+@dataclass(frozen=True)
+class Payload(Generic[T]):
+    data: T
+    provider: str
+    endpoint: str
+    retrieved_at: datetime
+    coverage: Coverage
 ```
 
 ---
@@ -389,7 +413,7 @@ record Payload<T>(T Data, string Provider, string Endpoint, DateTimeOffset Retri
 ┌──────────────────────────── Controller enclosure ────────────────────────────┐
 │  [RP2040]──HID──┐                                                           │
 │  sticks×2  ──── │        ┌──────────┐                                       │
-│  buttons   ──── ├────────┤ USB 2.0  ├──── USB-C to PC                       │
+│  buttons   ──── ├────────┤ USB 2.0  ├──── USB-C to the client device        │
 │  triggers  ──── │        │   hub    │                                       │
 │  rumble/batt ───┘        └────┬─────┘                                       │
 │                               │ downstream port                             │
@@ -397,46 +421,70 @@ record Payload<T>(T Data, string Provider, string Endpoint, DateTimeOffset Retri
 │                     │  cartridge slot   │ ← spring contacts / USB-C recept. │
 │                     └───────────────────┘                                   │
 └──────────────────────────────────────────────────────────────────────────────┘
-          Cartridge: USB flash PCB in Game Boy-style shell, keyed so it only
+          Cartridge: USB flash PCB in a Game Boy-style shell, keyed so it only
           inserts one way; the same shell also clips to the controller back
           for transport (the clip is mechanical only).
 ```
 
-- The PC sees two independent devices: a gamepad (serial = controller ID) and a removable disk (volume label = `PSFC-<cartridge id>`). Gameplay input never waits on disk I/O.
-- A standalone **profile-loading unit** is the same hub + slot without the MCU, satisfying "borrowed or replacement controller".
+- The client device sees two independent USB devices: a gamepad (serial = controller ID) and a removable disk (volume label `PSFC-<cartridge id>`). Gameplay input never waits on disk I/O.
+- A standalone **profile-loading unit** is the same hub and slot without the MCU, satisfying "borrowed or replacement controller".
+- **Console option (tier B).** A Raspberry Pi 5 in a printed console shell with two controller ports and a cartridge slot is the same hub arrangement at the console rather than in the controller. It is the natural living-room form of the product and is kept as an option, not a requirement.
 - Firmware: TinyUSB HID gamepad descriptor (2 × 2 axes 16-bit, 1 hat, 16 buttons), 1 kHz poll, debounce in firmware, calibration stored in RP2040 flash and mirrored to the cartridge `settings.json` (cartridge copy wins when both present, so a borrowed controller still feels right). UF2 drag-and-drop updates with the second flash slot kept as a fallback image.
 
 ---
 
 ## 9. Deployment and operations
 
+### 9.1 Host topology
+
 ```
-Raspberry Pi 5 (8 GB, NVMe) — "world host"
+DigitalOcean droplet (2 vCPU / 2 GB is sufficient) — "world host", primary
   docker compose:
-    postgres:16          (volume on NVMe)
-    host-api             (ASP.NET Core; World API + Community)
-    match-session        (lobby WS, UDP relay :7777, validator worker)
+    postgres:16          (volume)
+    api                  (uvicorn; World API + Community)
+    match                (lobby WS, UDP relay :7777, validator worker; image includes psfc-replay)
     ingest               (provider adapters, proposal gate, schedulers)
-    backup               (nightly pg_dump + payload archive → other server via rsync/restic)
+    backup               (nightly pg_dump + payload archive → home Pi over WireGuard/Tailscale, and/or object storage)
     caddy                (TLS termination, reverse proxy)
-Other server(s): backup target, optional second relay region, Grafana.
-Clients: Windows/Linux PCs running the Godot build; auto-update via signed release manifest.
+
+Raspberry Pi 5 at home — alternative primary host (same Compose file), otherwise backup target and tier-B console client.
+Other Pis — additional consoles, or a warm standby host restored from backup.
 ```
 
-Performance targets to measure (§16):
+Why the droplet is primary: a public address removes NAT traversal from the critical path, the relay fallback sits where every participant can reach it, and the host stays up when the home connection does not. The data remains the group's own, and the Pi can take over from a backup at any time. If the group prefers the record at home, the Pi runs the same stack and the droplet is reduced to relay and backup.
+
+The droplet is not a rendering target. It has no GPU, software rendering of 22 animated footballers cannot reach playable frame rates, and video streaming would add 60–150 ms of input latency to a game whose entire feel depends on responsiveness.
+
+### 9.2 Client tiers
+
+| Tier | Device | Renderer | Target | Status |
+|------|--------|----------|--------|--------|
+| A | Windows / Linux / macOS PC with a mid-range GPU | Godot Forward+ or Mobile | 1080p, 60 fps, full visual settings | Primary |
+| B | Raspberry Pi 5 (4 or 8 GB) in a console shell, Linux arm64 build | Godot Compatibility (OpenGL ES 3) | 720p–1080p, 30 fps floor, 60 fps goal; low-poly art budget | Supported after the phase-1 render gate passes |
+| C | Chromebook via the Linux container (Crostini) with GPU acceleration enabled, x86-64 or arm64 build | Godot Compatibility | 720p, 30 fps | Best effort; a browser build is the long-term route (ADR-0002) |
+
+Raspberry Pi 4 and earlier are not client targets. Several Pis cannot be combined to render one frame; GPU rendering does not distribute across machines.
+
+**Tier-B art budget**, applied to all assets from the start because it also suits the late-2000s console aesthetic: footballers ≤ 3 k triangles and ≤ 30 bones with four-bone skinning; one directional light with a single low-resolution shadow or baked shadows only; stadium as a handful of textured shells with a crowd texture; 1024² texture atlases; no post-processing beyond colour grading. Tier A adds higher-detail models and effects on top of the same scenes.
+
+**Phase-1 render gate.** A test scene with 22 animated tier-B footballers, ball, pitch and stadium shell must hold 30 fps at 720p on the actual Pi 5 build before tier B is confirmed. If it fails, the Pi is demoted to host and companion duties and the console shell idea is dropped.
+
+### 9.3 Performance targets to measure (requirements §16)
 
 | Metric | Target |
 |--------|--------|
-| Sim tick cost (client, 22 players) | < 2 ms |
-| Client render | 60 fps at 1080p on a GTX 1060-class GPU |
-| Local input-to-photon latency | < 50 ms |
-| Online rollback budget | 8 frames (≈133 ms RTT) before stall |
-| Host replay of a full match (Pi 5, arm64) | < 30 s |
+| Simulation tick cost (22 players, Rust, Pi 5 arm64) | < 2 ms |
+| Rollback re-simulation of 8 frames (Pi 5) | < 12 ms |
+| Tier A render | 60 fps at 1080p on a GTX 1060-class GPU |
+| Tier B render | 30 fps floor at 720p on Pi 5 |
+| Local input-to-photon latency | < 50 ms (tier A), < 70 ms (tier B) |
+| Online rollback budget | 8 frames (about 133 ms RTT) before stall |
+| Host replay of a full match (`psfc-replay`, 1 vCPU) | < 15 s |
 | World API p95 | < 200 ms |
-| Concurrent official sessions on the Pi | 4 |
+| Concurrent official sessions on the host | 4 |
 | Backup restore drill | < 30 min, run quarterly |
 
-Security: TLS everywhere; JWT with device binding; cartridge credential is a refresh token scoped to one participant and one world, revocable; no admin credentials on cartridges; all cartridge files schema-validated; input logs and events are the only accepted evidence of a result.
+Security: TLS everywhere; JWT with device binding; the cartridge credential is a refresh token scoped to one participant and one world, revocable; no admin credentials on cartridges; all cartridge files schema-validated; input logs and events are the only accepted evidence of a result.
 
 ---
 
@@ -444,31 +492,38 @@ Security: TLS everywhere; JWT with device binding; cartridge credential is a ref
 
 | Layer | Approach |
 |-------|----------|
-| Sim determinism | Golden replays: record input logs, assert identical `StateHash` sequence on x64 Windows, x64 Linux, arm64 Linux in CI. Fuzzed inputs for thousands of matches. |
-| Rules engine | Scenario tests (offside, advantage, second yellow, aggregate/away goals, shootout order). |
-| Ledger invariants | Property tests: random event sequences + corrections → rebuilt projections equal incremental ones; no fixture ever has two results; replaced fixtures never receive imported events. |
+| Simulation determinism | Golden replays: record input logs, assert identical hash series from `psfc-replay` on x86-64 Linux, x86-64 Windows, aarch64 Linux and wasm32 in CI. Fuzzed inputs for thousands of matches. |
+| Rules engine | Scenario tests in Rust (offside, advantage, second yellow, aggregate and away goals, shootout order). |
+| Ledger invariants | Property tests (Hypothesis): random event sequences plus corrections → rebuilt projections equal incremental ones; no fixture ever has two results; replaced fixtures never receive imported events. |
 | Proposal gate | Table-driven tests for every fixture state × import type. |
 | Competition engine | Format conformance tests per competition; divergence scenarios (cup upset, parallel qualification). |
-| Netcode | Simulated latency/loss harness; desync injection; reconnection. |
-| Cartridge | Power-cut simulation during write (kill mid-write, assert previous generation loads); corrupt-file rejection. |
-| Hardware | Bench rig: scripted button/stick sequences, HID report timing, hub enumeration with cartridge hot-plug during gameplay. |
-| End-to-end | The §19 acceptance table encoded as automated scenarios against a Compose test stack. |
+| Netcode | Simulated latency and loss harness in Rust; desync injection; reconnection. |
+| Cartridge | Power-cut simulation during write (kill mid-write, assert the previous generation loads); corrupt-file rejection. |
+| Hardware | Bench rig: scripted button and stick sequences, HID report timing, hub enumeration with cartridge hot-plug during gameplay. |
+| Render tiers | Automated frame-time capture of the gate scene on a Pi 5 and a reference PC per release. |
+| End-to-end | The requirements §19 acceptance table encoded as automated scenarios against a Compose test stack. |
 
 ---
 
 ## 11. Repository layout (proposed)
 
 ```
-/client/            Godot 4 project (C#)
-/sim/               ParallelSeason.Sim (deterministic core) + tests
-/shared/            Domain contracts, DTOs, event schemas, fixed-point math
-/host/              ASP.NET Core services: Api, Match, Competition, Ledger, Ingest, Community
+/client/            Godot 4 project (GDScript presentation; loads the psfc-godot extension)
+/sim/               Rust workspace
+  psfc-sim/           deterministic simulation core + tests
+  psfc-rollback/      rollback netcode, transport trait
+  psfc-godot/         GDExtension bindings (gdext)
+  psfc-replay/        headless replay CLI (host validator + CI)
+/host/              Python package psfc_host: api, match, competition, ledger, ingest, catalogue, community; alembic/
+/shared/            Schemas shared across languages: event payload JSON Schemas, InputFrame layout, snapshot format
 /firmware/          RP2040 (Pico SDK + TinyUSB) controller firmware
-/hardware/          KiCad PCBs, 3D-printable enclosures, BOM
+/hardware/          KiCad PCBs, 3D-printable enclosures (controller, cartridge, console shell), BOM
 /cartridge/         Save-format spec and validators
 /deploy/            docker-compose, Caddy, backup scripts, Grafana dashboards
 /docs/              This document, ADRs, season rules
 ```
+
+The existing `.gitignore` is an Adventure Game Studio template left over from repository creation and is replaced in phase 0 with Godot, Rust and Python ignores.
 
 ---
 
@@ -476,32 +531,35 @@ Security: TLS everywhere; JWT with device binding; cartridge credential is a ref
 
 | Phase | Goal | Exit criterion |
 |-------|------|----------------|
-| 0 Foundations | Repo re-init (Godot + .NET), fixed-point math, sim skeleton with hash + replay harness, ledger schema and event store, proposal gate | A recorded input log replays identically on x64 and arm64; property tests green |
-| 1 Playable core | Movement, pass, shoot, tackle, switching, GK AI, basic rules, two local controllers, capsule visuals | Two people finish a 2×4-minute match locally; events recorded |
-| 2 World & season | Takeover import, calendar, windows, result-source assignment, CPU matches, standings/stats projections, dashboard pages | A one-participant season runs end to end with imported background results |
-| 3 Personal kit | Controller firmware + hub PCB, cartridge format, cartridge manager, sync protocol, enclosures | Cartridge inserted on another PC restores identity and career; power-cut test passes |
-| 4 Online play | Lobby, rollback netcode, relay, validator, idempotent acceptance | Two homes play an official fixture; host-replayed result accepted once |
-| 5 Divergence & rollover | Full competition formats, generator, generated-result model, season completion, qualification | Parallel cup winner ≠ real; next season's European entries follow the parallel record |
-| 6 Feel & presentation | Skill moves, animation, stadiums, kits, broadcast camera, replays, audio | Group signs off on "feels like 2010 FIFA" against the §9 checklist |
+| 0 Foundations | Repo re-init (Godot project, Rust workspace, Python package), fixed-point math crate, simulation skeleton with hash and `psfc-replay`, ledger schema and event store, proposal gate; **tier-B render spike** on a Pi 5 | A recorded input log replays identically on x86-64, aarch64 and wasm32; property tests green; Pi 5 frame-time numbers recorded |
+| 1 Playable core | Movement, pass, shoot, tackle, switching, goalkeeper AI, basic rules, two local controllers, capsule visuals; render gate scene | Two people finish a 2 × 4-minute match locally; events recorded; tier-B gate decided |
+| 2 World and season | Takeover import, calendar, windows, result-source assignment, CPU matches, standings and statistics projections, dashboard pages | A one-participant season runs end to end with imported background results |
+| 3 Personal kit | Controller firmware and hub PCB, cartridge format, cartridge manager, sync protocol, enclosures | Cartridge inserted on another device restores identity and career; power-cut test passes |
+| 4 Online play | Lobby, rollback netcode, relay on the droplet, validator, idempotent acceptance | Two homes play an official fixture; host-replayed result accepted once |
+| 5 Divergence and rollover | Full competition formats, generator, generated-result model, season completion, qualification | Parallel cup winner differs from the real one; next season's European entries follow the parallel record |
+| 6 Feel and presentation | Skill moves, animation, stadiums, kits, broadcast camera, replays, audio | Group signs off on "feels like 2010 FIFA" against the requirements §9 checklist |
 
-Phases 2–3 can proceed in parallel with phase 1 since they do not depend on gameplay feel.
+Phases 2 and 3 can proceed in parallel with phase 1 since they do not depend on gameplay feel.
 
 ---
 
 ## 13. Decisions to confirm with the group
 
-1. Godot 4 + C# as the engine (vs Unity/Unreal).
-2. Fixed-point deterministic sim (accepting more up-front maths work for guaranteed cross-platform replay).
-3. Cartridge = USB mass storage behind a hub in the controller (vs MCU-read SD card).
-4. Official matches require host connectivity in v1 (no offline official results).
-5. Match duration and difficulty as frozen season settings; which assistance settings are allowed in official fixtures.
-6. Which football-data provider, and whether event-level coverage for unrepresented matches is purchased.
-7. Generated-result model acceptance (rating-based Poisson) and whether its goals count toward footballer "earned" statistics for unrepresented clubs.
-8. Who holds the `commissioner` role and the dispute process.
+1. Godot 4 with a Rust GDExtension simulation (ADR-0001), versus a browser-native client (ADR-0002, alternative).
+2. Python for the host services, with Go as the alternative if a single compiled binary is preferred (ADR-0001).
+3. DigitalOcean droplet as primary world host, Pi at home as backup and console (ADR-0002); or the reverse.
+4. Fixed-point deterministic simulation (accepting more up-front maths work for guaranteed cross-platform replay).
+5. Cartridge = USB mass storage behind a hub in the controller (versus an MCU-read SD card).
+6. Official matches require host connectivity in v1 (no offline official results).
+7. Match duration and difficulty as frozen season settings; which assistance settings are allowed in official fixtures.
+8. Which football-data provider, and whether event-level coverage for unrepresented matches is purchased.
+9. Generated-result model acceptance (rating-based Poisson) and whether its goals count toward footballer "earned" statistics for unrepresented clubs.
+10. Who holds the `commissioner` role and the dispute process.
 
 ## 14. What to revisit as the system grows
 
+- If zero-install browser play becomes a must (for example, Chromebooks become the main devices): the Rust simulation already targets wasm32; build the browser client described in ADR-0002 and add a WebRTC transport to `psfc-rollback`.
 - If several friend groups want separate worlds on one host: the schema already keys everything by `world_id`; add per-world rate limits and storage quotas.
-- If matches move beyond 2 participants (shared control, spectators): the input log and rollback are per-side today; extending to N inputs is mechanical, but lobby and controller assignment UI need redesign.
-- If the Pi becomes a bottleneck for replay validation: move the validator worker to the other server; it is already a separate process consuming from the input-log table.
-- If a provider is replaced: only `/host/Ingest/Adapters/<Provider>` changes; identities survive via `external_identity`.
+- If matches move beyond two participants (shared control, spectators): the input log and rollback are per side today; extending to N inputs is mechanical, but lobby and controller-assignment UI need redesign.
+- If replay validation ever becomes a bottleneck: `psfc-replay` is a stateless binary consuming the input-log table and can run on any machine, including a Pi at home.
+- If a provider is replaced: only `host/psfc_host/ingest/adapters/<provider>/` changes; identities survive via `external_identity`.

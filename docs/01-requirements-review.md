@@ -21,9 +21,9 @@ The document is comparatively weak on **technical constraints**: no engine, lang
 
 ## 2. Findings that change the architecture
 
-### 2.1 The repository is set up for the wrong kind of engine
+### 2.1 The repository's `.gitignore` is a placeholder
 
-`.gitignore` is the Adventure Game Studio template (`Game.agf`, `acsprset.spr`, `AudioCache/`). AGS is a 2D point-and-click engine and cannot host a real-time 3D 11-a-side game. The repository should be re-initialised for whichever engine is chosen (recommendation in the architecture document: Godot 4 with C#).
+`.gitignore` is the Adventure Game Studio template (`Game.agf`, `acsprset.spr`, `AudioCache/`), chosen at random when the repository was created. It did not influence any decision in this review or in the architecture; it simply needs replacing with Godot, Rust and Python ignores when the repository is initialised in phase 0.
 
 ### 2.2 Deterministic simulation is implied but never stated
 
@@ -35,9 +35,14 @@ Three requirements only hold together if the football simulation is deterministi
 
 A deterministic, fixed-timestep simulation that is independent of the rendering engine gives you all three for free: rollback netcode for responsive 2-player play, desync detection by state hash, and **result validation by replaying the input log headlessly on the host**. This should be promoted to a first-class requirement; it is the single most consequential technical decision in the project.
 
-### 2.3 The Raspberry Pi is a host, not a 3D client
+### 2.3 Where the host runs and where the 3D client runs are separate questions
 
-Section 16 names "the Raspberry Pi hosting target". A Pi 5 can comfortably run the world host (API, database, match relay, headless replay verifier). It is not a credible target for rendering 22 animated footballers at 60 fps. The architecture separates "world host" (Pi-class) from "game client" (PC-class) and makes that explicit. If a Pi is ever wanted as a living-room client, it should be measured on the real build before being promised.
+Section 16 names "the Raspberry Pi hosting target" and "your other servers". The available hardware is a DigitalOcean droplet, several Raspberry Pis and two Chromebooks, plus participants' own PCs.
+
+- **World host.** Any of these can run the host services; a Pi 5 or a small droplet is ample. The architecture recommends the droplet as primary because its public address removes NAT traversal from online play, with the Pi as backup target or alternative primary (ADR-0002).
+- **3D client on the droplet.** Not viable. The droplet has no GPU, software rendering of 22 animated footballers cannot reach playable frame rates, and streaming video to a Chromebook or Pi would add 60–150 ms of input latency to a game that lives on responsiveness.
+- **Raspberry Pi 5 as a console client.** Plausible with a deliberate low-poly art budget and Godot's Compatibility renderer, and it fits the product's console identity well. It is gated on a measured render test in phase 1 rather than promised. Pi 4 and earlier are not targets. Several Pis cannot be combined to render one frame.
+- **Chromebooks.** Supported best-effort through the Linux container; a browser build is the long-term route and is kept open by compiling the simulation to WebAssembly (ADR-0002).
 
 ### 2.4 Season-rollover divergence is a full competition generator
 
@@ -90,10 +95,10 @@ The season ledger, scheduling, import and cartridge systems do not depend on sta
 
 Where the document is silent, the architecture adopts these assumptions. Each should be confirmed by the group.
 
-- A1. One world host per friend group, self-hosted on a Raspberry Pi 5 (or any Linux box); clients are PCs running the game.
+- A1. One world host per friend group, self-hosted on the DigitalOcean droplet or a Raspberry Pi 5; clients are participants' PCs, optional Raspberry Pi 5 consoles, and Chromebooks on a best-effort basis.
 - A2. ≤ 20 participants, ≤ 4 concurrent official matches, one season active at a time per world.
 - A3. Official matches require host connectivity; same-room play uses one client talking to the host.
 - A4. The trust model is "friends", but validation is still done properly because deterministic replay makes it cheap.
 - A5. Real club and player data are for private use only.
 - A6. Controllers connect by USB cable (no wireless in v1); the cartridge is a USB mass-storage device.
-- A7. The game client runs on Windows and Linux x86-64; macOS is nice-to-have.
+- A7. The game client runs on Windows and Linux x86-64 and Linux arm64 (Raspberry Pi 5); macOS is nice-to-have; ChromeOS is reached through its Linux container.
