@@ -1,4 +1,4 @@
-"""FastAPI World API for Parallel Season FC + 5v5 Browser/WASM Client host."""
+"""FastAPI World API for Parallel Season FC + 5v5 Browser/WASM Client host (Phases 1–6)."""
 
 from __future__ import annotations
 
@@ -6,15 +6,22 @@ import os
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
+from psfc_host.api.auth import DeviceAuthService
 from psfc_host.catalogue.clubs import GAMEPLAY_VERSION, ClubCatalogue
+from psfc_host.community.appointments import AppointmentService
+from psfc_host.community.cartridge import CartridgeSyncService
+from psfc_host.competition.engine import CompetitionEngine
+from psfc_host.ingest.adapters import ProviderFeedAdapter
 from psfc_host.ingest.proposal_gate import ProposalGate
 from psfc_host.ledger.projections import project_player_stats, project_standings
 from psfc_host.ledger.store import WorldLedgerStore
+from psfc_host.match.lobby import OnlineLobbyService
+from psfc_host.match.relay import MatchInputRelayRecorder
 from psfc_host.match.validator import (
     MatchSessionService,
     ReplayValidationError,
@@ -64,6 +71,22 @@ class IngestResultRequest(BaseModel):
     provider: str = "real_football_feed_v1"
 
 
+class ProviderFixtureIngestRequest(BaseModel):
+    provider: str = "football_data_v4"
+    external_fixture_id: str
+    external_home_club_id: str
+    external_away_club_id: str
+    home_goals: int = Field(ge=0)
+    away_goals: int = Field(ge=0)
+    events: list[dict[str, Any]] = Field(default_factory=list)
+    target_fixture_id: str | None = None
+
+
+class ResolveIdentityRequest(BaseModel):
+    internal_id: str = Field(..., min_length=2)
+    actor_id: str = "commissioner"
+
+
 class IngestTransferRequest(BaseModel):
     footballer_id: str
     from_club_id: str
@@ -80,13 +103,99 @@ class CorrectResultRequest(BaseModel):
     reason: str = "commissioner audit ruling"
 
 
+class ResolveAdminFixtureRequest(BaseModel):
+    home_goals: int = Field(ge=0)
+    away_goals: int = Field(ge=0)
+    actor_id: str = "commissioner"
+    reason: str = "commissioner walkover / ruling"
+
+
+class ExpireWindowsRequest(BaseModel):
+    as_of_utc: str | None = None
+    actor_id: str = "scheduler"
+
+
+class ProposeAppointmentRequest(BaseModel):
+    proposed_by: str = "part-alex"
+    proposed_at_utc: str
+
+
+class RespondAppointmentRequest(BaseModel):
+    responder_id: str = "part-sam"
+    accept: bool = True
+
+
+class RegisterDeviceRequest(BaseModel):
+    participant_id: str
+    label: str = "Custom RP2040 Pad + Cartridge"
+    device_id: str | None = None
+
+
+class RevokeDeviceRequest(BaseModel):
+    actor_id: str = "commissioner"
+
+
+class CartridgeSyncRequest(BaseModel):
+    participant_id: str = "part-alex"
+    device_id: str = "dev-alex-01"
+    camera_preset: str = "broadcast_5v5"
+    controller_profile: dict[str, Any] | None = None
+
+
+class IssueTokenRequest(BaseModel):
+    device_id: str
+    device_secret: str
+    ttl_seconds: int = Field(default=86_400, ge=60, le=604_800)
+
+
+class LobbyReadyRequest(BaseModel):
+    side: str = Field(..., pattern="^(home|away)$")
+    actor_id: str = "part-alex"
+
+
+class LobbyActionRequest(BaseModel):
+    actor_id: str = "part-alex"
+
+
+class LobbyDisconnectRequest(BaseModel):
+    disconnected_actor: str = "part-sam"
+
+
+class LobbyAbandonRequest(BaseModel):
+    reason: str = "reconnect_timeout"
+    actor_id: str = "lobby_watchdog"
+
+
+class RelayInputBatchRequest(BaseModel):
+    side: str = Field(..., pattern="^(home|away)$")
+    first_tick: int = Field(..., ge=1)
+    frames: list[dict[str, Any] | str]
+
+
+class AdvanceCompetitionRequest(BaseModel):
+    actor_id: str = "competition_engine"
+
+
+class GenerateFixtureRequest(BaseModel):
+    seed: int | None = None
+    actor_id: str = "poisson_generator"
+
+
+class SeasonRolloverRequest(BaseModel):
+    next_season_label: str = "2027/28"
+    actor_id: str = "commissioner"
+
+
 def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> FastAPI:
     resolved_db = db_path or os.environ.get("PSFC_DB_PATH", "/tmp/psfc_world.db")
 
     app = FastAPI(
         title="classicFutbol — Parallel Season FC World API",
         version=GAMEPLAY_VERSION,
-        description="Event-sourced Parallel Season host, Proposal Gate, and deterministic 5v5/11v11 replay validator.",
+        description=(
+            "Event-sourced Parallel Season host, Proposal Gate, Competition Divergence Engine, "
+            "Signed Cartridge Sync, Online Lobby/Relay, and deterministic 5v5/11v11 replay validator."
+        ),
     )
 
     state_holder: dict[str, Any] = {}
@@ -105,12 +214,26 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         catalogue = ClubCatalogue()
         gate = ProposalGate(store, catalogue)
         sessions = MatchSessionService(store, catalogue)
+        adapter = ProviderFeedAdapter(store, gate)
+        appointments = AppointmentService(store)
+        cartridge = CartridgeSyncService(store)
+        auth = DeviceAuthService(store)
+        lobby = OnlineLobbyService(store)
+        relay = MatchInputRelayRecorder(store)
+        competition_engine = CompetitionEngine(store, catalogue)
         if seed_demo:
             ensure_demo_world(store, catalogue)
         state_holder["store"] = store
         state_holder["catalogue"] = catalogue
         state_holder["gate"] = gate
         state_holder["sessions"] = sessions
+        state_holder["adapter"] = adapter
+        state_holder["appointments"] = appointments
+        state_holder["cartridge"] = cartridge
+        state_holder["auth"] = auth
+        state_holder["lobby"] = lobby
+        state_holder["relay"] = relay
+        state_holder["competition_engine"] = competition_engine
 
     _init_services(reset_file=False)
 
@@ -153,6 +276,15 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         store: WorldLedgerStore = state_holder["store"]
         return {"worlds": store.list_worlds(), "default_world_id": DEFAULT_WORLD_ID}
 
+    @app.get("/api/worlds/{world_id}/competitions")
+    def get_competitions(world_id: str) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        try:
+            store.get_world(world_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"world_id": world_id, "competitions": store.list_competitions(world_id)}
+
     @app.get("/api/worlds/{world_id}/standings")
     def get_standings(world_id: str) -> dict[str, Any]:
         store: WorldLedgerStore = state_holder["store"]
@@ -179,7 +311,7 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         return {"world_id": world_id, "players": stats}
 
     @app.get("/api/worlds/{world_id}/fixtures")
-    def get_fixtures(world_id: str) -> dict[str, Any]:
+    def get_fixtures(world_id: str, competition_id: str | None = None) -> dict[str, Any]:
         store: WorldLedgerStore = state_holder["store"]
         cat: ClubCatalogue = state_holder["catalogue"]
         try:
@@ -187,7 +319,7 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         clubs = _clubs_summary(cat)
-        fixtures = store.list_fixtures(world_id)
+        fixtures = store.list_fixtures(world_id, competition_id=competition_id)
         for f in fixtures:
             f["home_club"] = clubs.get(f["home_club_id"])
             f["away_club"] = clubs.get(f["away_club_id"])
@@ -208,6 +340,9 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         store: WorldLedgerStore = state_holder["store"]
         cat: ClubCatalogue = state_holder["catalogue"]
         gate: ProposalGate = state_holder["gate"]
+        appointments: AppointmentService = state_holder["appointments"]
+        cartridge: CartridgeSyncService = state_holder["cartridge"]
+        adapter: ProviderFeedAdapter = state_holder["adapter"]
         try:
             world = store.get_world(world_id)
         except KeyError as exc:
@@ -226,11 +361,16 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
 
         return {
             "world": world,
+            "competitions": store.list_competitions(world_id),
             "clubs": list(clubs.values()),
             "assignments": assignments,
             "standings": standings_proj["standings"],
             "players": player_stats[:16],
             "fixtures": fixtures,
+            "appointments": appointments.list_appointments(world_id)[:12],
+            "honours": store.list_honours(world_id),
+            "devices": cartridge.list_devices(),
+            "identity_queue": adapter.list_identity_queue(world_id)[:12],
             "recent_events": list(reversed(events[-25:])),
             "total_events": len(events),
             "proposals": gate.list_proposals(world_id)[:12],
@@ -284,10 +424,16 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
     @app.post("/api/sessions/{session_id}/complete")
     def complete_fixture_session(session_id: str, req: CompleteSessionRequest) -> dict[str, Any]:
         sessions: MatchSessionService = state_holder["sessions"]
+        relay: MatchInputRelayRecorder = state_holder["relay"]
+        frames_hex = req.frames_hex
+        if frames_hex is None and req.frames is None:
+            _, assembled = relay.assemble_session_frames_hex(session_id)
+            if assembled:
+                frames_hex = assembled
         try:
             return sessions.complete_session(
                 session_id=session_id,
-                frames_hex=req.frames_hex,
+                frames_hex=frames_hex,
                 frames=req.frames,
                 claimed_final_hash_hex=req.claimed_final_hash_hex,
                 claimed_score=req.claimed_score,
@@ -302,6 +448,8 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
 
+    # --- Phase 2: Ingestion Adapter, Identity Queue, Deadlines, & Appointments ---
+
     @app.post("/api/worlds/{world_id}/ingest/result")
     def ingest_external_result(world_id: str, req: IngestResultRequest) -> dict[str, Any]:
         gate: ProposalGate = state_holder["gate"]
@@ -314,6 +462,44 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
                 events=req.events,
                 provider=req.provider,
             )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/{world_id}/ingest/provider-fixture")
+    def ingest_provider_fixture(
+        world_id: str, req: ProviderFixtureIngestRequest
+    ) -> dict[str, Any]:
+        adapter: ProviderFeedAdapter = state_holder["adapter"]
+        try:
+            return adapter.ingest_provider_fixture_payload(
+                world_id=world_id,
+                provider=req.provider,
+                external_fixture_id=req.external_fixture_id,
+                external_home_club_id=req.external_home_club_id,
+                external_away_club_id=req.external_away_club_id,
+                home_goals=req.home_goals,
+                away_goals=req.away_goals,
+                events=req.events,
+                target_fixture_id=req.target_fixture_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/worlds/{world_id}/identity-queue")
+    def get_identity_queue(world_id: str) -> dict[str, Any]:
+        adapter: ProviderFeedAdapter = state_holder["adapter"]
+        return {"world_id": world_id, "queue": adapter.list_identity_queue(world_id)}
+
+    @app.post("/api/identity-queue/{queue_id}/resolve")
+    def resolve_identity_queue_item(queue_id: str, req: ResolveIdentityRequest) -> dict[str, Any]:
+        adapter: ProviderFeedAdapter = state_holder["adapter"]
+        try:
+            resolved = adapter.resolve_identity_mapping(
+                queue_id=queue_id,
+                internal_id=req.internal_id,
+                actor_id=req.actor_id,
+            )
+            return {"resolved": resolved}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -332,6 +518,31 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         except (KeyError, ValueError) as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.post("/api/worlds/{world_id}/expire-windows")
+    def expire_playing_windows(world_id: str, req: ExpireWindowsRequest) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        transitioned = store.expire_overdue_windows(
+            world_id=world_id,
+            as_of_utc=req.as_of_utc,
+            actor_id=req.actor_id,
+        )
+        return {"transitioned": transitioned, "count": len(transitioned)}
+
+    @app.post("/api/admin/fixtures/{fixture_id}/resolve")
+    def admin_resolve_fixture(fixture_id: str, req: ResolveAdminFixtureRequest) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        try:
+            res = store.resolve_awaiting_admin_fixture(
+                fixture_id=fixture_id,
+                home_goals=req.home_goals,
+                away_goals=req.away_goals,
+                actor_id=req.actor_id,
+                reason=req.reason,
+            )
+            return {"accepted_result": res}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
     @app.post("/api/admin/fixtures/{fixture_id}/correct")
     def admin_correct_result(fixture_id: str, req: CorrectResultRequest) -> dict[str, Any]:
         store: WorldLedgerStore = state_holder["store"]
@@ -349,6 +560,242 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.get("/api/worlds/{world_id}/appointments")
+    def get_appointments(world_id: str) -> dict[str, Any]:
+        appointments: AppointmentService = state_holder["appointments"]
+        return {"world_id": world_id, "appointments": appointments.list_appointments(world_id)}
+
+    @app.post("/api/fixtures/{fixture_id}/appointments")
+    def propose_fixture_appointment(
+        fixture_id: str, req: ProposeAppointmentRequest
+    ) -> dict[str, Any]:
+        appointments: AppointmentService = state_holder["appointments"]
+        try:
+            appt = appointments.propose_appointment(
+                fixture_id=fixture_id,
+                proposed_by=req.proposed_by,
+                proposed_at_utc=req.proposed_at_utc,
+            )
+            return {"appointment": appt}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/appointments/{appointment_id}/respond")
+    def respond_fixture_appointment(
+        appointment_id: str, req: RespondAppointmentRequest
+    ) -> dict[str, Any]:
+        appointments: AppointmentService = state_holder["appointments"]
+        try:
+            appt = appointments.respond_appointment(
+                appointment_id=appointment_id,
+                responder_id=req.responder_id,
+                accept=req.accept,
+            )
+            return {"appointment": appt}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    # --- Phase 3: Cartridge Devices & Signed Sync ---
+
+    @app.get("/api/worlds/{world_id}/devices")
+    def get_devices(world_id: str, participant_id: str | None = None) -> dict[str, Any]:
+        cartridge: CartridgeSyncService = state_holder["cartridge"]
+        return {"world_id": world_id, "devices": cartridge.list_devices(participant_id)}
+
+    @app.post("/api/worlds/{world_id}/devices")
+    def register_device_endpoint(world_id: str, req: RegisterDeviceRequest) -> dict[str, Any]:
+        cartridge: CartridgeSyncService = state_holder["cartridge"]
+        return cartridge.register_device(
+            participant_id=req.participant_id,
+            world_id=world_id,
+            label=req.label,
+            device_id=req.device_id,
+        )
+
+    @app.post("/api/worlds/{world_id}/devices/{device_id}/revoke")
+    def revoke_device_endpoint(
+        world_id: str, device_id: str, req: RevokeDeviceRequest
+    ) -> dict[str, Any]:
+        cartridge: CartridgeSyncService = state_holder["cartridge"]
+        try:
+            return cartridge.revoke_device(
+                device_id=device_id,
+                world_id=world_id,
+                actor_id=req.actor_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/{world_id}/cartridge/sync")
+    def sync_cartridge_endpoint(world_id: str, req: CartridgeSyncRequest) -> dict[str, Any]:
+        cartridge: CartridgeSyncService = state_holder["cartridge"]
+        cat: ClubCatalogue = state_holder["catalogue"]
+        try:
+            envelope = cartridge.issue_signed_cartridge(
+                world_id=world_id,
+                participant_id=req.participant_id,
+                device_id=req.device_id,
+                clubs_summary=_clubs_summary(cat),
+                controller_profile=req.controller_profile,
+                camera_preset=req.camera_preset,
+            )
+            return {"envelope": envelope}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    @app.post("/api/cartridge/verify")
+    def verify_cartridge_endpoint(body: dict[str, Any]) -> dict[str, Any]:
+        cartridge: CartridgeSyncService = state_holder["cartridge"]
+        envelope = body.get("envelope") if isinstance(body.get("envelope"), dict) else body
+        return cartridge.verify_cartridge_envelope(envelope)
+
+    # --- Phase 4: Device JWT Auth, Online Lobby, & Relay Input Batches ---
+
+    @app.post("/api/auth/token")
+    def issue_device_jwt(req: IssueTokenRequest) -> dict[str, Any]:
+        auth: DeviceAuthService = state_holder["auth"]
+        try:
+            return auth.issue_token(
+                device_id=req.device_id,
+                device_secret=req.device_secret,
+                ttl_seconds=req.ttl_seconds,
+            )
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    @app.get("/api/auth/verify")
+    def verify_device_jwt(
+        token: str | None = None,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        auth: DeviceAuthService = state_holder["auth"]
+        raw = token
+        if not raw and authorization and authorization.lower().startswith("bearer "):
+            raw = authorization[7:].strip()
+        if not raw:
+            raise HTTPException(status_code=401, detail="Missing token")
+        try:
+            claims = auth.verify_token(raw)
+            return {"valid": True, "claims": claims}
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/ready")
+    def session_mark_ready(session_id: str, req: LobbyReadyRequest) -> dict[str, Any]:
+        lobby: OnlineLobbyService = state_holder["lobby"]
+        try:
+            return {"session": lobby.mark_ready(session_id=session_id, side=req.side, actor_id=req.actor_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/pause")
+    def session_pause(session_id: str, req: LobbyActionRequest) -> dict[str, Any]:
+        lobby: OnlineLobbyService = state_holder["lobby"]
+        try:
+            return {"session": lobby.request_pause(session_id=session_id, actor_id=req.actor_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/resume")
+    def session_resume(session_id: str, req: LobbyActionRequest) -> dict[str, Any]:
+        lobby: OnlineLobbyService = state_holder["lobby"]
+        try:
+            return {"session": lobby.resume_session(session_id=session_id, actor_id=req.actor_id)}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/disconnect")
+    def session_disconnect(session_id: str, req: LobbyDisconnectRequest) -> dict[str, Any]:
+        lobby: OnlineLobbyService = state_holder["lobby"]
+        try:
+            return {
+                "session": lobby.report_disconnect(
+                    session_id=session_id, disconnected_actor=req.disconnected_actor
+                )
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/abandon")
+    def session_abandon(session_id: str, req: LobbyAbandonRequest) -> dict[str, Any]:
+        lobby: OnlineLobbyService = state_holder["lobby"]
+        try:
+            return {
+                "session": lobby.abandon_session(
+                    session_id=session_id, reason=req.reason, actor_id=req.actor_id
+                )
+            }
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/sessions/{session_id}/relay-inputs")
+    def session_relay_inputs(session_id: str, req: RelayInputBatchRequest) -> dict[str, Any]:
+        relay: MatchInputRelayRecorder = state_holder["relay"]
+        try:
+            written = relay.record_input_batch(
+                session_id=session_id,
+                side=req.side,
+                first_tick=req.first_tick,
+                frames=req.frames,
+            )
+            return {"session_id": session_id, "written": written}
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # --- Phase 5: Competition Divergence, Poisson Generator, & Season Rollover ---
+
+    @app.post("/api/worlds/{world_id}/competitions/{competition_id}/advance")
+    def advance_competition_endpoint(
+        world_id: str, competition_id: str, req: AdvanceCompetitionRequest
+    ) -> dict[str, Any]:
+        comp_engine: CompetitionEngine = state_holder["competition_engine"]
+        try:
+            return comp_engine.advance_knockout_competition(
+                world_id=world_id,
+                competition_id=competition_id,
+                actor_id=req.actor_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/fixtures/{fixture_id}/generate")
+    def generate_fixture_endpoint(fixture_id: str, req: GenerateFixtureRequest) -> dict[str, Any]:
+        comp_engine: CompetitionEngine = state_holder["competition_engine"]
+        try:
+            return comp_engine.generate_poisson_fixture_result(
+                fixture_id=fixture_id,
+                seed=req.seed,
+                actor_id=req.actor_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/{world_id}/rollover")
+    def rollover_season_endpoint(world_id: str, req: SeasonRolloverRequest) -> dict[str, Any]:
+        comp_engine: CompetitionEngine = state_holder["competition_engine"]
+        try:
+            return comp_engine.complete_season_and_rollover(
+                world_id=world_id,
+                next_season_label=req.next_season_label,
+                actor_id=req.actor_id,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/worlds/{world_id}/reset-demo")
     def reset_demo_world(world_id: str) -> dict[str, Any]:

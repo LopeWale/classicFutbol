@@ -7,8 +7,8 @@ use crate::ai::{
 use crate::config::{formation_anchors, SideController, TeamSide, TICKS_PER_SECOND};
 use crate::events::{MatchEvent, MatchEventType, PlayerMatchStats};
 use crate::input::{
-    InputFrame, BTN_CALL_RUN, BTN_JOCKEY, BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_SLIDE, BTN_SPRINT,
-    BTN_SWITCH, BTN_TACKLE, BTN_THROUGH,
+    InputFrame, BTN_CALL_RUN, BTN_JOCKEY, BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_SKILL, BTN_SLIDE,
+    BTN_SPRINT, BTN_SWITCH, BTN_TACKLE, BTN_THROUGH,
 };
 use crate::math::{angle_diff_bam, atan2_bam, turn_toward_bam, Fp, Vec2, Vec3};
 use crate::rng::DeterministicRng;
@@ -113,6 +113,8 @@ impl MatchSimulation {
                     assist_candidate: None,
                 },
                 rng: DeterministicRng::new(snapshot.seed),
+                went_to_extra_time: false,
+                shootout_score: None,
                 pending_events: Vec::new(),
                 recorded_events: Vec::new(),
             },
@@ -205,15 +207,42 @@ impl MatchSimulation {
             }
             MatchPhase::HalfTime { wait_ticks } => {
                 if wait_ticks <= 1 {
-                    self.state.half = 2;
-                    self.arrange_kickoff(TeamSide::Away);
-                    self.emit_event(
-                        MatchEventType::KickOff,
-                        TeamSide::Away,
-                        None,
-                        None,
-                        "Second half kick-off".to_string(),
-                    );
+                    match self.state.half {
+                        1 => {
+                            self.state.half = 2;
+                            self.arrange_kickoff(TeamSide::Away);
+                            self.emit_event(
+                                MatchEventType::KickOff,
+                                TeamSide::Away,
+                                None,
+                                None,
+                                "Second half kick-off".to_string(),
+                            );
+                        }
+                        2 => {
+                            self.state.half = 3;
+                            self.state.went_to_extra_time = true;
+                            self.arrange_kickoff(TeamSide::Home);
+                            self.emit_event(
+                                MatchEventType::ExtraTimeStart,
+                                TeamSide::Home,
+                                None,
+                                None,
+                                "Extra time first half kick-off".to_string(),
+                            );
+                        }
+                        _ => {
+                            self.state.half = 4;
+                            self.arrange_kickoff(TeamSide::Away);
+                            self.emit_event(
+                                MatchEventType::KickOff,
+                                TeamSide::Away,
+                                None,
+                                None,
+                                "Extra time second half kick-off".to_string(),
+                            );
+                        }
+                    }
                 } else {
                     self.state.phase = MatchPhase::HalfTime {
                         wait_ticks: wait_ticks - 1,
@@ -674,6 +703,7 @@ impl MatchSimulation {
                 let side_attack_sign = side.attack_sign(self.state.second_half_swapped());
                 let ball_xy_now = self.state.ball.pos.xy();
                 let mut kick_to_execute: Option<(u16, u16, bool, Vec2)> = None;
+                let mut skill_move_triggered: Option<(String, String, u8)> = None;
                 {
                     let p = &mut self.state.players[s_idx][idx];
 
@@ -723,6 +753,21 @@ impl MatchSimulation {
                             } else {
                                 p.action = PlayerActionState::Cooldown {
                                     ticks_left: ticks_left - 1,
+                                };
+                            }
+                        }
+                        PlayerActionState::SkillMove {
+                            kind,
+                            ticks_left,
+                            dir,
+                        } => {
+                            if !has_ball || ticks_left <= 1 {
+                                p.action = PlayerActionState::Normal;
+                            } else {
+                                p.action = PlayerActionState::SkillMove {
+                                    kind,
+                                    ticks_left: ticks_left - 1,
+                                    dir,
                                 };
                             }
                         }
@@ -776,6 +821,10 @@ impl MatchSimulation {
                             {
                                 if has_ball {
                                     let pressed_kick = side_input.buttons & CHARGE_MASK;
+                                    let skill_rising =
+                                        side_input.pressed(BTN_SKILL) && (prev_btns & BTN_SKILL) == 0;
+                                    let rstick_flick =
+                                        !is_gk && side_input.aim_vec().len() > Fp::from_milli(680);
                                     if pressed_kick != 0 && (prev_btns & CHARGE_MASK) == 0 {
                                         // Pick highest-priority single button bit
                                         let single_btn = if (pressed_kick & BTN_SHOOT) != 0 {
@@ -798,6 +847,26 @@ impl MatchSimulation {
                                             finesse: side_input.pressed(BTN_JOCKEY),
                                             aim: init_aim,
                                         };
+                                    } else if !is_gk && (skill_rising || rstick_flick) {
+                                        let kind: u8 = if skill_rising { 1 } else { 2 };
+                                        let burst_dir = if rstick_flick {
+                                            side_input.aim_vec().normalize_or_zero()
+                                        } else if side_input.move_vec().len() > Fp::from_milli(150) {
+                                            side_input.move_vec().normalize_or_zero()
+                                        } else {
+                                            Vec2::from_bam(p.facing_bam, Fp::ONE)
+                                        };
+                                        p.facing_bam = burst_dir.to_bam();
+                                        p.action = PlayerActionState::SkillMove {
+                                            kind,
+                                            ticks_left: 14,
+                                            dir: burst_dir,
+                                        };
+                                        skill_move_triggered = Some((
+                                            p.footballer_id.clone(),
+                                            p.name.clone(),
+                                            kind,
+                                        ));
                                     }
                                 } else if !is_gk {
                                     // Defending tackle / slide triggers
@@ -878,6 +947,11 @@ impl MatchSimulation {
                             let lunge = Fp::from_milli(1_400 + (ticks_left as i64) * 180);
                             Vec2::from_bam(p.facing_bam, lunge)
                         }
+                        PlayerActionState::SkillMove { dir, .. } => {
+                            let skill_burst =
+                                Fp::from_milli(5_800 + (p.attributes.dribbling as i64) * 20);
+                            dir.scale(skill_burst)
+                        }
                         PlayerActionState::Stumbled { .. } => p.vel.scale(Fp::from_milli(820)),
                         _ => move_dir.scale(top_speed),
                     };
@@ -921,6 +995,18 @@ impl MatchSimulation {
                         p.facing_bam
                     };
                     p.facing_bam = turn_toward_bam(p.facing_bam, face_target, 2800);
+                }
+
+                if let Some((fid, pname, kind)) = skill_move_triggered {
+                    self.state.player_stats[s_idx][idx].skill_moves_completed += 1;
+                    let move_label = if kind == 1 { "roulette" } else { "step-over" };
+                    self.emit_event(
+                        MatchEventType::SkillMove,
+                        side,
+                        Some(fid),
+                        None,
+                        format!("{pname} executes {move_label}"),
+                    );
                 }
 
                 if let Some((btn, charge_ticks, finesse, aim)) = kick_to_execute {
@@ -1199,6 +1285,22 @@ impl MatchSimulation {
                 continue;
             }
 
+            // Active SkillMove carrier can evade a lunging tackle based on dribbling skill
+            if matches!(
+                self.state.players[carrier_side.index()][carrier_idx].action,
+                PlayerActionState::SkillMove { .. }
+            ) {
+                let drib = self.state.players[carrier_side.index()][carrier_idx]
+                    .attributes
+                    .dribbling as u32;
+                let evade_pct = (48 + drib / 2).min(92);
+                if self.state.rng.chance_percent(evade_pct) {
+                    self.state.players[def_side.index()][d_idx].action =
+                        PlayerActionState::Cooldown { ticks_left: 16 };
+                    continue;
+                }
+            }
+
             let tackle_skill = self.state.players[def_side.index()][d_idx]
                 .attributes
                 .tackling as u32;
@@ -1345,14 +1447,62 @@ impl MatchSimulation {
             );
             self.setup_set_piece(RestartKind::PenaltyKick, victim_side, pen_spot);
         } else {
-            self.emit_event(
-                MatchEventType::FreeKick,
-                victim_side,
-                None,
-                None,
-                "Free kick awarded".to_string(),
-            );
-            self.setup_set_piece(RestartKind::FreeKick, victim_side, foul_pos);
+            // Advantage rule: in attacking half, if fouler wasn't sent off and an open teammate
+            // is within 9.5m in an advantageous position, play on!
+            let fouler_sent_off = self.state.players[fouling_side.index()][fouler_idx].sent_off;
+            let in_attacking_half = foul_pos.x.to_milli() * victim_attack_sign > 0;
+            let mut advantage_mate: Option<usize> = None;
+            if !fouler_sent_off && in_attacking_half {
+                let mut best_d = Fp::from_milli(9_500);
+                for (m_idx, mate) in self.state.players[victim_side.index()].iter().enumerate() {
+                    if m_idx == 0 || m_idx == victim_idx || mate.sent_off {
+                        continue;
+                    }
+                    let d = mate.pos.dist(foul_pos);
+                    let prog_ok = mate.pos.x.to_milli() * victim_attack_sign
+                        >= foul_pos.x.to_milli() * victim_attack_sign - 2_500;
+                    if d <= best_d && prog_ok {
+                        best_d = d;
+                        advantage_mate = Some(m_idx);
+                    }
+                }
+            }
+
+            if let Some(mate_idx) = advantage_mate {
+                let mate_id = self.state.players[victim_side.index()][mate_idx]
+                    .footballer_id
+                    .clone();
+                let mate_name = self.state.players[victim_side.index()][mate_idx]
+                    .name
+                    .clone();
+                let mate_pos = self.state.players[victim_side.index()][mate_idx].pos;
+                self.state.players[fouling_side.index()][fouler_idx].action =
+                    PlayerActionState::Cooldown { ticks_left: 22 };
+                self.state.players[victim_side.index()][victim_idx].action =
+                    PlayerActionState::Stumbled { ticks_left: 10 };
+                self.state.ball.owner = Some((victim_side, mate_idx));
+                self.state.ball.pos = Vec3::new(mate_pos.x, mate_pos.y, Fp::ZERO);
+                self.state.ball.vel = Vec3::ZERO;
+                self.state.ball.last_touch_team = Some(victim_side);
+                self.state.ball.last_touch_player = Some((victim_side, mate_idx));
+                self.state.controlled_idx[victim_side.index()] = mate_idx;
+                self.emit_event(
+                    MatchEventType::Advantage,
+                    victim_side,
+                    Some(mate_id),
+                    None,
+                    format!("Advantage played to {mate_name}!"),
+                );
+            } else {
+                self.emit_event(
+                    MatchEventType::FreeKick,
+                    victim_side,
+                    None,
+                    None,
+                    "Free kick awarded".to_string(),
+                );
+                self.setup_set_piece(RestartKind::FreeKick, victim_side, foul_pos);
+            }
         }
     }
 
@@ -1889,6 +2039,9 @@ impl MatchSimulation {
     fn check_clock_whistle(&mut self) {
         let half_limit = self.state.rules.half_duration_ticks;
         let full_limit = half_limit.saturating_mul(2);
+        let et_half = (half_limit / 3).max(180);
+        let et_first_limit = full_limit.saturating_add(et_half);
+        let et_full_limit = full_limit.saturating_add(et_half.saturating_mul(2));
 
         // Allow up to 90 ticks (1.5s) injury grace if a shot is actively flying near a goal
         let ball_near_goal = self.state.ball.owner.is_none()
@@ -1914,25 +2067,193 @@ impl MatchSimulation {
                 ),
             );
             self.state.phase = MatchPhase::HalfTime { wait_ticks: 60 };
-        } else if self.state.half >= 2 && self.state.clock_ticks >= full_limit {
+        } else if self.state.half == 2 && self.state.clock_ticks >= full_limit {
             if ball_near_goal && self.state.clock_ticks < full_limit + 90 {
                 return;
             }
+            if self.state.rules.extra_time_enabled && self.state.score[0] == self.state.score[1] {
+                self.emit_event(
+                    MatchEventType::HalfTime,
+                    TeamSide::Home,
+                    None,
+                    None,
+                    format!(
+                        "End of regulation ({} - {}) — Extra Time!",
+                        self.state.score[0], self.state.score[1]
+                    ),
+                );
+                self.state.phase = MatchPhase::HalfTime { wait_ticks: 60 };
+            } else {
+                self.finish_full_time();
+            }
+        } else if self.state.half == 3 && self.state.clock_ticks >= et_first_limit {
+            if ball_near_goal && self.state.clock_ticks < et_first_limit + 90 {
+                return;
+            }
             self.emit_event(
-                MatchEventType::FullTime,
+                MatchEventType::HalfTime,
                 TeamSide::Home,
                 None,
                 None,
                 format!(
-                    "Full-time: {} {} - {} {}",
+                    "Extra time half-time: {} {} - {} {}",
                     self.state.teams[0].short_name,
                     self.state.score[0],
                     self.state.score[1],
                     self.state.teams[1].short_name
                 ),
             );
-            self.state.phase = MatchPhase::FullTime;
+            self.state.phase = MatchPhase::HalfTime { wait_ticks: 45 };
+        } else if self.state.half >= 4 && self.state.clock_ticks >= et_full_limit {
+            if ball_near_goal && self.state.clock_ticks < et_full_limit + 90 {
+                return;
+            }
+            if self.state.score[0] == self.state.score[1] {
+                self.resolve_penalty_shootout();
+            }
+            self.finish_full_time();
         }
+    }
+
+    fn finish_full_time(&mut self) {
+        let summary = match self.state.shootout_score {
+            Some([hp, ap]) => format!(
+                "Full-time (AET, Pens {hp}-{ap}): {} {} - {} {}",
+                self.state.teams[0].short_name,
+                self.state.score[0],
+                self.state.score[1],
+                self.state.teams[1].short_name
+            ),
+            None if self.state.went_to_extra_time => format!(
+                "Full-time (AET): {} {} - {} {}",
+                self.state.teams[0].short_name,
+                self.state.score[0],
+                self.state.score[1],
+                self.state.teams[1].short_name
+            ),
+            None => format!(
+                "Full-time: {} {} - {} {}",
+                self.state.teams[0].short_name,
+                self.state.score[0],
+                self.state.score[1],
+                self.state.teams[1].short_name
+            ),
+        };
+        self.emit_event(MatchEventType::FullTime, TeamSide::Home, None, None, summary);
+        self.state.phase = MatchPhase::FullTime;
+    }
+
+    fn resolve_penalty_shootout(&mut self) {
+        self.emit_event(
+            MatchEventType::PenaltyShootoutStart,
+            TeamSide::Home,
+            None,
+            None,
+            "Scores level after 120' — Penalty Shootout!".to_string(),
+        );
+
+        let takers_for = |players: &[PlayerState]| -> Vec<usize> {
+            let mut order: Vec<usize> = (1..players.len())
+                .rev()
+                .filter(|&i| !players[i].sent_off)
+                .collect();
+            if !players[0].sent_off {
+                order.push(0);
+            }
+            if order.is_empty() {
+                order.push(0);
+            }
+            order
+        };
+
+        let home_order = takers_for(&self.state.players[0]);
+        let away_order = takers_for(&self.state.players[1]);
+        let mut h_pens: u8 = 0;
+        let mut a_pens: u8 = 0;
+
+        for round in 0..25_usize {
+            // Home kick
+            {
+                let idx = home_order[round % home_order.len()];
+                let sht = self.state.players[0][idx].attributes.shooting as i32;
+                let gk = self.state.players[1][0].attributes.goalkeeping as i32;
+                let fid = self.state.players[0][idx].footballer_id.clone();
+                let name = self.state.players[0][idx].name.clone();
+                let pct = (58 + sht / 2 - gk / 3).clamp(48, 88) as u32;
+                if self.state.rng.chance_percent(pct) {
+                    h_pens = h_pens.saturating_add(1);
+                    self.emit_event(
+                        MatchEventType::ShootoutGoal,
+                        TeamSide::Home,
+                        Some(fid),
+                        None,
+                        format!("Shootout R{}: {name} scores! ({h_pens}-{a_pens})", round + 1),
+                    );
+                } else {
+                    self.emit_event(
+                        MatchEventType::ShootoutMiss,
+                        TeamSide::Home,
+                        Some(fid),
+                        None,
+                        format!("Shootout R{}: {name} saved/missed ({h_pens}-{a_pens})", round + 1),
+                    );
+                }
+            }
+
+            if round < 5 {
+                let rem_h = (4 - round) as u8;
+                let rem_a = (5 - round) as u8;
+                if h_pens > a_pens + rem_a || a_pens > h_pens + rem_h {
+                    break;
+                }
+            }
+
+            // Away kick
+            {
+                let idx = away_order[round % away_order.len()];
+                let sht = self.state.players[1][idx].attributes.shooting as i32;
+                let gk = self.state.players[0][0].attributes.goalkeeping as i32;
+                let fid = self.state.players[1][idx].footballer_id.clone();
+                let name = self.state.players[1][idx].name.clone();
+                let pct = (58 + sht / 2 - gk / 3).clamp(48, 88) as u32;
+                if self.state.rng.chance_percent(pct) {
+                    a_pens = a_pens.saturating_add(1);
+                    self.emit_event(
+                        MatchEventType::ShootoutGoal,
+                        TeamSide::Away,
+                        Some(fid),
+                        None,
+                        format!("Shootout R{}: {name} scores! ({h_pens}-{a_pens})", round + 1),
+                    );
+                } else {
+                    self.emit_event(
+                        MatchEventType::ShootoutMiss,
+                        TeamSide::Away,
+                        Some(fid),
+                        None,
+                        format!("Shootout R{}: {name} saved/missed ({h_pens}-{a_pens})", round + 1),
+                    );
+                }
+            }
+
+            if round < 5 {
+                let rem = (4 - round) as u8;
+                if h_pens > a_pens + rem || a_pens > h_pens + rem {
+                    break;
+                }
+            } else if h_pens != a_pens {
+                break;
+            }
+        }
+
+        if h_pens == a_pens {
+            if self.state.rng.chance_percent(50) {
+                h_pens = h_pens.saturating_add(1);
+            } else {
+                a_pens = a_pens.saturating_add(1);
+            }
+        }
+        self.state.shootout_score = Some([h_pens, a_pens]);
     }
 
     fn emit_event(
@@ -2147,5 +2468,74 @@ mod tests {
             sim.state().player_stats[1][0].saves >= 1,
             "expected Away Goalkeeper to record a Save"
         );
+    }
+
+    #[test]
+    fn skill_move_execution_and_right_stick_flick_work() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(31415);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).unwrap();
+
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.controlled_idx[0] = 4;
+        sim.state.players[0][4].pos = Vec2::from_milli(5_000, 0);
+        sim.state.players[0][4].action = PlayerActionState::Normal;
+        sim.state.ball.owner = Some((TeamSide::Home, 4));
+        sim.state.ball.pos = Vec3::from_milli(5_500, 0, 0);
+        sim.state.prev_buttons = [0, 0];
+
+        // Trigger roulette via BTN_SKILL
+        sim.tick(&[
+            InputFrame {
+                move_x: 127,
+                move_y: 20,
+                buttons: BTN_SKILL,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert!(matches!(
+            sim.state().players[0][4].action,
+            PlayerActionState::SkillMove { kind: 1, .. }
+        ));
+        assert_eq!(sim.state().player_stats[0][4].skill_moves_completed, 1);
+        assert!(
+            sim.state()
+                .recorded_events
+                .iter()
+                .any(|e| e.event_type == MatchEventType::SkillMove)
+        );
+    }
+
+    #[test]
+    fn knockout_extra_time_and_penalty_shootout_produce_deterministic_winner() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(8888);
+        snap.rules.extra_time_enabled = true;
+        snap.rules.half_duration_ticks = 180;
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+
+        let mut sim_a = MatchSimulation::new(&snap).unwrap();
+        let mut sim_b = MatchSimulation::new(&snap).unwrap();
+
+        // Both human sides stay idle after auto-kickoffs -> 0-0 draw through regulation & extra time -> shootout!
+        for _ in 0..1_600 {
+            sim_a.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            sim_b.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim_a.is_finished() && sim_b.is_finished() {
+                break;
+            }
+        }
+
+        assert!(sim_a.is_finished());
+        assert!(sim_a.state().went_to_extra_time);
+        let pens = sim_a
+            .state()
+            .shootout_score
+            .expect("expected shootout score after level extra time");
+        assert_ne!(pens[0], pens[1], "shootout must produce a winner");
+        assert_eq!(sim_a.state().shootout_score, sim_b.state().shootout_score);
+        assert_eq!(sim_a.state_hash(), sim_b.state_hash());
     }
 }

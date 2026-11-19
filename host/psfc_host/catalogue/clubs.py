@@ -101,13 +101,14 @@ def default_ruleset(
     home_controller: dict[str, Any] | None = None,
     away_controller: dict[str, Any] | None = None,
     half_duration_ticks: int | None = None,
+    extra_time_enabled: bool = False,
 ) -> dict[str, Any]:
     is_11 = format_name == "11v11"
     return {
         "half_duration_ticks": half_duration_ticks or (14_400 if is_11 else 7_200),
         "offsides_enabled": is_11,
         "fouls_enabled": True,
-        "extra_time_enabled": False,
+        "extra_time_enabled": extra_time_enabled,
         "home_controller": home_controller or {"kind": "Human"},
         "away_controller": away_controller or {"kind": "Cpu", "difficulty": "Normal"},
     }
@@ -345,6 +346,23 @@ class ClubCatalogue:
             "substitutes": [_serialize_member(m) for m in rest],
         }
 
+    def club_strength_ratings(self, club_id: str, format_name: str = "5v5") -> tuple[float, float]:
+        """Return `(attack_rating, defense_rating)` in `[0, 100]` from active starters."""
+        snap = self.build_team_snapshot(club_id, format_name=format_name)
+        starters = snap["starters"]
+        gk = starters[0]["attributes"]
+        outfield = [p["attributes"] for p in starters[1:]]
+        att = sum(
+            0.45 * p["shooting"] + 0.30 * p["passing"] + 0.25 * p["dribbling"]
+            for p in outfield
+        ) / max(1, len(outfield))
+        dfn_out = sum(
+            0.50 * p["tackling"] + 0.30 * p["positioning"] + 0.20 * p["strength"]
+            for p in outfield
+        ) / max(1, len(outfield))
+        dfn = 0.55 * dfn_out + 0.45 * (0.65 * gk["goalkeeping"] + 0.35 * gk["positioning"])
+        return (att, dfn)
+
     def build_fixture_snapshot(
         self,
         fixture_id: str,
@@ -355,6 +373,7 @@ class ClubCatalogue:
         home_controller: dict[str, Any] | None = None,
         away_controller: dict[str, Any] | None = None,
         half_duration_ticks: int | None = None,
+        extra_time_enabled: bool = False,
     ) -> dict[str, Any]:
         return {
             "fixture_id": fixture_id,
@@ -366,6 +385,7 @@ class ClubCatalogue:
                 home_controller=home_controller,
                 away_controller=away_controller,
                 half_duration_ticks=half_duration_ticks,
+                extra_time_enabled=extra_time_enabled,
             ),
             "home": self.build_team_snapshot(home_club_id, format_name=format_name),
             "away": self.build_team_snapshot(away_club_id, format_name=format_name),

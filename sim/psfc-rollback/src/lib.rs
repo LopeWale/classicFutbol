@@ -6,6 +6,11 @@ use psfc_sim::{FixtureSnapshot, InputFrame, MatchSimulation, SimError, TeamSide}
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod udp;
+#[cfg(not(target_arch = "wasm32"))]
+pub use udp::UdpSocketTransport;
+
 pub const MAX_ROLLBACK_FRAMES: u32 = 8;
 pub const HASH_CHECK_INTERVAL_TICKS: u32 = 60;
 

@@ -88,7 +88,7 @@ class MatchSessionService:
             active_sess = self.store.conn.execute(
                 """
                 SELECT * FROM match_session
-                WHERE fixture_id = ? AND state IN ('created', 'running')
+                WHERE fixture_id = ? AND state IN ('created', 'ready_check', 'running', 'paused')
                 ORDER BY started_at DESC LIMIT 1
                 """,
                 (fixture_id,),
@@ -133,6 +133,7 @@ class MatchSessionService:
                 home_controller=home_controller,
                 away_controller=away_controller,
                 half_duration_ticks=half_duration_ticks,
+                extra_time_enabled=bool(fx.get("extra_time_enabled", 0)),
             )
         )
 
@@ -308,6 +309,10 @@ class MatchSessionService:
 
         auth_home = int(report["home_goals"])
         auth_away = int(report["away_goals"])
+        went_aet = bool(report.get("went_to_extra_time", False))
+        shootout = report.get("shootout_score")
+        sh_home = int(shootout[0]) if isinstance(shootout, list) and len(shootout) == 2 else None
+        sh_away = int(shootout[1]) if isinstance(shootout, list) and len(shootout) == 2 else None
         final_hash = str(report["final_hash_hex"])
         replay_events = list(report.get("events", []))
 
@@ -331,6 +336,8 @@ class MatchSessionService:
                 "elapsed_replay_ms": report["elapsed_ms"],
                 "client_claimed_score": claimed_score,
                 "authoritative_score": [auth_home, auth_away],
+                "went_to_extra_time": went_aet,
+                "shootout_score": [sh_home, sh_away] if sh_home is not None else None,
                 "score_discrepancy_detected": score_discrepancy,
             },
             caused_by=actor_id,
@@ -345,11 +352,15 @@ class MatchSessionService:
             aggregate_id=fixture_id,
             payload={
                 "fixture_id": fixture_id,
+                "competition_id": fx.get("competition_id"),
+                "stage": fx.get("stage", "league"),
                 "session_id": session_id,
                 "home_club_id": fx["home_club_id"],
                 "away_club_id": fx["away_club_id"],
                 "home_goals": auth_home,
                 "away_goals": auth_away,
+                "went_to_extra_time": went_aet,
+                "shootout_score": [sh_home, sh_away] if sh_home is not None else None,
                 "source": fx["result_source"],
                 "final_hash_hex": final_hash,
                 "format_name": report["format_name"],
@@ -380,9 +391,10 @@ class MatchSessionService:
             """
             INSERT INTO accepted_result (
                 fixture_id, world_id, session_id, source,
-                home_goals, away_goals, final_hash_hex, accepted_at, event_seq
+                home_goals, away_goals, went_to_extra_time, shootout_home, shootout_away,
+                final_hash_hex, accepted_at, event_seq
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fixture_id,
@@ -391,6 +403,9 @@ class MatchSessionService:
                 fx["result_source"],
                 auth_home,
                 auth_away,
+                int(went_aet),
+                sh_home,
+                sh_away,
                 final_hash,
                 ts,
                 res_ev["seq"],
@@ -420,6 +435,8 @@ class MatchSessionService:
                 "hash_verified": True,
                 "home_goals": auth_home,
                 "away_goals": auth_away,
+                "went_to_extra_time": went_aet,
+                "shootout_score": [sh_home, sh_away] if sh_home is not None else None,
                 "possession_home_pct": report["possession_home_pct"],
                 "elapsed_ms": report["elapsed_ms"],
                 "event_count": len(replay_events),

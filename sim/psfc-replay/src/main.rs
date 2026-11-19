@@ -110,6 +110,8 @@ pub struct ReplayVerificationResult {
     pub hash_mismatch_reason: Option<String>,
     pub home_goals: u16,
     pub away_goals: u16,
+    pub went_to_extra_time: bool,
+    pub shootout_score: Option<[u8; 2]>,
     pub possession_home_pct: u8,
     pub elapsed_ms: u128,
     pub hash_checkpoints: Vec<HashCheckpoint>,
@@ -196,6 +198,8 @@ fn run_verify(snapshot_path: &str, inputs_path: &str, out_path: Option<&str>) ->
         hash_mismatch_reason: mismatch_reason.clone(),
         home_goals: st.score[0],
         away_goals: st.score[1],
+        went_to_extra_time: st.went_to_extra_time,
+        shootout_score: st.shootout_score,
         possession_home_pct: poss_home,
         elapsed_ms: started.elapsed().as_millis(),
         hash_checkpoints: checkpoints,
@@ -279,7 +283,7 @@ fn run_simulate_demo(args: &[String]) -> Result<(), String> {
     let mut pairs: Vec<[InputFrame; 2]> = Vec::new();
     let mut checkpoints = Vec::new();
 
-    let safety_cap = half_ticks.saturating_mul(3).saturating_add(2_000);
+    let safety_cap = half_ticks.saturating_mul(5).saturating_add(3_000);
     while !sim.is_finished() && sim.state().tick < safety_cap {
         let pair = [InputFrame::IDLE, InputFrame::IDLE];
         sim.tick(&pair);
@@ -329,6 +333,8 @@ fn run_simulate_demo(args: &[String]) -> Result<(), String> {
         hash_mismatch_reason: None,
         home_goals: st.score[0],
         away_goals: st.score[1],
+        went_to_extra_time: st.went_to_extra_time,
+        shootout_score: st.shootout_score,
         possession_home_pct: poss_home,
         elapsed_ms: started.elapsed().as_millis(),
         hash_checkpoints: checkpoints,

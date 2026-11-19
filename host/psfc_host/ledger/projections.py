@@ -1,9 +1,9 @@
 """Pure derived projections from the append-only `world_event` log.
 
-Standings and footballer statistics (`inherited`, `earned`, `combined`) are NEVER
-mutated directly or overwritten by external season totals. Corrections (`result_corrected`
-with `supersedes_seq`) replace superseded events during projection rebuilds without
-double-counting.
+Standings, knockout brackets, and footballer statistics (`inherited`, `earned`, `combined`)
+are NEVER mutated directly or overwritten by external season totals. Corrections
+(`result_corrected` with `supersedes_seq`) replace superseded events during projection
+rebuilds without double-counting.
 """
 
 from __future__ import annotations
@@ -22,6 +22,10 @@ MATCH_STAT_EVENT_TYPES = {
     "match_events_recorded",
     "imported_match_events_recorded",
 }
+
+
+def _normalize_event_kind(raw: str) -> str:
+    return raw.strip().lower().replace("_", "").replace("-", "")
 
 
 def _resolve_active_fixture_outcomes(events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -44,6 +48,8 @@ def _resolve_active_fixture_outcomes(events: list[dict[str, Any]]) -> dict[str, 
             fid = payload["fixture_id"]
             fixtures_meta[fid] = {
                 "fixture_id": fid,
+                "competition_id": payload.get("competition_id"),
+                "stage": payload.get("stage", "league"),
                 "round": payload.get("round", 1),
                 "home_club_id": payload["home_club_id"],
                 "away_club_id": payload["away_club_id"],
@@ -58,22 +64,26 @@ def _resolve_active_fixture_outcomes(events: list[dict[str, Any]]) -> dict[str, 
             fid = payload["fixture_id"]
             meta = fixtures_meta.get(fid, {})
             source = payload.get("source") or (
-                "imported" if etype == "imported_result_accepted" else "played_vs_cpu"
+                "imported"
+                if etype == "imported_result_accepted"
+                else ("generated" if etype == "generated_result_accepted" else "played_vs_cpu")
             )
             outcomes[fid] = {
                 "seq": seq,
                 "fixture_id": fid,
+                "competition_id": payload.get("competition_id") or meta.get("competition_id"),
+                "stage": payload.get("stage") or meta.get("stage", "league"),
                 "home_club_id": payload.get("home_club_id") or meta.get("home_club_id"),
                 "away_club_id": payload.get("away_club_id") or meta.get("away_club_id"),
                 "home_goals": int(payload["home_goals"]),
                 "away_goals": int(payload["away_goals"]),
+                "went_to_extra_time": bool(payload.get("went_to_extra_time", False)),
+                "shootout_score": payload.get("shootout_score"),
                 "source": source,
                 "events": list(payload.get("events", [])),
             }
         elif etype in MATCH_STAT_EVENT_TYPES:
             fid = payload["fixture_id"]
-            # If the parent result event for this fixture was superseded by a `result_corrected`
-            # with a higher seq, ignore the older match_events_recorded!
             cur = outcomes.get(fid)
             if cur is not None and cur["seq"] > seq:
                 continue
@@ -115,10 +125,12 @@ def project_standings(
             "form": [],
         }
 
-    # Compute Real-World reference points from `fixture_created` real_reference_score when available
+    # Compute Real-World reference points from league `fixture_created` real_reference_score
     for ev in events:
         if ev["type"] == "fixture_created":
             pl = ev["payload"]
+            if pl.get("stage", "league") != "league":
+                continue
             ref = pl.get("real_reference_score")
             if ref and len(ref) == 2 and ref[0] is not None and ref[1] is not None:
                 hg, ag = int(ref[0]), int(ref[1])
@@ -132,8 +144,9 @@ def project_standings(
                         real_pts[hc] += 1
                         real_pts[ac] += 1
 
-    # Accumulate Parallel Season outcomes
-    for out in outcomes.values():
+    # Accumulate Parallel Season league outcomes
+    league_outcomes = [o for o in outcomes.values() if o.get("stage", "league") == "league"]
+    for out in league_outcomes:
         hc = out["home_club_id"]
         ac = out["away_club_id"]
         if hc not in table or ac not in table:
@@ -192,7 +205,7 @@ def project_standings(
 
     return {
         "standings": rows,
-        "accepted_fixture_count": len(outcomes),
+        "accepted_fixture_count": len(league_outcomes),
     }
 
 
@@ -203,6 +216,7 @@ def _empty_stat_bucket() -> dict[str, int]:
         "shots": 0,
         "saves": 0,
         "tackles": 0,
+        "skill_moves": 0,
         "yellow_cards": 0,
         "red_cards": 0,
     }
@@ -243,28 +257,30 @@ def project_player_stats(
     for out in outcomes.values():
         bucket_key = "inherited" if out["source"] == "imported" else "earned"
         for mev in out["events"]:
-            etype = str(mev.get("event_type") or mev.get("type") or "")
+            norm = _normalize_event_kind(str(mev.get("event_type") or mev.get("type") or ""))
             fid = mev.get("footballer_id")
             assist_id = mev.get("assist_footballer_id")
 
             if fid:
                 p_entry = _ensure_player(fid)
                 b = p_entry[bucket_key]
-                if etype == "Goal":
+                if norm == "goal":
                     b["goals"] += 1
                     b["shots"] += 1
-                elif etype == "Shot":
+                elif norm == "shot":
                     b["shots"] += 1
-                elif etype == "Save":
+                elif norm == "save":
                     b["saves"] += 1
-                elif etype == "Tackle":
+                elif norm == "tackle":
                     b["tackles"] += 1
-                elif etype == "YellowCard":
+                elif norm == "skillmove":
+                    b["skill_moves"] += 1
+                elif norm == "yellowcard":
                     b["yellow_cards"] += 1
-                elif etype == "RedCard":
+                elif norm == "redcard":
                     b["red_cards"] += 1
 
-            if etype == "Goal" and assist_id:
+            if norm == "goal" and assist_id:
                 a_entry = _ensure_player(assist_id)
                 a_entry[bucket_key]["assists"] += 1
 

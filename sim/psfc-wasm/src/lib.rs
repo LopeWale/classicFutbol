@@ -45,6 +45,8 @@ struct ExportedSummary<'a> {
     finished: bool,
     final_hash_hex: String,
     score: [u16; 2],
+    went_to_extra_time: bool,
+    shootout_score: Option<[u8; 2]>,
     possession_ticks: [u32; 2],
     home_player_stats: &'a [psfc_sim::PlayerMatchStats],
     away_player_stats: &'a [psfc_sim::PlayerMatchStats],
@@ -353,6 +355,7 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                         PlayerActionState::Diving { .. } => 4,
                         PlayerActionState::Stumbled { .. } => 5,
                         PlayerActionState::Cooldown { .. } => 6,
+                        PlayerActionState::SkillMove { .. } => 7,
                     };
                     let stamina = p.stamina_permille.clamp(0, 1000);
                     let charge = (p.charge_ratio_permille() as i32).clamp(0, 1000);
@@ -444,6 +447,8 @@ pub extern "C" fn sim_export_summary_json() -> usize {
             finished: sess.sim.is_finished(),
             final_hash_hex: format!("{:016x}", sess.sim.state_hash()),
             score: st.score,
+            went_to_extra_time: st.went_to_extra_time,
+            shootout_score: st.shootout_score,
             possession_ticks: st.possession_ticks,
             home_player_stats: &st.player_stats[0],
             away_player_stats: &st.player_stats[1],

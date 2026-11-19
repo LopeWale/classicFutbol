@@ -13,6 +13,7 @@ pub const BTN_JOCKEY: u16 = 1 << 6;
 pub const BTN_TACKLE: u16 = 1 << 7;
 pub const BTN_SLIDE: u16 = 1 << 8;
 pub const BTN_CALL_RUN: u16 = 1 << 9;
+pub const BTN_SKILL: u16 = 1 << 10;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InputFrame {

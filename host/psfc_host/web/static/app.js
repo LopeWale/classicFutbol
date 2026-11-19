@@ -12,6 +12,7 @@
   const BTN_TACKLE = 1 << 7;
   const BTN_SLIDE = 1 << 8;
   const BTN_CALL_RUN = 1 << 9;
+  const BTN_SKILL = 1 << 10;
 
   const PHASE_LABELS = {
     0: "KICK OFF",
@@ -22,11 +23,13 @@
     5: "FREE KICK",
     6: "PENALTY KICK",
     10: "GOAL!",
-    11: "HALF-TIME",
+    11: "BREAK",
     12: "FULL-TIME",
   };
 
   const DEFAULT_WORLD_ID = "world-prem-2026";
+  const DEFAULT_CUP_ID = "comp-facup-2026";
+  const REPLAY_CAPACITY = 360; // 6.0 seconds at 60 Hz
 
   // DOM References
   const canvas = document.getElementById("pitch-canvas");
@@ -34,12 +37,14 @@
   const wasmPill = document.getElementById("wasm-status-pill");
   const gamepadPill = document.getElementById("gamepad-status-pill");
   const hashPill = document.getElementById("hash-status-pill");
+  const btnAudioToggle = document.getElementById("btn-audio-toggle");
 
   const formatSelect = document.getElementById("format-select");
   const modeSelect = document.getElementById("mode-select");
   const durationSelect = document.getElementById("duration-select");
   const btnExhibition = document.getElementById("btn-exhibition");
   const btnPause = document.getElementById("btn-pause");
+  const btnInstantReplay = document.getElementById("btn-instant-replay");
   const btnSimRest = document.getElementById("btn-sim-rest");
   const btnSubmitSession = document.getElementById("btn-submit-session");
 
@@ -52,6 +57,7 @@
   const sbHalf = document.getElementById("sb-half");
   const sbTime = document.getElementById("sb-time");
   const sbPhase = document.getElementById("sb-phase");
+  const replayPill = document.getElementById("replay-pill");
 
   const goalBanner = document.getElementById("goal-banner");
   const goalBannerTitle = document.getElementById("goal-banner-title");
@@ -59,21 +65,172 @@
   const verifyBanner = document.getElementById("verify-banner");
   const eventFeed = document.getElementById("match-event-feed");
   const possessionBadge = document.getElementById("possession-badge");
+  const worldSelect = document.getElementById("world-select");
 
   // Runtime state
   let wasm = null;
+  let activeWorldId = DEFAULT_WORLD_ID;
+  let activeCompFilter = "all"; // "all" | "league" | "knockout"
   let currentSnapshot = null;
-  let activeOfficialSession = null; // { sessionId, fixtureId }
+  let activeOfficialSession = null;
   let paused = false;
   let goalBannerTicks = 0;
+  let lastShootoutScore = null;
   let camX = 0.0;
   let camY = 0.0;
   let ballTrail = [];
   let homePossTicks = 1;
   let awayPossTicks = 1;
+
+  // Instant Replay ring buffer
+  let replayBuffer = [];
+  let replayActive = false;
+  let replayCursor = 0.0;
+
+  // Synced Cartridge envelope in browser memory
+  let latestSyncedEnvelope = null;
+
   const keysDown = new Set();
   const enc = new TextEncoder();
   const dec = new TextDecoder();
+
+  // --- Procedural WebAudio Stadium Sound Engine (Zero External Audio Assets) ---
+
+  const StadiumAudio = (() => {
+    let audioCtx = null;
+    let enabled = true;
+
+    function ensureCtx() {
+      if (!enabled) return null;
+      if (!audioCtx) {
+        const Ctor = window.AudioContext || window.webkitAudioContext;
+        if (!Ctor) return null;
+        audioCtx = new Ctor();
+      }
+      if (audioCtx.state === "suspended") {
+        audioCtx.resume().catch(() => {});
+      }
+      return audioCtx;
+    }
+
+    function playKick(power = 0.6) {
+      const ac = ensureCtx();
+      if (!ac) return;
+      const now = ac.currentTime;
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(135 + power * 45, now);
+      osc.frequency.exponentialRampToValueAtTime(42, now + 0.085);
+      gain.gain.setValueAtTime(0.18 * Math.min(1.2, power + 0.35), now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
+      osc.connect(gain).connect(ac.destination);
+      osc.start(now);
+      osc.stop(now + 0.095);
+    }
+
+    function playWhistle(longBlast = false) {
+      const ac = ensureCtx();
+      if (!ac) return;
+      const now = ac.currentTime;
+      const dur = longBlast ? 0.38 : 0.18;
+      for (const freq of [2780, 2940]) {
+        const osc = ac.createOscillator();
+        const gain = ac.createGain();
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(freq, now);
+        osc.frequency.linearRampToValueAtTime(freq - 60, now + dur);
+        gain.gain.setValueAtTime(0.055, now);
+        gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+        osc.connect(gain).connect(ac.destination);
+        osc.start(now);
+        osc.stop(now + dur + 0.01);
+      }
+    }
+
+    function playSaveSlap() {
+      const ac = ensureCtx();
+      if (!ac) return;
+      const now = ac.currentTime;
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = "square";
+      osc.frequency.setValueAtTime(320, now);
+      osc.frequency.exponentialRampToValueAtTime(90, now + 0.07);
+      gain.gain.setValueAtTime(0.11, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.075);
+      osc.connect(gain).connect(ac.destination);
+      osc.start(now);
+      osc.stop(now + 0.08);
+    }
+
+    function playGoalCrowdRoar() {
+      const ac = ensureCtx();
+      if (!ac) return;
+      const now = ac.currentTime;
+      const dur = 1.35;
+      const bufSize = Math.floor(ac.sampleRate * dur);
+      const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+      const ch = buf.getChannelData(0);
+      let last = 0;
+      for (let i = 0; i < bufSize; i++) {
+        const white = Math.random() * 2 - 1;
+        last = (last + 0.06 * white) / 1.06;
+        ch[i] = last * 3.0;
+      }
+      const src = ac.createBufferSource();
+      src.buffer = buf;
+      const filter = ac.createBiquadFilter();
+      filter.type = "bandpass";
+      filter.frequency.setValueAtTime(640, now);
+      filter.Q.setValueAtTime(0.85, now);
+      const gain = ac.createGain();
+      gain.gain.setValueAtTime(0.01, now);
+      gain.gain.linearRampToValueAtTime(0.22, now + 0.18);
+      gain.gain.exponentialRampToValueAtTime(0.002, now + dur);
+      src.connect(filter).connect(gain).connect(ac.destination);
+      src.start(now);
+    }
+
+    function playSkillWhoosh() {
+      const ac = ensureCtx();
+      if (!ac) return;
+      const now = ac.currentTime;
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = "sine";
+      osc.frequency.setValueAtTime(360, now);
+      osc.frequency.exponentialRampToValueAtTime(720, now + 0.09);
+      gain.gain.setValueAtTime(0.06, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.095);
+      osc.connect(gain).connect(ac.destination);
+      osc.start(now);
+      osc.stop(now + 0.1);
+    }
+
+    function toggle() {
+      enabled = !enabled;
+      return enabled;
+    }
+
+    return {
+      ensureCtx,
+      playKick,
+      playWhistle,
+      playSaveSlap,
+      playGoalCrowdRoar,
+      playSkillWhoosh,
+      toggle,
+    };
+  })();
+
+  window.addEventListener("pointerdown", () => StadiumAudio.ensureCtx(), { once: true });
+
+  btnAudioToggle.addEventListener("click", () => {
+    const on = StadiumAudio.toggle();
+    btnAudioToggle.textContent = on ? "Audio: Stadium FX" : "Audio: Muted";
+    btnAudioToggle.classList.toggle("muted-audio", !on);
+  });
 
   // --- WASM Bridge Helpers ---
 
@@ -98,19 +255,32 @@
     return new Int32Array(wasm.memory.buffer, ptr, count);
   }
 
+  function toggleInstantReplay() {
+    if (replayBuffer.length < 20) return;
+    replayActive = !replayActive;
+    replayCursor = 0.0;
+    replayPill.hidden = !replayActive;
+    btnInstantReplay.textContent = replayActive ? "Exit Replay" : "Instant Replay (6s)";
+  }
+
   // --- Controller Sampling (Keyboard + HTML5 Gamepad API) ---
 
   window.addEventListener("keydown", (ev) => {
-    // Prevent page scroll on Space / Arrow keys when interacting with pitch
     if (
       document.activeElement &&
       ["SELECT", "INPUT", "TEXTAREA"].includes(document.activeElement.tagName)
     ) {
       return;
     }
+    if (ev.code === "Tab") {
+      ev.preventDefault();
+      toggleInstantReplay();
+      return;
+    }
     if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.code)) {
       ev.preventDefault();
     }
+    StadiumAudio.ensureCtx();
     keysDown.add(ev.code);
   });
 
@@ -127,28 +297,21 @@
 
     const deadzone = (v) => (Math.abs(v) < 0.16 ? 0 : v);
     const lx = deadzone(pad.axes[0] || 0);
-    // Note: pitch +Y goes toward top/far or bottom/near consistently with screen:
-    // screen +Y is down, so stick down (+axis[1]) -> +move_y!
     const ly = deadzone(pad.axes[1] || 0);
     const rx = deadzone(pad.axes[2] || 0);
     const ry = deadzone(pad.axes[3] || 0);
 
     const b = (i) => Boolean(pad.buttons[i] && pad.buttons[i].pressed);
     let buttons = 0;
-    if (b(0)) buttons |= BTN_PASS; // Cross / A
-    if (b(3)) buttons |= BTN_THROUGH; // Triangle / Y
-    if (b(2)) buttons |= BTN_LOB; // Square / X
-    if (b(1)) buttons |= BTN_SHOOT; // Circle / B
-    if (b(7)) buttons |= BTN_SPRINT; // R2 / RT
-    if (b(4)) buttons |= BTN_SWITCH | BTN_CALL_RUN; // L1 / LB
-    if (b(6)) buttons |= BTN_JOCKEY; // L2 / LT
-    if (b(1) && !b(0)) {
-      // Defending stand tackle also bound to B/Circle or R1
-    }
-    if (b(5)) buttons |= BTN_TACKLE; // R1 / RB
-    if (b(2)) {
-      // Slide tackle when off-ball handled or dedicated X
-    }
+    if (b(0)) buttons |= BTN_PASS;
+    if (b(3)) buttons |= BTN_THROUGH;
+    if (b(2)) buttons |= BTN_LOB;
+    if (b(1)) buttons |= BTN_SHOOT;
+    if (b(7)) buttons |= BTN_SPRINT;
+    if (b(4)) buttons |= BTN_SWITCH | BTN_CALL_RUN;
+    if (b(6)) buttons |= BTN_JOCKEY;
+    if (b(5)) buttons |= BTN_TACKLE;
+    if (b(11)) buttons |= BTN_SKILL; // R3 click -> Roulette skill move
 
     return {
       mx: Math.round(lx * 127),
@@ -162,8 +325,8 @@
 
   function sampleHomeInput(allowArrowKeys) {
     const gp = sampleGamepad(0);
-    if (gp && (gp.mx !== 0 || gp.my !== 0 || gp.btns !== 0)) {
-      gamepadPill.textContent = `Gamepad #1 Active`;
+    if (gp && (gp.mx !== 0 || gp.my !== 0 || gp.ax !== 0 || gp.ay !== 0 || gp.btns !== 0)) {
+      gamepadPill.textContent = "Gamepad #1 Active";
       return gp;
     }
 
@@ -190,10 +353,13 @@
     if (keysDown.has("KeyE")) btns |= BTN_TACKLE;
     if (keysDown.has("KeyC")) btns |= BTN_SLIDE;
     if (keysDown.has("KeyR")) btns |= BTN_CALL_RUN;
+    if (keysDown.has("KeyZ")) btns |= BTN_SKILL;
 
     const mx = Math.round(dx * 127);
     const my = Math.round(dy * 127);
-    return { mx, my, ax: mx, ay: my, btns };
+    // Keep aim neutral unless charging/passing so right-stick step-over flick isn't spammed by WASD
+    const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
+    return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
   }
 
   function sampleAwayLocalInput() {
@@ -215,12 +381,14 @@
     if (keysDown.has("Numpad1") || keysDown.has("Period")) btns |= BTN_PASS;
     if (keysDown.has("Numpad2") || keysDown.has("Slash")) btns |= BTN_SHOOT;
     if (keysDown.has("Numpad3")) btns |= BTN_THROUGH;
+    if (keysDown.has("Numpad0")) btns |= BTN_SKILL;
     if (keysDown.has("RightControl") || keysDown.has("ControlRight")) btns |= BTN_SPRINT;
     if (keysDown.has("Comma")) btns |= BTN_SWITCH | BTN_TACKLE;
 
     const mx = Math.round(dx * 127);
     const my = Math.round(dy * 127);
-    return { mx, my, ax: mx, ay: my, btns };
+    const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
+    return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
   }
 
   // --- Match Initialization (Exhibition & Official Host Session) ---
@@ -237,6 +405,11 @@
   function resetMatchUiForSnapshot(snapshot, contextLabel) {
     currentSnapshot = snapshot;
     ballTrail = [];
+    replayBuffer = [];
+    replayActive = false;
+    replayPill.hidden = true;
+    btnInstantReplay.textContent = "Instant Replay (6s)";
+    lastShootoutScore = null;
     homePossTicks = 1;
     awayPossTicks = 1;
     camX = 0;
@@ -277,7 +450,7 @@
     renderWorldOverviewCardsHighlight();
   }
 
-  async function launchOfficialFixtureSession(fixtureId, resultSource) {
+  async function launchOfficialFixtureSession(fixtureId, resultSource, stageLabel) {
     if (!wasm) return;
     const fmtName = formatSelect.value;
     const halfTicks = parseInt(durationSelect.value, 10) || 3600;
@@ -329,10 +502,12 @@
     };
     paused = false;
     btnPause.textContent = "Pause";
+    const etTag = payload.snapshot.rules.extra_time_enabled ? " · ET+PENS" : "";
     resetMatchUiForSnapshot(
       payload.snapshot,
-      `OFFICIAL R${payload.snapshot.fixture_id.includes("r3") ? "3" : "4"} · ${payload.snapshot.format.name}`
+      `OFFICIAL ${stageLabel.toUpperCase()} · ${payload.snapshot.format.name}${etTag}`
     );
+    StadiumAudio.playWhistle(false);
     await refreshWorldOverview();
     window.scrollTo({ top: 0, behavior: "smooth" });
   }
@@ -341,14 +516,14 @@
     if (!wasm || !activeOfficialSession || activeOfficialSession.submitting || activeOfficialSession.completed) {
       return;
     }
-    // Ensure match has reached FullTime (if user clicked Verify early, fast-forward remaining ticks!)
     wasm.sim_export_summary_json();
     let summary = JSON.parse(wasmReadText());
     if (!summary.finished) {
-      wasm.sim_auto_step(60000);
+      wasm.sim_auto_step(90000);
       wasm.sim_export_summary_json();
       summary = JSON.parse(wasmReadText());
     }
+    lastShootoutScore = summary.shootout_score || null;
 
     activeOfficialSession.submitting = true;
     btnSubmitSession.textContent = "Verifying via psfc-replay…";
@@ -379,11 +554,19 @@
       activeOfficialSession.completed = true;
       btnSubmitSession.hidden = true;
       const rep = data.replay_report;
+      const ar = data.accepted_result;
+      const penTag =
+        ar.shootout_home !== null && ar.shootout_home !== undefined
+          ? ` (Pens ${ar.shootout_home}-${ar.shootout_away})`
+          : ar.went_to_extra_time
+            ? " (AET)"
+            : "";
+
       verifyBanner.hidden = false;
       verifyBanner.innerHTML = `
         <strong>psfc-replay Authoritative Verification Passed (${rep ? rep.elapsed_ms : 0} ms)</strong><br/>
-        Score Accepted: <strong>${currentSnapshot.home.short_name} ${data.accepted_result.home_goals} - ${data.accepted_result.away_goals} ${currentSnapshot.away.short_name}</strong>
-        · Final Hash <code>#${data.accepted_result.final_hash_hex}</code> · Standings &amp; Earned Stats Updated!
+        Accepted: <strong>${currentSnapshot.home.short_name} ${ar.home_goals} - ${ar.away_goals} ${currentSnapshot.away.short_name}${penTag}</strong>
+        · Final Hash <code>#${ar.final_hash_hex}</code>
       `;
       await refreshWorldOverview();
     } catch (err) {
@@ -395,25 +578,28 @@
     }
   }
 
-  // --- 3D Broadcast Camera Projection & Pitch Rendering ---
+  // --- 3D Broadcast & Orbiting Replay Camera Projection ---
 
-  function makeProjector(W, H, pitchLenM, pitchWidM) {
-    // Smooth broadcast camera sitting on the south touchline elevated, looking inward & slightly tilted
-    const zoomScale = pitchLenM > 80 ? 0.62 : 1.0;
-    const camDistY = (pitchWidM * 0.92 + 17.0) / zoomScale;
-    const camHeightZ = (23.5) / zoomScale;
-    const lookY = camY * 0.25;
-    const ry = -lookY + camDistY; // camera at (camX, lookY - camDistY, camHeightZ)? Let's use clean explicit basis!
+  function makeProjector(W, H, pitchLenM, pitchWidM, ballX, ballY, orbitAngleRad) {
+    let eyeX, eyeY, eyeZ, targetX, targetY, targetZ;
 
-    const eyeX = camX;
-    const eyeY = camY * 0.28 + (pitchWidM * 0.86 + 15.5); // South side (+Y is near touchline, -Y is far touchline)
-    const eyeZ = pitchLenM > 80 ? 36.0 : 22.5;
+    if (orbitAngleRad !== null) {
+      const radius = pitchLenM > 80 ? 28.0 : 18.5;
+      eyeX = ballX + Math.sin(orbitAngleRad) * radius;
+      eyeY = ballY + Math.cos(orbitAngleRad) * radius;
+      eyeZ = 12.5;
+      targetX = ballX;
+      targetY = ballY;
+      targetZ = 0.65;
+    } else {
+      eyeX = camX;
+      eyeY = camY * 0.28 + (pitchWidM * 0.86 + 15.5);
+      eyeZ = pitchLenM > 80 ? 36.0 : 22.5;
+      targetX = camX;
+      targetY = camY * 0.18 - 1.5;
+      targetZ = 0.0;
+    }
 
-    const targetX = camX;
-    const targetY = camY * 0.18 - 1.5;
-    const targetZ = 0.0;
-
-    // Forward vector F = normalize(target - eye)
     let fx = targetX - eyeX;
     let fy = targetY - eyeY;
     let fz = targetZ - eyeZ;
@@ -422,7 +608,6 @@
     fy /= fl;
     fz /= fl;
 
-    // World up = (0, 0, 1). Right R = normalize(F x Up) = normalize((fy, -fx, 0))
     let rx = fy;
     let ry2 = -fx;
     let rz = 0;
@@ -430,7 +615,6 @@
     rx /= rl;
     ry2 /= rl;
 
-    // Camera Up U = R x F
     const ux = ry2 * fz - rz * fy;
     const uy = rz * fx - rx * fz;
     const uz = rx * fy - ry2 * fx;
@@ -452,6 +636,7 @@
         x: W * 0.5 + cx * scale,
         y: H * 0.52 - cy * scale,
         s: scale,
+        depth,
       };
     };
   }
@@ -490,7 +675,6 @@
     const depth = sign * 1.65;
     const backX = goalX + depth;
 
-    // Net translucent side & back panels
     poly3D(
       project,
       [
@@ -527,7 +711,6 @@
       "rgba(226, 232, 240, 0.28)",
       1
     );
-    // Roof net
     poly3D(
       project,
       [
@@ -540,17 +723,15 @@
       null
     );
 
-    // Crisp white posts & crossbar
     line3D(project, goalX, -goalHalfW, 0, goalX, -goalHalfW, goalH, "#ffffff", 3.4);
     line3D(project, goalX, goalHalfW, 0, goalX, goalHalfW, goalH, "#ffffff", 3.4);
     line3D(project, goalX, -goalHalfW, goalH, goalX, goalHalfW, goalH, "#ffffff", 3.6);
   }
 
-  function drawScene(packed) {
+  function drawScene(packed, orbitAngleRad = null) {
     const W = canvas.width;
     const H = canvas.height;
 
-    // Stadium night backdrop gradient
     const sky = ctx.createLinearGradient(0, 0, 0, H);
     sky.addColorStop(0, "#060b12");
     sky.addColorStop(0.32, "#0b1814");
@@ -571,19 +752,20 @@
     const goalH = fmt.goal_height_mm / 1000;
     const circleR = fmt.center_circle_radius_mm / 1000;
 
+    const tick = packed[0];
     const ballX = packed[9] / 1000;
     const ballY = packed[10] / 1000;
     const ballZ = packed[11] / 1000;
 
-    // Smooth camera pan clamped so goal mouths remain legible
-    const maxPanX = halfL * 0.44;
-    const targetCamX = Math.max(-maxPanX, Math.min(maxPanX, ballX * 0.62));
-    camX += (targetCamX - camX) * 0.1;
-    camY += (ballY - camY) * 0.08;
+    if (orbitAngleRad === null) {
+      const maxPanX = halfL * 0.44;
+      const targetCamX = Math.max(-maxPanX, Math.min(maxPanX, ballX * 0.62));
+      camX += (targetCamX - camX) * 0.1;
+      camY += (ballY - camY) * 0.08;
+    }
 
-    const project = makeProjector(W, H, pitchLen, pitchWid);
+    const project = makeProjector(W, H, pitchLen, pitchWid, ballX, ballY, orbitAngleRad);
 
-    // Outer stadium apron
     poly3D(
       project,
       [
@@ -597,7 +779,6 @@
       2
     );
 
-    // Mowed alternating grass stripes
     const stripeCount = fmt.players_per_side <= 6 ? 10 : 16;
     const stripeW = pitchLen / stripeCount;
     for (let i = 0; i < stripeCount; i++) {
@@ -617,7 +798,6 @@
       );
     }
 
-    // Advertising hoarding strip along far touchline
     poly3D(
       project,
       [
@@ -631,7 +811,6 @@
       1.2
     );
 
-    // Crisp white chalk pitch markings
     const lineCol = "rgba(245, 250, 255, 0.84)";
     poly3D(
       project,
@@ -645,10 +824,8 @@
       lineCol,
       2.1
     );
-    // Halfway line
     line3D(project, 0, -halfW, 0.01, 0, halfW, 0.01, lineCol, 1.9);
 
-    // Center circle
     ctx.beginPath();
     for (let s = 0; s <= 40; s++) {
       const a = (s / 40) * Math.PI * 2;
@@ -660,7 +837,6 @@
     ctx.lineWidth = 1.8;
     ctx.stroke();
 
-    // Penalty boxes (left & right)
     for (const sign of [-1, 1]) {
       const gx = sign * halfL;
       const ix = gx - sign * boxD;
@@ -676,7 +852,6 @@
         lineCol,
         1.8
       );
-      // Penalty spot
       const penSpot = project(gx - sign * ((boxD * 2) / 3), 0, 0.01);
       ctx.fillStyle = "#ffffff";
       ctx.beginPath();
@@ -684,7 +859,6 @@
       ctx.fill();
     }
 
-    // Unpack players & depth-sort (`wy` ascending: far `-Y` drawn first, near `+Y` drawn last)
     const pps = packed[6];
     const homeCtrl = packed[7];
     const awayCtrl = packed[8];
@@ -708,14 +882,16 @@
       const sentOff = ((flags >> 26) & 1) === 1;
       if (sentOff) continue;
 
+      const projDepth = project(x, y, 0).depth;
       drawables.push({
         kind: "player",
-        y,
+        depth: projDepth,
         side,
         idx,
         shirt,
         role,
         x,
+        y,
         vx,
         vy,
         facingRad,
@@ -726,15 +902,19 @@
       });
     }
 
-    drawables.push({ kind: "ball", y: ballY, x: ballX, z: ballZ });
-    drawables.sort((a, b) => a.y - b.y);
+    drawables.push({
+      kind: "ball",
+      depth: project(ballX, ballY, ballZ).depth,
+      x: ballX,
+      y: ballY,
+      z: ballZ,
+    });
+    drawables.sort((a, b) => b.depth - a.depth);
 
-    // Draw goals behind / around entities (draw far parts first, then entities)
     drawGoal3D(project, -halfL, -1, goalHW, goalH);
     drawGoal3D(project, halfL, 1, goalHW, goalH);
 
-    // Ball velocity trail
-    if (ballTrail.length > 1) {
+    if (ballTrail.length > 1 && orbitAngleRad === null) {
       ctx.beginPath();
       for (let i = 0; i < ballTrail.length; i++) {
         const tp = project(ballTrail[i].x, ballTrail[i].y, ballTrail[i].z);
@@ -746,20 +926,17 @@
       ctx.stroke();
     }
 
-    // Draw depth-sorted players & 3D ball
     for (const item of drawables) {
       if (item.kind === "ball") {
         const gnd = project(item.x, item.y, 0);
         const air = project(item.x, item.y, item.z);
         const r = Math.max(4.0, air.s * 0.22);
 
-        // Ground shadow
         ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
         ctx.beginPath();
         ctx.ellipse(gnd.x, gnd.y, r * 1.1, r * 0.55, 0, 0, Math.PI * 2);
         ctx.fill();
 
-        // Soccer ball sphere
         const grad = ctx.createRadialGradient(
           air.x - r * 0.3,
           air.y - r * 0.3,
@@ -781,12 +958,20 @@
         continue;
       }
 
-      // Player rendering
       const foot = project(item.x, item.y, 0);
       const head = project(item.x, item.y, item.action === 4 ? 0.65 : 1.75);
       const pxRadius = Math.max(4.5, foot.s * 0.38);
 
-      // Controlled-player classic arcade ring + facing chevron!
+      // Skill Move (`action === 7`) golden roulette flourish!
+      if (item.action === 7) {
+        const spinStart = (tick * 0.45) % (Math.PI * 2);
+        ctx.strokeStyle = "#fde047";
+        ctx.lineWidth = 2.8;
+        ctx.beginPath();
+        ctx.ellipse(foot.x, foot.y, pxRadius * 2.35, pxRadius * 1.15, 0, spinStart, spinStart + Math.PI * 1.45);
+        ctx.stroke();
+      }
+
       if (item.isControlled) {
         const ringColor = item.side === 0 ? "#fbbf24" : "#38bdf8";
         ctx.strokeStyle = ringColor;
@@ -795,7 +980,6 @@
         ctx.ellipse(foot.x, foot.y, pxRadius * 1.9, pxRadius * 0.95, 0, 0, Math.PI * 2);
         ctx.stroke();
 
-        // Facing directional pointer on turf
         const fx = item.x + Math.cos(item.facingRad) * 1.05;
         const fy = item.y + Math.sin(item.facingRad) * 1.05;
         const fp = project(fx, fy, 0.02);
@@ -804,7 +988,6 @@
         ctx.arc(fp.x, fp.y, 3.0, 0, Math.PI * 2);
         ctx.fill();
       } else if (item.role === 0) {
-        // Subtle Goalkeeper glove/box indicator ring
         ctx.strokeStyle = "rgba(16, 185, 129, 0.55)";
         ctx.lineWidth = 1.4;
         ctx.beginPath();
@@ -812,13 +995,11 @@
         ctx.stroke();
       }
 
-      // Ground shadow
       ctx.fillStyle = "rgba(0, 0, 0, 0.38)";
       ctx.beginPath();
       ctx.ellipse(foot.x, foot.y, pxRadius * 1.15, pxRadius * 0.55, 0, 0, Math.PI * 2);
       ctx.fill();
 
-      // Kit colors (Goalkeepers wear high-visibility emerald/lime & gold!)
       let jerseyColor =
         item.side === 0
           ? currentSnapshot.home.primary_color
@@ -828,7 +1009,6 @@
           ? currentSnapshot.home.secondary_color
           : currentSnapshot.away.secondary_color;
 
-      // Avoid kit clash if both clubs wear red (e.g. MUN vs ARS or MUN vs LIV!)
       if (
         item.side === 1 &&
         currentSnapshot.home.primary_color.startsWith("#D") &&
@@ -843,19 +1023,19 @@
         trimColor = "#ffffff";
       }
 
-      // Body capsule (tilts horizontally if Diving or Sliding!)
       const bodyH = Math.max(10, foot.y - head.y);
       ctx.fillStyle = jerseyColor;
-      ctx.strokeStyle = trimColor;
-      ctx.lineWidth = 1.5;
+      ctx.strokeStyle = item.action === 7 ? "#fde047" : trimColor;
+      ctx.lineWidth = item.action === 7 ? 2.2 : 1.5;
+
+      const spinOffset = item.action === 7 ? Math.sin(tick * 0.6) * pxRadius * 0.35 : 0;
 
       ctx.beginPath();
       if (item.action === 4 || item.action === 3) {
-        // Horizontal dive / slide lunge!
         ctx.ellipse(foot.x, foot.y - pxRadius * 0.8, pxRadius * 1.9, pxRadius * 0.85, 0, 0, Math.PI * 2);
       } else {
         ctx.roundRect(
-          foot.x - pxRadius * 0.85,
+          foot.x - pxRadius * 0.85 + spinOffset,
           head.y + bodyH * 0.24,
           pxRadius * 1.7,
           bodyH * 0.72,
@@ -865,19 +1045,16 @@
       ctx.fill();
       ctx.stroke();
 
-      // Head
       ctx.fillStyle = "#f1c27d";
       ctx.beginPath();
-      ctx.arc(head.x, head.y + bodyH * 0.16, Math.max(3.2, pxRadius * 0.58), 0, Math.PI * 2);
+      ctx.arc(head.x + spinOffset * 0.5, head.y + bodyH * 0.16, Math.max(3.2, pxRadius * 0.58), 0, Math.PI * 2);
       ctx.fill();
 
-      // Shirt number
       ctx.fillStyle = item.side === 1 && jerseyColor === "#facc15" ? "#0f172a" : "#ffffff";
       ctx.font = `700 ${Math.max(9, Math.round(pxRadius * 1.05))}px Inter, sans-serif`;
       ctx.textAlign = "center";
-      ctx.fillText(String(item.shirt), foot.x, head.y + bodyH * 0.68);
+      ctx.fillText(String(item.shirt), foot.x + spinOffset, head.y + bodyH * 0.68);
 
-      // Overhead Shot / Pass Power Charge Bar!
       if (item.charge > 0.02) {
         const bw = 32;
         const bh = 5;
@@ -890,7 +1067,6 @@
       }
     }
 
-    // Classic Bottom-Center 2D Tactical Radar
     drawTacticalRadar(W, H, packed, halfL, halfW);
   }
 
@@ -908,7 +1084,6 @@
     ctx.fill();
     ctx.stroke();
 
-    // Halfway line on radar
     ctx.beginPath();
     ctx.moveTo(rx + rw * 0.5, ry + 4);
     ctx.lineTo(rx + rw * 0.5, ry + rh - 4);
@@ -935,7 +1110,6 @@
       ctx.fill();
     }
 
-    // Radar ball dot
     const bx = mapX(packed[9] / 1000);
     const by = mapY(packed[10] / 1000);
     ctx.fillStyle = "#ffffff";
@@ -946,31 +1120,83 @@
 
   // --- Main 60 Hz Simulation & Render Loop ---
 
+  function showBanner(title, sub, ticks = 120) {
+    goalBannerTitle.textContent = title;
+    goalBannerSub.textContent = sub;
+    goalBanner.hidden = false;
+    goalBannerTicks = ticks;
+  }
+
   function drainAndRenderMatchEvents() {
     const len = wasm.sim_drain_events_json();
     if (len <= 2) return;
     const events = JSON.parse(wasmReadText());
     for (const ev of events) {
+      const kind = String(ev.event_type || "").toLowerCase();
       const li = document.createElement("li");
       li.innerHTML = `<span class="ev-min">${ev.minute}'</span><span>${ev.detail}</span>`;
       eventFeed.prepend(li);
-      while (eventFeed.children.length > 18) {
+      while (eventFeed.children.length > 20) {
         eventFeed.removeChild(eventFeed.lastChild);
       }
 
-      if (ev.event_type === "Goal") {
-        goalBannerTitle.textContent = "GOAL!";
-        goalBannerSub.textContent = ev.detail;
-        goalBanner.hidden = false;
-        goalBannerTicks = 130;
-      } else if (ev.event_type === "FullTime" && activeOfficialSession && !activeOfficialSession.completed) {
-        submitOfficialSessionResult();
+      if (kind === "goal" || kind === "shootout_goal") {
+        StadiumAudio.playGoalCrowdRoar();
+        showBanner(kind === "shootout_goal" ? "PENALTY SCORED!" : "GOAL!", ev.detail, 135);
+      } else if (kind === "shot") {
+        StadiumAudio.playKick(0.95);
+      } else if (kind === "pass") {
+        StadiumAudio.playKick(0.45);
+      } else if (kind === "save") {
+        StadiumAudio.playSaveSlap();
+      } else if (kind === "skill_move") {
+        StadiumAudio.playSkillWhoosh();
+      } else if (kind === "advantage") {
+        showBanner("ADVANTAGE!", ev.detail, 75);
+      } else if (kind === "extra_time_start") {
+        StadiumAudio.playWhistle(true);
+        showBanner("EXTRA TIME!", ev.detail, 110);
+      } else if (kind === "penalty_shootout_start") {
+        StadiumAudio.playWhistle(true);
+        showBanner("PENALTY SHOOTOUT!", ev.detail, 130);
+      } else if (kind === "foul" || kind === "kick_off" || kind === "half_time") {
+        StadiumAudio.playWhistle(false);
+      } else if (kind === "full_time") {
+        StadiumAudio.playWhistle(true);
+        wasm.sim_export_summary_json();
+        const summary = JSON.parse(wasmReadText());
+        lastShootoutScore = summary.shootout_score || null;
+        if (activeOfficialSession && !activeOfficialSession.completed) {
+          submitOfficialSessionResult();
+        }
       }
     }
   }
 
+  function formatHalfBadge(half, phase) {
+    if (phase === 12) return "FT";
+    if (half === 3) return "ET1";
+    if (half === 4) return "ET2";
+    return `${half}H`;
+  }
+
   function frameLoop() {
     if (wasm && currentSnapshot) {
+      if (replayActive && replayBuffer.length > 0) {
+        const idx = Math.min(replayBuffer.length - 1, Math.floor(replayCursor));
+        const snapPacked = replayBuffer[idx];
+        const orbitAngle = replayCursor * 0.022;
+        drawScene(snapPacked, orbitAngle);
+        replayCursor += 0.5; // 0.5x slow-motion playback
+        if (replayCursor >= replayBuffer.length) {
+          replayActive = false;
+          replayPill.hidden = true;
+          btnInstantReplay.textContent = "Instant Replay (6s)";
+        }
+        requestAnimationFrame(frameLoop);
+        return;
+      }
+
       if (!paused) {
         const is2P = modeSelect.value === "local_2p";
         const hIn = sampleHomeInput(!is2P);
@@ -1000,7 +1226,12 @@
         const aScore = packed[5];
         const ownerSide = packed[15];
 
-        if (!paused) {
+        if (!paused && phase !== 12) {
+          if (replayBuffer.length >= REPLAY_CAPACITY) {
+            replayBuffer.shift();
+          }
+          replayBuffer.push(new Int32Array(packed));
+
           if (ownerSide === 0) homePossTicks++;
           else if (ownerSide === 1) awayPossTicks++;
 
@@ -1011,9 +1242,11 @@
           if (ballTrail.length > 10) ballTrail.shift();
         }
 
-        // Update Scorebug & Clock
-        sbScore.textContent = `${hScore} - ${aScore}`;
-        sbHalf.textContent = phase === 12 ? "FT" : `${half}H`;
+        const penSuffix = lastShootoutScore
+          ? ` (${lastShootoutScore[0]}-${lastShootoutScore[1]}p)`
+          : "";
+        sbScore.textContent = `${hScore} - ${aScore}${penSuffix}`;
+        sbHalf.textContent = formatHalfBadge(half, phase);
         const totalSec = Math.floor(clockTicks / 60);
         const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
         const ss = String(totalSec % 60).padStart(2, "0");
@@ -1036,7 +1269,7 @@
           if (goalBannerTicks === 0) goalBanner.hidden = true;
         }
 
-        drawScene(packed);
+        drawScene(packed, null);
       }
     }
     requestAnimationFrame(frameLoop);
@@ -1048,8 +1281,7 @@
 
   function renderWorldOverviewCardsHighlight() {
     if (!latestOverview) return;
-    const cards = document.querySelectorAll(".fixture-card");
-    cards.forEach((el) => {
+    document.querySelectorAll(".fixture-card").forEach((el) => {
       const fid = el.getAttribute("data-fixture-id");
       el.classList.toggle(
         "active-session",
@@ -1058,8 +1290,23 @@
     });
   }
 
+  async function refreshWorldsDropdown() {
+    const res = await fetch("/api/worlds");
+    if (!res.ok) return;
+    const data = await res.json();
+    worldSelect.innerHTML = "";
+    for (const w of data.worlds) {
+      const opt = document.createElement("option");
+      opt.value = w.id;
+      opt.textContent = `${w.season_label} (${w.status})`;
+      if (w.id === activeWorldId) opt.selected = true;
+      worldSelect.appendChild(opt);
+    }
+  }
+
   async function refreshWorldOverview() {
-    const res = await fetch(`/api/worlds/${DEFAULT_WORLD_ID}/overview`);
+    await refreshWorldsDropdown();
+    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/overview`);
     if (!res.ok) return;
     const data = await res.json();
     latestOverview = data;
@@ -1069,45 +1316,95 @@
       .map((a) => `${a.club_id.toUpperCase()} (${a.participant_name.split(" ")[0]})`)
       .join(", ");
     document.getElementById("world-meta").textContent =
-      `${data.world.season_label} · Default ${data.world.default_match_format} · Active: ${repLabel}`;
+      `${data.world.season_label} · ${data.world.status.toUpperCase()} · ${repLabel || "Unassigned"}`;
 
-    // 1. Render Fixtures
+    // Honours strip
+    const honStrip = document.getElementById("honours-strip");
+    if (data.honours && data.honours.length > 0) {
+      honStrip.hidden = false;
+      honStrip.innerHTML = data.honours
+        .map((h) => `<span>🏆 <strong>${h.category.replace("_", " ").toUpperCase()}:</strong> ${h.winner_name}</span>`)
+        .join("");
+    } else {
+      honStrip.hidden = true;
+    }
+
+    // 1. Render Fixtures (filtered by activeCompFilter)
     const fxContainer = document.getElementById("fixture-list");
     fxContainer.innerHTML = "";
-    for (const fx of data.fixtures) {
+    const filteredFixtures = data.fixtures.filter((fx) => {
+      if (activeCompFilter === "league") return fx.stage === "league";
+      if (activeCompFilter === "knockout") return fx.stage !== "league";
+      return true;
+    });
+
+    for (const fx of filteredFixtures) {
+      const isCup = fx.stage !== "league";
       const srcClass =
         fx.result_source === "played_vs_friend"
           ? "src-friend"
           : fx.result_source === "played_vs_cpu"
             ? "src-cpu"
-            : "src-imported";
+            : fx.result_source === "generated"
+              ? "src-generated"
+              : "src-imported";
 
       const isPlayable =
         fx.state !== "accepted" &&
         (fx.result_source === "played_vs_friend" || fx.result_source === "played_vs_cpu");
+      const isGeneratable = fx.state !== "accepted" && fx.result_source === "generated";
+      const isAdminPending = fx.state === "awaiting_admin";
 
-      const scoreText =
-        fx.state === "accepted"
-          ? `${fx.accepted_home_goals} - ${fx.accepted_away_goals}`
-          : fx.state === "in_session"
-            ? "IN SESSION"
-            : "vs";
+      let scoreText = "vs";
+      if (fx.state === "accepted") {
+        const pen =
+          fx.accepted_shootout_home !== null && fx.accepted_shootout_home !== undefined
+            ? ` (${fx.accepted_shootout_home}-${fx.accepted_shootout_away}p)`
+            : fx.accepted_aet
+              ? " (AET)"
+              : "";
+        scoreText = `${fx.accepted_home_goals} - ${fx.accepted_away_goals}${pen}`;
+      } else if (fx.state === "in_session") {
+        scoreText = "IN SESSION";
+      } else if (isAdminPending) {
+        scoreText = "ADMIN RULING";
+      }
+
+      const stageBadge =
+        fx.stage === "cup_sf"
+          ? "FA CUP SEMI-FINAL"
+          : fx.stage === "cup_final"
+            ? "FA CUP FINAL"
+            : `League R${fx.round}`;
+
+      const realNote =
+        fx.real_home_goals !== null && fx.real_away_goals !== null
+          ? `Real Ref: ${fx.real_home_goals}-${fx.real_away_goals}`
+          : isCup
+            ? "Parallel-Only Divergent Tie!"
+            : "";
+
+      let actionHtml = `<span>${fx.accepted_source === "imported" ? "Inherited / Imported" : "Verified"}</span>`;
+      if (isPlayable) {
+        actionHtml = `<button class="btn btn-primary btn-play-fx" data-fx="${fx.id}" data-src="${fx.result_source}" data-stage="${stageBadge}">
+          ${fx.state === "in_session" ? "Resume 5v5" : "Play Official 5v5"}
+        </button>`;
+      } else if (isGeneratable) {
+        actionHtml = `<button class="btn btn-amber btn-gen-fx" data-fx="${fx.id}">Generate Poisson</button>`;
+      } else if (isAdminPending) {
+        actionHtml = `<button class="btn btn-secondary btn-admin-fx" data-fx="${fx.id}">Award 3-0 Ruling</button>`;
+      }
 
       const card = document.createElement("div");
-      card.className = "fixture-card";
+      card.className = `fixture-card${isCup ? " cup-card" : ""}`;
       card.setAttribute("data-fixture-id", fx.id);
       if (activeOfficialSession && activeOfficialSession.fixtureId === fx.id) {
         card.classList.add("active-session");
       }
 
-      const realNote =
-        fx.real_home_goals !== null && fx.real_away_goals !== null
-          ? `Real Ref: ${fx.real_home_goals}-${fx.real_away_goals}`
-          : "";
-
       card.innerHTML = `
         <div class="fx-top">
-          <span>Round ${fx.round} · ${fx.state.toUpperCase()}</span>
+          <span>${stageBadge} · ${fx.state.toUpperCase()}${fx.extra_time_enabled ? " · ET/Pens" : ""}</span>
           <span class="fx-source ${srcClass}">${fx.result_source}</span>
         </div>
         <div class="fx-mid">
@@ -1116,14 +1413,8 @@
           <span>${fx.away_club.name}</span>
         </div>
         <div class="fx-bottom">
-          <span>${realNote}${fx.accepted_hash_hex ? ` · Hash #${fx.accepted_hash_hex.slice(0, 8)}` : ""}</span>
-          ${
-            isPlayable
-              ? `<button class="btn btn-primary btn-play-fx" data-fx="${fx.id}" data-src="${fx.result_source}">
-                   ${fx.state === "in_session" ? "Resume 5v5 Session" : "Play Official 5v5"}
-                 </button>`
-              : `<span>${fx.accepted_source === "imported" ? "Inherited / Imported" : "Verified"}</span>`
-          }
+          <span>${realNote}${fx.accepted_hash_hex ? ` · #${fx.accepted_hash_hex.slice(0, 8)}` : ""}</span>
+          ${actionHtml}
         </div>
       `;
       fxContainer.appendChild(card);
@@ -1133,8 +1424,33 @@
       btn.addEventListener("click", () => {
         launchOfficialFixtureSession(
           btn.getAttribute("data-fx"),
-          btn.getAttribute("data-src")
+          btn.getAttribute("data-src"),
+          btn.getAttribute("data-stage")
         );
+      });
+    });
+
+    fxContainer.querySelectorAll(".btn-gen-fx").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const fid = btn.getAttribute("data-fx");
+        await fetch(`/api/fixtures/${encodeURIComponent(fid)}/generate`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({}),
+        });
+        await refreshWorldOverview();
+      });
+    });
+
+    fxContainer.querySelectorAll(".btn-admin-fx").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const fid = btn.getAttribute("data-fx");
+        await fetch(`/api/admin/fixtures/${encodeURIComponent(fid)}/resolve`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ home_goals: 3, away_goals: 0, reason: "commissioner walkover" }),
+        });
+        await refreshWorldOverview();
       });
     });
 
@@ -1160,7 +1476,7 @@
       stBody.appendChild(tr);
     }
 
-    // 3. Render Inherited / Earned / Combined Player Stats
+    // 3. Render Player Stats (Inherited / Earned / Combined + Skill Moves & Saves)
     const plBody = document.getElementById("players-tbody");
     plBody.innerHTML = "";
     for (const p of data.players) {
@@ -1171,19 +1487,44 @@
         <td>${p.inherited.goals}G / ${p.inherited.assists}A</td>
         <td>${p.earned.goals}G / ${p.earned.assists}A</td>
         <td><strong>${p.combined.goals}G / ${p.combined.assists}A</strong></td>
-        <td>${p.combined.saves}</td>
+        <td>${p.combined.skill_moves || 0}★ / ${p.combined.saves}Sv</td>
       `;
       plBody.appendChild(tr);
     }
 
-    // 4. Render Ledger Events
+    // 4. Render Appointments
+    const apptList = document.getElementById("appointment-list");
+    apptList.innerHTML = "";
+    for (const ap of data.appointments || []) {
+      const li = document.createElement("li");
+      const canAccept = ap.state === "proposed";
+      li.innerHTML = `
+        <span><code>${ap.fixture_id}</code> · ${ap.proposed_at_utc} (${ap.state.toUpperCase()})</span>
+        ${canAccept ? `<button class="btn btn-primary btn-accept-appt" data-id="${ap.id}">Accept</button>` : ""}
+      `;
+      apptList.appendChild(li);
+    }
+    apptList.querySelectorAll(".btn-accept-appt").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await fetch(`/api/appointments/${encodeURIComponent(btn.getAttribute("data-id"))}/respond`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ responder_id: "part-sam", accept: true }),
+        });
+        await refreshWorldOverview();
+      });
+    });
+
+    // 5. Render Ledger Events
     document.getElementById("event-count").textContent = String(data.total_events);
     const ledList = document.getElementById("ledger-list");
     ledList.innerHTML = "";
     for (const ev of data.recent_events) {
       const li = document.createElement("li");
-      if (ev.type === "import_parked") li.classList.add("ev-parked");
-      li.innerHTML = `<span class="ledger-seq">#${ev.seq}</span><strong>${ev.type}</strong> · <code>${ev.aggregate_id}</code>`;
+      if (ev.type === "import_parked" || ev.type === "identity_resolution_required") {
+        li.classList.add("ev-parked");
+      }
+      li.innerHTML = `<span><span class="ledger-seq">#${ev.seq}</span><strong>${ev.type}</strong> · <code>${ev.aggregate_id}</code></span>`;
       ledList.appendChild(li);
     }
   }
@@ -1200,6 +1541,20 @@
     });
   });
 
+  document.querySelectorAll(".comp-pill").forEach((pill) => {
+    pill.addEventListener("click", () => {
+      document.querySelectorAll(".comp-pill").forEach((p) => p.classList.remove("active"));
+      pill.classList.add("active");
+      activeCompFilter = pill.getAttribute("data-comp");
+      refreshWorldOverview();
+    });
+  });
+
+  worldSelect.addEventListener("change", () => {
+    activeWorldId = worldSelect.value;
+    refreshWorldOverview();
+  });
+
   btnExhibition.addEventListener("click", startExhibitionMatch);
   formatSelect.addEventListener("change", () => {
     if (!activeOfficialSession) startExhibitionMatch();
@@ -1213,9 +1568,11 @@
     btnPause.textContent = paused ? "Resume" : "Pause";
   });
 
+  btnInstantReplay.addEventListener("click", toggleInstantReplay);
+
   btnSimRest.addEventListener("click", async () => {
     if (!wasm) return;
-    wasm.sim_auto_step(60000);
+    wasm.sim_auto_step(90000);
     drainAndRenderMatchEvents();
     if (activeOfficialSession && !activeOfficialSession.completed) {
       await submitOfficialSessionResult();
@@ -1224,8 +1581,121 @@
 
   btnSubmitSession.addEventListener("click", submitOfficialSessionResult);
 
+  // Advance Knockout Cup (`comp-facup-2026`)
+  document.getElementById("btn-advance-cup").addEventListener("click", async () => {
+    const msgBox = document.getElementById("cup-divergence-msg");
+    const comps = (latestOverview && latestOverview.competitions) || [];
+    const cup = comps.find((c) => c.kind === "knockout");
+    const cupId = cup ? cup.id : DEFAULT_CUP_ID;
+
+    const res = await fetch(
+      `/api/worlds/${encodeURIComponent(activeWorldId)}/competitions/${encodeURIComponent(cupId)}/advance`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      }
+    );
+    const out = await res.json();
+    msgBox.hidden = false;
+    if (!res.ok) {
+      msgBox.innerHTML = `<strong>Cup Advance Blocked:</strong> ${out.detail || "Play both Cup Semi-Finals first!"}`;
+      return;
+    }
+    const fx = out.final_fixture;
+    msgBox.innerHTML = out.diverged_from_real_world
+      ? `<strong>Parallel Divergence Detected!</strong> Real Final was <code>LIV vs ARS</code>, so generated Parallel-Only Final <code>${fx.home_club_id.toUpperCase()} vs ${fx.away_club_id.toUpperCase()}</code> (source: <code>${fx.result_source}</code>)!`
+      : `<strong>Real-World Alignment:</strong> Finalists match real football — created Final <code>${fx.home_club_id.toUpperCase()} vs ${fx.away_club_id.toUpperCase()}</code>.`;
+    await refreshWorldOverview();
+  });
+
+  // Season Honours & Rollover
+  document.getElementById("btn-rollover-season").addEventListener("click", async () => {
+    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/rollover`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ next_season_label: "2027/28" }),
+    });
+    const out = await res.json();
+    const box = document.getElementById("rollover-msg");
+    box.hidden = false;
+    if (!res.ok) {
+      box.textContent = out.detail || "Rollover error";
+      return;
+    }
+    box.innerHTML = `<strong>Season Completed &amp; Rolled Over!</strong> Awarded ${out.honours.length} honours · Created <code>${out.next_world.id}</code> (${out.next_world.season_label}) preserving club ownership!`;
+    await refreshWorldOverview();
+  });
+
+  // Cartridge Sync / Verify / Download
+  document.getElementById("btn-sync-cartridge").addEventListener("click", async () => {
+    const [participantId, deviceId] = document.getElementById("cart-device-select").value.split("|");
+    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/cartridge/sync`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        participant_id: participantId,
+        device_id: deviceId,
+        camera_preset: "broadcast_5v5",
+      }),
+    });
+    const out = await res.json();
+    const box = document.getElementById("cartridge-msg");
+    box.hidden = false;
+    if (!res.ok) {
+      box.textContent = out.detail || "Cartridge sync error";
+      return;
+    }
+    latestSyncedEnvelope = out.envelope;
+    document.getElementById("btn-verify-cartridge").disabled = false;
+    document.getElementById("btn-download-cartridge").disabled = false;
+    const m = latestSyncedEnvelope.manifest;
+    box.innerHTML = `Issued <code>PSFC-CART-V1</code> Rev #${m.revision} for <code>${m.device_id}</code> · Seq #${m.world.last_event_seq} · HMAC <code>${latestSyncedEnvelope.signature.slice(0, 14)}…</code>`;
+    await refreshWorldOverview();
+  });
+
+  document.getElementById("btn-verify-cartridge").addEventListener("click", async () => {
+    if (!latestSyncedEnvelope) return;
+    const res = await fetch("/api/cartridge/verify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ envelope: latestSyncedEnvelope }),
+    });
+    const out = await res.json();
+    const box = document.getElementById("cartridge-msg");
+    box.hidden = false;
+    box.innerHTML = `Host Verification: <strong>${out.valid ? "VALID SIGNATURE" : "INVALID"}</strong> · Rev #${out.revision} · Stale Cache: <code>${out.stale_cache}</code>`;
+  });
+
+  document.getElementById("btn-download-cartridge").addEventListener("click", () => {
+    if (!latestSyncedEnvelope) return;
+    const blob = new Blob([JSON.stringify(latestSyncedEnvelope, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${latestSyncedEnvelope.manifest.device_id}.psfc.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  // Kickoff Appointments
+  document.getElementById("btn-propose-appt").addEventListener("click", async () => {
+    await fetch("/api/fixtures/fix-r3-mun-ars/appointments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        proposed_by: "part-alex",
+        proposed_at_utc: "2026-08-30T20:00:00Z",
+      }),
+    });
+    await refreshWorldOverview();
+  });
+
+  // Proposal Gate & Identity Queue testers
   document.getElementById("btn-test-gate").addEventListener("click", async () => {
-    const res = await fetch(`/api/worlds/${DEFAULT_WORLD_ID}/ingest/result`, {
+    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/ingest/result`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -1243,9 +1713,32 @@
     await refreshWorldOverview();
   });
 
+  document.getElementById("btn-test-id-queue").addEventListener("click", async () => {
+    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/ingest/provider-fixture`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        provider: "football_data_v4",
+        external_fixture_id: "ext-fx-991",
+        external_home_club_id: "ext-club-unknown-999",
+        external_away_club_id: "ext-club-57",
+        home_goals: 0,
+        away_goals: 2,
+      }),
+    });
+    const out = await res.json();
+    const box = document.getElementById("gate-result-msg");
+    box.hidden = false;
+    box.innerHTML = `Provider Feed Status: <strong>${out.status}</strong> → Queued <code>${out.queue_item.id}</code> (${out.queue_item.display_hint}) without corrupting world state!`;
+    await refreshWorldOverview();
+  });
+
   document.getElementById("btn-reset-world").addEventListener("click", async () => {
+    activeWorldId = DEFAULT_WORLD_ID;
     await fetch(`/api/worlds/${DEFAULT_WORLD_ID}/reset-demo`, { method: "POST" });
     activeOfficialSession = null;
+    document.getElementById("cup-divergence-msg").hidden = true;
+    document.getElementById("rollover-msg").hidden = true;
     startExhibitionMatch();
     await refreshWorldOverview();
   });

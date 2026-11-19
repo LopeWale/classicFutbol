@@ -543,6 +543,8 @@ The existing `.gitignore` is an Adventure Game Studio template left over from re
 
 Phases 2 and 3 can proceed in parallel with phase 1 since they do not depend on gameplay feel.
 
+**Current Implementation Status**: Phases **0, 1, 2, 3, 4, 5, and 6** are implemented end-to-end across `/sim`, `/host`, `/client`, `/cartridge`, `/firmware`, `/hardware`, `/shared`, and `/deploy` with **5v5 (4 outfield + 1 goalkeeper)** as the primary format and `MatchFormat::eleven_a_side()` (**11v11**, Phase 1b) parameterized and selectable across the Rust simulation, WASM preview, Godot 4 GDExtension, and World Host API.
+
 ---
 
 ## 13. Decisions to confirm with the group

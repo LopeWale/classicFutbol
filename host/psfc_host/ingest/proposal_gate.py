@@ -147,6 +147,8 @@ class ProposalGate:
             aggregate_id=fixture_id,
             payload={
                 "fixture_id": fixture_id,
+                "competition_id": fx.get("competition_id"),
+                "stage": fx.get("stage", "league"),
                 "home_club_id": fx["home_club_id"],
                 "away_club_id": fx["away_club_id"],
                 "home_goals": home_goals,

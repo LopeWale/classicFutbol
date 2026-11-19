@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,19 @@ CREATE TABLE IF NOT EXISTS world (
     season_label TEXT NOT NULL,
     season_timezone TEXT NOT NULL,
     default_match_format TEXT NOT NULL DEFAULT '5v5',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
+    parent_world_id TEXT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS competition (
+    id TEXT PRIMARY KEY,
+    world_id TEXT NOT NULL REFERENCES world(id),
+    name TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('league', 'knockout')),
+    format_name TEXT NOT NULL DEFAULT '5v5',
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'completed')),
+    real_final_pair_json TEXT NULL,
     created_at TEXT NOT NULL
 );
 
@@ -31,6 +45,16 @@ CREATE TABLE IF NOT EXISTS participant (
     id TEXT PRIMARY KEY,
     display_name TEXT NOT NULL,
     created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS device (
+    id TEXT PRIMARY KEY,
+    participant_id TEXT NOT NULL REFERENCES participant(id),
+    label TEXT NOT NULL,
+    secret_hash TEXT NOT NULL,
+    revoked INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    revoked_at TEXT NULL
 );
 
 CREATE TABLE IF NOT EXISTS club_assignment (
@@ -47,6 +71,8 @@ CREATE TABLE IF NOT EXISTS club_assignment (
 CREATE TABLE IF NOT EXISTS fixture (
     id TEXT PRIMARY KEY,
     world_id TEXT NOT NULL REFERENCES world(id),
+    competition_id TEXT NULL REFERENCES competition(id),
+    stage TEXT NOT NULL DEFAULT 'league',
     round INTEGER NOT NULL,
     home_club_id TEXT NOT NULL,
     away_club_id TEXT NOT NULL,
@@ -59,8 +85,20 @@ CREATE TABLE IF NOT EXISTS fixture (
     state TEXT NOT NULL CHECK (
         state IN ('scheduled', 'open', 'in_session', 'played', 'accepted', 'void', 'postponed', 'awaiting_admin')
     ),
+    extra_time_enabled INTEGER NOT NULL DEFAULT 0,
     real_home_goals INTEGER NULL,
     real_away_goals INTEGER NULL
+);
+
+CREATE TABLE IF NOT EXISTS appointment (
+    id TEXT PRIMARY KEY,
+    fixture_id TEXT NOT NULL REFERENCES fixture(id),
+    world_id TEXT NOT NULL REFERENCES world(id),
+    proposed_by TEXT NOT NULL REFERENCES participant(id),
+    proposed_at_utc TEXT NOT NULL,
+    accepted_by TEXT NULL REFERENCES participant(id),
+    state TEXT NOT NULL CHECK (state IN ('proposed', 'accepted', 'declined', 'expired')),
+    created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS fixture_snapshot (
@@ -77,12 +115,26 @@ CREATE TABLE IF NOT EXISTS match_session (
     fixture_id TEXT NOT NULL REFERENCES fixture(id),
     world_id TEXT NOT NULL REFERENCES world(id),
     kind TEXT NOT NULL CHECK (kind IN ('official', 'friendly')),
-    state TEXT NOT NULL CHECK (state IN ('created', 'running', 'completed', 'abandoned')),
+    state TEXT NOT NULL CHECK (
+        state IN ('created', 'ready_check', 'running', 'paused', 'completed', 'abandoned')
+    ),
+    home_ready INTEGER NOT NULL DEFAULT 0,
+    away_ready INTEGER NOT NULL DEFAULT 0,
+    pause_budget_remaining INTEGER NOT NULL DEFAULT 3,
+    reconnect_deadline_utc TEXT NULL,
     started_at TEXT NOT NULL,
     ended_at TEXT NULL,
     format_name TEXT NOT NULL,
     gameplay_version TEXT NOT NULL,
     final_hash_hex TEXT NULL
+);
+
+CREATE TABLE IF NOT EXISTS match_input_log (
+    session_id TEXT NOT NULL REFERENCES match_session(id),
+    tick INTEGER NOT NULL,
+    side TEXT NOT NULL CHECK (side IN ('home', 'away')),
+    input_hex TEXT NOT NULL,
+    PRIMARY KEY (session_id, tick, side)
 );
 
 CREATE TABLE IF NOT EXISTS accepted_result (
@@ -92,6 +144,9 @@ CREATE TABLE IF NOT EXISTS accepted_result (
     source TEXT NOT NULL,
     home_goals INTEGER NOT NULL,
     away_goals INTEGER NOT NULL,
+    went_to_extra_time INTEGER NOT NULL DEFAULT 0,
+    shootout_home INTEGER NULL,
+    shootout_away INTEGER NULL,
     final_hash_hex TEXT NULL,
     accepted_at TEXT NOT NULL,
     event_seq INTEGER NOT NULL
@@ -139,6 +194,53 @@ CREATE TABLE IF NOT EXISTS import_proposal (
     decision TEXT NOT NULL CHECK (decision IN ('applied', 'parked', 'rejected')),
     reason TEXT NOT NULL,
     decided_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS external_identity (
+    provider TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    internal_id TEXT NOT NULL,
+    resolved_at TEXT NOT NULL,
+    PRIMARY KEY (provider, entity_type, external_id)
+);
+
+CREATE TABLE IF NOT EXISTS identity_resolution_queue (
+    id TEXT PRIMARY KEY,
+    world_id TEXT NOT NULL REFERENCES world(id),
+    provider TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    display_hint TEXT NOT NULL,
+    raw_context_json TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'resolved')),
+    resolved_internal_id TEXT NULL,
+    created_at TEXT NOT NULL,
+    resolved_at TEXT NULL
+);
+
+CREATE TABLE IF NOT EXISTS cartridge_revision (
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES device(id),
+    participant_id TEXT NOT NULL REFERENCES participant(id),
+    world_id TEXT NOT NULL REFERENCES world(id),
+    rev_number INTEGER NOT NULL,
+    last_event_seq INTEGER NOT NULL,
+    manifest_hash TEXT NOT NULL,
+    signature TEXT NOT NULL,
+    manifest_json TEXT NOT NULL,
+    issued_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS season_honour (
+    id TEXT PRIMARY KEY,
+    world_id TEXT NOT NULL REFERENCES world(id),
+    season_label TEXT NOT NULL,
+    category TEXT NOT NULL,
+    winner_id TEXT NOT NULL,
+    winner_name TEXT NOT NULL,
+    detail_json TEXT NOT NULL,
+    awarded_at TEXT NOT NULL
 );
 """
 
@@ -236,7 +338,7 @@ class WorldLedgerStore:
             for r in rows
         ]
 
-    # --- World, Participants, & Club Assignments ---
+    # --- World, Competitions, Participants, & Club Assignments ---
 
     def create_world(
         self,
@@ -247,15 +349,28 @@ class WorldLedgerStore:
         season_label: str,
         season_timezone: str = "Europe/London",
         default_match_format: str = "5v5",
+        parent_world_id: str | None = None,
         caused_by: str = "system",
     ) -> dict[str, Any]:
         ts = utc_now_iso()
         self._conn.execute(
             """
-            INSERT INTO world (id, name, competition_name, season_label, season_timezone, default_match_format, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO world (
+                id, name, competition_name, season_label, season_timezone,
+                default_match_format, status, parent_world_id, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
             """,
-            (world_id, name, competition_name, season_label, season_timezone, default_match_format, ts),
+            (
+                world_id,
+                name,
+                competition_name,
+                season_label,
+                season_timezone,
+                default_match_format,
+                parent_world_id,
+                ts,
+            ),
         )
         self.append_event(
             world_id=world_id,
@@ -267,6 +382,7 @@ class WorldLedgerStore:
                 "competition_name": competition_name,
                 "season_label": season_label,
                 "default_match_format": default_match_format,
+                "parent_world_id": parent_world_id,
             },
             caused_by=caused_by,
             occurred_at=ts,
@@ -282,6 +398,77 @@ class WorldLedgerStore:
     def list_worlds(self) -> list[dict[str, Any]]:
         rows = self._conn.execute("SELECT * FROM world ORDER BY created_at ASC").fetchall()
         return [dict(r) for r in rows]
+
+    def create_competition(
+        self,
+        *,
+        competition_id: str,
+        world_id: str,
+        name: str,
+        kind: str = "league",
+        format_name: str = "5v5",
+        real_final_pair: list[str] | None = None,
+        caused_by: str = "commissioner",
+    ) -> dict[str, Any]:
+        ts = utc_now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO competition (id, world_id, name, kind, format_name, status, real_final_pair_json, created_at)
+            VALUES (?, ?, ?, ?, ?, 'active', ?, ?)
+            """,
+            (
+                competition_id,
+                world_id,
+                name,
+                kind,
+                format_name,
+                json.dumps(real_final_pair) if real_final_pair else None,
+                ts,
+            ),
+        )
+        self.append_event(
+            world_id=world_id,
+            event_type="competition_defined",
+            aggregate_type="competition",
+            aggregate_id=competition_id,
+            payload={
+                "competition_id": competition_id,
+                "name": name,
+                "kind": kind,
+                "format_name": format_name,
+                "real_final_pair": real_final_pair,
+            },
+            caused_by=caused_by,
+            occurred_at=ts,
+        )
+        return self.get_competition(competition_id)
+
+    def get_competition(self, competition_id: str) -> dict[str, Any]:
+        row = self._conn.execute(
+            "SELECT * FROM competition WHERE id = ?",
+            (competition_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Competition '{competition_id}' not found")
+        d = dict(row)
+        d["real_final_pair"] = (
+            json.loads(d["real_final_pair_json"]) if d.get("real_final_pair_json") else None
+        )
+        return d
+
+    def list_competitions(self, world_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM competition WHERE world_id = ? ORDER BY created_at ASC",
+            (world_id,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["real_final_pair"] = (
+                json.loads(d["real_final_pair_json"]) if d.get("real_final_pair_json") else None
+            )
+            out.append(d)
+        return out
 
     def register_participant(self, participant_id: str, display_name: str, world_id: str) -> dict[str, Any]:
         ts = utc_now_iso()
@@ -358,7 +545,6 @@ class WorldLedgerStore:
             occurred_at=ts,
             commit=False,
         )
-        # Recompute advance-assigned result_source for future open/scheduled fixtures!
         self._refresh_future_result_sources(world_id, from_round=effective_from_round, caused_by=participant_id)
         self._conn.commit()
         return self.list_assignments(world_id)[-1]
@@ -384,25 +570,43 @@ class WorldLedgerStore:
         ).fetchall()
         return {r["club_id"]: r["participant_id"] for r in rows}
 
-    def _refresh_future_result_sources(self, world_id: str, from_round: int, caused_by: str) -> None:
+    def compute_advance_result_source(
+        self,
+        world_id: str,
+        home_club_id: str,
+        away_club_id: str,
+        *,
+        has_real_equivalent: bool = True,
+    ) -> str:
         rep = self.represented_clubs(world_id)
+        h_rep = home_club_id in rep
+        a_rep = away_club_id in rep
+        if h_rep and a_rep:
+            return "played_vs_friend"
+        if h_rep or a_rep:
+            return "played_vs_cpu"
+        return "imported" if has_real_equivalent else "generated"
+
+    def _refresh_future_result_sources(self, world_id: str, from_round: int, caused_by: str) -> None:
         fixtures = self._conn.execute(
             """
-            SELECT id, home_club_id, away_club_id, result_source, state
+            SELECT id, stage, round, home_club_id, away_club_id, result_source, state, real_home_goals
             FROM fixture
-            WHERE world_id = ? AND round >= ? AND state IN ('scheduled', 'open')
+            WHERE world_id = ? AND state IN ('scheduled', 'open')
+              AND (stage != 'league' OR round >= ?)
             """,
             (world_id, from_round),
         ).fetchall()
         for f in fixtures:
-            h_rep = f["home_club_id"] in rep
-            a_rep = f["away_club_id"] in rep
-            if h_rep and a_rep:
-                new_src = "played_vs_friend"
-            elif h_rep or a_rep:
-                new_src = "played_vs_cpu"
-            else:
-                new_src = "imported"
+            if f["result_source"] == "admin":
+                continue
+            has_real = f["result_source"] != "generated"
+            new_src = self.compute_advance_result_source(
+                world_id,
+                f["home_club_id"],
+                f["away_club_id"],
+                has_real_equivalent=has_real,
+            )
             if new_src != f["result_source"]:
                 self._conn.execute(
                     "UPDATE fixture SET result_source = ? WHERE id = ?",
@@ -418,7 +622,7 @@ class WorldLedgerStore:
                     commit=False,
                 )
 
-    # --- Fixtures & Results ---
+    # --- Fixtures, Deadlines, & Results ---
 
     def create_fixture(
         self,
@@ -433,6 +637,9 @@ class WorldLedgerStore:
         window_close_utc: str,
         result_source: str,
         state: str = "open",
+        competition_id: str | None = None,
+        stage: str = "league",
+        extra_time_enabled: bool = False,
         real_home_goals: int | None = None,
         real_away_goals: int | None = None,
         caused_by: str = "system",
@@ -440,15 +647,17 @@ class WorldLedgerStore:
         self._conn.execute(
             """
             INSERT INTO fixture (
-                id, world_id, round, home_club_id, away_club_id,
+                id, world_id, competition_id, stage, round, home_club_id, away_club_id,
                 kickoff_utc, window_open_utc, window_close_utc,
-                result_source, state, real_home_goals, real_away_goals
+                result_source, state, extra_time_enabled, real_home_goals, real_away_goals
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 fixture_id,
                 world_id,
+                competition_id,
+                stage,
                 round_no,
                 home_club_id,
                 away_club_id,
@@ -457,6 +666,7 @@ class WorldLedgerStore:
                 window_close_utc,
                 result_source,
                 state,
+                int(extra_time_enabled),
                 real_home_goals,
                 real_away_goals,
             ),
@@ -468,11 +678,14 @@ class WorldLedgerStore:
             aggregate_id=fixture_id,
             payload={
                 "fixture_id": fixture_id,
+                "competition_id": competition_id,
+                "stage": stage,
                 "round": round_no,
                 "home_club_id": home_club_id,
                 "away_club_id": away_club_id,
                 "kickoff_utc": kickoff_utc,
                 "result_source": result_source,
+                "extra_time_enabled": extra_time_enabled,
                 "real_reference_score": (
                     [real_home_goals, real_away_goals]
                     if real_home_goals is not None and real_away_goals is not None
@@ -489,6 +702,9 @@ class WorldLedgerStore:
             SELECT f.*,
                    ar.home_goals AS accepted_home_goals,
                    ar.away_goals AS accepted_away_goals,
+                   ar.went_to_extra_time AS accepted_aet,
+                   ar.shootout_home AS accepted_shootout_home,
+                   ar.shootout_away AS accepted_shootout_away,
                    ar.source AS accepted_source,
                    ar.final_hash_hex AS accepted_hash_hex,
                    ar.accepted_at AS accepted_at,
@@ -503,24 +719,154 @@ class WorldLedgerStore:
             raise KeyError(f"Fixture '{fixture_id}' not found")
         return dict(row)
 
-    def list_fixtures(self, world_id: str) -> list[dict[str, Any]]:
-        rows = self._conn.execute(
-            """
-            SELECT f.*,
-                   ar.home_goals AS accepted_home_goals,
-                   ar.away_goals AS accepted_away_goals,
-                   ar.source AS accepted_source,
-                   ar.final_hash_hex AS accepted_hash_hex,
-                   ar.accepted_at AS accepted_at,
-                   ar.event_seq AS accepted_event_seq
-            FROM fixture f
-            LEFT JOIN accepted_result ar ON ar.fixture_id = f.id
-            WHERE f.world_id = ?
-            ORDER BY f.round ASC, f.kickoff_utc ASC, f.id ASC
-            """,
-            (world_id,),
-        ).fetchall()
+    def list_fixtures(
+        self,
+        world_id: str,
+        competition_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if competition_id:
+            rows = self._conn.execute(
+                """
+                SELECT f.*,
+                       ar.home_goals AS accepted_home_goals,
+                       ar.away_goals AS accepted_away_goals,
+                       ar.went_to_extra_time AS accepted_aet,
+                       ar.shootout_home AS accepted_shootout_home,
+                       ar.shootout_away AS accepted_shootout_away,
+                       ar.source AS accepted_source,
+                       ar.final_hash_hex AS accepted_hash_hex,
+                       ar.accepted_at AS accepted_at,
+                       ar.event_seq AS accepted_event_seq
+                FROM fixture f
+                LEFT JOIN accepted_result ar ON ar.fixture_id = f.id
+                WHERE f.world_id = ? AND f.competition_id = ?
+                ORDER BY f.round ASC, f.kickoff_utc ASC, f.id ASC
+                """,
+                (world_id, competition_id),
+            ).fetchall()
+        else:
+            rows = self._conn.execute(
+                """
+                SELECT f.*,
+                       ar.home_goals AS accepted_home_goals,
+                       ar.away_goals AS accepted_away_goals,
+                       ar.went_to_extra_time AS accepted_aet,
+                       ar.shootout_home AS accepted_shootout_home,
+                       ar.shootout_away AS accepted_shootout_away,
+                       ar.source AS accepted_source,
+                       ar.final_hash_hex AS accepted_hash_hex,
+                       ar.accepted_at AS accepted_at,
+                       ar.event_seq AS accepted_event_seq
+                FROM fixture f
+                LEFT JOIN accepted_result ar ON ar.fixture_id = f.id
+                WHERE f.world_id = ?
+                ORDER BY f.round ASC, f.kickoff_utc ASC, f.id ASC
+                """,
+                (world_id,),
+            ).fetchall()
         return [dict(r) for r in rows]
+
+    def expire_overdue_windows(
+        self,
+        world_id: str,
+        as_of_utc: str | None = None,
+        actor_id: str = "scheduler",
+    ) -> list[dict[str, Any]]:
+        """Transition expired unplayed represented fixtures to `awaiting_admin` without substituting real scores."""
+        cutoff = as_of_utc or utc_now_iso()
+        overdue = self._conn.execute(
+            """
+            SELECT * FROM fixture
+            WHERE world_id = ?
+              AND state IN ('scheduled', 'open')
+              AND result_source IN ('played_vs_friend', 'played_vs_cpu')
+              AND window_close_utc < ?
+            """,
+            (world_id, cutoff),
+        ).fetchall()
+        transitioned: list[dict[str, Any]] = []
+        for row in overdue:
+            fid = row["id"]
+            self._conn.execute(
+                "UPDATE fixture SET state = 'awaiting_admin' WHERE id = ?",
+                (fid,),
+            )
+            self.append_event(
+                world_id=world_id,
+                event_type="admin_resolution_required",
+                aggregate_type="fixture",
+                aggregate_id=fid,
+                payload={
+                    "fixture_id": fid,
+                    "reason": "playing_window_expired",
+                    "window_close_utc": row["window_close_utc"],
+                    "as_of_utc": cutoff,
+                    "result_source": row["result_source"],
+                },
+                caused_by=actor_id,
+                commit=False,
+            )
+            transitioned.append(fid)
+        self._conn.commit()
+        return [self.get_fixture(fid) for fid in transitioned]
+
+    def resolve_awaiting_admin_fixture(
+        self,
+        *,
+        fixture_id: str,
+        home_goals: int,
+        away_goals: int,
+        actor_id: str = "commissioner",
+        reason: str = "commissioner walkover / ruling",
+    ) -> dict[str, Any]:
+        fx = self.get_fixture(fixture_id)
+        if self.get_accepted_result(fixture_id) is not None:
+            return self.correct_result_admin(
+                fixture_id=fixture_id,
+                new_home_goals=home_goals,
+                new_away_goals=away_goals,
+                actor_id=actor_id,
+                reason=reason,
+            )
+        ts = utc_now_iso()
+        world_id = fx["world_id"]
+        res_ev = self.append_event(
+            world_id=world_id,
+            event_type="result_accepted",
+            aggregate_type="fixture",
+            aggregate_id=fixture_id,
+            payload={
+                "fixture_id": fixture_id,
+                "competition_id": fx.get("competition_id"),
+                "stage": fx.get("stage", "league"),
+                "home_club_id": fx["home_club_id"],
+                "away_club_id": fx["away_club_id"],
+                "home_goals": home_goals,
+                "away_goals": away_goals,
+                "source": "admin",
+                "reason": reason,
+            },
+            caused_by=actor_id,
+            occurred_at=ts,
+            commit=False,
+        )
+        self._conn.execute(
+            """
+            INSERT INTO accepted_result (
+                fixture_id, world_id, session_id, source,
+                home_goals, away_goals, went_to_extra_time, shootout_home, shootout_away,
+                final_hash_hex, accepted_at, event_seq
+            )
+            VALUES (?, ?, NULL, 'admin', ?, ?, 0, NULL, NULL, NULL, ?, ?)
+            """,
+            (fixture_id, world_id, home_goals, away_goals, ts, res_ev["seq"]),
+        )
+        self._conn.execute(
+            "UPDATE fixture SET state = 'accepted', result_source = 'admin' WHERE id = ?",
+            (fixture_id,),
+        )
+        self._conn.commit()
+        return self.get_accepted_result(fixture_id) or {}
 
     def get_frozen_snapshot(self, fixture_id: str) -> dict[str, Any] | None:
         row = self._conn.execute(
@@ -566,6 +912,8 @@ class WorldLedgerStore:
             aggregate_id=fixture_id,
             payload={
                 "fixture_id": fixture_id,
+                "competition_id": fx.get("competition_id"),
+                "stage": fx.get("stage", "league"),
                 "home_club_id": fx["home_club_id"],
                 "away_club_id": fx["away_club_id"],
                 "home_goals": new_home_goals,
@@ -593,3 +941,54 @@ class WorldLedgerStore:
         )
         self._conn.commit()
         return self.get_accepted_result(fixture_id) or {}
+
+    def record_honour(
+        self,
+        *,
+        world_id: str,
+        season_label: str,
+        category: str,
+        winner_id: str,
+        winner_name: str,
+        detail: dict[str, Any],
+        awarded_at: str,
+    ) -> dict[str, Any]:
+        hid = f"hon-{uuid.uuid4().hex[:10]}"
+        self._conn.execute(
+            """
+            INSERT INTO season_honour (id, world_id, season_label, category, winner_id, winner_name, detail_json, awarded_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                hid,
+                world_id,
+                season_label,
+                category,
+                winner_id,
+                winner_name,
+                json.dumps(detail, separators=(",", ":"), sort_keys=True),
+                awarded_at,
+            ),
+        )
+        return {
+            "id": hid,
+            "world_id": world_id,
+            "season_label": season_label,
+            "category": category,
+            "winner_id": winner_id,
+            "winner_name": winner_name,
+            "detail": detail,
+            "awarded_at": awarded_at,
+        }
+
+    def list_honours(self, world_id: str) -> list[dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM season_honour WHERE world_id = ? ORDER BY awarded_at ASC, id ASC",
+            (world_id,),
+        ).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["detail"] = json.loads(d.pop("detail_json"))
+            out.append(d)
+        return out

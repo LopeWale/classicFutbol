@@ -1,0 +1,27 @@
+# Multi-stage build for Parallel Season FC World Host + psfc-replay + psfc-wasm
+FROM rust:1.83-bookworm AS rust-builder
+
+WORKDIR /build/sim
+RUN rustup target add wasm32-unknown-unknown
+COPY sim/ ./
+RUN cargo build --release -p psfc-replay && \
+    cargo build --release -p psfc-wasm --target wasm32-unknown-unknown
+
+FROM python:3.11-slim-bookworm AS runtime
+
+WORKDIR /app
+COPY --from=rust-builder /build/sim/target/release/psfc-replay /usr/local/bin/psfc-replay
+COPY host/ ./host/
+COPY --from=rust-builder /build/sim/target/wasm32-unknown-unknown/release/psfc_wasm.wasm \
+     ./host/psfc_host/web/static/wasm/psfc_wasm.wasm
+
+RUN pip install --no-cache-dir ./host
+
+ENV PSFC_REPLAY_BIN=/usr/local/bin/psfc-replay \
+    PSFC_DB_PATH=/data/psfc_world.db \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 8000/tcp
+EXPOSE 27960/udp
+
+CMD ["uvicorn", "psfc_host.api.app:app", "--host", "0.0.0.0", "--port", "8000"]

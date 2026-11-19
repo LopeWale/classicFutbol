@@ -4,11 +4,11 @@
   "title": "WorldEvent",
   "description": "Immutable append-only event record in the Parallel Season FC world ledger.",
   "type": "object",
-  "required": ["seq", "world_id", "event_type", "aggregate_type", "aggregate_id", "payload", "caused_by", "occurred_at"],
+  "required": ["seq", "world_id", "type", "aggregate_type", "aggregate_id", "payload", "caused_by", "occurred_at"],
   "properties": {
     "seq": { "type": "integer", "minimum": 1 },
     "world_id": { "type": "string" },
-    "event_type": {
+    "type": {
       "type": "string",
       "enum": [
         "world_created",
@@ -25,13 +25,31 @@
         "snapshot_frozen",
         "session_completed",
         "session_abandoned",
+        "lobby_ready_updated",
+        "session_paused",
+        "session_resumed",
+        "peer_disconnected",
         "result_accepted",
         "match_events_recorded",
         "imported_result_accepted",
         "imported_match_events_recorded",
         "import_parked",
         "generated_result_accepted",
-        "result_corrected"
+        "result_corrected",
+        "admin_resolution_required",
+        "identity_resolution_required",
+        "identity_mapping_resolved",
+        "appointment_proposed",
+        "appointment_confirmed",
+        "appointment_declined",
+        "device_registered",
+        "device_revoked",
+        "cartridge_synced",
+        "draw_generated",
+        "honours_awarded",
+        "qualification_determined",
+        "season_completed",
+        "season_rolled_over"
       ]
     },
     "aggregate_type": { "type": "string" },

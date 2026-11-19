@@ -33,6 +33,11 @@ pub enum PlayerActionState {
     Cooldown {
         ticks_left: u8,
     },
+    SkillMove {
+        kind: u8,
+        ticks_left: u8,
+        dir: Vec2,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -212,6 +217,10 @@ pub struct MatchState {
     pub player_stats: [Vec<PlayerMatchStats>; 2],
     pub ball: BallState,
     pub rng: DeterministicRng,
+    #[serde(default)]
+    pub went_to_extra_time: bool,
+    #[serde(default)]
+    pub shootout_score: Option<[u8; 2]>,
     #[serde(skip)]
     pub pending_events: Vec<MatchEvent>,
     pub recorded_events: Vec<MatchEvent>,
@@ -220,14 +229,21 @@ pub struct MatchState {
 impl MatchState {
     #[inline]
     pub const fn second_half_swapped(&self) -> bool {
-        self.half >= 2
+        self.half.is_multiple_of(2)
     }
 
-    /// Approximate football match minute (`1..=90`) scaled to configured match length for broadcast/ledger display.
+    /// Approximate football match minute (`1..=90` in regulation, `91..=120` in extra time) scaled to configured match length.
     pub fn display_minute(&self) -> u16 {
-        let total_ticks = (self.rules.half_duration_ticks.saturating_mul(2)).max(1);
-        let scaled = ((self.clock_ticks as u64) * 90) / (total_ticks as u64);
-        (scaled as u16 + 1).min(90)
+        let reg_ticks = (self.rules.half_duration_ticks.saturating_mul(2)).max(1);
+        if self.half <= 2 {
+            let scaled = ((self.clock_ticks as u64) * 90) / (reg_ticks as u64);
+            (scaled as u16 + 1).min(90)
+        } else {
+            let et_total = ((self.rules.half_duration_ticks / 3).max(180).saturating_mul(2)).max(1);
+            let et_elapsed = self.clock_ticks.saturating_sub(reg_ticks);
+            let scaled = ((et_elapsed as u64) * 30) / (et_total as u64);
+            (91 + scaled as u16).min(120)
+        }
     }
 
     /// Canonical 64-bit deterministic hash over simulation state.
@@ -240,6 +256,15 @@ impl MatchState {
         h.u8(self.half);
         h.u16(self.score[0]);
         h.u16(self.score[1]);
+        h.u8(u8::from(self.went_to_extra_time));
+        match self.shootout_score {
+            Some([hp, ap]) => {
+                h.u8(1);
+                h.u8(hp);
+                h.u8(ap);
+            }
+            None => h.u8(0),
+        }
         h.u32(self.possession_ticks[0]);
         h.u32(self.possession_ticks[1]);
         h.u32(self.controlled_idx[0] as u32);
@@ -365,6 +390,17 @@ impl MatchState {
                     PlayerActionState::Cooldown { ticks_left } => {
                         h.u8(6);
                         h.u8(ticks_left);
+                    }
+                    PlayerActionState::SkillMove {
+                        kind,
+                        ticks_left,
+                        dir,
+                    } => {
+                        h.u8(7);
+                        h.u8(kind);
+                        h.u8(ticks_left);
+                        h.i64(dir.x.raw());
+                        h.i64(dir.y.raw());
                     }
                 }
             }

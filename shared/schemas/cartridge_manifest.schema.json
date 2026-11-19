@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://classicfutbol.local/schemas/cartridge_manifest.schema.json",
+  "title": "SignedCartridgeEnvelope",
+  "description": "Host-signed Parallel Season FC profile cartridge envelope (portable cache + preferences; never authoritative over the host ledger).",
+  "type": "object",
+  "required": ["manifest", "manifest_hash", "signature_alg", "signature"],
+  "properties": {
+    "manifest": {
+      "type": "object",
+      "required": [
+        "schema_version",
+        "cartridge_magic",
+        "revision",
+        "issued_at",
+        "device_id",
+        "participant_id",
+        "world",
+        "preferences",
+        "career_summary"
+      ],
+      "properties": {
+        "schema_version": { "type": "string", "const": "1.0.0" },
+        "cartridge_magic": { "type": "string", "const": "PSFC-CART-V1" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "issued_at": { "type": "string", "format": "date-time" },
+        "device_id": { "type": "string", "minLength": 2 },
+        "participant_id": { "type": "string", "minLength": 2 },
+        "world": {
+          "type": "object",
+          "required": ["world_id", "name", "season_label", "default_match_format", "last_event_seq"],
+          "properties": {
+            "world_id": { "type": "string" },
+            "name": { "type": "string" },
+            "season_label": { "type": "string" },
+            "default_match_format": { "type": "string", "enum": ["5v5", "11v11"] },
+            "last_event_seq": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "preferences": {
+          "type": "object",
+          "required": ["camera_preset", "controller_mapping"],
+          "properties": {
+            "camera_preset": { "type": "string" },
+            "controller_mapping": { "type": "object" }
+          }
+        },
+        "career_summary": {
+          "type": "object",
+          "required": ["assigned_clubs", "club_standings_snapshot", "honours"],
+          "properties": {
+            "assigned_clubs": { "type": "array", "items": { "type": "string" } },
+            "club_standings_snapshot": { "type": "array", "items": { "type": "object" } },
+            "honours": { "type": "array", "items": { "type": "object" } }
+          }
+        }
+      }
+    },
+    "manifest_hash": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "signature_alg": { "type": "string", "enum": ["HMAC-SHA256"] },
+    "signature": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

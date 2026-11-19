@@ -223,6 +223,17 @@ impl PsfcMatchSim {
     }
 
     #[func]
+    pub fn get_shootout_score(&self) -> Vector2i {
+        let Some(ref sim) = self.sim else {
+            return Vector2i::new(-1, -1);
+        };
+        match sim.state().shootout_score {
+            Some([hp, ap]) => Vector2i::new(hp as i32, ap as i32),
+            None => Vector2i::new(-1, -1),
+        }
+    }
+
+    #[func]
     pub fn get_controlled_indices(&self) -> Vector2i {
         let Some(ref sim) = self.sim else {
             return Vector2i::new(1, 1);

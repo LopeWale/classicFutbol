@@ -1,7 +1,8 @@
 class_name ControllerInterface
 extends Node
 ## Translates raw HID gamepad / keyboard state into calibrated 60 Hz InputFrames
-## and preserves participant-to-device bindings across disconnects (README §11).
+## (including Phase 4/6 `BTN_SKILL` & Right-Stick skill-move flicks) and preserves
+## participant-to-device bindings across disconnects (README §11).
 
 const BTN_PASS: int = 1 << 0
 const BTN_THROUGH: int = 1 << 1
@@ -13,6 +14,7 @@ const BTN_JOCKEY: int = 1 << 6
 const BTN_TACKLE: int = 1 << 7
 const BTN_SLIDE: int = 1 << 8
 const BTN_CALL_RUN: int = 1 << 9
+const BTN_SKILL: int = 1 << 10
 
 class DeviceCalibration:
 	var dead_zone: float = 0.12
@@ -92,6 +94,8 @@ func _sample_joypad(dev_id: int, guid: String) -> Dictionary:
 		btns |= BTN_SWITCH
 	if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_RIGHT_SHOULDER):
 		btns |= BTN_CALL_RUN
+	if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_RIGHT_STICK):
+		btns |= BTN_SKILL
 
 	return {
 		"move_x": clampi(int(round(lx * 127.0)), -127, 127),
@@ -133,6 +137,8 @@ func _sample_keyboard_p1() -> Dictionary:
 		btns |= BTN_SWITCH
 	if Input.is_key_pressed(KEY_E):
 		btns |= BTN_CALL_RUN
+	if Input.is_key_pressed(KEY_Z):
+		btns |= BTN_SKILL
 
 	return {
 		"move_x": clampi(int(round(v.x * 127.0)), -127, 127),
