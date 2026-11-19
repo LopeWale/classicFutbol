@@ -84,8 +84,8 @@ Nothing states the in-game match length (classic FIFA defaults were 4–6 minute
 
 The gameplay chapter (section 9) alone describes most of a commercial sports title. The design assumes the following staging so a playable, record-keeping season exists long before the football "feels like FIFA":
 
-1. **Playable core** — movement, pass, shoot, tackle, switching, goalkeeper AI, rules for goals, out of play, kick-off, basic fouls. Capsule-and-stick visuals are acceptable.
-2. **Complete rules** — offside, cards, set pieces, substitutions, extra time, penalties.
+1. **Playable 5v5 core (ADR-0003)** — 4 outfield players + 1 goalkeeper per side (`56 m × 36 m` pitch, standard touchlines, offsides off), parameterized via `MatchFormat` so team size scales cleanly to 11v11. Covers movement, pass, shoot, tackle, switching, goalkeeper AI, goals, out of play, kick-off, basic fouls. Capsule-and-stick visuals are acceptable.
+2. **Complete rules & 11v11 expansion** — expand `MatchFormat` default from 5v5 to 11v11 (`105 m × 68 m`), enable offsides, cards, full set pieces, substitutions, extra time, penalties.
 3. **Feel** — skill moves, driven/lofted variants, first-time play, jockeying, animation quality, camera polish.
 4. **Presentation** — stadiums, kits, broadcast UI, replays.
 

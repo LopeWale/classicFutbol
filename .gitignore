@@ -1,31 +1,45 @@
-# Built things
-_Debug/
-Compiled/
+# Rust
+/sim/target/
+**/*.rs.bk
 
-# AudioCache can be rebuilt from sources
-AudioCache/
+# Godot 4
+/client/.godot/
+/client/*.import
+/client/export_presets.cfg
+/client/bin/*.so
+/client/bin/*.dll
+/client/bin/*.dylib
+/client/bin/*.wasm
 
-# Lockfile
-_OpenInEditor.lock
+# WebAssembly & generated web artifacts
+/host/psfc_host/web/static/wasm/*.wasm
 
-# User settings
-Game.agf.user
-*.crm.user
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+/host/.venv/
+.pytest_cache/
+.hypothesis/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+*.sqlite
+*.sqlite3
+*.db
 
-# Backups
-Game.agf.bak
-backup_acsprset.spr
+# Environment & local secrets
+.env
+.env.*
+!.env.example
 
-# Memory dumps
-*.dmp
-
-# Temporary files
-# temporarily created during sprite or room background compression
-~aclzw.tmp
-# temporary, main game data, before getting packed into exe
-game28.dta
-# temporary build of the game before being moved to Compiled/ folder
-*.exe
-
-# Log files
-warnings.log
+# OS & editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.vscode/
+.idea/

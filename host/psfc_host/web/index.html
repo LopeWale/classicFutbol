@@ -1,0 +1,218 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>classicFutbol — Parallel Season FC (5v5 + GK Live Pitch &amp; World Host)</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">PSFC</span>
+      <div>
+        <h1>classicFutbol <span class="brand-sub">Parallel Season FC</span></h1>
+        <p class="brand-meta">Deterministic Q32.32 Fixed-Point Engine · 5v5 (4 Outfield + 1 GK) Default · Event-Sourced World Ledger</p>
+      </div>
+    </div>
+    <div class="topbar-status">
+      <div class="pill pill-emerald" id="wasm-status-pill">WASM Sim: Loading…</div>
+      <div class="pill pill-slate" id="gamepad-status-pill">Controller: Keyboard + Gamepad Ready</div>
+      <div class="pill pill-mono" id="hash-status-pill">State Hash: ----------------</div>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <!-- LEFT / PRIMARY: 3D Broadcast Pitch & Match Controls -->
+    <section class="pitch-column">
+      <div class="match-toolbar">
+        <div class="toolbar-group">
+          <label for="format-select">Format</label>
+          <select id="format-select">
+            <option value="5v5" selected>5v5 (4 Outfield + 1 GK · 56m×36m)</option>
+            <option value="11v11">11v11 Expansion (10 + 1 GK · 105m×68m)</option>
+          </select>
+        </div>
+
+        <div class="toolbar-group">
+          <label for="mode-select">Control</label>
+          <select id="mode-select">
+            <option value="p1_cpu_normal" selected>1P vs CPU (Normal)</option>
+            <option value="p1_cpu_hard">1P vs CPU (Hard)</option>
+            <option value="p1_cpu_easy">1P vs CPU (Easy)</option>
+            <option value="cpu_vs_cpu">CPU vs CPU (Spectate)</option>
+            <option value="local_2p">2P Local Couch</option>
+          </select>
+        </div>
+
+        <div class="toolbar-group">
+          <label for="duration-select">Half Length</label>
+          <select id="duration-select">
+            <option value="1800">30s Quick Half</option>
+            <option value="3600" selected>1m Arcade Half</option>
+            <option value="7200">2m Standard 5v5 Half</option>
+          </select>
+        </div>
+
+        <div class="toolbar-actions">
+          <button class="btn btn-secondary" id="btn-exhibition">New Exhibition</button>
+          <button class="btn btn-secondary" id="btn-pause">Pause</button>
+          <button class="btn btn-amber" id="btn-sim-rest" title="Deterministically fast-forward remaining match ticks">Fast-Forward to FT</button>
+          <button class="btn btn-primary" id="btn-submit-session" hidden>Verify &amp; Record Result</button>
+        </div>
+      </div>
+
+      <div class="viewport-card">
+        <canvas id="pitch-canvas" width="1120" height="630"></canvas>
+
+        <!-- Classic Broadcast Scorebug -->
+        <div class="scorebug">
+          <div class="sb-mode" id="sb-context">EXHIBITION · 5v5</div>
+          <div class="sb-teams">
+            <span class="sb-swatch" id="sb-home-swatch"></span>
+            <span class="sb-code" id="sb-home-code">MUN</span>
+            <span class="sb-score" id="sb-score">0 - 0</span>
+            <span class="sb-code" id="sb-away-code">ARS</span>
+            <span class="sb-swatch" id="sb-away-swatch"></span>
+          </div>
+          <div class="sb-clock">
+            <span id="sb-half">1H</span>
+            <span id="sb-time">00:00</span>
+          </div>
+          <div class="sb-phase" id="sb-phase">KICK OFF</div>
+        </div>
+
+        <!-- Goal / Event Broadcast Banner -->
+        <div class="goal-banner" id="goal-banner" hidden>
+          <div class="goal-banner-title" id="goal-banner-title">GOAL!</div>
+          <div class="goal-banner-sub" id="goal-banner-sub">M. Rashford</div>
+        </div>
+
+        <!-- Official Replay Verification Receipt Toast -->
+        <div class="verify-banner" id="verify-banner" hidden></div>
+      </div>
+
+      <!-- Controls Reference & Live Match Feed -->
+      <div class="under-pitch-grid">
+        <div class="panel controls-panel">
+          <div class="panel-header">
+            <h2>Pitch Controls (Classic Arcade Mapping)</h2>
+            <span class="badge">Zero Play-Calling Menus · Pure Stick + Button Skill</span>
+          </div>
+          <div class="controls-grid">
+            <div><kbd>WASD</kbd> / <kbd>Arrows</kbd> Move &amp; Aim</div>
+            <div><kbd>J</kbd> / <kbd>Space</kbd> Ground Pass</div>
+            <div><kbd>K</kbd> Through Ball</div>
+            <div><kbd>U</kbd> Lob / Cross</div>
+            <div><kbd>L</kbd> / <kbd>Enter</kbd> Shoot (Hold Charge)</div>
+            <div><kbd>Shift</kbd> Sprint</div>
+            <div><kbd>Q</kbd> Switch Defender</div>
+            <div><kbd>E</kbd> Stand Tackle · <kbd>C</kbd> Slide</div>
+            <div><kbd>F</kbd> Jockey / Finesse Shot</div>
+            <div><kbd>R</kbd> Trigger Run / GK Rush</div>
+          </div>
+        </div>
+
+        <div class="panel feed-panel">
+          <div class="panel-header">
+            <h2>Live Match Event Ticker</h2>
+            <span class="badge" id="possession-badge">Possession 50% - 50%</span>
+          </div>
+          <ul class="event-feed" id="match-event-feed"></ul>
+        </div>
+      </div>
+    </section>
+
+    <!-- RIGHT: Parallel Season World Host, Standings, Inherited/Earned Stats & Ledger -->
+    <aside class="world-column">
+      <div class="panel world-header-panel">
+        <div class="world-title-row">
+          <div>
+            <span class="eyebrow">ACTIVE PARALLEL WORLD</span>
+            <h2 id="world-name">Friends Premier Parallel Season</h2>
+            <p id="world-meta" class="muted">2026/27 · Represented: MUN (Alex), ARS (Sam)</p>
+          </div>
+          <button class="btn btn-ghost" id="btn-reset-world" title="Reset demo world to Round 3">Reset Demo</button>
+        </div>
+
+        <div class="tabs" role="tablist">
+          <button class="tab active" data-tab="fixtures">Fixtures</button>
+          <button class="tab" data-tab="standings">Standings</button>
+          <button class="tab" data-tab="players">Inherited / Earned</button>
+          <button class="tab" data-tab="ledger">Ledger &amp; Gate</button>
+        </div>
+      </div>
+
+      <!-- TAB 1: Fixtures & Official Session Launcher -->
+      <div class="tab-pane active" id="tab-fixtures">
+        <div class="pane-note">
+          Each fixture has ONE advance-assigned <code>result_source</code>. Represented clubs play 5v5 (+GK) matches validated by <code>psfc-replay</code>; unrepresented fixtures import real football results.
+        </div>
+        <div class="fixture-list" id="fixture-list"></div>
+      </div>
+
+      <!-- TAB 2: Parallel Standings vs Real Reference -->
+      <div class="tab-pane" id="tab-standings" hidden>
+        <div class="pane-note">
+          Pure projection rebuilt from <code>world_event</code>. Compare Parallel Season points (<code>Inh + Earn</code>) against the real-world reference table.
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Club</th>
+                <th>P</th>
+                <th>W-D-L</th>
+                <th>GD</th>
+                <th>Inh</th>
+                <th>Earn</th>
+                <th>Pts</th>
+                <th>vs Real</th>
+              </tr>
+            </thead>
+            <tbody id="standings-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 3: Player Statistics (Inherited vs Earned vs Combined) -->
+      <div class="tab-pane" id="tab-players" hidden>
+        <div class="pane-note">
+          <strong>Strict Provenance Separation:</strong> Real-world provider season totals never overwrite Parallel Season stats (<code>Combined = Inherited + Earned</code>).
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Player</th>
+                <th>Club</th>
+                <th>Inh G/A</th>
+                <th>Earn G/A</th>
+                <th>Comb G/A</th>
+                <th>Saves</th>
+              </tr>
+            </thead>
+            <tbody id="players-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <!-- TAB 4: Append-Only Ledger & Proposal Gate Tester -->
+      <div class="tab-pane" id="tab-ledger" hidden>
+        <div class="gate-tester">
+          <h3>Test Proposal Gate (World Precedence)</h3>
+          <p class="muted">Simulate an external real-football data provider pushing a result onto represented Round 3 <code>MUN vs ARS</code>. Watch the gate park it with <code>world_precedence</code>.</p>
+          <button class="btn btn-secondary btn-full" id="btn-test-gate">Simulate External Feed Import on MUN vs ARS</button>
+          <div id="gate-result-msg" class="gate-msg" hidden></div>
+        </div>
+
+        <h3 class="section-subhead">Append-Only <code>world_event</code> Log (<span id="event-count">0</span>)</h3>
+        <ul class="ledger-list" id="ledger-list"></ul>
+      </div>
+    </aside>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

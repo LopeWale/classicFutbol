@@ -1,0 +1,6 @@
+[gd_scene load_steps=2 format=3 uid="uid://c5v5matchscene"]
+
+[ext_resource type="Script" path="res://scripts/match/match_controller.gd" id="1_match"]
+
+[node name="Match5v5" type="Node3D"]
+script = ExtResource("1_match")

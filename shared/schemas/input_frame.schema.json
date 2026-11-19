@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://classicfutbol.local/schemas/input_frame.schema.json",
+  "title": "InputFrame",
+  "description": "8-byte per-tick controller input frame consumed by psfc-sim at 60 Hz.",
+  "type": "object",
+  "required": ["move_x", "move_y", "aim_x", "aim_y", "buttons"],
+  "properties": {
+    "move_x": { "type": "integer", "minimum": -127, "maximum": 127 },
+    "move_y": { "type": "integer", "minimum": -127, "maximum": 127 },
+    "aim_x": { "type": "integer", "minimum": -127, "maximum": 127 },
+    "aim_y": { "type": "integer", "minimum": -127, "maximum": 127 },
+    "buttons": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535,
+      "description": "Bitmask: 0=PASS, 1=THROUGH, 2=LOB, 3=SHOOT, 4=SPRINT, 5=SWITCH, 6=JOCKEY, 7=TACKLE, 8=SLIDE, 9=CALL_RUN"
+    },
+    "reserved": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0 }
+  },
+  "additionalProperties": false
+}

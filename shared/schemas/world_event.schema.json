@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://classicfutbol.local/schemas/world_event.schema.json",
+  "title": "WorldEvent",
+  "description": "Immutable append-only event record in the Parallel Season FC world ledger.",
+  "type": "object",
+  "required": ["seq", "world_id", "event_type", "aggregate_type", "aggregate_id", "payload", "caused_by", "occurred_at"],
+  "properties": {
+    "seq": { "type": "integer", "minimum": 1 },
+    "world_id": { "type": "string" },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "world_created",
+        "participant_joined",
+        "club_registered",
+        "footballer_registered",
+        "squad_membership_recorded",
+        "competition_defined",
+        "fixture_created",
+        "result_source_assigned",
+        "club_assigned",
+        "takeover_snapshot_recorded",
+        "session_opened",
+        "snapshot_frozen",
+        "session_completed",
+        "session_abandoned",
+        "result_accepted",
+        "match_events_recorded",
+        "imported_result_accepted",
+        "imported_match_events_recorded",
+        "import_parked",
+        "generated_result_accepted",
+        "result_corrected"
+      ]
+    },
+    "aggregate_type": { "type": "string" },
+    "aggregate_id": { "type": "string" },
+    "payload": { "type": "object" },
+    "caused_by": { "type": "string" },
+    "occurred_at": { "type": "string", "format": "date-time" },
+    "supersedes_seq": { "type": ["integer", "null"], "minimum": 1 }
+  }
+}

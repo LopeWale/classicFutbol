@@ -510,11 +510,12 @@ Security: TLS everywhere; JWT with device binding; the cartridge credential is a
 ```
 /client/            Godot 4 project (GDScript presentation; loads the psfc-godot extension)
 /sim/               Rust workspace
-  psfc-sim/           deterministic simulation core + tests
+  psfc-sim/           deterministic simulation core (parameterized 5v5 / 11v11) + tests
   psfc-rollback/      rollback netcode, transport trait
   psfc-godot/         GDExtension bindings (gdext)
+  psfc-wasm/          wasm32 C-ABI bindings for zero-install browser preview & cross-arch CI
   psfc-replay/        headless replay CLI (host validator + CI)
-/host/              Python package psfc_host: api, match, competition, ledger, ingest, catalogue, community; alembic/
+/host/              Python package psfc_host: api, match, competition, ledger, ingest, catalogue, community, web preview
 /shared/            Schemas shared across languages: event payload JSON Schemas, InputFrame layout, snapshot format
 /firmware/          RP2040 (Pico SDK + TinyUSB) controller firmware
 /hardware/          KiCad PCBs, 3D-printable enclosures (controller, cartridge, console shell), BOM
@@ -531,8 +532,9 @@ The existing `.gitignore` is an Adventure Game Studio template left over from re
 
 | Phase | Goal | Exit criterion |
 |-------|------|----------------|
-| 0 Foundations | Repo re-init (Godot project, Rust workspace, Python package), fixed-point math crate, simulation skeleton with hash and `psfc-replay`, ledger schema and event store, proposal gate; **tier-B render spike** on a Pi 5 | A recorded input log replays identically on x86-64, aarch64 and wasm32; property tests green; Pi 5 frame-time numbers recorded |
-| 1 Playable core | Movement, pass, shoot, tackle, switching, goalkeeper AI, basic rules, two local controllers, capsule visuals; render gate scene | Two people finish a 2 × 4-minute match locally; events recorded; tier-B gate decided |
+| 0 Foundations | Repo re-init (Godot project, Rust workspace, Python package), fixed-point math, parameterized `MatchFormat` (5v5 default, 11v11 preset; ADR-0003), simulation with hash, `psfc-replay` and `psfc-wasm`, ledger schema and event store, proposal gate | A recorded input log replays identically on x86-64 and wasm32; ledger invariant tests green |
+| 1 Playable 5v5 core | 4 outfield + 1 GK per side on `56 m × 36 m` pitch: movement, pass, shoot, tackle, switching, goalkeeper AI, basic rules (throw-ins, corners, goal kicks, fouls; offsides off), local 2P & CPU, Godot 4 scenes + browser WASM preview | Complete 5v5 + GK match plays end to end and validates via `psfc-replay` into the host ledger |
+| 1b 11v11 expansion | Promote `MatchFormat::eleven_a_side()` (`105 m × 68 m`, 10 outfield + 1 GK, offsides on), tune 22-player spacing, run Pi 5 render gate | Two people finish an 11v11 match locally; events recorded; tier-B 22-player gate decided |
 | 2 World and season | Takeover import, calendar, windows, result-source assignment, CPU matches, standings and statistics projections, dashboard pages | A one-participant season runs end to end with imported background results |
 | 3 Personal kit | Controller firmware and hub PCB, cartridge format, cartridge manager, sync protocol, enclosures | Cartridge inserted on another device restores identity and career; power-cut test passes |
 | 4 Online play | Lobby, rollback netcode, relay on the droplet, validator, idempotent acceptance | Two homes play an official fixture; host-replayed result accepted once |
