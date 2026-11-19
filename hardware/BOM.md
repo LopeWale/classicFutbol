@@ -1,8 +1,18 @@
-# Parallel Season FC — Hardware Bill of Materials (Phase 3 Prototype)
+# Parallel Season FC — Controller Compatibility & Optional DIY Hardware BOM
 
-Each player unit consists of a **Custom Hall-Effect Football Controller** with an integrated top-slot **USB-C Cartridge Dock** and a pocketable **Removable Profile Cartridge (`PSFC-CART-V1`)**.
+> **Plug-and-Play Off-the-Shelf Controller Support (No Custom Hardware Required):**
+> Any standard USB or Bluetooth gamepad from Amazon works out of the box in **both** the Browser/WASM client and the Godot 4 client, with automatic profile detection, Left-Stick + D-Pad movement, analog triggers, and Right-Stick skill-move flicks:
+> - **Xbox Wireless / Wired Controllers** (Xbox Series X|S, Xbox One, GameSir G7 SE, PowerA) — native XInput
+> - **8BitDo Ultimate 2C / Ultimate Bluetooth / Pro 2** — XInput (`X` mode) & Switch/DirectInput modes supported
+> - **Sony PlayStation DualSense (PS5) & DualShock 4 (PS4)** — USB-C or Bluetooth (`Cross` = Pass, `Circle` = Shoot, `Square` = Lob/Slide, `Triangle` = Through)
+> - **Logitech F310 / F710 & Generic USB DirectInput Pads** — both `X` (XInput) and `D` (DirectInput) switch modes auto-mapped
+> - **Nintendo Switch Pro Controller** — positional south/east/west/north mapping + optional AB/XY layout selector in Browser UI
+>
+> The custom RP2040 Hall-effect controller + removable `PSFC-CART-V1` cartridge below is an **optional Phase 3 physical hardware build** for couch tournaments.
 
-## 1. Custom Controller + Integrated Cartridge Dock (Per Pad)
+Each optional DIY player unit consists of a **Custom Hall-Effect Football Controller** with an integrated top-slot **USB-C Cartridge Dock** and a pocketable **Removable Profile Cartridge (`PSFC-CART-V1`)**.
+
+## 1. Custom Controller + Integrated Cartridge Dock (Optional DIY Per Pad)
 
 | Qty | Component | Part / Spec | Approx. Unit Cost (USD) | Role |
 | ---: | --- | --- | ---: | --- |

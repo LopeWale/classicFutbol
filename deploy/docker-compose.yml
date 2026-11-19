@@ -5,6 +5,8 @@ services:
       dockerfile: deploy/Dockerfile.host
     restart: unless-stopped
     environment:
+      PSFC_ENV: production
+      PSFC_ENABLE_DEMO_RESET: "0"
       PSFC_DB_PATH: /data/psfc_world.db
       PSFC_SIGNING_SECRET: ${PSFC_SIGNING_SECRET:-change-me-in-production}
       PSFC_JWT_SECRET: ${PSFC_JWT_SECRET:-change-me-in-production}

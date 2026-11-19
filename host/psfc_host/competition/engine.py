@@ -187,8 +187,9 @@ class CompetitionEngine:
             seed = int.from_bytes(digest[:8], "little")
 
         rng = random.Random(seed)
-        h_att, h_def = self.catalogue.club_strength_ratings(fx["home_club_id"], format_name=fmt)
-        a_att, a_def = self.catalogue.club_strength_ratings(fx["away_club_id"], format_name=fmt)
+        world_cat = self.catalogue.for_world(self.store, world_id)
+        h_att, h_def = world_cat.club_strength_ratings(fx["home_club_id"], format_name=fmt)
+        a_att, a_def = world_cat.club_strength_ratings(fx["away_club_id"], format_name=fmt)
 
         # Expected goals scaled by attack vs opponent defense + mild home advantage
         lam_home = max(0.35, 1.45 * math.exp((h_att - a_def) / 42.0) * 1.08)
@@ -225,8 +226,8 @@ class CompetitionEngine:
                 sh_home, sh_away = hp, ap
 
         # Synthesize goal events attributed to active starters weighted by shooting attribute
-        h_snap = self.catalogue.build_team_snapshot(fx["home_club_id"], format_name=fmt)
-        a_snap = self.catalogue.build_team_snapshot(fx["away_club_id"], format_name=fmt)
+        h_snap = world_cat.build_team_snapshot(fx["home_club_id"], format_name=fmt)
+        a_snap = world_cat.build_team_snapshot(fx["away_club_id"], format_name=fmt)
 
         def _pick_scorer_and_assist(starters: list[dict[str, Any]]) -> tuple[str, str | None]:
             outfield = starters[1:] or starters
@@ -356,7 +357,8 @@ class CompetitionEngine:
         clubs = self._clubs_summary()
         rep = set(self.store.represented_clubs(world_id).keys())
         standings = project_standings(events, clubs, represented_club_ids=rep)["standings"]
-        players = project_player_stats(events, self.catalogue.all_footballers())
+        world_cat = self.catalogue.for_world(self.store, world_id)
+        players = project_player_stats(events, world_cat.all_footballers())
         ts = utc_now_iso()
 
         honours: list[dict[str, Any]] = []
@@ -516,7 +518,7 @@ class CompetitionEngine:
                     home_club_id=hc,
                     away_club_id=ac,
                     kickoff_utc="2027-08-15T15:00:00Z",
-                    window_open_utc="2027-08-01T00:00:00Z",
+                    window_open_utc=ts,
                     window_close_utc="2027-12-31T23:59:59Z",
                     result_source=src,
                     state="open",

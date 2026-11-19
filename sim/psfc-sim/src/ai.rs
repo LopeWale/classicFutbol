@@ -127,16 +127,24 @@ pub fn compute_goalkeeper_intent(
     }
 
     // Standard arc positioning bisecting ball-to-goal-center angle
-    let stand_off_mm = if dist_ball_to_goal_x < Fp::from_milli(12_000) {
-        1_500
-    } else if dist_ball_to_goal_x < Fp::from_milli(24_000) {
-        2_400
+    let is_5v5 = state.format.players_per_side <= 6;
+    let stand_off_mm = if dist_ball_to_goal_x < Fp::from_milli(11_000) {
+        if is_5v5 { 1_300 } else { 1_500 }
+    } else if dist_ball_to_goal_x < Fp::from_milli(22_000) {
+        if is_5v5 { 2_050 } else { 2_400 }
+    } else if is_5v5 {
+        2_750
     } else {
         3_200
     };
     let target_x = own_goal_x + into_pitch_sign.mul(Fp::from_milli(stand_off_mm));
-    let max_y = (goal_half_w - Fp::from_milli(350)).max(Fp::from_milli(800));
-    let target_y = ball_xy.y.mul(Fp::from_milli(460)).clamp(-max_y, max_y);
+    let max_y = (goal_half_w - Fp::from_milli(320)).max(Fp::from_milli(800));
+    let y_track = if is_5v5 {
+        Fp::from_milli(510)
+    } else {
+        Fp::from_milli(460)
+    };
+    let target_y = ball_xy.y.mul(y_track).clamp(-max_y, max_y);
     let target = Vec2::new(target_x, target_y);
 
     let delta = target - p.pos;
@@ -151,7 +159,7 @@ pub fn compute_goalkeeper_intent(
     } else {
         AiMoveIntent {
             move_dir: delta.normalize_or_zero(),
-            sprint: dist > Fp::from_milli(1_800),
+            sprint: dist > Fp::from_milli(1_600),
             jockey: dist < Fp::from_milli(1_200),
             trigger_dive: None,
         }
@@ -165,6 +173,7 @@ pub fn compute_outfield_ai_intent(
     idx: usize,
 ) -> AiMoveIntent {
     let p = &state.players[side.index()][idx];
+    let is_5v5 = state.format.players_per_side <= 6;
     let attack_sign = side.attack_sign(state.second_half_swapped());
     let half_len = state.format.half_length();
     let half_wid = state.format.half_width();
@@ -241,17 +250,42 @@ pub fn compute_outfield_ai_intent(
         .clamp(Fp::NEG_ONE, Fp::ONE);
 
     if own_team_has_ball {
-        // Attacking shape: shift anchors forward with ball progression
-        let shift = ball_attack_norm.mul(Fp::from_milli(380)) + Fp::from_milli(140);
+        // Attacking shape: shift anchors forward with ball progression (livelier Fluidity in 5v5)
+        let shift = if is_5v5 {
+            ball_attack_norm.mul(Fp::from_milli(440)) + Fp::from_milli(170)
+        } else {
+            ball_attack_norm.mul(Fp::from_milli(380)) + Fp::from_milli(140)
+        };
         let mut target = world_anchor_for_player(state, side, idx, shift);
 
-        // Lateral ball attraction for passing triangles
-        target.y = target.y.lerp(ball_xy.y, Fp::from_milli(260));
+        // Lateral ball attraction for passing triangles — preserve width if carrier is on same flank
+        let lateral_pull = if is_5v5 {
+            Fp::from_milli(210)
+        } else {
+            Fp::from_milli(260)
+        };
+        target.y = target.y.lerp(ball_xy.y, lateral_pull);
 
-        // Forward darting run if triggered (`run_boost_ticks > 0`) or striker in final half
-        if p.run_boost_ticks > 0 || (p.role == PlayerRole::Forward && ball_attack_norm > Fp::from_milli(-150)) {
+        // In 5v5, avoid crowding the ball carrier so clean one-two triangles stay open
+        if is_5v5 {
+            let to_target_from_ball = target - ball_xy;
+            if to_target_from_ball.len() < Fp::from_milli(4_800) {
+                let spread_sign = if idx.is_multiple_of(2) { Fp::ONE } else { Fp::NEG_ONE };
+                target.y += spread_sign.mul(Fp::from_milli(3_600));
+            }
+        }
+
+        // Forward darting run if triggered (`run_boost_ticks > 0`) or striker/midfielder in final half
+        let auto_overlap = p.role == PlayerRole::Forward && ball_attack_norm > Fp::from_milli(-180);
+        if p.run_boost_ticks > 0 || auto_overlap {
             let onside_limit_x = compute_onside_limit_x(state, side);
-            let run_push = Fp::from_milli(if p.run_boost_ticks > 0 { 9_500 } else { 5_500 });
+            let run_push = Fp::from_milli(if p.run_boost_ticks > 0 {
+                if is_5v5 { 7_800 } else { 9_500 }
+            } else if is_5v5 {
+                4_600
+            } else {
+                5_500
+            });
             let desired_x = target.x + Fp::from_int(attack_sign as i32).mul(run_push);
             target.x = if attack_sign > 0 {
                 desired_x.min(onside_limit_x)
@@ -271,13 +305,18 @@ pub fn compute_outfield_ai_intent(
 
         let delta = target - p.pos;
         let dist = delta.len();
+        let sprint_thresh = if is_5v5 {
+            Fp::from_milli(4_200)
+        } else {
+            Fp::from_milli(6_000)
+        };
         AiMoveIntent {
-            move_dir: if dist > Fp::from_milli(350) {
+            move_dir: if dist > Fp::from_milli(320) {
                 delta.normalize_or_zero()
             } else {
                 Vec2::ZERO
             },
-            sprint: p.run_boost_ticks > 0 || dist > Fp::from_milli(6_000),
+            sprint: p.run_boost_ticks > 0 || dist > sprint_thresh,
             jockey: false,
             trigger_dive: None,
         }

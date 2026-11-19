@@ -7,5 +7,8 @@
         Referrer-Policy "strict-origin-when-cross-origin"
     }
 
+    @demo_reset path /api/worlds/*/reset-demo
+    respond @demo_reset 403
+
     reverse_proxy psfc-host:8000
 }

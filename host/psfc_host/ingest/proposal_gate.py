@@ -89,6 +89,13 @@ class ProposalGate:
         provider: str = "real_football_feed_v1",
     ) -> dict[str, Any]:
         """Apply or park an external real-world match result according to Parallel World Precedence."""
+        self.store.get_world(world_id)
+        fx = self.store.get_fixture(fixture_id)
+        if fx["world_id"] != world_id:
+            raise ValueError(
+                f"Fixture '{fixture_id}' belongs to world '{fx['world_id']}', not '{world_id}'"
+            )
+
         raw = {
             "fixture_id": fixture_id,
             "home_goals": home_goals,
@@ -96,13 +103,67 @@ class ProposalGate:
             "events": events or [],
         }
         payload_id = self._record_raw_payload(provider, f"/fixtures/{fixture_id}/result", raw)
-        fx = self.store.get_fixture(fixture_id)
+
+        # IDEMPOTENT EVENT ENRICHMENT FOR SCORE-ONLY IMPORTED FIXTURES:
+        # If an unrepresented `imported` fixture was previously accepted without player events
+        # (e.g. provider delayed goal/save feed or identity resolution completed later), allow
+        # attaching the missing events once as long as the accepted source is `'imported'` and
+        # the score matches, while continuing to reject imports for played fixtures.
+        if fx["state"] == "accepted" and fx["result_source"] == "imported" and events:
+            existing_acc = self.store.get_accepted_result(fixture_id)
+            has_recorded_events = (
+                self.store.conn.execute(
+                    """
+                    SELECT 1 FROM world_event
+                    WHERE world_id = ? AND aggregate_id = ? AND type = 'imported_match_events_recorded'
+                    LIMIT 1
+                    """,
+                    (world_id, fixture_id),
+                ).fetchone()
+                is not None
+            )
+            if (
+                existing_acc is not None
+                and existing_acc.get("source") == "imported"
+                and int(existing_acc["home_goals"]) == home_goals
+                and int(existing_acc["away_goals"]) == away_goals
+                and not has_recorded_events
+            ):
+                ts = utc_now_iso()
+                prop = self._record_proposal(
+                    payload_id=payload_id,
+                    world_id=world_id,
+                    target_type="fixture",
+                    target_id=fixture_id,
+                    proposed=raw,
+                    decision="applied",
+                    reason="imported_events_enriched",
+                )
+                self.store.append_event(
+                    world_id=world_id,
+                    event_type="imported_match_events_recorded",
+                    aggregate_type="fixture",
+                    aggregate_id=fixture_id,
+                    payload={
+                        "fixture_id": fixture_id,
+                        "source": "imported",
+                        "enriched": True,
+                        "events": events,
+                    },
+                    caused_by=f"ingest:{provider}",
+                    occurred_at=ts,
+                    commit=True,
+                )
+                return prop
 
         # WORLD PRECEDENCE RULE:
-        # 1. Any fixture already in_session, played, or accepted is immutable to imports.
+        # 1. Any fixture already in_session, played, accepted, or awaiting_admin is immutable to imports.
         # 2. Any fixture advance-assigned to played_vs_friend / played_vs_cpu / generated / admin
         #    cannot be silently replaced by an external feed!
-        if fx["state"] in ("in_session", "played", "accepted") or fx["result_source"] != "imported":
+        if (
+            fx["state"] in ("in_session", "played", "accepted", "awaiting_admin")
+            or fx["result_source"] != "imported"
+        ):
             prop = self._record_proposal(
                 payload_id=payload_id,
                 world_id=world_id,
@@ -204,6 +265,7 @@ class ProposalGate:
         provider: str = "real_football_feed_v1",
     ) -> dict[str, Any]:
         """Apply a squad transfer interval to future snapshots without mutating frozen snapshots."""
+        self.store.get_world(world_id)
         ts = utc_now_iso()
         raw = {
             "footballer_id": footballer_id,
@@ -211,14 +273,27 @@ class ProposalGate:
             "to_club_id": to_club_id,
             "new_shirt": new_shirt,
         }
-        payload_id = self._record_raw_payload(provider, "/transfers", raw)
-        joined = self.catalogue.record_transfer(
+        world_cat = self.catalogue.for_world(self.store, world_id)
+        joined = world_cat.record_transfer(
             footballer_id=footballer_id,
             from_club_id=from_club_id,
             to_club_id=to_club_id,
             occurred_at=ts,
             new_shirt=new_shirt,
         )
+        # Keep in-memory default catalogue synced as well when applicable
+        if any(
+            m.footballer_id == footballer_id and m.effective_to is None
+            for m in self.catalogue.clubs[from_club_id].squad
+        ):
+            self.catalogue.record_transfer(
+                footballer_id=footballer_id,
+                from_club_id=from_club_id,
+                to_club_id=to_club_id,
+                occurred_at=ts,
+                new_shirt=new_shirt,
+            )
+        payload_id = self._record_raw_payload(provider, "/transfers", raw)
         prop = self._record_proposal(
             payload_id=payload_id,
             world_id=world_id,

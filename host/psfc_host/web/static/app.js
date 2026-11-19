@@ -40,13 +40,25 @@
   const btnAudioToggle = document.getElementById("btn-audio-toggle");
 
   const formatSelect = document.getElementById("format-select");
+  const homeClubSelect = document.getElementById("home-club-select");
+  const awayClubSelect = document.getElementById("away-club-select");
   const modeSelect = document.getElementById("mode-select");
   const durationSelect = document.getElementById("duration-select");
+  const padProfileSelect = document.getElementById("pad-profile-select");
   const btnExhibition = document.getElementById("btn-exhibition");
   const btnPause = document.getElementById("btn-pause");
   const btnInstantReplay = document.getElementById("btn-instant-replay");
   const btnSimRest = document.getElementById("btn-sim-rest");
   const btnSubmitSession = document.getElementById("btn-submit-session");
+
+  const squadClubSelect = document.getElementById("squad-club-select");
+  const squadFormationSelect = document.getElementById("squad-formation-select");
+  const squadCountPill = document.getElementById("squad-count-pill");
+  const squadRosterList = document.getElementById("squad-roster-list");
+  const btnSaveLineup = document.getElementById("btn-save-lineup");
+  const btnPlayWithSquad = document.getElementById("btn-play-with-squad");
+  const btnResetLineupDefault = document.getElementById("btn-reset-lineup-default");
+  const squadSaveMsg = document.getElementById("squad-save-msg");
 
   const sbContext = document.getElementById("sb-context");
   const sbHomeSwatch = document.getElementById("sb-home-swatch");
@@ -81,6 +93,9 @@
   let ballTrail = [];
   let homePossTicks = 1;
   let awayPossTicks = 1;
+
+  // Interactive 11->5 squad builder state per club
+  const draftLineups = {};
 
   // Instant Replay ring buffer
   let replayBuffer = [];
@@ -290,34 +305,142 @@
 
   window.addEventListener("blur", () => keysDown.clear());
 
+  function classifyGamepadVendor(idStr) {
+    const s = String(idStr || "").toLowerCase();
+    if (s.includes("psfc") || s.includes("rp2040") || s.includes("2e8a")) return "PSFC RP2040 Pad";
+    if (s.includes("045e") || s.includes("xbox") || s.includes("xinput")) return "Xbox Pad";
+    if (s.includes("054c") || s.includes("dualsense") || s.includes("dualshock") || s.includes("wireless controller")) {
+      return "PlayStation Pad";
+    }
+    if (s.includes("2dc8") || s.includes("8bitdo")) return "8BitDo Pad";
+    if (s.includes("057e") || s.includes("pro controller") || s.includes("nintendo")) return "Switch Pro Pad";
+    if (s.includes("046d") || s.includes("logitech") || s.includes("f310") || s.includes("f710")) return "Logitech Pad";
+    return "USB Gamepad";
+  }
+
+  function updateConnectedGamepadBadge() {
+    const pads = navigator.getGamepads ? Array.from(navigator.getGamepads()).filter((p) => p && p.connected) : [];
+    if (pads.length > 0) {
+      const label = classifyGamepadVendor(pads[0].id);
+      const countSuffix = pads.length > 1 ? ` (+${pads.length - 1})` : "";
+      gamepadPill.textContent = `Controller: ${label}${countSuffix} Ready`;
+      gamepadPill.className = "pill pill-emerald";
+    } else {
+      gamepadPill.textContent = "Controller: Keyboard + Gamepad Ready";
+      gamepadPill.className = "pill pill-slate";
+    }
+  }
+
+  window.addEventListener("gamepadconnected", updateConnectedGamepadBadge);
+  window.addEventListener("gamepaddisconnected", updateConnectedGamepadBadge);
+
   function sampleGamepad(padIndex) {
     const pads = navigator.getGamepads ? navigator.getGamepads() : [];
     const pad = pads[padIndex];
     if (!pad || !pad.connected) return null;
 
-    const deadzone = (v) => (Math.abs(v) < 0.16 ? 0 : v);
-    const lx = deadzone(pad.axes[0] || 0);
-    const ly = deadzone(pad.axes[1] || 0);
-    const rx = deadzone(pad.axes[2] || 0);
-    const ry = deadzone(pad.axes[3] || 0);
+    const profile = padProfileSelect ? padProfileSelect.value : "auto";
+    const idLc = String(pad.id || "").toLowerCase();
+    const isDirectInput =
+      profile === "dinput" ||
+      (profile === "auto" &&
+        pad.mapping !== "standard" &&
+        !idLc.includes("xbox") &&
+        !idLc.includes("xinput") &&
+        !idLc.includes("045e") &&
+        !idLc.includes("054c") &&
+        !idLc.includes("dualsense") &&
+        !idLc.includes("dualshock") &&
+        !idLc.includes("2dc8") &&
+        !idLc.includes("8bitdo"));
+    const isSwitchSwap = profile === "switch";
 
-    const b = (i) => Boolean(pad.buttons[i] && pad.buttons[i].pressed);
+    const deadzone = (v) => (Math.abs(v) < 0.15 ? 0 : v);
+    let lx = deadzone(pad.axes[0] || 0);
+    let ly = deadzone(pad.axes[1] || 0);
+    const rx = deadzone(pad.axes[2] || 0);
+    const rawRy =
+      isDirectInput && pad.axes.length >= 6 && Math.abs(pad.axes[3] || 0) < 0.05
+        ? pad.axes[5] || 0
+        : pad.axes[3] || 0;
+    const ry = deadzone(rawRy);
+
+    const b = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.45));
+    const trig = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.22));
+
+    // D-Pad fallback (Standard buttons 12..15 + DirectInput 8-way POV hat on axes[9])
+    if (lx === 0 && ly === 0) {
+      let dx = 0;
+      let dy = 0;
+      if (b(14)) dx -= 1;
+      if (b(15)) dx += 1;
+      if (b(12)) dy -= 1;
+      if (b(13)) dy += 1;
+
+      if (dx === 0 && dy === 0 && isDirectInput && pad.axes.length > 9) {
+        const hat = pad.axes[9];
+        if (hat >= -1.05 && hat <= 1.05 && Math.abs(hat) > 0.05) {
+          // POV hat angle: -1.0 is North (-Y), advancing clockwise in 45-deg steps of 2/7
+          const step = Math.round(((hat + 1.0) * 7.0) / 2.0) % 8;
+          const dirs = [
+            [0, -1],
+            [1, -1],
+            [1, 0],
+            [1, 1],
+            [0, 1],
+            [-1, 1],
+            [-1, 0],
+            [-1, -1],
+          ];
+          if (dirs[step]) {
+            dx = dirs[step][0];
+            dy = dirs[step][1];
+          }
+        }
+      }
+      if (dx !== 0 && dy !== 0) {
+        dx *= Math.SQRT1_2;
+        dy *= Math.SQRT1_2;
+      }
+      lx = dx;
+      ly = dy;
+    }
+
+    // Face buttons: South (Pass/Tackle), East (Shoot), West (Lob/Slide), North (Through)
+    let southPressed, eastPressed, westPressed, northPressed;
+    if (isSwitchSwap) {
+      southPressed = b(1);
+      eastPressed = b(0);
+      westPressed = b(3);
+      northPressed = b(2);
+    } else if (isDirectInput) {
+      southPressed = b(1);
+      eastPressed = b(2);
+      westPressed = b(0);
+      northPressed = b(3);
+    } else {
+      southPressed = b(0);
+      eastPressed = b(1);
+      westPressed = b(2);
+      northPressed = b(3);
+    }
+
     let buttons = 0;
-    if (b(0)) buttons |= BTN_PASS;
-    if (b(3)) buttons |= BTN_THROUGH;
-    if (b(2)) buttons |= BTN_LOB;
-    if (b(1)) buttons |= BTN_SHOOT;
-    if (b(7)) buttons |= BTN_SPRINT;
-    if (b(4)) buttons |= BTN_SWITCH | BTN_CALL_RUN;
-    if (b(6)) buttons |= BTN_JOCKEY;
-    if (b(5)) buttons |= BTN_TACKLE;
-    if (b(11)) buttons |= BTN_SKILL; // R3 click -> Roulette skill move
+    if (southPressed) buttons |= BTN_PASS | BTN_TACKLE;
+    if (northPressed) buttons |= BTN_THROUGH;
+    if (westPressed) buttons |= BTN_LOB | BTN_SLIDE;
+    if (eastPressed) buttons |= BTN_SHOOT;
+    if (trig(7)) buttons |= BTN_SPRINT;
+    if (trig(6)) buttons |= BTN_JOCKEY;
+    if (b(4)) buttons |= BTN_SWITCH;
+    if (b(5)) buttons |= BTN_CALL_RUN | BTN_TACKLE;
+    if (b(11) || b(10)) buttons |= BTN_SKILL; // R3 / L3 click -> 360 Roulette skill move
 
     return {
-      mx: Math.round(lx * 127),
-      my: Math.round(ly * 127),
-      ax: Math.round(rx * 127),
-      ay: Math.round(ry * 127),
+      mx: Math.max(-127, Math.min(127, Math.round(lx * 127))),
+      my: Math.max(-127, Math.min(127, Math.round(ly * 127))),
+      ax: Math.max(-127, Math.min(127, Math.round(rx * 127))),
+      ay: Math.max(-127, Math.min(127, Math.round(ry * 127))),
       btns: buttons,
       id: pad.id,
     };
@@ -326,7 +449,8 @@
   function sampleHomeInput(allowArrowKeys) {
     const gp = sampleGamepad(0);
     if (gp && (gp.mx !== 0 || gp.my !== 0 || gp.ax !== 0 || gp.ay !== 0 || gp.btns !== 0)) {
-      gamepadPill.textContent = "Gamepad #1 Active";
+      gamepadPill.textContent = `${classifyGamepadVendor(gp.id)} Active`;
+      gamepadPill.className = "pill pill-emerald";
       return gp;
     }
 
@@ -343,9 +467,9 @@
     }
 
     let btns = 0;
-    if (keysDown.has("Space") || keysDown.has("KeyJ")) btns |= BTN_PASS;
+    if (keysDown.has("Space") || keysDown.has("KeyJ")) btns |= BTN_PASS | BTN_TACKLE;
     if (keysDown.has("KeyK")) btns |= BTN_THROUGH;
-    if (keysDown.has("KeyU")) btns |= BTN_LOB;
+    if (keysDown.has("KeyU")) btns |= BTN_LOB | BTN_SLIDE;
     if (keysDown.has("KeyL") || keysDown.has("Enter")) btns |= BTN_SHOOT;
     if (keysDown.has("ShiftLeft") || keysDown.has("ShiftRight")) btns |= BTN_SPRINT;
     if (keysDown.has("KeyQ")) btns |= BTN_SWITCH;
@@ -364,7 +488,7 @@
 
   function sampleAwayLocalInput() {
     const gp2 = sampleGamepad(1);
-    if (gp2 && (gp2.mx !== 0 || gp2.my !== 0 || gp2.btns !== 0)) {
+    if (gp2 && (gp2.mx !== 0 || gp2.my !== 0 || gp2.ax !== 0 || gp2.ay !== 0 || gp2.btns !== 0)) {
       return gp2;
     }
     let dx = 0;
@@ -378,7 +502,7 @@
       dy *= Math.SQRT1_2;
     }
     let btns = 0;
-    if (keysDown.has("Numpad1") || keysDown.has("Period")) btns |= BTN_PASS;
+    if (keysDown.has("Numpad1") || keysDown.has("Period")) btns |= BTN_PASS | BTN_TACKLE;
     if (keysDown.has("Numpad2") || keysDown.has("Slash")) btns |= BTN_SHOOT;
     if (keysDown.has("Numpad3")) btns |= BTN_THROUGH;
     if (keysDown.has("Numpad0")) btns |= BTN_SKILL;
@@ -400,6 +524,13 @@
     if (val === "cpu_vs_cpu") return { home: 3, away: 3 };
     if (val === "local_2p") return { home: 0, away: 0 };
     return { home: 0, away: 2 };
+  }
+
+  function controllerSpecFromCode(code) {
+    if (code === 0) return { kind: "Human" };
+    if (code === 1) return { kind: "Cpu", difficulty: "Easy" };
+    if (code === 3) return { kind: "Cpu", difficulty: "Hard" };
+    return { kind: "Cpu", difficulty: "Normal" };
   }
 
   function resetMatchUiForSnapshot(snapshot, contextLabel) {
@@ -426,16 +557,51 @@
     btnSubmitSession.hidden = !activeOfficialSession;
   }
 
-  function startExhibitionMatch() {
+  async function startExhibitionMatch() {
     if (!wasm) return;
     activeOfficialSession = null;
     paused = false;
     btnPause.textContent = "Pause";
 
-    const fmtCode = formatSelect.value === "11v11" ? 1 : 0;
+    const fmtName = formatSelect.value === "11v11" ? "11v11" : "5v5";
+    const fmtCode = fmtName === "11v11" ? 1 : 0;
     const halfTicks = parseInt(durationSelect.value, 10) || 3600;
     const ctrls = decodeModeControllers();
     const seedLo = (Date.now() & 0x7fffffff) >>> 0;
+    const homeClubId = homeClubSelect ? homeClubSelect.value : "man-utd";
+    const awayClubId = awayClubSelect ? awayClubSelect.value : "arsenal";
+
+    try {
+      const res = await fetch("/api/exhibition/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          world_id: activeWorldId,
+          home_club_id: homeClubId,
+          away_club_id: awayClubId,
+          format_name: fmtName,
+          half_duration_ticks: halfTicks,
+          home_controller: controllerSpecFromCode(ctrls.home),
+          away_controller: controllerSpecFromCode(ctrls.away),
+          seed: seedLo,
+        }),
+      });
+      if (res.ok) {
+        const data = await res.json();
+        wasmWriteInputText(JSON.stringify(data.snapshot));
+        if (wasm.sim_init_from_snapshot_json()) {
+          const snap = data.snapshot;
+          resetMatchUiForSnapshot(
+            snap,
+            `EXHIBITION · ${snap.format.name} · ${snap.home.formation} vs ${snap.away.formation}`
+          );
+          renderWorldOverviewCardsHighlight();
+          return;
+        }
+      }
+    } catch (_err) {
+      // Fallback to built-in WASM preset if offline
+    }
 
     const ok = wasm.sim_init_preset(fmtCode, seedLo, 0, halfTicks, ctrls.home, ctrls.away);
     if (!ok) {
@@ -456,17 +622,10 @@
     const halfTicks = parseInt(durationSelect.value, 10) || 3600;
     const ctrls = decodeModeControllers();
 
-    const ctrlObj = (code) => {
-      if (code === 0) return { kind: "Human" };
-      if (code === 1) return { kind: "Cpu", difficulty: "Easy" };
-      if (code === 3) return { kind: "Cpu", difficulty: "Hard" };
-      return { kind: "Cpu", difficulty: "Normal" };
-    };
-
     const awayCtrl =
       resultSource === "played_vs_friend" && modeSelect.value === "local_2p"
         ? { kind: "Human" }
-        : ctrlObj(ctrls.away === 0 ? 2 : ctrls.away);
+        : controllerSpecFromCode(ctrls.away === 0 ? 2 : ctrls.away);
 
     const res = await fetch(`/api/fixtures/${encodeURIComponent(fixtureId)}/sessions`, {
       method: "POST",
@@ -475,7 +634,7 @@
         actor_id: "part-alex",
         format_name: fmtName,
         half_duration_ticks: halfTicks,
-        home_controller: ctrlObj(ctrls.home),
+        home_controller: controllerSpecFromCode(ctrls.home),
         away_controller: awayCtrl,
       }),
     });
@@ -593,10 +752,10 @@
       targetZ = 0.65;
     } else {
       eyeX = camX;
-      eyeY = camY * 0.28 + (pitchWidM * 0.86 + 15.5);
-      eyeZ = pitchLenM > 80 ? 36.0 : 22.5;
+      eyeY = camY * 0.28 + (pitchWidM * 0.78 + 13.0);
+      eyeZ = pitchLenM > 80 ? 33.5 : 20.5;
       targetX = camX;
-      targetY = camY * 0.18 - 1.5;
+      targetY = camY * 0.18 - 1.2;
       targetZ = 0.0;
     }
 
@@ -619,7 +778,8 @@
     const uy = rz * fx - rx * fz;
     const uz = rx * fy - ry2 * fx;
 
-    const focal = H * 1.18;
+    const focal = H * 1.32;
+    const screenCenterY = orbitAngleRad !== null ? H * 0.52 : H * 0.43;
 
     return function project(wx, wy, wz) {
       const dx = wx - eyeX;
@@ -634,7 +794,7 @@
 
       return {
         x: W * 0.5 + cx * scale,
-        y: H * 0.52 - cy * scale,
+        y: screenCenterY - cy * scale,
         s: scale,
         depth,
       };
@@ -733,11 +893,22 @@
     const H = canvas.height;
 
     const sky = ctx.createLinearGradient(0, 0, 0, H);
-    sky.addColorStop(0, "#060b12");
-    sky.addColorStop(0.32, "#0b1814");
-    sky.addColorStop(1, "#091710");
+    sky.addColorStop(0, "#050912");
+    sky.addColorStop(0.26, "#0d1a28");
+    sky.addColorStop(0.45, "#0b1a15");
+    sky.addColorStop(1, "#08140e");
     ctx.fillStyle = sky;
     ctx.fillRect(0, 0, W, H);
+
+    // Subtle stadium floodlight cones in upper night sky
+    for (const lx of [W * 0.18, W * 0.82]) {
+      const glow = ctx.createRadialGradient(lx, H * 0.06, 4, lx, H * 0.08, W * 0.28);
+      glow.addColorStop(0, "rgba(224, 242, 254, 0.16)");
+      glow.addColorStop(0.45, "rgba(56, 189, 248, 0.05)");
+      glow.addColorStop(1, "rgba(6, 11, 18, 0)");
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, W, H * 0.45);
+    }
 
     if (!packed || !currentSnapshot) return;
 
@@ -765,6 +936,44 @@
     }
 
     const project = makeProjector(W, H, pitchLen, pitchWid, ballX, ballY, orbitAngleRad);
+
+    // Far-side stadium terrace tier & club supporter fascia
+    if (orbitAngleRad === null) {
+      poly3D(
+        project,
+        [
+          [-halfL - 5, -halfW - 4.5, 0],
+          [halfL + 5, -halfW - 4.5, 0],
+          [halfL + 7.5, -halfW - 12.0, 5.8],
+          [-halfL - 7.5, -halfW - 12.0, 5.8],
+        ],
+        "#0c1522",
+        "rgba(148, 163, 184, 0.22)",
+        1.2
+      );
+      line3D(
+        project,
+        -halfL - 5.2,
+        -halfW - 6.8,
+        1.8,
+        0,
+        -halfW - 6.8,
+        1.8,
+        currentSnapshot.home.primary_color,
+        2.4
+      );
+      line3D(
+        project,
+        0,
+        -halfW - 6.8,
+        1.8,
+        halfL + 5.2,
+        -halfW - 6.8,
+        1.8,
+        currentSnapshot.away.primary_color,
+        2.4
+      );
+    }
 
     poly3D(
       project,
@@ -1054,6 +1263,32 @@
       ctx.font = `700 ${Math.max(9, Math.round(pxRadius * 1.05))}px Inter, sans-serif`;
       ctx.textAlign = "center";
       ctx.fillText(String(item.shirt), foot.x + spinOffset, head.y + bodyH * 0.68);
+
+      const isBallCarrier = packed[15] === item.side && packed[16] === item.idx;
+      if (item.isControlled || isBallCarrier) {
+        const teamSnap = item.side === 0 ? currentSnapshot.home : currentSnapshot.away;
+        const member = teamSnap.starters && teamSnap.starters[item.idx];
+        if (member && member.name) {
+          const parts = member.name.trim().split(/\s+/);
+          const surname = parts[parts.length - 1];
+          ctx.font = "600 10px Inter, sans-serif";
+          const tw = ctx.measureText(surname).width;
+          const pillW = tw + 10;
+          const pillH = 14;
+          const pillX = head.x - pillW * 0.5;
+          const pillY = head.y - (item.charge > 0.02 ? 27 : 18);
+          ctx.fillStyle = "rgba(9, 14, 21, 0.82)";
+          ctx.strokeStyle = item.side === 0 ? "rgba(251, 191, 36, 0.65)" : "rgba(56, 189, 248, 0.65)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          ctx.roundRect(pillX, pillY, pillW, pillH, 4);
+          ctx.fill();
+          ctx.stroke();
+          ctx.fillStyle = "#f8fafc";
+          ctx.textAlign = "center";
+          ctx.fillText(surname, head.x, pillY + 10.5);
+        }
+      }
 
       if (item.charge > 0.02) {
         const bw = 32;
@@ -1527,6 +1762,159 @@
       li.innerHTML = `<span><span class="ledger-seq">#${ev.seq}</span><strong>${ev.type}</strong> · <code>${ev.aggregate_id}</code></span>`;
       ledList.appendChild(li);
     }
+
+    // 6. Sync & Render 5v5 Squad Builder (11 -> 5)
+    renderSquadBuilder();
+  }
+
+  function ensureClubDraft(roster) {
+    const cid = roster.club_id;
+    if (!draftLineups[cid] || !draftLineups[cid].dirty) {
+      draftLineups[cid] = {
+        starterIds: new Set(roster.starter_ids_5v5 || []),
+        formation: roster.formation_5v5 || "1-2-1",
+        dirty: false,
+      };
+    }
+    return draftLineups[cid];
+  }
+
+  function roleBadgeMeta(role) {
+    if (role === "Goalkeeper") return { label: "GK", cls: "role-gk" };
+    if (role === "Defender") return { label: "DEF", cls: "role-def" };
+    if (role === "Midfielder") return { label: "MID", cls: "role-mid" };
+    return { label: "FWD", cls: "role-fwd" };
+  }
+
+  function renderSquadBuilder() {
+    if (!squadRosterList || !latestOverview || !latestOverview.rosters) return;
+    const clubId = squadClubSelect.value;
+    const roster = latestOverview.rosters[clubId];
+    if (!roster) return;
+
+    const draft = ensureClubDraft(roster);
+    squadFormationSelect.value = draft.formation;
+
+    let gkCount = 0;
+    let outCount = 0;
+    for (const p of roster.squad) {
+      if (draft.starterIds.has(p.footballer_id)) {
+        if (p.role === "Goalkeeper") gkCount++;
+        else outCount++;
+      }
+    }
+
+    const validFive = gkCount === 1 && outCount === 4;
+    if (validFive) {
+      const savedTag = draft.dirty ? "Unsaved" : roster.custom_lineup_active ? "Custom Saved" : "Default 5";
+      squadCountPill.textContent = `5 / 5 Ready (${savedTag})`;
+      squadCountPill.className = "pill pill-emerald";
+      btnSaveLineup.disabled = false;
+      btnPlayWithSquad.disabled = false;
+    } else {
+      const needed = 4 - outCount;
+      squadCountPill.textContent = `${gkCount + outCount} / 5 (Pick ${needed} more Outfield)`;
+      squadCountPill.className = "pill pill-amber";
+      btnSaveLineup.disabled = true;
+      btnPlayWithSquad.disabled = true;
+    }
+
+    squadRosterList.innerHTML = "";
+    for (const p of roster.squad) {
+      const isSelected = draft.starterIds.has(p.footballer_id);
+      const rb = roleBadgeMeta(p.role);
+      const a = p.attributes;
+      const attrSummary =
+        p.role === "Goalkeeper"
+          ? `REF ${a.goalkeeping} · POS ${a.positioning} · PAS ${a.passing}`
+          : `PAC ${a.pace} · DRI ${a.dribbling} · PAS ${a.passing} · SHO ${a.shooting} · DEF ${a.tackling}`;
+
+      const row = document.createElement("div");
+      row.className = `squad-player-row${isSelected ? " selected" : ""}`;
+      row.innerHTML = `
+        <div class="sp-left">
+          <span class="sp-check">✓</span>
+          <span class="sp-shirt">#${p.shirt_number}</span>
+          <span class="role-tag ${rb.cls}">${rb.label}</span>
+          <span class="sp-name">${p.name}${p.default_starter_5v5 ? '<span class="sp-default-star" title="Default 5v5 Starter">★</span>' : ""}</span>
+        </div>
+        <div class="sp-right">
+          <span class="sp-attrs">${attrSummary}</span>
+          <span class="ovr-pill">${p.overall}</span>
+        </div>
+      `;
+
+      row.addEventListener("click", () => {
+        if (p.role === "Goalkeeper") {
+          for (const other of roster.squad) {
+            if (other.role === "Goalkeeper") draft.starterIds.delete(other.footballer_id);
+          }
+          draft.starterIds.add(p.footballer_id);
+          squadSaveMsg.hidden = false;
+          squadSaveMsg.innerHTML = `Goalkeeper <strong>${p.name}</strong> locked in (every 5v5 lineup requires 1 GK + 4 Outfielders).`;
+          renderSquadBuilder();
+          return;
+        }
+
+        if (draft.starterIds.has(p.footballer_id)) {
+          draft.starterIds.delete(p.footballer_id);
+          draft.dirty = true;
+          squadSaveMsg.hidden = true;
+        } else {
+          let currentOut = 0;
+          for (const m of roster.squad) {
+            if (m.role !== "Goalkeeper" && draft.starterIds.has(m.footballer_id)) currentOut++;
+          }
+          if (currentOut >= 4) {
+            squadSaveMsg.hidden = false;
+            squadSaveMsg.innerHTML = `4 outfielders already selected — uncheck one starter first to swap in <strong>${p.name}</strong>.`;
+            return;
+          }
+          draft.starterIds.add(p.footballer_id);
+          draft.dirty = true;
+          squadSaveMsg.hidden = true;
+        }
+        renderSquadBuilder();
+      });
+
+      squadRosterList.appendChild(row);
+    }
+  }
+
+  async function persistSelectedClubLineup() {
+    const clubId = squadClubSelect.value;
+    const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[clubId];
+    if (!roster) return false;
+    const draft = ensureClubDraft(roster);
+
+    const res = await fetch(
+      `/api/worlds/${encodeURIComponent(activeWorldId)}/clubs/${encodeURIComponent(clubId)}/lineup`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          starter_ids: Array.from(draft.starterIds),
+          formation_5v5: draft.formation,
+          actor_id: "part-alex",
+        }),
+      }
+    );
+    const out = await res.json();
+    squadSaveMsg.hidden = false;
+    if (!res.ok) {
+      squadSaveMsg.innerHTML = `<strong>Lineup Error:</strong> ${out.detail || "Invalid 5v5 selection"}`;
+      return false;
+    }
+    draft.dirty = false;
+    draft.starterIds = new Set(out.roster.starter_ids_5v5);
+    draft.formation = out.roster.formation_5v5;
+    const pickedNames = out.roster.squad
+      .filter((m) => m.selected_5v5)
+      .map((m) => m.name.split(" ").slice(-1)[0])
+      .join(", ");
+    squadSaveMsg.innerHTML = `<strong>Saved ${out.roster.short_name} 5v5 (${out.roster.formation_5v5}):</strong> ${pickedNames}`;
+    await refreshWorldOverview();
+    return true;
   }
 
   // --- UI Event Wiring ---
@@ -1552,10 +1940,68 @@
 
   worldSelect.addEventListener("change", () => {
     activeWorldId = worldSelect.value;
+    Object.keys(draftLineups).forEach((k) => delete draftLineups[k]);
     refreshWorldOverview();
   });
 
-  btnExhibition.addEventListener("click", startExhibitionMatch);
+  squadClubSelect.addEventListener("change", () => {
+    squadSaveMsg.hidden = true;
+    renderSquadBuilder();
+  });
+
+  squadFormationSelect.addEventListener("change", () => {
+    const clubId = squadClubSelect.value;
+    const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[clubId];
+    if (!roster) return;
+    const draft = ensureClubDraft(roster);
+    draft.formation = squadFormationSelect.value;
+    draft.dirty = true;
+    renderSquadBuilder();
+  });
+
+  btnResetLineupDefault.addEventListener("click", () => {
+    const clubId = squadClubSelect.value;
+    const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[clubId];
+    if (!roster) return;
+    const defaults = roster.squad.filter((m) => m.default_starter_5v5).map((m) => m.footballer_id);
+    draftLineups[clubId] = {
+      starterIds: new Set(defaults),
+      formation: "1-2-1",
+      dirty: true,
+    };
+    squadSaveMsg.hidden = false;
+    squadSaveMsg.textContent = "Reset selection to club's default 5v5 starters — click Save to persist.";
+    renderSquadBuilder();
+  });
+
+  btnSaveLineup.addEventListener("click", async () => {
+    const clubId = squadClubSelect.value;
+    const ok = await persistSelectedClubLineup();
+    if (ok && !activeOfficialSession && (homeClubSelect.value === clubId || awayClubSelect.value === clubId)) {
+      await startExhibitionMatch();
+    }
+  });
+
+  btnPlayWithSquad.addEventListener("click", async () => {
+    const clubId = squadClubSelect.value;
+    const ok = await persistSelectedClubLineup();
+    if (!ok) return;
+    homeClubSelect.value = clubId;
+    if (awayClubSelect.value === clubId) {
+      awayClubSelect.value = clubId === "arsenal" ? "man-utd" : "arsenal";
+    }
+    formatSelect.value = "5v5";
+    await startExhibitionMatch();
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  });
+
+  btnExhibition.addEventListener("click", () => startExhibitionMatch());
+  homeClubSelect.addEventListener("change", () => {
+    if (!activeOfficialSession) startExhibitionMatch();
+  });
+  awayClubSelect.addEventListener("change", () => {
+    if (!activeOfficialSession) startExhibitionMatch();
+  });
   formatSelect.addEventListener("change", () => {
     if (!activeOfficialSession) startExhibitionMatch();
   });
@@ -1735,17 +2181,21 @@
 
   document.getElementById("btn-reset-world").addEventListener("click", async () => {
     activeWorldId = DEFAULT_WORLD_ID;
+    Object.keys(draftLineups).forEach((k) => delete draftLineups[k]);
     await fetch(`/api/worlds/${DEFAULT_WORLD_ID}/reset-demo`, { method: "POST" });
     activeOfficialSession = null;
     document.getElementById("cup-divergence-msg").hidden = true;
     document.getElementById("rollover-msg").hidden = true;
-    startExhibitionMatch();
+    squadSaveMsg.hidden = true;
     await refreshWorldOverview();
+    await startExhibitionMatch();
   });
 
   // --- Boot WASM & World Overview ---
 
   async function boot() {
+    updateConnectedGamepadBadge();
+    await refreshWorldOverview();
     try {
       const resp = await fetch("/wasm/psfc_wasm.wasm");
       if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
@@ -1753,13 +2203,12 @@
       const { instance } = await WebAssembly.instantiate(bytes, {});
       wasm = instance.exports;
       wasmPill.textContent = "WASM Sim: 60Hz Fixed-Point Ready";
-      startExhibitionMatch();
+      await startExhibitionMatch();
       requestAnimationFrame(frameLoop);
     } catch (err) {
       wasmPill.textContent = `WASM Error: ${err.message}`;
       console.error(err);
     }
-    await refreshWorldOverview();
   }
 
   boot();

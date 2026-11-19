@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,31 @@ class OpenSessionRequest(BaseModel):
     home_controller: dict[str, Any] | None = None
     away_controller: dict[str, Any] | None = None
     seed: int | None = None
+    home_starters: list[str] | None = None
+    away_starters: list[str] | None = None
+    home_formation: str | None = None
+    away_formation: str | None = None
+
+
+class UpdateLineup5v5Request(BaseModel):
+    starter_ids: list[str]
+    formation_5v5: str = "1-2-1"
+    actor_id: str = "part-alex"
+
+
+class ExhibitionSnapshotRequest(BaseModel):
+    world_id: str | None = None
+    home_club_id: str = "man-utd"
+    away_club_id: str = "arsenal"
+    format_name: str = Field(default="5v5", pattern="^(5v5|11v11)$")
+    half_duration_ticks: int = Field(default=3600, ge=60, le=36_000)
+    home_controller: dict[str, Any] | None = None
+    away_controller: dict[str, Any] | None = None
+    home_starters: list[str] | None = None
+    away_starters: list[str] | None = None
+    home_formation: str | None = None
+    away_formation: str | None = None
+    seed: int | None = None
 
 
 class CompleteSessionRequest(BaseModel):
@@ -60,7 +86,6 @@ class CompleteSessionRequest(BaseModel):
     claimed_final_hash_hex: str | None = None
     claimed_score: list[int] | None = None
     hash_checkpoints: list[dict[str, Any]] = Field(default_factory=list)
-    require_finished: bool = True
 
 
 class IngestResultRequest(BaseModel):
@@ -186,7 +211,11 @@ class SeasonRolloverRequest(BaseModel):
     actor_id: str = "commissioner"
 
 
-def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> FastAPI:
+def create_app(
+    db_path: str | Path | None = None,
+    seed_demo: bool = True,
+    enable_demo_reset: bool | None = None,
+) -> FastAPI:
     resolved_db = db_path or os.environ.get("PSFC_DB_PATH", "/tmp/psfc_world.db")
 
     app = FastAPI(
@@ -200,16 +229,16 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
 
     state_holder: dict[str, Any] = {}
 
-    def _init_services(reset_file: bool = False) -> None:
-        if reset_file and str(resolved_db) != ":memory:":
-            old = state_holder.get("store")
-            if old is not None:
-                old.close()
-            for suffix in ("", "-wal", "-shm"):
-                p = Path(f"{resolved_db}{suffix}")
-                if p.exists():
-                    p.unlink()
+    def _is_demo_reset_enabled() -> bool:
+        if enable_demo_reset is not None:
+            return enable_demo_reset
+        if os.environ.get("PSFC_ENV", "development").lower() == "production":
+            return False
+        if "PSFC_ENABLE_DEMO_RESET" in os.environ:
+            return os.environ["PSFC_ENABLE_DEMO_RESET"].lower() in ("1", "true", "yes")
+        return str(resolved_db) in (":memory:", "/tmp/psfc_world.db")
 
+    def _init_services() -> None:
         store = WorldLedgerStore(resolved_db)
         catalogue = ClubCatalogue()
         gate = ProposalGate(store, catalogue)
@@ -223,6 +252,13 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         competition_engine = CompetitionEngine(store, catalogue)
         if seed_demo:
             ensure_demo_world(store, catalogue)
+        # Rehydrate persisted squad transfers onto the base catalogue on startup
+        existing_world_ids = [w["id"] for w in store.list_worlds()]
+        if DEFAULT_WORLD_ID in existing_world_ids:
+            catalogue.replay_transfer_events(store.list_events(DEFAULT_WORLD_ID))
+        elif len(existing_world_ids) == 1:
+            catalogue.replay_transfer_events(store.list_events(existing_world_ids[0]))
+
         state_holder["store"] = store
         state_holder["catalogue"] = catalogue
         state_holder["gate"] = gate
@@ -235,7 +271,14 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         state_holder["relay"] = relay
         state_holder["competition_engine"] = competition_engine
 
-    _init_services(reset_file=False)
+    _init_services()
+
+    def _world_catalogue(world_id: str | None) -> ClubCatalogue:
+        store: WorldLedgerStore = state_holder["store"]
+        base: ClubCatalogue = state_holder["catalogue"]
+        if not world_id:
+            return base
+        return base.for_world(store, world_id)
 
     def _clubs_summary(cat: ClubCatalogue) -> dict[str, dict[str, Any]]:
         return {
@@ -288,11 +331,11 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
     @app.get("/api/worlds/{world_id}/standings")
     def get_standings(world_id: str) -> dict[str, Any]:
         store: WorldLedgerStore = state_holder["store"]
-        cat: ClubCatalogue = state_holder["catalogue"]
         try:
             world = store.get_world(world_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        cat = _world_catalogue(world_id)
         events = store.list_events(world_id)
         rep = set(store.represented_clubs(world_id).keys())
         proj = project_standings(events, _clubs_summary(cat), represented_club_ids=rep)
@@ -301,11 +344,11 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
     @app.get("/api/worlds/{world_id}/players")
     def get_players(world_id: str) -> dict[str, Any]:
         store: WorldLedgerStore = state_holder["store"]
-        cat: ClubCatalogue = state_holder["catalogue"]
         try:
             store.get_world(world_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        cat = _world_catalogue(world_id)
         events = store.list_events(world_id)
         stats = project_player_stats(events, cat.all_footballers())
         return {"world_id": world_id, "players": stats}
@@ -313,11 +356,11 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
     @app.get("/api/worlds/{world_id}/fixtures")
     def get_fixtures(world_id: str, competition_id: str | None = None) -> dict[str, Any]:
         store: WorldLedgerStore = state_holder["store"]
-        cat: ClubCatalogue = state_holder["catalogue"]
         try:
             store.get_world(world_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        cat = _world_catalogue(world_id)
         clubs = _clubs_summary(cat)
         fixtures = store.list_fixtures(world_id, competition_id=competition_id)
         for f in fixtures:
@@ -338,7 +381,6 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
     @app.get("/api/worlds/{world_id}/overview")
     def get_world_overview(world_id: str) -> dict[str, Any]:
         store: WorldLedgerStore = state_holder["store"]
-        cat: ClubCatalogue = state_holder["catalogue"]
         gate: ProposalGate = state_holder["gate"]
         appointments: AppointmentService = state_holder["appointments"]
         cartridge: CartridgeSyncService = state_holder["cartridge"]
@@ -348,7 +390,10 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
+        cat = _world_catalogue(world_id)
         clubs = _clubs_summary(cat)
+        world_lineups = store.list_club_lineups_5v5(world_id)
+        rosters = cat.all_rosters(world_lineups)
         events = store.list_events(world_id)
         assignments = store.list_assignments(world_id)
         rep = {a["club_id"] for a in assignments}
@@ -363,6 +408,7 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             "world": world,
             "competitions": store.list_competitions(world_id),
             "clubs": list(clubs.values()),
+            "rosters": rosters,
             "assignments": assignments,
             "standings": standings_proj["standings"],
             "players": player_stats[:16],
@@ -375,6 +421,129 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             "total_events": len(events),
             "proposals": gate.list_proposals(world_id)[:12],
         }
+
+    @app.get("/api/worlds/{world_id}/clubs")
+    def list_world_club_rosters(world_id: str) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        try:
+            store.get_world(world_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        cat = _world_catalogue(world_id)
+        lineups = store.list_club_lineups_5v5(world_id)
+        return {"world_id": world_id, "rosters": cat.all_rosters(lineups)}
+
+    @app.get("/api/worlds/{world_id}/clubs/{club_id}/squad")
+    def get_club_squad_endpoint(world_id: str, club_id: str) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        try:
+            store.get_world(world_id)
+            cat = _world_catalogue(world_id)
+            saved = store.get_club_lineup_5v5(world_id, club_id)
+            roster = cat.get_club_roster(
+                club_id,
+                selected_starter_ids=saved["starter_ids"] if saved else None,
+                formation_5v5=saved["formation_5v5"] if saved else None,
+            )
+            return {"world_id": world_id, "roster": roster}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/{world_id}/clubs/{club_id}/lineup")
+    def save_club_lineup_endpoint(
+        world_id: str, club_id: str, req: UpdateLineup5v5Request
+    ) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        try:
+            store.get_world(world_id)
+            cat = _world_catalogue(world_id)
+            validated, formation = cat.validate_5v5_selection(
+                club_id, req.starter_ids, req.formation_5v5
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        ordered_ids = [m.footballer_id for m in validated]
+        saved = store.save_club_lineup_5v5(
+            world_id=world_id,
+            club_id=club_id,
+            starter_ids=ordered_ids,
+            formation_5v5=formation,
+            actor_id=req.actor_id,
+        )
+        return {
+            "saved_lineup": saved,
+            "roster": cat.get_club_roster(
+                club_id, selected_starter_ids=ordered_ids, formation_5v5=formation
+            ),
+        }
+
+    @app.post("/api/exhibition/snapshot")
+    def create_exhibition_snapshot(req: ExhibitionSnapshotRequest) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        if req.world_id:
+            try:
+                store.get_world(req.world_id)
+            except KeyError as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+        cat = _world_catalogue(req.world_id)
+        if req.home_club_id not in cat.clubs:
+            raise HTTPException(status_code=404, detail=f"Unknown club '{req.home_club_id}'")
+        if req.away_club_id not in cat.clubs:
+            raise HTTPException(status_code=404, detail=f"Unknown club '{req.away_club_id}'")
+
+        saved_home = (
+            store.get_club_lineup_5v5(req.world_id, req.home_club_id)
+            if req.world_id
+            else None
+        )
+        saved_away = (
+            store.get_club_lineup_5v5(req.world_id, req.away_club_id)
+            if req.world_id
+            else None
+        )
+        eff_home_starters = (
+            req.home_starters
+            if req.home_starters is not None
+            else (saved_home["starter_ids"] if saved_home else None)
+        )
+        eff_away_starters = (
+            req.away_starters
+            if req.away_starters is not None
+            else (saved_away["starter_ids"] if saved_away else None)
+        )
+        eff_home_fmt = (
+            req.home_formation
+            if req.home_formation is not None
+            else (saved_home["formation_5v5"] if saved_home else None)
+        )
+        eff_away_fmt = (
+            req.away_formation
+            if req.away_formation is not None
+            else (saved_away["formation_5v5"] if saved_away else None)
+        )
+        chosen_seed = req.seed if req.seed is not None else 20_261_119
+        try:
+            snapshot = cat.build_fixture_snapshot(
+                fixture_id=f"exh-{req.home_club_id}-vs-{req.away_club_id}-{req.format_name}",
+                home_club_id=req.home_club_id,
+                away_club_id=req.away_club_id,
+                seed=chosen_seed,
+                format_name=req.format_name,
+                home_controller=req.home_controller,
+                away_controller=req.away_controller,
+                half_duration_ticks=req.half_duration_ticks,
+                extra_time_enabled=False,
+                home_starters=eff_home_starters,
+                away_starters=eff_away_starters,
+                home_formation=eff_home_fmt,
+                away_formation=eff_away_fmt,
+            )
+            return {"snapshot": snapshot}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/worlds/{world_id}/assignments")
     def assign_club_endpoint(world_id: str, req: ClubTakeoverRequest) -> dict[str, Any]:
@@ -407,6 +576,10 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
                 home_controller=req.home_controller,
                 away_controller=req.away_controller,
                 seed=req.seed,
+                home_starters=req.home_starters,
+                away_starters=req.away_starters,
+                home_formation=req.home_formation,
+                away_formation=req.away_formation,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -438,7 +611,6 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
                 claimed_final_hash_hex=req.claimed_final_hash_hex,
                 claimed_score=req.claimed_score,
                 hash_checkpoints=req.hash_checkpoints,
-                require_finished=req.require_finished,
                 actor_id=req.actor_id,
             )
         except KeyError as exc:
@@ -464,6 +636,8 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/worlds/{world_id}/ingest/provider-fixture")
     def ingest_provider_fixture(
@@ -484,6 +658,8 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.get("/api/worlds/{world_id}/identity-queue")
     def get_identity_queue(world_id: str) -> dict[str, Any]:
@@ -798,11 +974,46 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/api/worlds/{world_id}/reset-demo")
-    def reset_demo_world(world_id: str) -> dict[str, Any]:
-        if str(resolved_db) == ":memory:":
-            _init_services(reset_file=False)
-        else:
-            _init_services(reset_file=True)
+    def reset_demo_world(
+        world_id: str,
+        x_admin_token: str | None = Header(default=None),
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        if not _is_demo_reset_enabled():
+            raise HTTPException(
+                status_code=403,
+                detail="Demo reset endpoint is disabled outside development",
+            )
+        admin_token = os.environ.get("PSFC_ADMIN_TOKEN")
+        if admin_token:
+            bearer = (
+                authorization[7:].strip()
+                if authorization and authorization.lower().startswith("bearer ")
+                else None
+            )
+            supplied = x_admin_token or bearer or ""
+            if not supplied or not secrets.compare_digest(supplied, admin_token):
+                raise HTTPException(status_code=403, detail="Invalid or missing admin token")
+
+        store: WorldLedgerStore = state_holder["store"]
+        try:
+            store.get_world(world_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if world_id != DEFAULT_WORLD_ID:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Only the demo world '{DEFAULT_WORLD_ID}' may be reset",
+            )
+
+        store.reset_world_for_demo(world_id)
+        fresh_catalogue = ClubCatalogue()
+        ensure_demo_world(store, fresh_catalogue)
+        state_holder["catalogue"] = fresh_catalogue
+        state_holder["gate"] = ProposalGate(store, fresh_catalogue)
+        state_holder["sessions"] = MatchSessionService(store, fresh_catalogue)
+        state_holder["adapter"] = ProviderFeedAdapter(store, state_holder["gate"])
+        state_holder["competition_engine"] = CompetitionEngine(store, fresh_catalogue)
         return {"status": "reset", "world_id": world_id}
 
     # --- Browser / WASM 5v5 Match Client Routes ---
