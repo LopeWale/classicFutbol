@@ -242,6 +242,16 @@ CREATE TABLE IF NOT EXISTS season_honour (
     detail_json TEXT NOT NULL,
     awarded_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS club_lineup_5v5 (
+    world_id TEXT NOT NULL REFERENCES world(id),
+    club_id TEXT NOT NULL,
+    starter_ids_json TEXT NOT NULL,
+    formation_5v5 TEXT NOT NULL,
+    updated_by TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (world_id, club_id)
+);
 """
 
 
@@ -992,3 +1002,91 @@ class WorldLedgerStore:
             d["detail"] = json.loads(d.pop("detail_json"))
             out.append(d)
         return out
+
+    # --- 5v5 Squad Selection (11 -> 5 Lineup & Formation Persistence) ---
+
+    def save_club_lineup_5v5(
+        self,
+        *,
+        world_id: str,
+        club_id: str,
+        starter_ids: list[str],
+        formation_5v5: str,
+        actor_id: str = "participant",
+    ) -> dict[str, Any]:
+        self.get_world(world_id)
+        ts = utc_now_iso()
+        self._conn.execute(
+            """
+            INSERT INTO club_lineup_5v5 (world_id, club_id, starter_ids_json, formation_5v5, updated_by, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(world_id, club_id) DO UPDATE SET
+                starter_ids_json = excluded.starter_ids_json,
+                formation_5v5 = excluded.formation_5v5,
+                updated_by = excluded.updated_by,
+                updated_at = excluded.updated_at
+            """,
+            (
+                world_id,
+                club_id,
+                json.dumps(starter_ids, separators=(",", ":")),
+                formation_5v5,
+                actor_id,
+                ts,
+            ),
+        )
+        self.append_event(
+            world_id=world_id,
+            event_type="lineup_updated",
+            aggregate_type="club",
+            aggregate_id=club_id,
+            payload={
+                "club_id": club_id,
+                "starter_ids": starter_ids,
+                "formation_5v5": formation_5v5,
+            },
+            caused_by=actor_id,
+            occurred_at=ts,
+            commit=True,
+        )
+        return {
+            "world_id": world_id,
+            "club_id": club_id,
+            "starter_ids": starter_ids,
+            "formation_5v5": formation_5v5,
+            "updated_by": actor_id,
+            "updated_at": ts,
+        }
+
+    def get_club_lineup_5v5(self, world_id: str, club_id: str) -> dict[str, Any] | None:
+        row = self._conn.execute(
+            "SELECT * FROM club_lineup_5v5 WHERE world_id = ? AND club_id = ?",
+            (world_id, club_id),
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "world_id": row["world_id"],
+            "club_id": row["club_id"],
+            "starter_ids": json.loads(row["starter_ids_json"]),
+            "formation_5v5": row["formation_5v5"],
+            "updated_by": row["updated_by"],
+            "updated_at": row["updated_at"],
+        }
+
+    def list_club_lineups_5v5(self, world_id: str) -> dict[str, dict[str, Any]]:
+        rows = self._conn.execute(
+            "SELECT * FROM club_lineup_5v5 WHERE world_id = ?",
+            (world_id,),
+        ).fetchall()
+        return {
+            r["club_id"]: {
+                "world_id": r["world_id"],
+                "club_id": r["club_id"],
+                "starter_ids": json.loads(r["starter_ids_json"]),
+                "formation_5v5": r["formation_5v5"],
+                "updated_by": r["updated_by"],
+                "updated_at": r["updated_at"],
+            }
+            for r in rows
+        }

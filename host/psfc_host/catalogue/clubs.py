@@ -7,6 +7,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 GAMEPLAY_VERSION = "0.1.0-5v5"
+SUPPORTED_5V5_FORMATIONS = ("1-2-1", "2-2", "1-1-2")
+_ROLE_ORDER = {"Goalkeeper": 0, "Defender": 1, "Midfielder": 2, "Forward": 3}
+
+
+def _member_overall(m: SquadMemberRecord) -> int:
+    a = m.attributes
+    if m.role == "Goalkeeper":
+        return round(0.62 * a["goalkeeping"] + 0.26 * a["positioning"] + 0.12 * a["passing"])
+    if m.role == "Defender":
+        return round(0.40 * a["tackling"] + 0.25 * a["positioning"] + 0.20 * a["strength"] + 0.15 * a["pace"])
+    if m.role == "Midfielder":
+        return round(0.36 * a["passing"] + 0.30 * a["dribbling"] + 0.18 * a["shooting"] + 0.16 * a["stamina"])
+    return round(0.40 * a["shooting"] + 0.26 * a["pace"] + 0.22 * a["dribbling"] + 0.12 * a["passing"])
 
 
 def _gk_attrs(gk: int, pos: int, passing: int) -> dict[str, int]:
@@ -305,7 +318,143 @@ class ClubCatalogue:
         dst.squad.append(joined)
         return joined
 
-    def build_team_snapshot(self, club_id: str, format_name: str = "5v5") -> dict[str, Any]:
+    def validate_5v5_selection(
+        self,
+        club_id: str,
+        starter_ids: list[str],
+        formation_5v5: str | None = None,
+    ) -> tuple[list[SquadMemberRecord], str]:
+        """Validate a 5v5 selection (1 GK + 4 outfielders) from the club's active 11-player squad."""
+        if club_id not in self.clubs:
+            raise KeyError(f"Unknown club '{club_id}'")
+        club = self.clubs[club_id]
+        formation = formation_5v5 or club.formation_5v5
+        if formation not in SUPPORTED_5V5_FORMATIONS:
+            raise ValueError(
+                f"Unsupported 5v5 formation '{formation}'; choose one of {list(SUPPORTED_5V5_FORMATIONS)}"
+            )
+
+        if len(starter_ids) != 5 or len(set(starter_ids)) != 5:
+            raise ValueError(
+                f"5v5 lineup for '{club_id}' must select exactly 5 unique players from the official squad (got {len(starter_ids)})"
+            )
+
+        active_by_id = {
+            m.footballer_id: m for m in club.squad if m.effective_to is None
+        }
+        chosen: list[SquadMemberRecord] = []
+        for fid in starter_ids:
+            member = active_by_id.get(fid)
+            if member is None:
+                raise ValueError(
+                    f"Footballer '{fid}' is not in active official squad of '{club_id}'"
+                )
+            chosen.append(member)
+
+        gks = [m for m in chosen if m.role == "Goalkeeper"]
+        if len(gks) != 1:
+            raise ValueError(
+                f"5v5 lineup for '{club_id}' must include exactly 1 Goalkeeper + 4 outfield players (got {len(gks)} Goalkeepers)"
+            )
+
+        outfield = [m for m in chosen if m.role != "Goalkeeper"]
+        order_index = {fid: i for i, fid in enumerate(starter_ids)}
+        outfield.sort(key=lambda m: (_ROLE_ORDER.get(m.role, 9), order_index[m.footballer_id]))
+        return ([gks[0], *outfield], formation)
+
+    def default_5v5_starter_ids(self, club_id: str) -> list[str]:
+        club = self.clubs[club_id]
+        active = [m for m in club.squad if m.effective_to is None]
+        gks = [m for m in active if m.role == "Goalkeeper"]
+        if not gks:
+            raise ValueError(f"Club '{club_id}' has no active Goalkeeper")
+        preferred = [m for m in active if m.role != "Goalkeeper" and m.starter_5v5]
+        if len(preferred) < 4:
+            extras = [m for m in active if m.role != "Goalkeeper" and m not in preferred]
+            preferred.extend(extras[: 4 - len(preferred)])
+        return [gks[0].footballer_id, *[m.footballer_id for m in preferred[:4]]]
+
+    def get_club_roster(
+        self,
+        club_id: str,
+        selected_starter_ids: list[str] | None = None,
+        formation_5v5: str | None = None,
+    ) -> dict[str, Any]:
+        """Return full 11-player official squad + active 5v5 selection and formation."""
+        if club_id not in self.clubs:
+            raise KeyError(f"Unknown club '{club_id}'")
+        club = self.clubs[club_id]
+        active = [m for m in club.squad if m.effective_to is None]
+
+        effective_ids = self.default_5v5_starter_ids(club_id)
+        effective_formation = club.formation_5v5
+        custom_applied = False
+        if selected_starter_ids:
+            try:
+                validated, fmt = self.validate_5v5_selection(
+                    club_id, selected_starter_ids, formation_5v5
+                )
+                effective_ids = [m.footballer_id for m in validated]
+                effective_formation = fmt
+                custom_applied = True
+            except ValueError:
+                # If a player transferred away since saving custom lineup, gracefully fall back to valid defaults
+                effective_ids = self.default_5v5_starter_ids(club_id)
+                if formation_5v5 in SUPPORTED_5V5_FORMATIONS:
+                    effective_formation = formation_5v5
+        elif formation_5v5 in SUPPORTED_5V5_FORMATIONS:
+            effective_formation = str(formation_5v5)
+
+        selected_set = set(effective_ids)
+        return {
+            "club_id": club.club_id,
+            "name": club.name,
+            "short_name": club.short_name,
+            "country": club.country,
+            "stadium": club.stadium,
+            "primary_color": club.primary_color,
+            "secondary_color": club.secondary_color,
+            "formation_5v5": effective_formation,
+            "formation_11v11": club.formation_11v11,
+            "supported_formations_5v5": list(SUPPORTED_5V5_FORMATIONS),
+            "custom_lineup_active": custom_applied,
+            "starter_ids_5v5": effective_ids,
+            "squad": [
+                {
+                    "footballer_id": m.footballer_id,
+                    "name": m.name,
+                    "shirt_number": m.shirt_number,
+                    "role": m.role,
+                    "overall": _member_overall(m),
+                    "default_starter_5v5": m.starter_5v5,
+                    "selected_5v5": m.footballer_id in selected_set,
+                    "attributes": copy.deepcopy(m.attributes),
+                }
+                for m in active
+            ],
+        }
+
+    def all_rosters(
+        self, world_lineups: dict[str, dict[str, Any]] | None = None
+    ) -> dict[str, dict[str, Any]]:
+        lineups = world_lineups or {}
+        out: dict[str, dict[str, Any]] = {}
+        for cid in self.clubs:
+            saved = lineups.get(cid)
+            out[cid] = self.get_club_roster(
+                cid,
+                selected_starter_ids=saved["starter_ids"] if saved else None,
+                formation_5v5=saved["formation_5v5"] if saved else None,
+            )
+        return out
+
+    def build_team_snapshot(
+        self,
+        club_id: str,
+        format_name: str = "5v5",
+        starter_ids: list[str] | None = None,
+        formation_override: str | None = None,
+    ) -> dict[str, Any]:
         club = self.clubs[club_id]
         active = [m for m in club.squad if m.effective_to is None]
         gks = [m for m in active if m.role == "Goalkeeper"]
@@ -318,13 +467,16 @@ class ClubCatalogue:
             rest = [m for m in active if m not in selected]
             formation = club.formation_11v11
         else:
-            preferred = [m for m in active if m.role != "Goalkeeper" and m.starter_5v5]
-            if len(preferred) < 4:
-                extras = [m for m in active if m.role != "Goalkeeper" and m not in preferred]
-                preferred.extend(extras[: 4 - len(preferred)])
-            selected = [gks[0], *preferred[:4]]
+            if starter_ids is not None:
+                selected, formation = self.validate_5v5_selection(
+                    club_id, starter_ids, formation_override
+                )
+            else:
+                default_ids = self.default_5v5_starter_ids(club_id)
+                selected, formation = self.validate_5v5_selection(
+                    club_id, default_ids, formation_override
+                )
             rest = [m for m in active if m not in selected]
-            formation = club.formation_5v5
 
         def _serialize_member(m: SquadMemberRecord) -> dict[str, Any]:
             return {
@@ -346,9 +498,16 @@ class ClubCatalogue:
             "substitutes": [_serialize_member(m) for m in rest],
         }
 
-    def club_strength_ratings(self, club_id: str, format_name: str = "5v5") -> tuple[float, float]:
+    def club_strength_ratings(
+        self,
+        club_id: str,
+        format_name: str = "5v5",
+        starter_ids: list[str] | None = None,
+    ) -> tuple[float, float]:
         """Return `(attack_rating, defense_rating)` in `[0, 100]` from active starters."""
-        snap = self.build_team_snapshot(club_id, format_name=format_name)
+        snap = self.build_team_snapshot(
+            club_id, format_name=format_name, starter_ids=starter_ids
+        )
         starters = snap["starters"]
         gk = starters[0]["attributes"]
         outfield = [p["attributes"] for p in starters[1:]]
@@ -374,6 +533,10 @@ class ClubCatalogue:
         away_controller: dict[str, Any] | None = None,
         half_duration_ticks: int | None = None,
         extra_time_enabled: bool = False,
+        home_starters: list[str] | None = None,
+        away_starters: list[str] | None = None,
+        home_formation: str | None = None,
+        away_formation: str | None = None,
     ) -> dict[str, Any]:
         return {
             "fixture_id": fixture_id,
@@ -387,6 +550,16 @@ class ClubCatalogue:
                 half_duration_ticks=half_duration_ticks,
                 extra_time_enabled=extra_time_enabled,
             ),
-            "home": self.build_team_snapshot(home_club_id, format_name=format_name),
-            "away": self.build_team_snapshot(away_club_id, format_name=format_name),
+            "home": self.build_team_snapshot(
+                home_club_id,
+                format_name=format_name,
+                starter_ids=home_starters,
+                formation_override=home_formation,
+            ),
+            "away": self.build_team_snapshot(
+                away_club_id,
+                format_name=format_name,
+                starter_ids=away_starters,
+                formation_override=away_formation,
+            ),
         }

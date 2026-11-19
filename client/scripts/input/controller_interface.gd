@@ -64,12 +64,47 @@ func sample_input_frame(side: int) -> Dictionary:
 		return _sample_keyboard_p1()
 	return {"move_x": 0, "move_y": 0, "aim_x": 0, "aim_y": 0, "buttons": 0}
 
+func detect_controller_profile(dev_id: int) -> String:
+	var name_lc := Input.get_joy_name(dev_id).to_lower()
+	if name_lc.contains("psfc") or name_lc.contains("parallel season"):
+		return "PSFC RP2040 Pad"
+	if name_lc.contains("dualsense") or name_lc.contains("dualshock") or name_lc.contains("ps5") or name_lc.contains("ps4") or name_lc.contains("wireless controller"):
+		return "PlayStation DualSense/DS4"
+	if name_lc.contains("8bitdo"):
+		return "8BitDo Controller"
+	if name_lc.contains("switch") or name_lc.contains("pro controller"):
+		return "Switch Pro Controller"
+	if name_lc.contains("logitech") or name_lc.contains("f310") or name_lc.contains("f710"):
+		return "Logitech Gamepad"
+	if name_lc.contains("xbox") or name_lc.contains("xinput") or name_lc.contains("microsoft"):
+		return "Xbox XInput Controller"
+	return "Standard USB/BT Gamepad"
+
 func _sample_joypad(dev_id: int, guid: String) -> Dictionary:
 	var cal: DeviceCalibration = calibration_by_guid.get(guid, DeviceCalibration.new())
 	var lx := _apply_deadzone(Input.get_joy_axis(dev_id, JOY_AXIS_LEFT_X), cal.dead_zone)
 	var ly := _apply_deadzone(Input.get_joy_axis(dev_id, JOY_AXIS_LEFT_Y), cal.dead_zone)
 	var rx := _apply_deadzone(Input.get_joy_axis(dev_id, JOY_AXIS_RIGHT_X), cal.dead_zone)
 	var ry := _apply_deadzone(Input.get_joy_axis(dev_id, JOY_AXIS_RIGHT_Y), cal.dead_zone)
+
+	# D-Pad fallback for off-the-shelf Xbox / DualSense / 8BitDo / USB pads when left stick is neutral
+	if absf(lx) < 0.05 and absf(ly) < 0.05:
+		var dx := 0.0
+		var dy := 0.0
+		if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_DPAD_RIGHT):
+			dx += 1.0
+		if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_DPAD_LEFT):
+			dx -= 1.0
+		if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_DPAD_DOWN):
+			dy += 1.0
+		if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_DPAD_UP):
+			dy -= 1.0
+		var dv := Vector2(dx, dy)
+		if dv.length() > 1.0:
+			dv = dv.normalized()
+		lx = dv.x
+		ly = dv.y
+
 	if cal.invert_x:
 		lx = -lx
 		rx = -rx
@@ -86,15 +121,15 @@ func _sample_joypad(dev_id: int, guid: String) -> Dictionary:
 		btns |= BTN_LOB | BTN_SLIDE
 	if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_B):
 		btns |= BTN_SHOOT
-	if Input.get_joy_axis(dev_id, JOY_AXIS_TRIGGER_RIGHT) > 0.35:
+	if Input.get_joy_axis(dev_id, JOY_AXIS_TRIGGER_RIGHT) > 0.25 or Input.is_joy_button_pressed(dev_id, JOY_BUTTON_PADDLE2):
 		btns |= BTN_SPRINT
-	if Input.get_joy_axis(dev_id, JOY_AXIS_TRIGGER_LEFT) > 0.35:
+	if Input.get_joy_axis(dev_id, JOY_AXIS_TRIGGER_LEFT) > 0.25 or Input.is_joy_button_pressed(dev_id, JOY_BUTTON_PADDLE1):
 		btns |= BTN_JOCKEY
 	if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_LEFT_SHOULDER):
 		btns |= BTN_SWITCH
 	if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_RIGHT_SHOULDER):
-		btns |= BTN_CALL_RUN
-	if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_RIGHT_STICK):
+		btns |= BTN_CALL_RUN | BTN_TACKLE
+	if Input.is_joy_button_pressed(dev_id, JOY_BUTTON_RIGHT_STICK) or Input.is_joy_button_pressed(dev_id, JOY_BUTTON_LEFT_STICK):
 		btns |= BTN_SKILL
 
 	return {

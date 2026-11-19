@@ -30,8 +30,25 @@
         <div class="toolbar-group">
           <label for="format-select">Format</label>
           <select id="format-select">
-            <option value="5v5" selected>5v5 (4 Outfield + 1 GK · 56m×36m)</option>
-            <option value="11v11">11v11 Expansion (10 + 1 GK · 105m×68m)</option>
+            <option value="5v5" selected>5v5 (4 + GK · 56m×36m)</option>
+            <option value="11v11">11v11 (10 + GK · 105m×68m)</option>
+          </select>
+        </div>
+
+        <div class="toolbar-group">
+          <label for="home-club-select">Matchup</label>
+          <select id="home-club-select" title="Home Club (Exhibition)">
+            <option value="man-utd" selected>MUN</option>
+            <option value="arsenal">ARS</option>
+            <option value="liverpool">LIV</option>
+            <option value="chelsea">CHE</option>
+          </select>
+          <span class="vs-sep">vs</span>
+          <select id="away-club-select" title="Away Club (Exhibition)">
+            <option value="man-utd">MUN</option>
+            <option value="arsenal" selected>ARS</option>
+            <option value="liverpool">LIV</option>
+            <option value="chelsea">CHE</option>
           </select>
         </div>
 
@@ -47,19 +64,19 @@
         </div>
 
         <div class="toolbar-group">
-          <label for="duration-select">Half Length</label>
+          <label for="duration-select">Half</label>
           <select id="duration-select">
-            <option value="1800">30s Quick Half</option>
-            <option value="3600" selected>1m Arcade Half</option>
-            <option value="7200">2m Standard 5v5 Half</option>
+            <option value="1800">30s</option>
+            <option value="3600" selected>1m</option>
+            <option value="7200">2m</option>
           </select>
         </div>
 
         <div class="toolbar-actions">
           <button class="btn btn-secondary" id="btn-exhibition">New Exhibition</button>
           <button class="btn btn-secondary" id="btn-pause">Pause</button>
-          <button class="btn btn-secondary" id="btn-instant-replay" title="Watch 6-second 0.5x slow-motion orbiting instant replay">Instant Replay (6s)</button>
-          <button class="btn btn-amber" id="btn-sim-rest" title="Deterministically fast-forward remaining match ticks (including Extra Time &amp; Shootout)">Fast-Forward to FT</button>
+          <button class="btn btn-secondary" id="btn-instant-replay" title="Watch 6-second 0.5x slow-motion orbiting instant replay">Replay (6s)</button>
+          <button class="btn btn-amber" id="btn-sim-rest" title="Deterministically fast-forward remaining match ticks (including Extra Time &amp; Shootout)">Fast-Forward FT</button>
           <button class="btn btn-primary" id="btn-submit-session" hidden>Verify &amp; Record Result</button>
         </div>
       </div>
@@ -101,20 +118,24 @@
       <div class="under-pitch-grid">
         <div class="panel controls-panel">
           <div class="panel-header">
-            <h2>Pitch Controls (Classic Arcade + Skill Moves)</h2>
-            <span class="badge">Zero Play-Calling Menus · Pure Stick + Button Skill</span>
+            <h2>Gamepad (Xbox / PS5 / 8BitDo / USB) &amp; Keyboard</h2>
+            <select id="pad-profile-select" title="Off-the-shelf USB / Bluetooth Controller Button Layout">
+              <option value="auto" selected>Pad: Auto (Xbox / PS / 8BitDo)</option>
+              <option value="switch">Pad: Switch Pro (Swap AB/XY)</option>
+              <option value="dinput">Pad: Generic USB DirectInput</option>
+            </select>
           </div>
           <div class="controls-grid">
-            <div><kbd>WASD</kbd> / <kbd>Arrows</kbd> Move &amp; Aim</div>
-            <div><kbd>J</kbd> / <kbd>Space</kbd> Ground Pass</div>
-            <div><kbd>K</kbd> Through Ball</div>
-            <div><kbd>U</kbd> Lob / Cross</div>
-            <div><kbd>L</kbd> / <kbd>Enter</kbd> Shoot (Hold Charge)</div>
-            <div><kbd>Z</kbd> / <kbd>R-Stick</kbd> Skill Move (Roulette)</div>
-            <div><kbd>Shift</kbd> Sprint · <kbd>F</kbd> Jockey/Finesse</div>
-            <div><kbd>Q</kbd> Switch · <kbd>E</kbd> Tackle · <kbd>C</kbd> Slide</div>
-            <div><kbd>R</kbd> Trigger Run / GK Rush</div>
-            <div><kbd>Tab</kbd> Toggle 6s Instant Replay</div>
+            <div><kbd>L-Stick</kbd> / <kbd>D-Pad</kbd> / <kbd>WASD</kbd> Move &amp; Aim</div>
+            <div><kbd>A / Cross</kbd> · <kbd>Space</kbd> Pass / Tackle</div>
+            <div><kbd>Y / Tri</kbd> · <kbd>K</kbd> Through Ball</div>
+            <div><kbd>X / Sq</kbd> · <kbd>U / C</kbd> Lob / Slide</div>
+            <div><kbd>B / Cir</kbd> · <kbd>L / Enter</kbd> Shoot (Hold)</div>
+            <div><kbd>R-Stick Flick</kbd> / <kbd>R3</kbd> / <kbd>Z</kbd> Skill Move</div>
+            <div><kbd>RT / R2</kbd> · <kbd>Shift</kbd> Sprint Knock-On</div>
+            <div><kbd>LT / L2</kbd> · <kbd>F</kbd> Sole-Roll / Finesse</div>
+            <div><kbd>LB / L1</kbd> · <kbd>Q</kbd> Goal-Side Switch</div>
+            <div><kbd>RB / R1</kbd> · <kbd>R</kbd> Trigger Run / GK Rush</div>
           </div>
         </div>
 
@@ -128,7 +149,7 @@
       </div>
     </section>
 
-    <!-- RIGHT: Parallel Season World Host, Competitions, Cartridges & Ledger -->
+    <!-- RIGHT: Parallel Season World Host, 5v5 Squad Builder, Competitions, Cartridges & Ledger -->
     <aside class="world-column">
       <div class="panel world-header-panel">
         <div class="world-title-row">
@@ -147,10 +168,11 @@
 
         <div class="tabs" role="tablist">
           <button class="tab active" data-tab="fixtures">Fixtures &amp; Cup</button>
+          <button class="tab" data-tab="squads">Squads (11→5)</button>
           <button class="tab" data-tab="standings">Standings</button>
           <button class="tab" data-tab="players">Inh / Earned</button>
           <button class="tab" data-tab="cartridge">Cartridge</button>
-          <button class="tab" data-tab="ledger">Ledger &amp; Gate</button>
+          <button class="tab" data-tab="ledger">Ledger</button>
         </div>
       </div>
 
@@ -166,6 +188,42 @@
         </div>
         <div id="cup-divergence-msg" class="gate-msg" hidden></div>
         <div class="fixture-list" id="fixture-list"></div>
+      </div>
+
+      <!-- TAB 1B: Interactive 5v5 Lineup Picker (Select 1 GK + 4 Outfield from Official 11-Man Squad) -->
+      <div class="tab-pane" id="tab-squads" hidden>
+        <div class="pane-note">
+          Each club carries its full <strong>11-player official lineup</strong>. Pick any <strong>1 Goalkeeper + 4 Outfielders</strong> and your 5v5 tactical shape for Official Fixtures &amp; Exhibition!
+        </div>
+        <div class="squad-controls-row">
+          <div class="toolbar-group">
+            <label for="squad-club-select">Club</label>
+            <select id="squad-club-select">
+              <option value="man-utd">Manchester United</option>
+              <option value="arsenal">Arsenal</option>
+              <option value="liverpool">Liverpool</option>
+              <option value="chelsea">Chelsea</option>
+            </select>
+          </div>
+          <div class="toolbar-group">
+            <label for="squad-formation-select">5v5 Shape</label>
+            <select id="squad-formation-select">
+              <option value="1-2-1">1-2-1 Diamond</option>
+              <option value="2-2">2-2 Box</option>
+              <option value="1-1-2">1-1-2 Attack</option>
+            </select>
+          </div>
+          <span class="pill pill-emerald" id="squad-count-pill">5 / 5 (1 GK + 4 Out)</span>
+        </div>
+
+        <div class="squad-roster-list" id="squad-roster-list"></div>
+
+        <div class="squad-actions-row">
+          <button class="btn btn-primary" id="btn-save-lineup">Save 5v5 Lineup to World</button>
+          <button class="btn btn-secondary" id="btn-play-with-squad">Play Exhibition w/ Club</button>
+          <button class="btn btn-ghost" id="btn-reset-lineup-default">Default 5</button>
+        </div>
+        <div id="squad-save-msg" class="gate-msg" hidden></div>
       </div>
 
       <!-- TAB 2: Parallel Standings vs Real Reference + Season Rollover -->
