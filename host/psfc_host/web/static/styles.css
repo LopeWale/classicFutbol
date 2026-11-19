@@ -544,7 +544,7 @@ kbd {
 
 .tabs {
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   gap: 3px;
   margin-top: 11px;
   background: var(--bg-base);
@@ -553,13 +553,19 @@ kbd {
   border: 1px solid var(--border-subtle);
 }
 
+@media (max-width: 560px) {
+  .tabs {
+    grid-template-columns: repeat(3, 1fr);
+  }
+}
+
 .tab {
   background: transparent;
   color: var(--text-secondary);
   border: none;
   border-radius: 6px;
-  padding: 6px 3px;
-  font-size: 11px;
+  padding: 6px 2px;
+  font-size: 10.5px;
   font-weight: 600;
   cursor: pointer;
   font-family: inherit;
@@ -834,4 +840,172 @@ code {
   font-family: var(--font-mono);
   color: var(--text-muted);
   margin-right: 6px;
+}
+
+/* Matchup Separator & Squads (11->5) Picker */
+.vs-sep {
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+.pill-amber {
+  background: var(--accent-amber-dim);
+  color: #fbbf24;
+  border-color: rgba(245, 158, 11, 0.45);
+}
+
+.squad-controls-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+}
+
+.squad-roster-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 410px;
+  overflow-y: auto;
+  padding-right: 2px;
+}
+
+.squad-player-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-subtle);
+  cursor: pointer;
+  transition: border-color 0.14s ease, background 0.14s ease;
+  user-select: none;
+}
+
+.squad-player-row:hover {
+  border-color: var(--border-strong);
+}
+
+.squad-player-row.selected {
+  background: rgba(16, 185, 129, 0.13);
+  border-color: rgba(16, 185, 129, 0.6);
+  box-shadow: inset 3px 0 0 var(--accent-emerald);
+}
+
+.sp-left {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sp-check {
+  width: 17px;
+  height: 17px;
+  border-radius: 4px;
+  border: 1px solid var(--border-strong);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  color: transparent;
+  background: var(--bg-base);
+  flex-shrink: 0;
+}
+
+.squad-player-row.selected .sp-check {
+  background: var(--accent-emerald);
+  border-color: var(--accent-emerald);
+  color: #03150e;
+}
+
+.sp-shirt {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  width: 24px;
+  text-align: right;
+  flex-shrink: 0;
+}
+
+.role-tag {
+  font-size: 10px;
+  font-weight: 800;
+  padding: 1px 6px;
+  border-radius: 4px;
+  letter-spacing: 0.04em;
+  flex-shrink: 0;
+}
+
+.role-gk {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+}
+
+.role-def {
+  background: rgba(56, 189, 248, 0.2);
+  color: #7dd3fc;
+}
+
+.role-mid {
+  background: rgba(16, 185, 129, 0.2);
+  color: #6ee7b7;
+}
+
+.role-fwd {
+  background: rgba(244, 63, 94, 0.22);
+  color: #fda4af;
+}
+
+.sp-name {
+  font-weight: 600;
+  font-size: 12.2px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sp-default-star {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: 3px;
+}
+
+.sp-right {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-shrink: 0;
+}
+
+.sp-attrs {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.ovr-pill {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--bg-base);
+  border: 1px solid var(--border-strong);
+  color: #f8fafc;
+}
+
+.squad-actions-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  flex-wrap: wrap;
 }

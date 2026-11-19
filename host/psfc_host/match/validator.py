@@ -71,6 +71,10 @@ class MatchSessionService:
         home_controller: dict[str, Any] | None = None,
         away_controller: dict[str, Any] | None = None,
         seed: int | None = None,
+        home_starters: list[str] | None = None,
+        away_starters: list[str] | None = None,
+        home_formation: str | None = None,
+        away_formation: str | None = None,
     ) -> dict[str, Any]:
         fx = self.store.get_fixture(fixture_id)
         world_id = fx["world_id"]
@@ -120,6 +124,30 @@ class MatchSessionService:
                     else {"kind": "Cpu", "difficulty": "Normal"}
                 )
 
+        # Resolve saved per-world 5v5 lineups unless caller explicitly supplied per-match overrides
+        saved_home = self.store.get_club_lineup_5v5(world_id, fx["home_club_id"])
+        saved_away = self.store.get_club_lineup_5v5(world_id, fx["away_club_id"])
+        eff_home_starters = (
+            home_starters
+            if home_starters is not None
+            else (saved_home["starter_ids"] if saved_home else None)
+        )
+        eff_away_starters = (
+            away_starters
+            if away_starters is not None
+            else (saved_away["starter_ids"] if saved_away else None)
+        )
+        eff_home_fmt = (
+            home_formation
+            if home_formation is not None
+            else (saved_home["formation_5v5"] if saved_home else None)
+        )
+        eff_away_fmt = (
+            away_formation
+            if away_formation is not None
+            else (saved_away["formation_5v5"] if saved_away else None)
+        )
+
         chosen_seed = seed if seed is not None else _deterministic_seed_for_fixture(fixture_id)
         snapshot = (
             existing_snap["snapshot"]
@@ -134,6 +162,10 @@ class MatchSessionService:
                 away_controller=away_controller,
                 half_duration_ticks=half_duration_ticks,
                 extra_time_enabled=bool(fx.get("extra_time_enabled", 0)),
+                home_starters=eff_home_starters,
+                away_starters=eff_away_starters,
+                home_formation=eff_home_fmt,
+                away_formation=eff_away_fmt,
             )
         )
 
@@ -164,6 +196,10 @@ class MatchSessionService:
                     "fixture_id": fixture_id,
                     "format_name": snapshot["format"]["name"],
                     "players_per_side": snapshot["format"]["players_per_side"],
+                    "home_formation": snapshot["home"]["formation"],
+                    "away_formation": snapshot["away"]["formation"],
+                    "home_starters": [p["footballer_id"] for p in snapshot["home"]["starters"]],
+                    "away_starters": [p["footballer_id"] for p in snapshot["away"]["starters"]],
                     "seed": chosen_seed,
                     "gameplay_version": GAMEPLAY_VERSION,
                 },

@@ -51,6 +51,31 @@ class OpenSessionRequest(BaseModel):
     home_controller: dict[str, Any] | None = None
     away_controller: dict[str, Any] | None = None
     seed: int | None = None
+    home_starters: list[str] | None = None
+    away_starters: list[str] | None = None
+    home_formation: str | None = None
+    away_formation: str | None = None
+
+
+class UpdateLineup5v5Request(BaseModel):
+    starter_ids: list[str]
+    formation_5v5: str = "1-2-1"
+    actor_id: str = "part-alex"
+
+
+class ExhibitionSnapshotRequest(BaseModel):
+    world_id: str | None = None
+    home_club_id: str = "man-utd"
+    away_club_id: str = "arsenal"
+    format_name: str = Field(default="5v5", pattern="^(5v5|11v11)$")
+    half_duration_ticks: int = Field(default=3600, ge=60, le=36_000)
+    home_controller: dict[str, Any] | None = None
+    away_controller: dict[str, Any] | None = None
+    home_starters: list[str] | None = None
+    away_starters: list[str] | None = None
+    home_formation: str | None = None
+    away_formation: str | None = None
+    seed: int | None = None
 
 
 class CompleteSessionRequest(BaseModel):
@@ -349,6 +374,8 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
         clubs = _clubs_summary(cat)
+        world_lineups = store.list_club_lineups_5v5(world_id)
+        rosters = cat.all_rosters(world_lineups)
         events = store.list_events(world_id)
         assignments = store.list_assignments(world_id)
         rep = {a["club_id"] for a in assignments}
@@ -363,6 +390,7 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             "world": world,
             "competitions": store.list_competitions(world_id),
             "clubs": list(clubs.values()),
+            "rosters": rosters,
             "assignments": assignments,
             "standings": standings_proj["standings"],
             "players": player_stats[:16],
@@ -375,6 +403,124 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
             "total_events": len(events),
             "proposals": gate.list_proposals(world_id)[:12],
         }
+
+    @app.get("/api/worlds/{world_id}/clubs")
+    def list_world_club_rosters(world_id: str) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        cat: ClubCatalogue = state_holder["catalogue"]
+        try:
+            store.get_world(world_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        lineups = store.list_club_lineups_5v5(world_id)
+        return {"world_id": world_id, "rosters": cat.all_rosters(lineups)}
+
+    @app.get("/api/worlds/{world_id}/clubs/{club_id}/squad")
+    def get_club_squad_endpoint(world_id: str, club_id: str) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        cat: ClubCatalogue = state_holder["catalogue"]
+        try:
+            store.get_world(world_id)
+            saved = store.get_club_lineup_5v5(world_id, club_id)
+            roster = cat.get_club_roster(
+                club_id,
+                selected_starter_ids=saved["starter_ids"] if saved else None,
+                formation_5v5=saved["formation_5v5"] if saved else None,
+            )
+            return {"world_id": world_id, "roster": roster}
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/worlds/{world_id}/clubs/{club_id}/lineup")
+    def save_club_lineup_endpoint(
+        world_id: str, club_id: str, req: UpdateLineup5v5Request
+    ) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        cat: ClubCatalogue = state_holder["catalogue"]
+        try:
+            store.get_world(world_id)
+            validated, formation = cat.validate_5v5_selection(
+                club_id, req.starter_ids, req.formation_5v5
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+        ordered_ids = [m.footballer_id for m in validated]
+        saved = store.save_club_lineup_5v5(
+            world_id=world_id,
+            club_id=club_id,
+            starter_ids=ordered_ids,
+            formation_5v5=formation,
+            actor_id=req.actor_id,
+        )
+        return {
+            "saved_lineup": saved,
+            "roster": cat.get_club_roster(
+                club_id, selected_starter_ids=ordered_ids, formation_5v5=formation
+            ),
+        }
+
+    @app.post("/api/exhibition/snapshot")
+    def create_exhibition_snapshot(req: ExhibitionSnapshotRequest) -> dict[str, Any]:
+        store: WorldLedgerStore = state_holder["store"]
+        cat: ClubCatalogue = state_holder["catalogue"]
+        if req.home_club_id not in cat.clubs:
+            raise HTTPException(status_code=404, detail=f"Unknown club '{req.home_club_id}'")
+        if req.away_club_id not in cat.clubs:
+            raise HTTPException(status_code=404, detail=f"Unknown club '{req.away_club_id}'")
+
+        saved_home = (
+            store.get_club_lineup_5v5(req.world_id, req.home_club_id)
+            if req.world_id
+            else None
+        )
+        saved_away = (
+            store.get_club_lineup_5v5(req.world_id, req.away_club_id)
+            if req.world_id
+            else None
+        )
+        eff_home_starters = (
+            req.home_starters
+            if req.home_starters is not None
+            else (saved_home["starter_ids"] if saved_home else None)
+        )
+        eff_away_starters = (
+            req.away_starters
+            if req.away_starters is not None
+            else (saved_away["starter_ids"] if saved_away else None)
+        )
+        eff_home_fmt = (
+            req.home_formation
+            if req.home_formation is not None
+            else (saved_home["formation_5v5"] if saved_home else None)
+        )
+        eff_away_fmt = (
+            req.away_formation
+            if req.away_formation is not None
+            else (saved_away["formation_5v5"] if saved_away else None)
+        )
+        chosen_seed = req.seed if req.seed is not None else 20_261_119
+        try:
+            snapshot = cat.build_fixture_snapshot(
+                fixture_id=f"exh-{req.home_club_id}-vs-{req.away_club_id}-{req.format_name}",
+                home_club_id=req.home_club_id,
+                away_club_id=req.away_club_id,
+                seed=chosen_seed,
+                format_name=req.format_name,
+                home_controller=req.home_controller,
+                away_controller=req.away_controller,
+                half_duration_ticks=req.half_duration_ticks,
+                extra_time_enabled=False,
+                home_starters=eff_home_starters,
+                away_starters=eff_away_starters,
+                home_formation=eff_home_fmt,
+                away_formation=eff_away_fmt,
+            )
+            return {"snapshot": snapshot}
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     @app.post("/api/worlds/{world_id}/assignments")
     def assign_club_endpoint(world_id: str, req: ClubTakeoverRequest) -> dict[str, Any]:
@@ -407,6 +553,10 @@ def create_app(db_path: str | Path | None = None, seed_demo: bool = True) -> Fas
                 home_controller=req.home_controller,
                 away_controller=req.away_controller,
                 seed=req.seed,
+                home_starters=req.home_starters,
+                away_starters=req.away_starters,
+                home_formation=req.home_formation,
+                away_formation=req.away_formation,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

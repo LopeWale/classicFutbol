@@ -509,3 +509,147 @@ def test_season_completion_honours_qualification_and_rollover() -> None:
     assert ov_next["world"]["parent_world_id"] == DEFAULT_WORLD_ID
     assigned_clubs = {a["club_id"]: a["participant_id"] for a in ov_next["assignments"]}
     assert assigned_clubs == {"man-utd": "part-alex", "arsenal": "part-sam"}
+
+
+def test_custom_5v5_lineup_selection_from_11_man_squad_and_replay_verification() -> None:
+    app = create_app(db_path=":memory:", seed_demo=True)
+    client = TestClient(app)
+
+    # 1. Inspect full 11-player official squad for Man Utd and verify default 5v5 reduction
+    r_sq = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/squad")
+    assert r_sq.status_code == 200
+    roster = r_sq.json()["roster"]
+    assert len(roster["squad"]) == 11
+    assert roster["formation_5v5"] == "1-2-1"
+    assert roster["custom_lineup_active"] is False
+    assert roster["starter_ids_5v5"] == [
+        "mun-gk-1",
+        "mun-def-1",
+        "mun-mid-1",
+        "mun-mid-2",
+        "mun-fwd-1",
+    ]
+
+    # 2. Reject invalid 5v5 lineups (e.g. missing goalkeeper or wrong count) with 422
+    r_no_gk = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
+        json={
+            "starter_ids": ["mun-def-1", "mun-def-2", "mun-mid-1", "mun-mid-2", "mun-fwd-1"],
+            "formation_5v5": "1-2-1",
+        },
+    )
+    assert r_no_gk.status_code == 422
+    assert "Goalkeeper" in r_no_gk.json()["detail"]
+
+    r_four = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
+        json={
+            "starter_ids": ["mun-gk-1", "mun-def-2", "mun-mid-2", "mun-fwd-2"],
+            "formation_5v5": "1-2-1",
+        },
+    )
+    assert r_four.status_code == 422
+
+    # 3. Save a custom 5v5 lineup swapping in Dalot (mun-def-2), Garnacho (mun-fwd-2), and Hojlund (mun-fwd-3) + 1-1-2 Attack formation
+    custom_ids = ["mun-fwd-3", "mun-fwd-2", "mun-gk-1", "mun-def-2", "mun-mid-2"]
+    r_save = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
+        json={
+            "starter_ids": custom_ids,
+            "formation_5v5": "1-1-2",
+            "actor_id": "part-alex",
+        },
+    )
+    assert r_save.status_code == 200, r_save.text
+    saved_roster = r_save.json()["roster"]
+    assert saved_roster["custom_lineup_active"] is True
+    assert saved_roster["formation_5v5"] == "1-1-2"
+    # Tactically ordered GK -> DEF -> MID -> FWD (preserving selection order within same role)
+    expected_ordered = ["mun-gk-1", "mun-def-2", "mun-mid-2", "mun-fwd-3", "mun-fwd-2"]
+    assert saved_roster["starter_ids_5v5"] == expected_ordered
+
+    events = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/events").json()["events"]
+    assert any(ev["type"] == "lineup_updated" and ev["aggregate_id"] == "man-utd" for ev in events)
+
+    # 4. Exhibition snapshot reflects saved custom 5v5 lineup + remaining 6 players on bench
+    r_exh = client.post(
+        "/api/exhibition/snapshot",
+        json={
+            "world_id": DEFAULT_WORLD_ID,
+            "home_club_id": "man-utd",
+            "away_club_id": "arsenal",
+            "format_name": "5v5",
+            "half_duration_ticks": 120,
+        },
+    )
+    assert r_exh.status_code == 200
+    exh_snap = r_exh.json()["snapshot"]
+    assert [p["footballer_id"] for p in exh_snap["home"]["starters"]] == expected_ordered
+    assert len(exh_snap["home"]["substitutes"]) == 6
+    assert exh_snap["home"]["formation"] == "1-1-2"
+
+    # 5. Official session freezes custom 5v5 starters + formation and passes WASM -> psfc-replay verification!
+    r_open = client.post(
+        "/api/fixtures/fix-r3-mun-ars/sessions",
+        json={
+            "actor_id": "part-alex",
+            "format_name": "5v5",
+            "half_duration_ticks": 90,
+            "home_controller": {"kind": "Human"},
+            "away_controller": {"kind": "Cpu", "difficulty": "Normal"},
+        },
+    )
+    assert r_open.status_code == 200
+    sess_payload = r_open.json()
+    snap = sess_payload["snapshot"]
+    assert [p["footballer_id"] for p in snap["home"]["starters"]] == expected_ordered
+    assert snap["home"]["formation"] == "1-1-2"
+
+    repo_root = Path(__file__).resolve().parents[2]
+    wasm_path = (
+        repo_root / "sim" / "target" / "wasm32-unknown-unknown" / "release" / "psfc_wasm.wasm"
+    )
+    with tempfile.TemporaryDirectory(prefix="psfc_custom_lineup_") as tmp:
+        snap_file = Path(tmp) / "snap.json"
+        out_file = Path(tmp) / "out.json"
+        snap_file.write_text(json.dumps(snap), encoding="utf-8")
+        script = """
+        const fs = require("fs");
+        (async () => {
+          const wasmBytes = fs.readFileSync(process.argv[1]);
+          const snapBytes = fs.readFileSync(process.argv[2]);
+          const outPath = process.argv[3];
+          const { instance } = await WebAssembly.instantiate(wasmBytes, {});
+          const ex = instance.exports;
+          const dec = new TextDecoder();
+          const readOut = () => dec.decode(new Uint8Array(ex.memory.buffer, ex.wasm_output_ptr(), ex.wasm_output_len()));
+          const inPtr = ex.wasm_prepare_input_buf(snapBytes.length);
+          new Uint8Array(ex.memory.buffer, inPtr, snapBytes.length).set(snapBytes);
+          if (!ex.sim_init_from_snapshot_json()) throw new Error("init failed: " + readOut());
+          ex.sim_auto_step(10000);
+          ex.sim_export_input_log_json();
+          fs.writeFileSync(outPath, readOut());
+        })();
+        """
+        subprocess.run(
+            ["node", "-e", script, str(wasm_path), str(snap_file), str(out_file)],
+            check=True,
+            timeout=15,
+        )
+        log = json.loads(out_file.read_text(encoding="utf-8"))
+
+    r_comp = client.post(
+        f"/api/sessions/{sess_payload['session_id']}/complete",
+        json={
+            "actor_id": "part-alex",
+            "frames_hex": log["frames_hex"],
+            "claimed_final_hash_hex": log["claimed_final_hash_hex"],
+            "claimed_score": log["claimed_score"],
+            "hash_checkpoints": log["hash_checkpoints"],
+        },
+    )
+    assert r_comp.status_code == 200, r_comp.text
+    comp_body = r_comp.json()
+    assert comp_body["replay_report"]["final_hash_hex"] == log["claimed_final_hash_hex"]
+    assert comp_body["accepted_result"]["final_hash_hex"] == log["claimed_final_hash_hex"]
+
