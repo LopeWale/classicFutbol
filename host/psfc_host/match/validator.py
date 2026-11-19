@@ -81,10 +81,32 @@ class MatchSessionService:
 
         if fx["state"] == "accepted":
             raise ValueError(f"Fixture '{fixture_id}' already has an accepted result")
+        if fx["state"] == "awaiting_admin":
+            raise ValueError(
+                f"Fixture '{fixture_id}' is awaiting commissioner resolution and cannot open a session"
+            )
+        if fx["state"] not in ("scheduled", "open", "in_session"):
+            raise ValueError(
+                f"Fixture '{fixture_id}' is in state='{fx['state']}' and is not eligible to open a session"
+            )
         if fx["result_source"] not in ("played_vs_friend", "played_vs_cpu"):
             raise ValueError(
                 f"Fixture '{fixture_id}' has result_source='{fx['result_source']}', not playable in an official session"
             )
+
+        now_utc = utc_now_iso()
+        if fx["state"] in ("scheduled", "open"):
+            win_close = fx.get("window_close_utc")
+            win_open = fx.get("window_open_utc")
+            if win_close and now_utc > str(win_close):
+                self.store.expire_overdue_windows(world_id, as_of_utc=now_utc)
+                raise ValueError(
+                    f"Playing window for fixture '{fixture_id}' closed at {win_close}; awaiting commissioner resolution"
+                )
+            if win_open and now_utc < str(win_open):
+                raise ValueError(
+                    f"Playing window for fixture '{fixture_id}' does not open until {win_open}"
+                )
 
         # If snapshot was already frozen for this official fixture, preserve immutability!
         existing_snap = self.store.get_frozen_snapshot(fixture_id)
@@ -148,11 +170,12 @@ class MatchSessionService:
             else (saved_away["formation_5v5"] if saved_away else None)
         )
 
+        world_cat = self.catalogue.for_world(self.store, world_id)
         chosen_seed = seed if seed is not None else _deterministic_seed_for_fixture(fixture_id)
         snapshot = (
             existing_snap["snapshot"]
             if existing_snap is not None
-            else self.catalogue.build_fixture_snapshot(
+            else world_cat.build_fixture_snapshot(
                 fixture_id=fixture_id,
                 home_club_id=fx["home_club_id"],
                 away_club_id=fx["away_club_id"],
@@ -295,7 +318,6 @@ class MatchSessionService:
         claimed_final_hash_hex: str | None = None,
         claimed_score: list[int] | None = None,
         hash_checkpoints: list[dict[str, Any]] | None = None,
-        require_finished: bool = True,
         actor_id: str = "participant",
     ) -> dict[str, Any]:
         """Deterministically replay the match input log via `psfc-replay` and record the authoritative result."""
@@ -318,11 +340,21 @@ class MatchSessionService:
                 "replay_report": None,
             }
 
+        if sess["state"] == "abandoned":
+            raise ValueError(
+                f"Match session '{session_id}' was abandoned and requires commissioner resolution"
+            )
+
         frozen = self.store.get_frozen_snapshot(fixture_id)
         if frozen is None:
             raise ValueError(f"No frozen snapshot found for fixture '{fixture_id}'")
 
         fx = self.store.get_fixture(fixture_id)
+        if fx["state"] == "awaiting_admin":
+            raise ValueError(
+                f"Fixture '{fixture_id}' is awaiting commissioner resolution and cannot be completed by client"
+            )
+
         input_log_payload: dict[str, Any] = {
             "session_id": session_id,
             "claimed_final_hash_hex": claimed_final_hash_hex,
@@ -338,7 +370,7 @@ class MatchSessionService:
 
         report = self.run_replay_verifier(frozen["snapshot"], input_log_payload)
 
-        if require_finished and not report.get("finished", False):
+        if not report.get("finished", False):
             raise ReplayValidationError(
                 f"Match simulation did not reach FullTime ({report.get('ticks_simulated')} ticks simulated)"
             )

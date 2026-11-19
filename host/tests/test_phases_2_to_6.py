@@ -653,3 +653,186 @@ def test_custom_5v5_lineup_selection_from_11_man_squad_and_replay_verification()
     assert comp_body["replay_report"]["final_hash_hex"] == log["claimed_final_hash_hex"]
     assert comp_body["accepted_result"]["final_hash_hex"] == log["claimed_final_hash_hex"]
 
+
+def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPatch) -> None:
+    # 1. File-backed DB blocks unauthenticated reset-demo outside dev, enforces admin token,
+    #    preserves independent worlds on scoped dev reset, and rebuilds transfers across restart!
+    with tempfile.TemporaryDirectory(prefix="psfc_codex_") as tmp:
+        db_file = Path(tmp) / "persistent.sqlite"
+        app1 = create_app(db_path=db_file, seed_demo=True)
+        c1 = TestClient(app1)
+
+        # Persistent file-backed DB disables reset-demo by default (`403`)
+        assert c1.post(f"/api/worlds/{DEFAULT_WORLD_ID}/reset-demo").status_code == 403
+
+        # Create an independent second world + an open unrepresented Round 5 fixture in DEFAULT_WORLD_ID
+        indep_store = WorldLedgerStore(db_file)
+        indep_store.create_world(
+            world_id="world-independent",
+            name="Independent Parallel League",
+            competition_name="Serie Parallel",
+            season_label="2026/27",
+        )
+        indep_store.create_fixture(
+            fixture_id="fix-r5-liv-che",
+            world_id=DEFAULT_WORLD_ID,
+            competition_id="comp-prem-2026",
+            stage="league",
+            round_no=5,
+            home_club_id="liverpool",
+            away_club_id="chelsea",
+            kickoff_utc="2026-10-01T15:00:00Z",
+            window_open_utc="2026-08-01T00:00:00Z",
+            window_close_utc="2026-12-31T23:59:59Z",
+            result_source="imported",
+            state="open",
+        )
+        indep_store.close()
+
+        # Apply a squad transfer in `world-prem-2026` before simulating host restart
+        r_tr = c1.post(
+            f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/transfer",
+            json={
+                "footballer_id": "mun-fwd-1",
+                "from_club_id": "man-utd",
+                "to_club_id": "chelsea",
+                "new_shirt": 19,
+            },
+        )
+        assert r_tr.status_code == 200
+
+        # Simulate server restart on the existing SQLite file
+        app2 = create_app(db_path=db_file, seed_demo=True)
+        c2 = TestClient(app2)
+
+        che_squad = c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/chelsea/squad").json()["roster"]["squad"]
+        mun_squad = c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/squad").json()["roster"]["squad"]
+        assert any(p["footballer_id"] == "mun-fwd-1" for p in che_squad)
+        assert not any(p["footballer_id"] == "mun-fwd-1" for p in mun_squad)
+
+        # Cross-world fixture ownership check: `world-independent` CANNOT import `fix-r5-liv-che`!
+        r_cross = c2.post(
+            "/api/worlds/world-independent/ingest/result",
+            json={"fixture_id": "fix-r5-liv-che", "home_goals": 2, "away_goals": 0, "events": []},
+        )
+        assert r_cross.status_code == 409
+        assert "belongs to world" in r_cross.json()["detail"]
+
+        # Score-only imported result followed by idempotent event enrichment (without double-counting points!)
+        r_imp_score = c2.post(
+            f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/result",
+            json={"fixture_id": "fix-r5-liv-che", "home_goals": 2, "away_goals": 0, "events": []},
+        )
+        assert r_imp_score.status_code == 200
+        assert r_imp_score.json()["decision"] == "applied"
+
+        liv_pts_before = next(
+            r["points"]
+            for r in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/standings").json()["standings"]
+            if r["club_id"] == "liverpool"
+        )
+        salah_before = next(
+            p["inherited"]["goals"]
+            for p in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
+            if p["footballer_id"] == "liv-fwd-1"
+        )
+
+        r_enrich = c2.post(
+            f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/result",
+            json={
+                "fixture_id": "fix-r5-liv-che",
+                "home_goals": 2,
+                "away_goals": 0,
+                "events": [{"event_type": "Goal", "footballer_id": "liv-fwd-1", "minute": 55}],
+            },
+        )
+        assert r_enrich.status_code == 200
+        assert r_enrich.json()["decision"] == "applied"
+        assert r_enrich.json()["reason"] == "imported_events_enriched"
+
+        liv_pts_after = next(
+            r["points"]
+            for r in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/standings").json()["standings"]
+            if r["club_id"] == "liverpool"
+        )
+        salah_after = next(
+            p["inherited"]["goals"]
+            for p in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
+            if p["footballer_id"] == "liv-fwd-1"
+        )
+        assert liv_pts_after == liv_pts_before
+        assert salah_after == salah_before + 1
+
+        # Subsequent duplicate enrichment is parked
+        r_dup_enrich = c2.post(
+            f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/result",
+            json={
+                "fixture_id": "fix-r5-liv-che",
+                "home_goals": 2,
+                "away_goals": 0,
+                "events": [{"event_type": "Goal", "footballer_id": "liv-fwd-1", "minute": 55}],
+            },
+        )
+        assert r_dup_enrich.json()["decision"] == "parked"
+
+        # Enable dev reset with PSFC_ADMIN_TOKEN -> enforce token, 404 on unknown world, preserve independent world
+        monkeypatch.setenv("PSFC_ADMIN_TOKEN", "super-secret-admin")
+        app_dev = create_app(db_path=db_file, seed_demo=True, enable_demo_reset=True)
+        c_dev = TestClient(app_dev)
+
+        assert c_dev.post(f"/api/worlds/{DEFAULT_WORLD_ID}/reset-demo").status_code == 403
+        assert (
+            c_dev.post(
+                "/api/worlds/nonexistent-world/reset-demo",
+                headers={"X-Admin-Token": "super-secret-admin"},
+            ).status_code
+            == 404
+        )
+        assert (
+            c_dev.post(
+                "/api/worlds/world-independent/reset-demo",
+                headers={"X-Admin-Token": "super-secret-admin"},
+            ).status_code
+            == 403
+        )
+        r_reset_ok = c_dev.post(
+            f"/api/worlds/{DEFAULT_WORLD_ID}/reset-demo",
+            headers={"X-Admin-Token": "super-secret-admin"},
+        )
+        assert r_reset_ok.status_code == 200
+        worlds_after = {w["id"] for w in c_dev.get("/api/worlds").json()["worlds"]}
+        assert {"world-independent", DEFAULT_WORLD_ID}.issubset(worlds_after)
+        monkeypatch.delenv("PSFC_ADMIN_TOKEN", raising=False)
+
+    # 2. Unconditional FullTime requirement on `/complete` AND `awaiting_admin` session-opening guard!
+    app_mem = create_app(db_path=":memory:", seed_demo=True)
+    cm = TestClient(app_mem)
+
+    r_open = cm.post(
+        "/api/fixtures/fix-r4-mun-liv/sessions",
+        json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 180},
+    )
+    assert r_open.status_code == 200
+    sess_id = r_open.json()["session_id"]
+
+    # Attempting to bank a 0-0 unfinished match with `frames: []` and `require_finished: false` MUST fail (`422`)!
+    r_unfin = cm.post(
+        f"/api/sessions/{sess_id}/complete",
+        json={"actor_id": "part-alex", "frames": [], "require_finished": False},
+    )
+    assert r_unfin.status_code == 422
+    assert "FullTime" in r_unfin.json()["detail"]
+
+    # Expiring overdue window transitions `fix-r3-mun-ars` to `awaiting_admin` -> `open_session` MUST reject (`409`)!
+    cm.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
+        json={"as_of_utc": "2027-01-10T00:00:00Z"},
+    )
+    r_blocked = cm.post(
+        "/api/fixtures/fix-r3-mun-ars/sessions",
+        json={"actor_id": "part-alex", "format_name": "5v5"},
+    )
+    assert r_blocked.status_code == 409
+    assert "commissioner" in r_blocked.json()["detail"]
+
+

@@ -1090,3 +1090,61 @@ class WorldLedgerStore:
             }
             for r in rows
         }
+
+    def reset_world_for_demo(self, world_id: str) -> None:
+        """Delete records strictly scoped to `world_id` (and rolled-over child worlds) without touching other worlds."""
+        self.get_world(world_id)  # Raises KeyError if world_id does not exist
+
+        # Include any seasons rolled over directly from this demo world
+        target_worlds = [world_id]
+        queue = [world_id]
+        while queue:
+            curr = queue.pop(0)
+            children = self._conn.execute(
+                "SELECT id FROM world WHERE parent_world_id = ?",
+                (curr,),
+            ).fetchall()
+            for ch in children:
+                cid = str(ch["id"])
+                if cid not in target_worlds:
+                    target_worlds.append(cid)
+                    queue.append(cid)
+
+        placeholders = ",".join("?" for _ in target_worlds)
+        params = tuple(target_worlds)
+
+        self._conn.execute("DROP TRIGGER IF EXISTS trg_world_event_no_delete")
+        try:
+            self._conn.execute(
+                f"DELETE FROM match_input_log WHERE session_id IN (SELECT id FROM match_session WHERE world_id IN ({placeholders}))",
+                params,
+            )
+            self._conn.execute(f"DELETE FROM accepted_result WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM match_session WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(
+                f"DELETE FROM fixture_snapshot WHERE fixture_id IN (SELECT id FROM fixture WHERE world_id IN ({placeholders}))",
+                params,
+            )
+            self._conn.execute(f"DELETE FROM appointment WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM fixture WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM competition WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM club_assignment WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM club_lineup_5v5 WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM season_honour WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM cartridge_revision WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM identity_resolution_queue WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM import_proposal WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM world_event WHERE world_id IN ({placeholders})", params)
+            self._conn.execute(f"DELETE FROM world WHERE id IN ({placeholders})", params)
+        finally:
+            self._conn.execute(
+                """
+                CREATE TRIGGER IF NOT EXISTS trg_world_event_no_delete
+                BEFORE DELETE ON world_event
+                BEGIN
+                    SELECT RAISE(ABORT, 'world_event ledger is strictly append-only; deletion is forbidden');
+                END
+                """
+            )
+        self._conn.commit()
+

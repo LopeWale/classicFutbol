@@ -252,7 +252,7 @@ Because the real version of a replaced fixture is never ingested as `imported_ma
 
 1. Client → World API: `POST /worlds/{w}/assignments {club_id}`; host checks the club has no active assignment (unless shared control is enabled).
 2. Ingestion fetches club identity, history, current-season fixtures and results, squad, footballer profiles (background jobs; progress visible on the Create/Join page with coverage status per information area).
-3. **Proposal gate** applies each item: anything about a fixture the world already holds in `played` or `accepted` state is **parked** with reason `world_precedence`; everything else appends `imported_*` events.
+3. **Proposal gate** applies each item: anything about a fixture whose state is `in_session`, `played`, `accepted`, or `awaiting_admin`, or whose assigned `result_source ≠ imported`, is **parked** with reason `world_precedence`; everything else appends `imported_*` events.
 4. `takeover_snapshot_recorded` captures the as-of baseline (inherited totals, position, honours) and the `effective_from` instant.
 5. Competition engine builds the club's calendar; fixtures from `effective_from` onward get windows and result sources.
 6. Cartridge revision issued; cartridge manager writes profile and career view.
@@ -312,9 +312,9 @@ Single client; the CPU side's inputs are produced by the simulation's CPU contro
 
 ### 6.5 Background import of an unrepresented fixture
 
-1. Ingest job fetches results and events for `real_fixture`s whose linked `fixture.result_source = imported` and `state = open` and whose real match is finished.
+1. Ingest job fetches results and events for `real_fixture`s whose linked `fixture.result_source = imported` and `state = open` (or `state = accepted` with `source = imported` and incomplete player events) and whose real match is finished.
 2. Normalise identities; unresolved footballers → admin queue, fixture still accepted at score level with events marked `incomplete`.
-3. Proposal gate → `imported_result_accepted`, `imported_match_events_recorded(coverage)`.
+3. Proposal gate → `imported_result_accepted`, `imported_match_events_recorded(coverage)`. If an `imported` fixture was previously accepted at score level without player events, a subsequent import carrying the matching score and resolved events idempotently appends `imported_match_events_recorded(enriched=true)` once without duplicating score points, while continuing to park real-world events for any played fixture.
 4. Projections update; the fixture becomes `accepted`.
 
 ### 6.6 Cartridge synchronisation

@@ -318,6 +318,47 @@ class ClubCatalogue:
         dst.squad.append(joined)
         return joined
 
+    def replay_transfer_events(self, events: list[dict[str, Any]]) -> int:
+        """Replay persisted `imported_squad_membership_changed` ledger events onto this catalogue."""
+        applied = 0
+        for ev in events:
+            if ev.get("type") != "imported_squad_membership_changed":
+                continue
+            p = ev.get("payload") or {}
+            fid = p.get("footballer_id")
+            from_cid = p.get("from_club_id")
+            to_cid = p.get("to_club_id")
+            if not fid or not from_cid or not to_cid:
+                continue
+            if from_cid not in self.clubs or to_cid not in self.clubs:
+                continue
+            already_at_dest = any(
+                m.footballer_id == fid and m.effective_to is None
+                for m in self.clubs[to_cid].squad
+            )
+            still_at_src = any(
+                m.footballer_id == fid and m.effective_to is None
+                for m in self.clubs[from_cid].squad
+            )
+            if already_at_dest and not still_at_src:
+                continue
+            if still_at_src:
+                self.record_transfer(
+                    footballer_id=str(fid),
+                    from_club_id=str(from_cid),
+                    to_club_id=str(to_cid),
+                    occurred_at=str(p.get("effective_from") or ev.get("occurred_at") or "2026-08-01T00:00:00Z"),
+                    new_shirt=int(p.get("new_shirt", 99)),
+                )
+                applied += 1
+        return applied
+
+    def for_world(self, store: Any, world_id: str) -> ClubCatalogue:
+        """Build a world-scoped catalogue reconstructed from default squads + `world_id` transfer events."""
+        cat = ClubCatalogue()
+        cat.replay_transfer_events(store.list_events(world_id))
+        return cat
+
     def validate_5v5_selection(
         self,
         club_id: str,
