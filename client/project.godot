@@ -1,0 +1,26 @@
+; Engine configuration file.
+; Generated for classicFutbol — Parallel Season FC (Godot 4.3+)
+
+config_version=5
+
+[application]
+
+config/name="classicFutbol — Parallel Season FC"
+config/description="Real-time controller-driven 3D football (5v5 initial milestone, scalable to 11v11) with shared parallel season ledger"
+run/main_scene="res://scenes/Match5v5.tscn"
+config/features=PackedStringArray("4.3", "GL Compatibility")
+
+[display]
+
+window/size/viewport_width=1280
+window/size/viewport_height=720
+window/stretch/mode="canvas_items"
+
+[physics]
+
+common/physics_ticks_per_second=60
+
+[rendering]
+
+renderer/rendering_method="gl_compatibility"
+renderer/rendering_method.mobile="gl_compatibility"

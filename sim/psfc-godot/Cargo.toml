@@ -1,0 +1,16 @@
+[package]
+name = "psfc-godot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Godot 4 GDExtension bindings (gdext) exposing psfc-sim and psfc-rollback to GDScript"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+godot = { version = "0.5.5", features = ["api-4-3"] }
+psfc-sim = { path = "../psfc-sim" }
+psfc-rollback = { path = "../psfc-rollback" }
+serde.workspace = true
+serde_json.workspace = true

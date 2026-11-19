@@ -1,0 +1,102 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://classicfutbol.local/schemas/fixture_snapshot.schema.json",
+  "title": "FixtureSnapshot",
+  "description": "Frozen competitive match setup (MatchFormat 5v5 or 11v11, RuleSet, seed, and two TeamSnapshots) consumed identically by client and psfc-replay.",
+  "type": "object",
+  "required": ["fixture_id", "gameplay_version", "seed", "format", "rules", "home", "away"],
+  "properties": {
+    "fixture_id": { "type": "string" },
+    "gameplay_version": { "type": "string" },
+    "seed": { "type": "integer", "minimum": 0 },
+    "format": {
+      "type": "object",
+      "required": [
+        "name",
+        "players_per_side",
+        "pitch_length_mm",
+        "pitch_width_mm",
+        "goal_width_mm",
+        "goal_height_mm",
+        "penalty_box_depth_mm",
+        "penalty_box_width_mm",
+        "center_circle_radius_mm"
+      ],
+      "properties": {
+        "name": { "type": "string" },
+        "players_per_side": { "type": "integer", "minimum": 2, "maximum": 11 },
+        "pitch_length_mm": { "type": "integer", "minimum": 20000 },
+        "pitch_width_mm": { "type": "integer", "minimum": 15000 },
+        "goal_width_mm": { "type": "integer", "minimum": 2000 },
+        "goal_height_mm": { "type": "integer", "minimum": 1500 },
+        "penalty_box_depth_mm": { "type": "integer", "minimum": 4000 },
+        "penalty_box_width_mm": { "type": "integer", "minimum": 8000 },
+        "center_circle_radius_mm": { "type": "integer", "minimum": 2000 }
+      }
+    },
+    "rules": {
+      "type": "object",
+      "required": ["half_duration_ticks", "offsides_enabled", "fouls_enabled", "home_controller", "away_controller"],
+      "properties": {
+        "half_duration_ticks": { "type": "integer", "minimum": 60 },
+        "offsides_enabled": { "type": "boolean" },
+        "fouls_enabled": { "type": "boolean" },
+        "extra_time_enabled": { "type": "boolean", "default": false },
+        "home_controller": { "type": "string" },
+        "away_controller": { "type": "string" }
+      }
+    },
+    "home": { "$ref": "#/$defs/TeamSnapshot" },
+    "away": { "$ref": "#/$defs/TeamSnapshot" }
+  },
+  "$defs": {
+    "PlayerAttributes": {
+      "type": "object",
+      "required": [
+        "pace", "acceleration", "dribbling", "passing", "shooting",
+        "tackling", "positioning", "stamina", "strength", "goalkeeping"
+      ],
+      "properties": {
+        "pace": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "acceleration": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "dribbling": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "passing": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "shooting": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "tackling": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "positioning": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "stamina": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "strength": { "type": "integer", "minimum": 1, "maximum": 100 },
+        "goalkeeping": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "PlayerSnapshot": {
+      "type": "object",
+      "required": ["footballer_id", "name", "shirt_number", "role", "attributes"],
+      "properties": {
+        "footballer_id": { "type": "string" },
+        "name": { "type": "string" },
+        "shirt_number": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "role": { "type": "string", "enum": ["Goalkeeper", "Defender", "Midfielder", "Forward"] },
+        "attributes": { "$ref": "#/$defs/PlayerAttributes" }
+      }
+    },
+    "TeamSnapshot": {
+      "type": "object",
+      "required": ["club_id", "club_name", "short_name", "primary_color", "secondary_color", "formation", "starters"],
+      "properties": {
+        "club_id": { "type": "string" },
+        "club_name": { "type": "string" },
+        "short_name": { "type": "string" },
+        "primary_color": { "type": "string" },
+        "secondary_color": { "type": "string" },
+        "formation": { "type": "string" },
+        "starters": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/PlayerSnapshot" },
+          "minItems": 2,
+          "maxItems": 11
+        }
+      }
+    }
+  }
+}

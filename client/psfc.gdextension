@@ -1,0 +1,14 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.3
+reloadable = true
+
+[libraries]
+linux.debug.x86_64 = "res://../sim/target/debug/libpsfc_godot.so"
+linux.release.x86_64 = "res://../sim/target/release/libpsfc_godot.so"
+linux.debug.arm64 = "res://../sim/target/aarch64-unknown-linux-gnu/debug/libpsfc_godot.so"
+linux.release.arm64 = "res://../sim/target/aarch64-unknown-linux-gnu/release/libpsfc_godot.so"
+windows.debug.x86_64 = "res://../sim/target/debug/psfc_godot.dll"
+windows.release.x86_64 = "res://../sim/target/release/psfc_godot.dll"
+macos.debug = "res://../sim/target/debug/libpsfc_godot.dylib"
+macos.release = "res://../sim/target/release/libpsfc_godot.dylib"

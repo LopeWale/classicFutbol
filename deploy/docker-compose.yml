@@ -1,0 +1,53 @@
+services:
+  psfc-host:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.host
+    restart: unless-stopped
+    environment:
+      PSFC_DB_PATH: /data/psfc_world.db
+      PSFC_SIGNING_SECRET: ${PSFC_SIGNING_SECRET:-change-me-in-production}
+      PSFC_JWT_SECRET: ${PSFC_JWT_SECRET:-change-me-in-production}
+      POSTGRES_DSN: postgresql://psfc:${POSTGRES_PASSWORD:-psfc_local_dev}@postgres:5432/psfc
+    volumes:
+      - psfc_data:/data
+    ports:
+      - "27960:27960/udp"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: psfc
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-psfc_local_dev}
+      POSTGRES_DB: psfc
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./migrations/001_initial_postgres.sql:/docker-entrypoint-initdb.d/001_initial_postgres.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U psfc -d psfc"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  caddy:
+    image: caddy:2.8-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - psfc-host
+
+volumes:
+  psfc_data:
+  pg_data:
+  caddy_data:
+  caddy_config:

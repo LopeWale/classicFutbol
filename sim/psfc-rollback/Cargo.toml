@@ -1,0 +1,11 @@
+[package]
+name = "psfc-rollback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GGPO-style deterministic lockstep with rollback netcode for classicFutbol / Parallel Season FC"
+
+[dependencies]
+psfc-sim = { path = "../psfc-sim" }
+serde.workspace = true
+serde_json.workspace = true

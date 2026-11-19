@@ -1,0 +1,14 @@
+[package]
+name = "psfc-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe zero-bindgen WebAssembly C-ABI wrapper around psfc-sim for browser playtesting & cross-arch CI"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+psfc-sim = { path = "../psfc-sim" }
+serde.workspace = true
+serde_json.workspace = true

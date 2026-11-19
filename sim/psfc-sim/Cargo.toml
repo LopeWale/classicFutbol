@@ -1,0 +1,10 @@
+[package]
+name = "psfc-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic fixed-point football simulation core for classicFutbol / Parallel Season FC (5v5 and 11v11)"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
