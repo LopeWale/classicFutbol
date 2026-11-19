@@ -752,10 +752,10 @@
       targetZ = 0.65;
     } else {
       eyeX = camX;
-      eyeY = camY * 0.28 + (pitchWidM * 0.86 + 15.5);
-      eyeZ = pitchLenM > 80 ? 36.0 : 22.5;
+      eyeY = camY * 0.28 + (pitchWidM * 0.78 + 13.0);
+      eyeZ = pitchLenM > 80 ? 33.5 : 20.5;
       targetX = camX;
-      targetY = camY * 0.18 - 1.5;
+      targetY = camY * 0.18 - 1.2;
       targetZ = 0.0;
     }
 
@@ -778,7 +778,8 @@
     const uy = rz * fx - rx * fz;
     const uz = rx * fy - ry2 * fx;
 
-    const focal = H * 1.18;
+    const focal = H * 1.32;
+    const screenCenterY = orbitAngleRad !== null ? H * 0.52 : H * 0.43;
 
     return function project(wx, wy, wz) {
       const dx = wx - eyeX;
@@ -793,7 +794,7 @@
 
       return {
         x: W * 0.5 + cx * scale,
-        y: H * 0.52 - cy * scale,
+        y: screenCenterY - cy * scale,
         s: scale,
         depth,
       };
@@ -892,11 +893,22 @@
     const H = canvas.height;
 
     const sky = ctx.createLinearGradient(0, 0, 0, H);
-    sky.addColorStop(0, "#060b12");
-    sky.addColorStop(0.32, "#0b1814");
-    sky.addColorStop(1, "#091710");
+    sky.addColorStop(0, "#050912");
+    sky.addColorStop(0.26, "#0d1a28");
+    sky.addColorStop(0.45, "#0b1a15");
+    sky.addColorStop(1, "#08140e");
     ctx.fillStyle = sky;
     ctx.fillRect(0, 0, W, H);
+
+    // Subtle stadium floodlight cones in upper night sky
+    for (const lx of [W * 0.18, W * 0.82]) {
+      const glow = ctx.createRadialGradient(lx, H * 0.06, 4, lx, H * 0.08, W * 0.28);
+      glow.addColorStop(0, "rgba(224, 242, 254, 0.16)");
+      glow.addColorStop(0.45, "rgba(56, 189, 248, 0.05)");
+      glow.addColorStop(1, "rgba(6, 11, 18, 0)");
+      ctx.fillStyle = glow;
+      ctx.fillRect(0, 0, W, H * 0.45);
+    }
 
     if (!packed || !currentSnapshot) return;
 
@@ -924,6 +936,44 @@
     }
 
     const project = makeProjector(W, H, pitchLen, pitchWid, ballX, ballY, orbitAngleRad);
+
+    // Far-side stadium terrace tier & club supporter fascia
+    if (orbitAngleRad === null) {
+      poly3D(
+        project,
+        [
+          [-halfL - 5, -halfW - 4.5, 0],
+          [halfL + 5, -halfW - 4.5, 0],
+          [halfL + 7.5, -halfW - 12.0, 5.8],
+          [-halfL - 7.5, -halfW - 12.0, 5.8],
+        ],
+        "#0c1522",
+        "rgba(148, 163, 184, 0.22)",
+        1.2
+      );
+      line3D(
+        project,
+        -halfL - 5.2,
+        -halfW - 6.8,
+        1.8,
+        0,
+        -halfW - 6.8,
+        1.8,
+        currentSnapshot.home.primary_color,
+        2.4
+      );
+      line3D(
+        project,
+        0,
+        -halfW - 6.8,
+        1.8,
+        halfL + 5.2,
+        -halfW - 6.8,
+        1.8,
+        currentSnapshot.away.primary_color,
+        2.4
+      );
+    }
 
     poly3D(
       project,
