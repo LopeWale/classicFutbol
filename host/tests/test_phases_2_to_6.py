@@ -836,3 +836,66 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
     assert "commissioner" in r_blocked.json()["detail"]
 
 
+def test_codex_pr3_stale_saved_lineup_fallback_and_rollover_transfer_inheritance() -> None:
+    app = create_app(db_path=":memory:", seed_demo=True)
+    client = TestClient(app)
+
+    # [P2] Save Man Utd's default five, then transfer one of those starters away.
+    default_ids = ["mun-gk-1", "mun-def-1", "mun-mid-1", "mun-mid-2", "mun-fwd-1"]
+    r_save = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
+        json={"starter_ids": default_ids, "formation_5v5": "2-2", "actor_id": "part-alex"},
+    )
+    assert r_save.status_code == 200
+    r_tr = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/transfer",
+        json={"footballer_id": "mun-fwd-1", "from_club_id": "man-utd", "to_club_id": "chelsea", "new_shirt": 19},
+    )
+    assert r_tr.status_code == 200
+
+    # Displayed roster falls back to valid defaults (no mun-fwd-1) ...
+    roster = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/squad").json()["roster"]
+    assert "mun-fwd-1" not in roster["starter_ids_5v5"]
+
+    # ... and the official session still opens using the same fallback instead of erroring.
+    r_open = client.post(
+        "/api/fixtures/fix-r4-mun-liv/sessions",
+        json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 180},
+    )
+    assert r_open.status_code == 200, r_open.text
+
+    # Exhibition endpoint consumes the stale saved lineup gracefully too, keeping the saved formation.
+    r_exh = client.post(
+        "/api/exhibition/snapshot",
+        json={"world_id": DEFAULT_WORLD_ID, "home_club_id": "man-utd", "away_club_id": "chelsea"},
+    )
+    assert r_exh.status_code == 200, r_exh.text
+    snap = r_exh.json()["snapshot"]
+    home = snap["home"] if "home" in snap else snap["teams"][0]
+    home_ids = [p["footballer_id"] for p in home["starters"]]
+    assert "mun-fwd-1" not in home_ids
+    assert home["formation"] == "2-2"
+
+    # Explicit invalid overrides are still strictly rejected.
+    r_bad = client.post(
+        "/api/exhibition/snapshot",
+        json={
+            "world_id": DEFAULT_WORLD_ID,
+            "home_club_id": "man-utd",
+            "away_club_id": "chelsea",
+            "home_starters": default_ids,
+        },
+    )
+    assert r_bad.status_code == 422
+
+    # [P2] Rolling the season over preserves the parent world's transfers in the child world.
+    r_roll = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/rollover",
+        json={"next_season_label": "2027/28", "actor_id": "commissioner"},
+    )
+    assert r_roll.status_code == 200
+    child_id = r_roll.json()["next_world"]["id"]
+    che = client.get(f"/api/worlds/{child_id}/clubs/chelsea/squad").json()["roster"]["squad"]
+    mun = client.get(f"/api/worlds/{child_id}/clubs/man-utd/squad").json()["roster"]["squad"]
+    assert any(p["footballer_id"] == "mun-fwd-1" for p in che)
+    assert not any(p["footballer_id"] == "mun-fwd-1" for p in mun)

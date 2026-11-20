@@ -24,3 +24,8 @@ packages = ["psfc_host"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Vercel's Python runtime could not auto-detect the FastAPI app (it only checks
+# app.py / index.py / server.py style default locations), so point it explicitly.
+[tool.vercel]
+entrypoint = "psfc_host.api.app:app"

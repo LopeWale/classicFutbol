@@ -354,10 +354,51 @@ class ClubCatalogue:
         return applied
 
     def for_world(self, store: Any, world_id: str) -> ClubCatalogue:
-        """Build a world-scoped catalogue reconstructed from default squads + `world_id` transfer events."""
+        """Build a world-scoped catalogue from default squads + transfer events of the whole season lineage.
+
+        A rolled-over child world inherits its parent's squads, so transfers are replayed
+        root-ancestor first, then each descendant down to `world_id`.
+        """
+        lineage: list[str] = []
+        seen: set[str] = set()
+        current: str | None = world_id
+        while current and current not in seen:
+            seen.add(current)
+            lineage.append(current)
+            try:
+                current = store.get_world(current).get("parent_world_id")
+            except KeyError:
+                break
         cat = ClubCatalogue()
-        cat.replay_transfer_events(store.list_events(world_id))
+        for wid in reversed(lineage):
+            cat.replay_transfer_events(store.list_events(wid))
         return cat
+
+    def resolve_saved_5v5_selection(
+        self,
+        club_id: str,
+        saved: dict[str, Any] | None,
+    ) -> tuple[list[str] | None, str | None]:
+        """Resolve a persisted 5v5 lineup against the club's *current* active squad.
+
+        Returns `(starter_ids, formation)`. If a saved starter has since transferred away
+        (or the saved lineup is otherwise no longer valid), starters fall back to `None`
+        (club defaults) — matching what `get_club_roster` displays — while a still-valid
+        saved formation is kept. Explicit per-match overrides are NOT routed through here
+        and continue to be strictly validated.
+        """
+        if not saved:
+            return (None, None)
+        fmt = saved.get("formation_5v5")
+        fmt = fmt if fmt in SUPPORTED_5V5_FORMATIONS else None
+        ids = saved.get("starter_ids")
+        if not ids:
+            return (None, fmt)
+        try:
+            self.validate_5v5_selection(club_id, list(ids), fmt)
+        except (ValueError, KeyError):
+            return (None, fmt)
+        return (list(ids), fmt)
 
     def validate_5v5_selection(
         self,
