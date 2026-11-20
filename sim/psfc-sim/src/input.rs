@@ -52,6 +52,22 @@ impl InputFrame {
     }
 
     #[inline]
+    pub const fn encode_substitution(pitch_slot: u8, bench_idx: u8) -> u16 {
+        0x8000_u16 | (((pitch_slot as u16) & 0x1F) << 5) | ((bench_idx as u16) & 0x1F)
+    }
+
+    #[inline]
+    pub const fn decode_substitution(self) -> Option<(usize, usize)> {
+        if (self.reserved & 0x8000) == 0 {
+            None
+        } else {
+            let pitch_slot = ((self.reserved >> 5) & 0x1F) as usize;
+            let bench_idx = (self.reserved & 0x1F) as usize;
+            Some((pitch_slot, bench_idx))
+        }
+    }
+
+    #[inline]
     pub const fn to_bytes(self) -> [u8; 8] {
         let btns = self.buttons.to_le_bytes();
         let res = self.reserved.to_le_bytes();

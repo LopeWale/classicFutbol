@@ -395,6 +395,14 @@ impl Vec2 {
     }
 
     #[inline]
+    pub fn clamp_box(self, half_x: Fp, half_y: Fp) -> Self {
+        Self {
+            x: self.x.clamp(-half_x, half_x),
+            y: self.y.clamp(-half_y, half_y),
+        }
+    }
+
+    #[inline]
     pub const fn lerp(self, target: Self, t: Fp) -> Self {
         Self {
             x: self.x.lerp(target.x, t),
