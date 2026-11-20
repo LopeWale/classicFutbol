@@ -1,8 +1,8 @@
 //! Deterministic 60 Hz football simulation engine (`MatchSimulation`).
 
 use crate::ai::{
-    compute_goalkeeper_intent, compute_outfield_ai_intent, generate_cpu_input,
-    world_anchor_for_player,
+    best_ball_intercept_for_player, compute_goalkeeper_intent, compute_outfield_ai_intent,
+    generate_cpu_input, world_anchor_for_player,
 };
 use crate::config::{formation_anchors, SideController, TeamSide, TICKS_PER_SECOND};
 use crate::events::{MatchEvent, MatchEventType, PlayerMatchStats};
@@ -14,12 +14,13 @@ use crate::math::{angle_diff_bam, atan2_bam, turn_toward_bam, Fp, Vec2, Vec3};
 use crate::rng::DeterministicRng;
 use crate::snapshot::{FixtureSnapshot, PlayerRole};
 use crate::state::{
-    AssistCandidate, BallState, MatchPhase, MatchState, PassInFlight, PlayerActionState,
-    PlayerState, RestartKind,
+    AssistCandidate, BallState, BufferedAction, MatchPhase, MatchState, PassInFlight,
+    PlayerActionState, PlayerState, RestartKind,
 };
 
 const CHARGE_MASK: u16 = BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT;
 const MAX_CHARGE_TICKS: u16 = 28;
+const INPUT_BUFFER_TTL_TICKS: u8 = 16;
 
 #[derive(Debug, Clone)]
 pub struct SimError(pub String);
@@ -91,6 +92,7 @@ impl MatchSimulation {
                 half: 1,
                 score: [0, 0],
                 possession_ticks: [0, 0],
+                possession_balance_permille: 0,
                 phase: MatchPhase::KickOff {
                     team: TeamSide::Home,
                     wait_ticks: 0,
@@ -98,8 +100,11 @@ impl MatchSimulation {
                 controlled_idx: [default_ctrl_home, default_ctrl_away],
                 prev_buttons: [0, 0],
                 switch_cooldown: [0, 0],
+                input_buffer: [None, None],
+                subs_used: [0, 0],
                 players: [home_players, away_players],
                 player_stats: [home_stats, away_stats],
+                archived_player_stats: [Vec::new(), Vec::new()],
                 ball: BallState {
                     pos: Vec3::ZERO,
                     vel: Vec3::ZERO,
@@ -170,6 +175,13 @@ impl MatchSimulation {
 
         self.state.tick = self.state.tick.saturating_add(1);
 
+        // Execute any deterministic substitution encoded in `external_inputs[s].reserved`
+        for side in [TeamSide::Home, TeamSide::Away] {
+            if let Some((pitch_slot, bench_idx)) = external_inputs[side.index()].decode_substitution() {
+                self.apply_substitution(side, pitch_slot, bench_idx);
+            }
+        }
+
         let home_in = match self.state.rules.home_controller {
             SideController::Human => external_inputs[0],
             SideController::Cpu(diff) => generate_cpu_input(&self.state, TeamSide::Home, diff),
@@ -182,6 +194,16 @@ impl MatchSimulation {
 
         for c in &mut self.state.switch_cooldown {
             *c = c.saturating_sub(1);
+        }
+        for slot in &mut self.state.input_buffer {
+            if let Some(mut buf) = *slot {
+                if buf.ttl_ticks <= 1 {
+                    *slot = None;
+                } else {
+                    buf.ttl_ticks -= 1;
+                    *slot = Some(buf);
+                }
+            }
         }
 
         // Phase state machine before movement/ball
@@ -287,8 +309,8 @@ impl MatchSimulation {
                 let action_btns = side_in.buttons & CHARGE_MASK;
                 let just_pressed = action_btns != 0 && (prev & CHARGE_MASK) == 0;
 
-                // Allow slight aiming / teammate drifting while waiting
-                self.step_set_piece_movement(team, taker_idx, spot);
+                // Allow slight aiming / teammate drifting while maintaining FreeKick defensive wall
+                self.step_set_piece_movement(kind, team, taker_idx, spot);
 
                 if just_pressed || wait_ticks >= 180 {
                     let chosen_btn = if action_btns != 0 {
@@ -297,6 +319,23 @@ impl MatchSimulation {
                         match kind {
                             RestartKind::CornerKick => BTN_LOB,
                             RestartKind::PenaltyKick => BTN_SHOOT,
+                            RestartKind::FreeKick => {
+                                let attack_sign = team.attack_sign(self.state.second_half_swapped());
+                                let opp_goal = Vec2::new(
+                                    Fp::from_milli(attack_sign * self.state.format.half_length().to_milli()),
+                                    Fp::ZERO,
+                                );
+                                let shoot_range = if self.state.format.players_per_side <= 6 {
+                                    Fp::from_milli(16_500)
+                                } else {
+                                    Fp::from_milli(25_000)
+                                };
+                                if spot.dist(opp_goal) <= shoot_range {
+                                    BTN_SHOOT
+                                } else {
+                                    BTN_PASS
+                                }
+                            }
                             _ => BTN_PASS,
                         }
                     };
@@ -310,6 +349,15 @@ impl MatchSimulation {
                             };
                             Vec2::new(Fp::from_milli(-attack_sign * 200), y_inward).normalize_or_zero()
                         }
+                        RestartKind::FreeKick if chosen_btn == BTN_SHOOT => {
+                            let goal_x = Fp::from_milli(attack_sign * self.state.format.half_length().to_milli());
+                            let corner_y = if spot.y >= Fp::ZERO {
+                                -self.state.format.goal_half_width().mul(Fp::from_milli(580))
+                            } else {
+                                self.state.format.goal_half_width().mul(Fp::from_milli(580))
+                            };
+                            (Vec2::new(goal_x, corner_y) - spot).normalize_or_zero()
+                        }
                         _ => Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO),
                     };
                     let aim = if side_in.move_vec().len() > Fp::from_milli(150) {
@@ -321,9 +369,10 @@ impl MatchSimulation {
                     let charge = match kind {
                         RestartKind::PenaltyKick => 14,
                         RestartKind::CornerKick | RestartKind::GoalKick => 18,
+                        RestartKind::FreeKick if chosen_btn == BTN_SHOOT => 16,
                         _ => 11,
                     };
-                    self.execute_kick(team, taker_idx, chosen_btn, charge, false, aim);
+                    self.execute_kick(team, taker_idx, chosen_btn, charge, kind == RestartKind::FreeKick, aim);
                 } else {
                     self.state.phase = MatchPhase::SetPiece {
                         kind,
@@ -344,6 +393,17 @@ impl MatchSimulation {
         self.state.clock_ticks = self.state.clock_ticks.saturating_add(1);
         if let Some((owner_side, _)) = self.state.ball.owner {
             self.state.possession_ticks[owner_side.index()] += 1;
+            let target_bal = if owner_side == TeamSide::Home { 1_000 } else { -1_000 };
+            let diff = target_bal - self.state.possession_balance_permille;
+            self.state.possession_balance_permille += diff.clamp(-38, 38);
+        } else if let Some(ref pass) = self.state.ball.pass_in_flight {
+            let target_bal = if pass.team == TeamSide::Home { 850 } else { -850 };
+            let diff = target_bal - self.state.possession_balance_permille;
+            self.state.possession_balance_permille += diff.clamp(-24, 24);
+        } else {
+            // Loose ball: decay gently (~12 permille/tick) so teammates hold tactical shape during 50/50s!
+            let cur = self.state.possession_balance_permille;
+            self.state.possession_balance_permille -= cur.clamp(-12, 12);
         }
 
         // Update ticks_on_pitch stats
@@ -530,25 +590,28 @@ impl MatchSimulation {
         taker.facing_bam = if attack_sign > 0 { 0 } else { 32768 };
         self.state.controlled_idx[team.index()] = taker_idx;
 
-        // Enforce minimum opponent distance from restart spot
+        // Enforce minimum opponent distance from restart spot & arrange FreeKick defensive wall!
         let opp = team.opponent();
-        let min_dist = if self.state.format.players_per_side <= 6 {
+        let is_5v5 = self.state.format.players_per_side <= 6;
+        let min_dist = if is_5v5 {
             Fp::from_milli(4_500)
         } else {
             Fp::from_milli(9_150)
         };
+        let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
+        let opp_goal = Vec2::new(opp_goal_x, Fp::ZERO);
+
         if kind == RestartKind::PenaltyKick {
-            let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
             for (idx, p) in self.state.players[opp.index()].iter_mut().enumerate() {
                 if idx == 0 {
-                    p.pos = Vec2::new(opp_goal_x, Fp::ZERO);
+                    p.pos = opp_goal;
                 } else {
                     p.pos.x = spot.x - Fp::from_milli(attack_sign * 3_500);
                 }
             }
         } else {
             for (idx, p) in self.state.players[opp.index()].iter_mut().enumerate() {
-                if idx == 0 {
+                if idx == 0 || p.sent_off {
                     continue;
                 }
                 let d = p.pos.dist(spot);
@@ -561,6 +624,15 @@ impl MatchSimulation {
                     p.pos = spot + push_dir.scale(min_dist);
                 }
             }
+
+            // Form a shoulder-to-shoulder Defensive Wall on dangerous Free Kicks!
+            let wall_assignments = self.compute_free_kick_wall(kind, team, spot);
+            for (w_idx, w_pos, w_facing) in wall_assignments {
+                let p = &mut self.state.players[opp.index()][w_idx];
+                p.pos = w_pos;
+                p.facing_bam = w_facing;
+                p.vel = Vec2::ZERO;
+            }
         }
 
         self.state.phase = MatchPhase::SetPiece {
@@ -572,8 +644,83 @@ impl MatchSimulation {
         };
     }
 
-    fn step_set_piece_movement(&mut self, taking_team: TeamSide, taker_idx: usize, _spot: Vec2) {
+    fn compute_free_kick_wall(
+        &self,
+        kind: RestartKind,
+        taking_team: TeamSide,
+        spot: Vec2,
+    ) -> Vec<(usize, Vec2, u16)> {
+        if kind != RestartKind::FreeKick {
+            return Vec::new();
+        }
+        let is_5v5 = self.state.format.players_per_side <= 6;
+        let half_len = self.state.format.half_length();
+        let half_wid = self.state.format.half_width();
+        let attack_sign = taking_team.attack_sign(self.state.second_half_swapped());
+        let opp_goal = Vec2::new(Fp::from_milli(attack_sign * half_len.to_milli()), Fp::ZERO);
+        let dist_to_goal = spot.dist(opp_goal);
+        let max_wall_range = if is_5v5 {
+            Fp::from_milli(24_000)
+        } else {
+            Fp::from_milli(35_000)
+        };
+        if dist_to_goal > max_wall_range || dist_to_goal < Fp::from_milli(5_200) {
+            return Vec::new();
+        }
+
+        let min_dist = if is_5v5 {
+            Fp::from_milli(4_500)
+        } else {
+            Fp::from_milli(9_150)
+        };
+        let to_goal = (opp_goal - spot).normalize_or_zero();
+        let perp = Vec2::new(-to_goal.y, to_goal.x);
+        let wall_center = spot + to_goal.scale(min_dist);
+        let face_ball_bam = (spot - wall_center).to_bam();
+
+        let opp = taking_team.opponent();
+        let mut eligible: Vec<(i64, usize)> = self.state.players[opp.index()]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(_, p)| !p.sent_off)
+            .map(|(i, p)| (p.pos.dist(wall_center).to_milli(), i))
+            .collect();
+        eligible.sort_by_key(|&(d, i)| (d, i));
+
+        let wall_count = if is_5v5 {
+            2.min(eligible.len())
+        } else if spot.y.abs() > Fp::from_milli(14_000) {
+            3.min(eligible.len())
+        } else {
+            4.min(eligible.len())
+        };
+        if wall_count == 0 {
+            return Vec::new();
+        }
+
+        let spacing_mm = 580_i64;
+        let mut out = Vec::with_capacity(wall_count);
+        for (slot, &(_, idx)) in eligible.iter().take(wall_count).enumerate() {
+            let offset_mm = (slot as i64) * spacing_mm - ((wall_count as i64 - 1) * spacing_mm) / 2;
+            let w_pos = (wall_center + perp.scale(Fp::from_milli(offset_mm)))
+                .clamp_box(half_len - Fp::from_milli(600), half_wid - Fp::from_milli(600));
+            out.push((idx, w_pos, face_ball_bam));
+        }
+        out
+    }
+
+    fn step_set_piece_movement(
+        &mut self,
+        kind: RestartKind,
+        taking_team: TeamSide,
+        taker_idx: usize,
+        spot: Vec2,
+    ) {
         let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
+        let wall = self.compute_free_kick_wall(kind, taking_team, spot);
+        let opp = taking_team.opponent();
+
         for side in [TeamSide::Home, TeamSide::Away] {
             let count = self.state.players[side.index()].len();
             for idx in 0..count {
@@ -582,6 +729,15 @@ impl MatchSimulation {
                 }
                 if idx == 0 || self.state.players[side.index()][idx].sent_off {
                     continue;
+                }
+                if side == opp {
+                    if let Some(&(_, w_pos, w_facing)) = wall.iter().find(|&&(wi, _, _)| wi == idx) {
+                        let p = &mut self.state.players[side.index()][idx];
+                        p.pos = w_pos;
+                        p.facing_bam = w_facing;
+                        p.vel = Vec2::ZERO;
+                        continue;
+                    }
                 }
                 let anchor = world_anchor_for_player(&self.state, side, idx, Fp::ZERO);
                 let p = &mut self.state.players[side.index()][idx];
@@ -592,6 +748,75 @@ impl MatchSimulation {
                 }
             }
         }
+    }
+
+    pub fn apply_substitution(&mut self, side: TeamSide, pitch_slot: usize, bench_idx: usize) -> bool {
+        let s_idx = side.index();
+        if self.state.subs_used[s_idx] >= 5 {
+            return false;
+        }
+        if pitch_slot >= self.state.players[s_idx].len()
+            || bench_idx >= self.state.teams[s_idx].substitutes.len()
+        {
+            return false;
+        }
+        if self.state.players[s_idx][pitch_slot].sent_off {
+            return false;
+        }
+        let incoming = self.state.teams[s_idx].substitutes[bench_idx].clone();
+        let is_gk_slot = pitch_slot == 0;
+        if is_gk_slot != (incoming.role == PlayerRole::Goalkeeper) {
+            return false;
+        }
+
+        let outgoing_snap = self.state.teams[s_idx].starters[pitch_slot].clone();
+        let outgoing_name = self.state.players[s_idx][pitch_slot].name.clone();
+        let incoming_id = incoming.footballer_id.clone();
+        let incoming_name = incoming.name.clone();
+
+        // Archive outgoing player's stats (or restore if re-entering in rolling 5v5 exhibition!)
+        let outgoing_stats = core::mem::replace(
+            &mut self.state.player_stats[s_idx][pitch_slot],
+            PlayerMatchStats {
+                footballer_id: incoming.footballer_id.clone(),
+                name: incoming.name.clone(),
+                team: Some(side),
+                ..PlayerMatchStats::default()
+            },
+        );
+        if let Some(prev_pos) = self.state.archived_player_stats[s_idx]
+            .iter()
+            .position(|st| st.footballer_id == incoming.footballer_id)
+        {
+            self.state.player_stats[s_idx][pitch_slot] =
+                self.state.archived_player_stats[s_idx].swap_remove(prev_pos);
+        }
+        self.state.archived_player_stats[s_idx].push(outgoing_stats);
+
+        // Swap TeamSnapshot starters <-> substitutes so bench remains up to date
+        self.state.teams[s_idx].starters[pitch_slot] = incoming.clone();
+        self.state.teams[s_idx].substitutes[bench_idx] = outgoing_snap;
+
+        // Refresh pitch PlayerState with fresh legs (`1000` permille stamina) while preserving position & anchor
+        let p = &mut self.state.players[s_idx][pitch_slot];
+        p.footballer_id = incoming.footballer_id;
+        p.name = incoming.name;
+        p.shirt_number = incoming.shirt_number;
+        p.role = incoming.role;
+        p.attributes = incoming.attributes;
+        p.stamina_permille = 1_000;
+        p.yellow_cards = 0;
+
+        self.state.subs_used[s_idx] += 1;
+
+        self.emit_event(
+            MatchEventType::Substitution,
+            side,
+            Some(incoming_id),
+            None,
+            format!("SUB: {incoming_name} ON for {outgoing_name}"),
+        );
+        true
     }
 
     fn step_celebration_drift(&mut self) {
@@ -631,14 +856,14 @@ impl MatchSimulation {
                 }
                 align.mul(Fp::from_int(22)) - dist.mul(Fp::from_milli(320))
             } else {
-                let d_ball = p.pos.dist(ball_xy);
+                let (_, intercept_ticks) = best_ball_intercept_for_player(&self.state, side, idx);
                 let rel_ball = (p.pos - ball_xy).normalize_or_zero();
                 let goal_side_bonus = if rel_ball.dot(to_own_goal) > Fp::from_milli(150) {
-                    Fp::from_milli(1_450)
+                    Fp::from_milli(1_950)
                 } else {
                     Fp::ZERO
                 };
-                -d_ball + goal_side_bonus
+                -Fp::from_milli((intercept_ticks as i64) * 145) + goal_side_bonus
             };
 
             if score > best_score {
@@ -712,10 +937,38 @@ impl MatchSimulation {
                 let current_tick = self.state.tick;
                 let side_attack_sign = side.attack_sign(self.state.second_half_swapped());
                 let ball_xy_now = self.state.ball.pos.xy();
+                let ball_z_now = self.state.ball.pos.z;
+                let ball_is_loose = self.state.ball.owner.is_none();
+                let own_team_receiving = ball_is_loose
+                    && (self.state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side)
+                        || self.state.ball.last_touch_team == Some(side));
+                let is_open_play = matches!(self.state.phase, MatchPhase::OpenPlay);
                 let mut kick_to_execute: Option<(u16, u16, bool, Vec2)> = None;
                 let mut skill_move_triggered: Option<(String, String, u8)> = None;
+                let mut new_buffered: Option<BufferedAction> = None;
                 {
                     let p = &mut self.state.players[s_idx][idx];
+
+                    // Step vertical jump kinematics (`p.z`, `p.vz`) for aerial headers & volleys!
+                    if p.z > Fp::ZERO || p.vz != Fp::ZERO {
+                        p.z += p.vz.mul(dt);
+                        p.vz -= Fp::from_milli(9_810).mul(dt);
+                        if p.z <= Fp::ZERO {
+                            p.z = Fp::ZERO;
+                            p.vz = Fp::ZERO;
+                        }
+                    } else if is_open_play
+                        && ball_is_loose
+                        && !is_gk
+                        && p.can_control_ball()
+                        && ball_z_now >= Fp::from_milli(1_180)
+                        && ball_z_now <= Fp::from_milli(2_450)
+                        && p.pos.dist(ball_xy_now) <= Fp::from_milli(2_350)
+                    {
+                        // Athletic leap to contest aerial cross / corner header!
+                        let jump_boost = 3_280 + (p.attributes.strength as i64) * 3;
+                        p.vz = Fp::from_milli(jump_boost);
+                    }
 
                     // Tick down temporary action states
                     match p.action {
@@ -831,13 +1084,14 @@ impl MatchSimulation {
                             if (is_controlled || gk_human_distribute)
                                 && matches!(p.action, PlayerActionState::Normal)
                             {
+                                let pressed_kick = side_input.buttons & CHARGE_MASK;
+                                let kick_rising = pressed_kick != 0 && (prev_btns & CHARGE_MASK) == 0;
                                 if has_ball {
-                                    let pressed_kick = side_input.buttons & CHARGE_MASK;
                                     let skill_rising =
                                         side_input.pressed(BTN_SKILL) && (prev_btns & BTN_SKILL) == 0;
                                     let rstick_flick =
                                         !is_gk && side_input.aim_vec().len() > Fp::from_milli(680);
-                                    if pressed_kick != 0 && (prev_btns & CHARGE_MASK) == 0 {
+                                    if kick_rising {
                                         // Pick highest-priority single button bit
                                         let single_btn = if (pressed_kick & BTN_SHOOT) != 0 {
                                             BTN_SHOOT
@@ -883,24 +1137,58 @@ impl MatchSimulation {
                                         ));
                                     }
                                 } else if !is_gk {
-                                    // Defending tackle / slide triggers
-                                    let tackle_rising =
-                                        side_input.pressed(BTN_TACKLE) && (prev_btns & BTN_TACKLE) == 0;
-                                    let slide_rising =
-                                        side_input.pressed(BTN_SLIDE) && (prev_btns & BTN_SLIDE) == 0;
-                                    if slide_rising {
-                                        let dir = if side_input.move_vec().len() > Fp::from_milli(150) {
-                                            side_input.move_vec().normalize_or_zero()
+                                    // Pre-contact Input Buffering (`~266ms` lookahead):
+                                    // When a pass is arriving from a teammate (or player explicitly presses Shoot/Through
+                                    // on a loose ball), buffer a crisp First-Time One-Touch Pass/Volley instead of lunging!
+                                    let explicit_first_time =
+                                        (pressed_kick & (BTN_SHOOT | BTN_THROUGH)) != 0;
+                                    if kick_rising
+                                        && ball_is_loose
+                                        && (own_team_receiving || explicit_first_time)
+                                        && p.pos.dist(ball_xy_now) <= Fp::from_milli(8_500)
+                                    {
+                                        let single_btn = if (pressed_kick & BTN_SHOOT) != 0 {
+                                            BTN_SHOOT
+                                        } else if (pressed_kick & BTN_LOB) != 0 {
+                                            BTN_LOB
+                                        } else if (pressed_kick & BTN_THROUGH) != 0 {
+                                            BTN_THROUGH
                                         } else {
-                                            Vec2::from_bam(p.facing_bam, Fp::ONE)
+                                            BTN_PASS
                                         };
-                                        p.facing_bam = dir.to_bam();
-                                        p.action = PlayerActionState::Sliding {
-                                            ticks_left: 20,
-                                            dir,
+                                        let init_aim = if side_input.aim_vec().len() > Fp::from_milli(150) {
+                                            side_input.aim_vec()
+                                        } else if side_input.move_vec().len() > Fp::from_milli(120) {
+                                            side_input.move_vec()
+                                        } else {
+                                            Vec2::new(Fp::from_int(side_attack_sign as i32), Fp::ZERO)
                                         };
-                                    } else if tackle_rising {
-                                        p.action = PlayerActionState::Tackling { ticks_left: 12 };
+                                        new_buffered = Some(BufferedAction {
+                                            button: single_btn,
+                                            aim: init_aim,
+                                            finesse: side_input.pressed(BTN_JOCKEY),
+                                            ttl_ticks: INPUT_BUFFER_TTL_TICKS,
+                                        });
+                                    } else if !own_team_receiving {
+                                        // Defending tackle / slide triggers
+                                        let tackle_rising =
+                                            side_input.pressed(BTN_TACKLE) && (prev_btns & BTN_TACKLE) == 0;
+                                        let slide_rising =
+                                            side_input.pressed(BTN_SLIDE) && (prev_btns & BTN_SLIDE) == 0;
+                                        if slide_rising {
+                                            let dir = if side_input.move_vec().len() > Fp::from_milli(150) {
+                                                side_input.move_vec().normalize_or_zero()
+                                            } else {
+                                                Vec2::from_bam(p.facing_bam, Fp::ONE)
+                                            };
+                                            p.facing_bam = dir.to_bam();
+                                            p.action = PlayerActionState::Sliding {
+                                                ticks_left: 20,
+                                                dir,
+                                            };
+                                        } else if tackle_rising {
+                                            p.action = PlayerActionState::Tackling { ticks_left: 12 };
+                                        }
                                     }
                                 }
                             }
@@ -1039,6 +1327,10 @@ impl MatchSimulation {
                     let dyn_turn = (pivot_bam - (spd_mm * (pivot_bam - sprint_min_bam)) / 8_500)
                         .clamp(sprint_min_bam, pivot_bam) as u16;
                     p.facing_bam = turn_toward_bam(p.facing_bam, face_target, dyn_turn);
+                }
+
+                if let Some(buf) = new_buffered {
+                    self.state.input_buffer[s_idx] = Some(buf);
                 }
 
                 if let Some((fid, pname, kind)) = skill_move_triggered {
@@ -1756,6 +2048,7 @@ impl MatchSimulation {
             // Left & right vertical posts (tube center offset by 60mm so clear mouth = 2*goal_half_w)
             let post_center_y = goal_half_w + Fp::from_milli(60);
             let bar_center_z = goal_h + Fp::from_milli(60);
+            let mut hit_woodwork = false;
             if self.state.ball.pos.z <= bar_center_z + post_radius {
                 for post_y in [-post_center_y, post_center_y] {
                     let post_xy = Vec2::new(goal_x, post_y);
@@ -1774,6 +2067,7 @@ impl MatchSimulation {
                             self.state.ball.pos.x = pushed.x;
                             self.state.ball.pos.y = pushed.y;
                             self.state.ball.pass_in_flight = None;
+                            hit_woodwork = true;
                         }
                     }
                 }
@@ -1792,6 +2086,18 @@ impl MatchSimulation {
                     + Fp::from_milli(1_200);
                 self.state.ball.pos.x = goal_x - Fp::from_milli(sign * 200);
                 self.state.ball.pass_in_flight = None;
+                hit_woodwork = true;
+            }
+
+            if hit_woodwork {
+                let shoot_side = self.state.ball.last_touch_team.unwrap_or(TeamSide::Home);
+                self.emit_event(
+                    MatchEventType::Woodwork,
+                    shoot_side,
+                    None,
+                    None,
+                    "Rattles the woodwork!".to_string(),
+                );
             }
         }
     }
@@ -1831,7 +2137,7 @@ impl MatchSimulation {
                         Fp::from_milli(2_250),
                     )
                 } else {
-                    (Fp::from_milli(720), Fp::from_milli(1_550))
+                    (Fp::from_milli(720), Fp::from_milli(1_550) + p.z)
                 };
 
                 let dist = p.pos.dist(ball_xy);
@@ -1905,14 +2211,24 @@ impl MatchSimulation {
                 }
                 return;
             } else {
-                // Strong shot -> GK parries wide!
+                // Strong shot -> GK parries wide! Corner-bound shots are tipped past the post for a Corner Kick!
                 let parry_y_sign = if self.state.ball.pos.y >= Fp::ZERO {
                     Fp::ONE
                 } else {
                     Fp::NEG_ONE
                 };
-                let rebound_x = Fp::from_int(attack_sign as i32).mul(Fp::from_milli(5_200));
-                let rebound_y = parry_y_sign.mul(Fp::from_milli(9_500));
+                let tip_behind_for_corner = self.state.ball.pos.y.abs() > Fp::from_milli(920);
+                let (rebound_x, rebound_y) = if tip_behind_for_corner {
+                    (
+                        Fp::from_int(-attack_sign as i32).mul(Fp::from_milli(4_800)),
+                        parry_y_sign.mul(Fp::from_milli(16_200)),
+                    )
+                } else {
+                    (
+                        Fp::from_int(attack_sign as i32).mul(Fp::from_milli(5_200)),
+                        parry_y_sign.mul(Fp::from_milli(9_500)),
+                    )
+                };
                 self.state.ball.vel = Vec3::new(rebound_x, rebound_y, Fp::from_milli(1_800));
                 self.state.ball.last_touch_team = Some(side);
                 self.state.ball.last_touch_player = Some((side, 0));
@@ -1993,6 +2309,22 @@ impl MatchSimulation {
 
         if idx != 0 {
             self.state.controlled_idx[s_idx] = idx;
+        }
+
+        // Consume any pre-buffered command (`input_buffer`) for an instant First-Time One-Touch Pass / Volley!
+        if idx != 0 {
+            if let Some(buffered) = self.state.input_buffer[s_idx].take() {
+                self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 6 };
+                let one_touch_charge: u16 = if (buffered.button & BTN_SHOOT) != 0 { 13 } else { 9 };
+                self.execute_kick(
+                    side,
+                    idx,
+                    buffered.button,
+                    one_touch_charge,
+                    buffered.finesse,
+                    buffered.aim,
+                );
+            }
         }
     }
 
@@ -2781,6 +3113,78 @@ mod tests {
             sim.state().controlled_idx[1],
             1,
             "neutral defensive switch should prioritize goal-side defender"
+        );
+    }
+
+    #[test]
+    fn input_buffering_free_kick_wall_and_live_substitutions_are_deterministic() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2026_99);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+
+        let mut sim_a = MatchSimulation::new(&snap).expect("valid 5v5 snapshot");
+        let mut sim_b = MatchSimulation::new(&snap).expect("valid 5v5 snapshot");
+
+        // 1. Test Free-Kick Defensive Wall setup in shooting range (`+16m` toward Away goal `+28m`)
+        sim_a.setup_set_piece(RestartKind::FreeKick, TeamSide::Home, Vec2::from_milli(16_000, 1_500));
+        sim_b.setup_set_piece(RestartKind::FreeKick, TeamSide::Home, Vec2::from_milli(16_000, 1_500));
+        let wall_dists: Vec<i64> = sim_a.state().players[1]
+            .iter()
+            .skip(1)
+            .map(|p| p.pos.dist(Vec2::from_milli(16_000, 1_500)).to_milli())
+            .collect();
+        let at_wall_dist = wall_dists.iter().filter(|&&d| (4_350..=4_650).contains(&d)).count();
+        assert!(
+            at_wall_dist >= 2,
+            "5v5 direct free kick should form a 2-man defensive wall at 4.5m ({wall_dists:?})"
+        );
+
+        // 2. Test Deterministic Live Substitution via `InputFrame::encode_substitution`
+        sim_a.state.players[0][4].stamina_permille = 420;
+        sim_b.state.players[0][4].stamina_permille = 420;
+        let bench_player_id = sim_a.state().teams[0].substitutes[4].footballer_id.clone();
+        let sub_frame = InputFrame {
+            reserved: InputFrame::encode_substitution(4, 4),
+            ..InputFrame::IDLE
+        };
+        sim_a.tick(&[sub_frame, InputFrame::IDLE]);
+        sim_b.tick(&[sub_frame, InputFrame::IDLE]);
+        assert_eq!(sim_a.state().players[0][4].footballer_id, bench_player_id);
+        assert_eq!(sim_a.state().players[0][4].stamina_permille, 1_000);
+        assert_eq!(sim_a.state().subs_used[0], 1);
+        assert_eq!(sim_a.state_hash(), sim_b.state_hash());
+
+        // 3. Test Pre-Contact Input Buffering -> Crisp First-Time One-Touch Shot!
+        sim_a.state.phase = MatchPhase::OpenPlay;
+        sim_a.state.controlled_idx[0] = 4;
+        sim_a.state.players[0][4].pos = Vec2::from_milli(12_000, 0);
+        sim_a.state.players[0][4].vel = Vec2::ZERO;
+        sim_a.state.ball.owner = None;
+        sim_a.state.ball.last_touch_team = Some(TeamSide::Home);
+        sim_a.state.ball.pos = Vec3::from_milli(10_800, 0, 0); // 1.2m away (outside 0.72m trap radius!)
+        sim_a.state.ball.vel = Vec3::from_milli(14_000, 0, 0); // Rolling rapidly toward Home[4]
+
+        // Press Shoot BEFORE ball reaches Home[4]!
+        sim_a.tick(&[
+            InputFrame {
+                move_x: 127,
+                aim_x: 127,
+                buttons: BTN_SHOOT,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert!(
+            sim_a.state().input_buffer[0].is_some() || sim_a.state().player_stats[0][4].shots >= 1,
+            "pressing Shoot right before ball arrives must buffer or fire a first-time shot"
+        );
+        // Step 4 more ticks with buttons released: ball contacts Home[4] and fires one-touch shot!
+        for _ in 0..4 {
+            sim_a.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        }
+        assert!(
+            sim_a.state().player_stats[0][4].shots >= 1,
+            "buffered pre-contact BTN_SHOOT must execute a crisp first-time shot upon contact!"
         );
     }
 }

@@ -24,6 +24,8 @@ pub enum MatchEventType {
     Offside,
     SkillMove,
     Advantage,
+    Substitution,
+    Woodwork,
     ExtraTimeStart,
     PenaltyShootoutStart,
     ShootoutGoal,

@@ -302,7 +302,7 @@ function disposeObjectTree(root) {
     const mats = Array.isArray(obj.material) ? obj.material : obj.material ? [obj.material] : [];
     for (const mat of mats) {
       if (RETAINED_GPU.has(mat)) continue;
-      for (const key of ["map", "emissiveMap", "alphaMap", "roughnessMap", "bumpMap"]) {
+      for (const key of ["map", "emissiveMap", "alphaMap", "roughnessMap", "bumpMap", "normalMap"]) {
         if (mat[key] && !RETAINED_GPU.has(mat[key])) {
           mat[key].dispose();
         }
@@ -985,6 +985,100 @@ function createFaceSkinTexture(skinHex, hairHex, hasBeard) {
   return tex;
 }
 
+/**
+ * Procedural 3-blade tapered 3D grass tuft geometry for GPU InstancedMesh turf detail (`IMG_0364`, `IMG_0366`).
+ */
+function createGrassTuftGeometry() {
+  const positions = [];
+  const normals = [];
+  const uvs = [];
+  const blades = [
+    { ox: 0.0, oz: 0.0, yaw: 0.0, lean: 0.015, h: 0.046, w: 0.0075 },
+    { ox: -0.014, oz: 0.011, yaw: 1.95, lean: 0.019, h: 0.04, w: 0.0068 },
+    { ox: 0.013, oz: -0.012, yaw: -2.05, lean: 0.017, h: 0.043, w: 0.007 },
+  ];
+  const pushTriBothSides = (ax, ay, az, bx, by, bz, cx, cy, cz, nx, ny, nz) => {
+    positions.push(ax, ay, az, bx, by, bz, cx, cy, cz);
+    positions.push(ax, ay, az, cx, cy, cz, bx, by, bz);
+    for (let k = 0; k < 6; k++) {
+      normals.push(nx, ny, nz);
+      uvs.push(0.5, 0.5);
+    }
+  };
+  for (const b of blades) {
+    const c = Math.cos(b.yaw);
+    const s = Math.sin(b.yaw);
+    const lx = -b.w * c;
+    const lz = -b.w * s;
+    const rx = b.w * c;
+    const rz = b.w * s;
+    const tx = b.ox + s * b.lean;
+    const tz = b.oz + c * b.lean;
+    const mxL = b.ox + lx * 0.58 + s * b.lean * 0.42;
+    const mzL = b.oz + lz * 0.58 + c * b.lean * 0.42;
+    const mxR = b.ox + rx * 0.58 + s * b.lean * 0.42;
+    const mzR = b.oz + rz * 0.58 + c * b.lean * 0.42;
+    const my = b.h * 0.52;
+    const nx = s * 0.16;
+    const ny = 0.97;
+    const nz = c * 0.16;
+
+    pushTriBothSides(b.ox + lx, 0, b.oz + lz, b.ox + rx, 0, b.oz + rz, mxR, my, mzR, nx, ny, nz);
+    pushTriBothSides(b.ox + lx, 0, b.oz + lz, mxR, my, mzR, mxL, my, mzL, nx, ny, nz);
+    pushTriBothSides(mxL, my, mzL, mxR, my, mzR, tx, b.h, tz, nx, ny, nz);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute("normal", new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute("uv", new THREE.Float32BufferAttribute(uvs, 2));
+  return geo;
+}
+
+/**
+ * Singleton Tangent-Space Cloth Weave & Tension Wrinkle Normal Map (`256x256`)
+ * Gives SkinnedMesh jerseys, sleeves & shorts realistic EA FIFA 10–12 fabric folds under floodlights!
+ */
+const SHARED_CLOTH_NORMAL = (() => {
+  const S = 256;
+  const data = new Uint8Array(S * S * 4);
+  const heightAt = (u, v) => {
+    // Diagonal athletic chest/underarm & waist tension creases + fine polyester piqué weave
+    const fold1 = Math.sin((u * 3.2 + v * 5.8) * Math.PI * 2) * Math.exp(-Math.pow((v - 0.38) * 3.4, 2)) * 0.45;
+    const fold2 = Math.sin((u * -3.0 + v * 6.2) * Math.PI * 2) * Math.exp(-Math.pow((v - 0.68) * 3.6, 2)) * 0.42;
+    const hemFold = Math.sin(u * 9.0 * Math.PI * 2) * Math.exp(-Math.pow((v - 0.88) * 6.0, 2)) * 0.32;
+    const weave = (Math.sin(u * 64 * Math.PI * 2) * Math.cos(v * 64 * Math.PI * 2)) * 0.08;
+    const organic = seededNoise2D(u * 10.5 + 3.1, v * 12.5 - 1.7) * 0.22;
+    return fold1 + fold2 + hemFold + weave + organic;
+  };
+  const eps = 1 / S;
+  const strength = 2.1;
+  for (let y = 0; y < S; y++) {
+    const v = y / S;
+    for (let x = 0; x < S; x++) {
+      const u = x / S;
+      const dhdu = (heightAt(u + eps, v) - heightAt(u - eps, v)) * strength;
+      const dhdv = (heightAt(u, v + eps) - heightAt(u, v - eps)) * strength;
+      let nx = -dhdu;
+      let ny = -dhdv;
+      let nz = 1.0;
+      const invL = 1.0 / Math.hypot(nx, ny, nz);
+      nx *= invL;
+      ny *= invL;
+      nz *= invL;
+      const idx = (y * S + x) * 4;
+      data[idx] = Math.round((nx * 0.5 + 0.5) * 255);
+      data[idx + 1] = Math.round((ny * 0.5 + 0.5) * 255);
+      data[idx + 2] = Math.round((nz * 0.5 + 0.5) * 255);
+      data[idx + 3] = 255;
+    }
+  }
+  const tex = new THREE.DataTexture(data, S, S, THREE.RGBAFormat);
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.needsUpdate = true;
+  return retainGpu(tex);
+})();
+
 // --- Singleton Shared Geometries ---
 
 const SHARED_GEO = (() => {
@@ -997,10 +1091,13 @@ const SHARED_GEO = (() => {
   const bootStripe = retainGpu(new THREE.BoxGeometry(0.092, 0.022, 0.084));
   const stud = retainGpu(new THREE.CylinderGeometry(0.007, 0.005, 0.014, 6));
 
-  const hand = retainGpu(new THREE.SphereGeometry(0.04, 10, 8));
-  hand.scale(0.84, 1.18, 0.66);
-  const gkGlove = retainGpu(new THREE.SphereGeometry(0.06, 12, 10));
-  gkGlove.scale(0.94, 1.28, 0.62);
+  const hand = retainGpu(new THREE.SphereGeometry(0.039, 10, 8));
+  hand.scale(0.84, 1.18, 0.64);
+  const wristTape = retainGpu(new THREE.CylinderGeometry(0.039, 0.038, 0.036, 12));
+  const gkGlove = retainGpu(new THREE.SphereGeometry(0.052, 12, 10));
+  gkGlove.scale(0.92, 1.12, 0.52);
+  const gkFinger = retainGpu(new THREE.CapsuleGeometry(0.0105, 0.038, 4, 6));
+  const gkCuff = retainGpu(new THREE.CylinderGeometry(0.044, 0.042, 0.042, 12));
 
   const neck = retainGpu(new THREE.CylinderGeometry(0.052, 0.064, 0.095, 12));
   const collar = retainGpu(new THREE.TorusGeometry(0.073, 0.015, 8, 18));
@@ -1021,6 +1118,7 @@ const SHARED_GEO = (() => {
   cursorCone.rotateX(Math.PI);
   const shadowDisc = retainGpu(new THREE.CircleGeometry(0.48, 20));
   shadowDisc.rotateX(-Math.PI * 0.5);
+  const grassTuft = retainGpu(createGrassTuftGeometry());
 
   return {
     skinnedTorso,
@@ -1031,7 +1129,10 @@ const SHARED_GEO = (() => {
     bootStripe,
     stud,
     hand,
+    wristTape,
     gkGlove,
+    gkFinger,
+    gkCuff,
     neck,
     collar,
     head,
@@ -1042,24 +1143,39 @@ const SHARED_GEO = (() => {
     aimArrow,
     cursorCone,
     shadowDisc,
+    grassTuft,
   };
 })();
 
 // ============================================================================
-// 3. STADIUM, SIMPLEX-NOISE TURF & TANGO 12 MATCH BALL TEXTURE BUILDERS
+// 3. WEATHER SKIES, PBR TURF MAPS, STADIUM JUMBOTRON & KIT TEXTURE BUILDERS
 // ============================================================================
 
-function createSkyTexture() {
+function createSkyTexture(mode = "night") {
   const c = document.createElement("canvas");
   c.width = 64;
   c.height = 512;
   const g = c.getContext("2d");
   const grad = g.createLinearGradient(0, 0, 0, 512);
-  grad.addColorStop(0.0, "#030712");
-  grad.addColorStop(0.32, "#0a162c");
-  grad.addColorStop(0.54, "#152c4e");
-  grad.addColorStop(0.72, "#1e3a5f");
-  grad.addColorStop(1.0, "#0b1914");
+  if (mode === "day") {
+    grad.addColorStop(0.0, "#1d4ed8");
+    grad.addColorStop(0.28, "#3b82f6");
+    grad.addColorStop(0.52, "#7dd3fc");
+    grad.addColorStop(0.72, "#bae6fd");
+    grad.addColorStop(1.0, "#dbeafe");
+  } else if (mode === "rain") {
+    grad.addColorStop(0.0, "#050b16");
+    grad.addColorStop(0.32, "#0f1e33");
+    grad.addColorStop(0.56, "#1e3048");
+    grad.addColorStop(0.76, "#283c54");
+    grad.addColorStop(1.0, "#12212b");
+  } else {
+    grad.addColorStop(0.0, "#030712");
+    grad.addColorStop(0.32, "#0a162c");
+    grad.addColorStop(0.54, "#152c4e");
+    grad.addColorStop(0.72, "#1e3a5f");
+    grad.addColorStop(1.0, "#0b1914");
+  }
   g.fillStyle = grad;
   g.fillRect(0, 0, 64, 512);
   const tex = new THREE.CanvasTexture(c);
@@ -1067,7 +1183,19 @@ function createSkyTexture() {
   return retainGpu(tex);
 }
 
-function createPitchTexture(pitchLen, pitchWid, fmt, maxAnisotropy) {
+const SKY_TEXTURES = {
+  night: createSkyTexture("night"),
+  day: createSkyTexture("day"),
+  rain: createSkyTexture("rain"),
+};
+
+/**
+ * Generates coordinated PBR Turf `map`, `normalMap`, and `roughnessMap` (`IMG_0350`, `IMG_0354`, `IMG_0366`):
+ * - Authentic Premier League botanical olive-emerald cross-mowed checkerboard grass
+ * - Tangent-space micro-blade normal relief
+ * - Directional mower-stripe & worn-box roughness map (enables realistic wet-pitch floodlight sheen!)
+ */
+function createPitchPbrMaps(pitchLen, pitchWid, fmt, maxAnisotropy) {
   const marginX = 5.5;
   const marginZ = 5.0;
   const totalW = pitchLen + marginX * 2;
@@ -1080,12 +1208,21 @@ function createPitchTexture(pitchLen, pitchWid, fmt, maxAnisotropy) {
   c.height = H;
   const ctx = c.getContext("2d");
 
+  // Roughness canvas (`#000000` = mirror wet, `#ffffff` = matte dry)
+  const rCanvas = document.createElement("canvas");
+  rCanvas.width = 512;
+  rCanvas.height = 320;
+  const rCtx = rCanvas.getContext("2d");
+  rCtx.fillStyle = "#d4d4d4";
+  rCtx.fillRect(0, 0, 512, 320);
+
   const pxX = (wx) => ((wx + totalW * 0.5) / totalW) * W;
   const pxZ = (wz) => ((wz + totalH * 0.5) / totalH) * H;
   const scaleX = W / totalW;
   const scaleZ = H / totalH;
 
-  ctx.fillStyle = "#14532d";
+  // Outer pitch apron in rich deep stadium turf olive
+  ctx.fillStyle = "#26581c";
   ctx.fillRect(0, 0, W, H);
 
   const halfL = pitchLen * 0.5;
@@ -1095,58 +1232,75 @@ function createPitchTexture(pitchLen, pitchWid, fmt, maxAnisotropy) {
   const pW = pitchLen * scaleX;
   const pH = pitchWid * scaleZ;
 
-  // Classic EA FIFA 10–12 lush emerald lawn-mower stripes
+  // Classic EA FIFA 10–12 botanical olive-emerald vertical mower stripes (`IMG_0350.webp`!)
   const stripeCount = pitchLen > 80 ? 18 : 12;
   const stripeM = pitchLen / stripeCount;
   for (let i = 0; i < stripeCount; i++) {
     const x0 = pxX(-halfL + i * stripeM);
     const x1 = pxX(-halfL + (i + 1) * stripeM);
-    ctx.fillStyle = i % 2 === 0 ? "#1f803d" : "#269448";
+    ctx.fillStyle = i % 2 === 0 ? "#317023" : "#3b802b";
     ctx.fillRect(x0, pTop, x1 - x0 + 0.8, pH);
+
+    // Alternating blade-lay roughness in PBR roughnessMap
+    rCtx.fillStyle = i % 2 === 0 ? "#bcbcbc" : "#d8d8d8";
+    rCtx.fillRect(x0 * 0.25, pTop * 0.25, (x1 - x0) * 0.25 + 0.5, pH * 0.25);
   }
 
+  // Subtle horizontal cross-cut checkerboard bands (`IMG_0350.webp`!)
   const crossRows = pitchWid > 50 ? 10 : 6;
   const rowH = pH / crossRows;
   for (let r = 0; r < crossRows; r++) {
-    if (r % 2 === 0) {
-      ctx.fillStyle = "rgba(255, 255, 255, 0.028)";
-      ctx.fillRect(pLeft, pTop + r * rowH, pW, rowH);
-    }
+    ctx.fillStyle = r % 2 === 0 ? "rgba(255, 255, 220, 0.036)" : "rgba(10, 32, 8, 0.032)";
+    ctx.fillRect(pLeft, pTop + r * rowH, pW, rowH);
   }
 
-  // Multi-octave Simplex Noise organic turf variation (eliminates flat digital green!)
-  const cell = 16;
+  // Multi-octave Simplex Noise organic turf grain & fine grass blade stippling
+  const cell = 12;
   for (let py = 0; py < H; py += cell) {
     for (let px = 0; px < W; px += cell) {
-      const n1 = seededNoise2D(px * 0.006, py * 0.006);
-      const n2 = seededNoise2D(px * 0.024 + 19.3, py * 0.024 - 7.1) * 0.5;
+      const n1 = seededNoise2D(px * 0.007, py * 0.007);
+      const n2 = seededNoise2D(px * 0.028 + 19.3, py * 0.028 - 7.1) * 0.55;
       const v = n1 + n2;
-      if (Math.abs(v) > 0.15) {
+      if (Math.abs(v) > 0.12) {
         ctx.fillStyle =
           v > 0
-            ? `rgba(187, 247, 208, ${(v * 0.032).toFixed(3)})`
-            : `rgba(5, 46, 22, ${(-v * 0.045).toFixed(3)})`;
+            ? `rgba(210, 245, 175, ${(v * 0.036).toFixed(3)})`
+            : `rgba(14, 42, 10, ${(-v * 0.05).toFixed(3)})`;
         ctx.fillRect(px, py, cell, cell);
       }
     }
   }
 
-  // Goal-mouth & center-circle turf wear
-  for (const sign of [-1, 1]) {
-    const gx = pxX(sign * (halfL - 1.2));
-    const gy = pxZ(0);
-    const wear = ctx.createRadialGradient(gx, gy, 4, gx, gy, scaleX * 3.4);
-    wear.addColorStop(0, "rgba(120, 92, 48, 0.16)");
-    wear.addColorStop(1, "rgba(120, 92, 48, 0)");
+  // Goal-mouth, six-yard & center-spot earth/wear patches (lower roughness when damp!)
+  for (const [wx, wz, radM, alpha] of [
+    [-halfL + 1.4, 0, 3.8, 0.22],
+    [halfL - 1.4, 0, 3.8, 0.22],
+    [0, 0, 2.8, 0.10],
+  ]) {
+    const gx = pxX(wx);
+    const gy = pxZ(wz);
+    const rPx = scaleX * radM;
+    const wear = ctx.createRadialGradient(gx, gy, 3, gx, gy, rPx);
+    wear.addColorStop(0, `rgba(112, 86, 46, ${alpha})`);
+    wear.addColorStop(0.55, `rgba(96, 76, 40, ${(alpha * 0.45).toFixed(3)})`);
+    wear.addColorStop(1, "rgba(96, 76, 40, 0)");
     ctx.fillStyle = wear;
     ctx.beginPath();
-    ctx.arc(gx, gy, scaleX * 3.4, 0, Math.PI * 2);
+    ctx.arc(gx, gy, rPx, 0, Math.PI * 2);
     ctx.fill();
+
+    const rWear = rCtx.createRadialGradient(gx * 0.25, gy * 0.25, 2, gx * 0.25, gy * 0.25, rPx * 0.25);
+    rWear.addColorStop(0, "rgba(110, 110, 110, 0.65)");
+    rWear.addColorStop(1, "rgba(110, 110, 110, 0)");
+    rCtx.fillStyle = rWear;
+    rCtx.beginPath();
+    rCtx.arc(gx * 0.25, gy * 0.25, rPx * 0.25, 0, Math.PI * 2);
+    rCtx.fill();
   }
 
   const linePx = Math.max(4.4, scaleX * 0.135);
-  ctx.strokeStyle = "rgba(248, 250, 252, 0.95)";
-  ctx.fillStyle = "rgba(248, 250, 252, 0.96)";
+  ctx.strokeStyle = "rgba(248, 250, 252, 0.94)";
+  ctx.fillStyle = "rgba(248, 250, 252, 0.95)";
   ctx.lineWidth = linePx;
   ctx.lineJoin = "miter";
 
@@ -1237,10 +1391,37 @@ function createPitchTexture(pitchLen, pitchWid, fmt, maxAnisotropy) {
   }
   ctx.setLineDash([]);
 
+  // Tileable high-frequency Tangent-Space Grass Blade Normal Map (`256x256` repeated across turf)
+  const NS = 256;
+  const nData = new Uint8Array(NS * NS * 4);
+  for (let y = 0; y < NS; y++) {
+    for (let x = 0; x < NS; x++) {
+      const g1 = seededNoise2D(x * 0.32, y * 0.32);
+      const g2 = seededNoise2D(x * 0.78 + 41.2, y * 0.78 - 13.7);
+      let nx = g1 * 0.36 + g2 * 0.22;
+      let ny = g2 * 0.36 - g1 * 0.18;
+      let nz = 1.0;
+      const inv = 1.0 / Math.hypot(nx, ny, nz);
+      const idx = (y * NS + x) * 4;
+      nData[idx] = Math.round(((nx * inv) * 0.5 + 0.5) * 255);
+      nData[idx + 1] = Math.round(((ny * inv) * 0.5 + 0.5) * 255);
+      nData[idx + 2] = Math.round(((nz * inv) * 0.5 + 0.5) * 255);
+      nData[idx + 3] = 255;
+    }
+  }
+  const normalMap = new THREE.DataTexture(nData, NS, NS, THREE.RGBAFormat);
+  normalMap.wrapS = THREE.RepeatWrapping;
+  normalMap.wrapT = THREE.RepeatWrapping;
+  normalMap.repeat.set(Math.round(totalW * 0.85), Math.round(totalH * 0.85));
+  normalMap.needsUpdate = true;
+
+  const roughnessMap = new THREE.CanvasTexture(rCanvas);
+  roughnessMap.anisotropy = maxAnisotropy || 4;
+
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.anisotropy = maxAnisotropy || 4;
-  return { tex, totalW, totalH };
+  return { tex, normalMap, roughnessMap, totalW, totalH };
 }
 
 function createGoalNetTexture() {
@@ -1249,9 +1430,9 @@ function createGoalNetTexture() {
   c.height = 128;
   const ctx = c.getContext("2d");
   ctx.clearRect(0, 0, 128, 128);
-  ctx.strokeStyle = "rgba(241, 245, 249, 0.78)";
-  ctx.lineWidth = 2.1;
-  for (let i = -128; i <= 256; i += 16) {
+  ctx.strokeStyle = "rgba(248, 250, 252, 0.86)";
+  ctx.lineWidth = 2.2;
+  for (let i = -128; i <= 256; i += 14) {
     ctx.beginPath();
     ctx.moveTo(i, 0);
     ctx.lineTo(i + 128, 128);
@@ -1264,7 +1445,7 @@ function createGoalNetTexture() {
   const tex = new THREE.CanvasTexture(c);
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(8, 4);
+  tex.repeat.set(9, 4.5);
   return tex;
 }
 
@@ -1283,7 +1464,6 @@ function createMatchBallTexture() {
   ctx.fillStyle = "#f8fafc";
   ctx.fillRect(0, 0, W, H);
 
-  // High-contrast 2010–2012 Tango/Jabulani thermal triad arcs so ball rotation pops visually
   const triads = [
     [0.125, 0.28],
     [0.375, 0.24],
@@ -1299,7 +1479,6 @@ function createMatchBallTexture() {
     [0.875, 0.74],
   ];
 
-  // Gold & crimson championship accent rings
   ctx.strokeStyle = "#d97706";
   ctx.lineWidth = 5;
   for (let i = 0; i < triads.length; i += 2) {
@@ -1357,13 +1536,14 @@ function createAdboardTexture(homeName, awayName, homeColor, awayColor, homeBann
   c.height = H;
   const ctx = c.getContext("2d");
 
+  // Authentic EA FIFA 10–12 high-contrast pitchside sponsor & club boards (`IMG_0351`, `IMG_0354`, `IMG_0359`)
   const panels = [
-    { bg: "#09111f", accent: "#22c55e", text: "PARALLEL SEASON FC", sub: "OFFICIAL WORLD HOST" },
-    { bg: homeColor || "#c8102e", accent: "#ffffff", text: (homeName || "HOME").toUpperCase(), sub: homeBanner },
-    { bg: "#0f172a", accent: "#facc15", text: "CLASSIC FUTBOL 12", sub: "60HZ DETERMINISTIC ENGINE" },
-    { bg: awayColor || "#1d4ed8", accent: "#ffffff", text: (awayName || "AWAY").toUpperCase(), sub: awayBanner },
-    { bg: "#064e3b", accent: "#34d399", text: "5V5 ARENA & STADIUM", sub: "EVERY RESULT MATTERS" },
-    { bg: "#1e1b4b", accent: "#38bdf8", text: "PROFILE CARTRIDGE", sub: "VERIFIED REPLAY LOGS" },
+    { bg: "#f8fafc", fg: "#0f172a", accent: "#1d4ed8", text: "PARALLEL SEASON FC", sub: "OFFICIAL CHAMPIONSHIP" },
+    { bg: homeColor || "#c8102e", fg: "#ffffff", accent: "#facc15", text: (homeName || "HOME").toUpperCase(), sub: homeBanner },
+    { bg: "#fde047", fg: "#0f172a", accent: "#15803d", text: "RESPECT · FAIR PLAY", sub: "EVERY MATCH MATTERS" },
+    { bg: "#0f172a", fg: "#ffffff", accent: "#38bdf8", text: "CLASSIC FUTBOL 3D", sub: "60HZ DETERMINISTIC SIM" },
+    { bg: awayColor || "#1d4ed8", fg: "#ffffff", accent: "#ffffff", text: (awayName || "AWAY").toUpperCase(), sub: awayBanner },
+    { bg: "#f8fafc", fg: "#111827", accent: "#dc2626", text: "5V5 & 11V11 STADIUM", sub: "VERIFIED CARTRIDGE SYNC" },
   ];
 
   const pw = W / panels.length;
@@ -1372,19 +1552,19 @@ function createAdboardTexture(homeName, awayName, homeColor, awayColor, homeBann
     ctx.fillStyle = p.bg;
     ctx.fillRect(x, 0, pw, H);
     ctx.fillStyle = p.accent;
-    ctx.fillRect(x, 0, pw, 8);
-    ctx.fillRect(x, H - 6, pw, 6);
-    ctx.strokeStyle = "rgba(255,255,255,0.22)";
+    ctx.fillRect(x, 0, pw, 9);
+    ctx.fillRect(x, H - 7, pw, 7);
+    ctx.strokeStyle = "rgba(15,23,42,0.22)";
     ctx.lineWidth = 3;
     ctx.strokeRect(x + 2, 2, pw - 4, H - 4);
 
-    ctx.fillStyle = "#ffffff";
+    ctx.fillStyle = p.fg;
     ctx.font = "900 34px 'Arial Narrow', Impact, sans-serif";
     ctx.textAlign = "center";
     ctx.fillText(p.text, x + pw * 0.5, 64);
 
-    ctx.fillStyle = p.accent;
-    ctx.font = "700 17px Inter, Arial, sans-serif";
+    ctx.fillStyle = p.fg === "#ffffff" ? p.accent : "#334155";
+    ctx.font = "800 16px Inter, Arial, sans-serif";
     ctx.fillText(p.sub, x + pw * 0.5, 98);
   });
 
@@ -1392,6 +1572,68 @@ function createAdboardTexture(homeName, awayName, homeColor, awayColor, homeBann
   tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = THREE.RepeatWrapping;
   return tex;
+}
+
+/**
+ * Live 3D Stadium Jumbotron Scoreboard (`IMG_0359.jpeg`, `IMG_0347.jpeg`).
+ * Mounted above the stadium bowl and updated dynamically whenever score or clock minute changes!
+ */
+function createJumbotronScoreboard(homeShort, awayShort, homeHex, awayHex) {
+  const c = document.createElement("canvas");
+  c.width = 512;
+  c.height = 192;
+  const ctx = c.getContext("2d");
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+
+  let lastKey = "";
+  const update = (hScore, aScore, clockStr, phaseStr) => {
+    const key = `${hScore}:${aScore}:${clockStr}:${phaseStr}`;
+    if (key === lastKey) return;
+    lastKey = key;
+
+    ctx.fillStyle = "#050b16";
+    ctx.fillRect(0, 0, 512, 192);
+
+    ctx.strokeStyle = "#38bdf8";
+    ctx.lineWidth = 5;
+    ctx.strokeRect(6, 6, 500, 180);
+
+    ctx.fillStyle = "#0f172a";
+    ctx.fillRect(10, 10, 492, 36);
+    ctx.fillStyle = "#facc15";
+    ctx.font = "800 18px Inter, Arial, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(`PARALLEL SEASON FC  ·  ${phaseStr || "LIVE"}`, 256, 34);
+
+    // Club color blocks
+    ctx.fillStyle = homeHex || "#c8102e";
+    ctx.fillRect(24, 62, 138, 72);
+    ctx.fillStyle = awayHex || "#1d4ed8";
+    ctx.fillRect(350, 62, 138, 72);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "900 44px 'Arial Narrow', Impact, sans-serif";
+    ctx.fillText((homeShort || "HOM").slice(0, 3), 93, 113);
+    ctx.fillText((awayShort || "AWY").slice(0, 3), 419, 113);
+
+    // Center LED Score
+    ctx.fillStyle = "#111827";
+    ctx.fillRect(172, 56, 168, 84);
+    ctx.fillStyle = "#4ade80";
+    ctx.font = "900 58px 'Arial Narrow', Impact, sans-serif";
+    ctx.fillText(`${hScore} - ${aScore}`, 256, 118);
+
+    // Clock bar
+    ctx.fillStyle = "#cbd5e1";
+    ctx.font = "800 24px Inter, monospace";
+    ctx.fillText(clockStr || "00:00", 256, 172);
+
+    tex.needsUpdate = true;
+  };
+
+  update(0, 0, "00:00", "KICK OFF");
+  return { tex, update };
 }
 
 function createGlowSpriteTexture() {
@@ -1409,6 +1651,64 @@ function createGlowSpriteTexture() {
   return retainGpu(new THREE.CanvasTexture(c));
 }
 
+function createShortsTexture(kit) {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = kit.shorts || "#ffffff";
+  ctx.fillRect(0, 0, 128, 128);
+
+  // Lateral contrast piping stripes strictly on outer hip seams (`IMG_0347`, `IMG_0348`)
+  ctx.fillStyle = kit.shortsStripe || kit.trim || "#ef4444";
+  ctx.fillRect(0, 0, 7, 128);
+  ctx.fillRect(61, 0, 7, 128);
+  ctx.fillRect(0, 0, 128, 7);
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function createShortsNumberTexture(kit, shirtNumber) {
+  const c = document.createElement("canvas");
+  c.width = 64;
+  c.height = 64;
+  const ctx = c.getContext("2d");
+  ctx.clearRect(0, 0, 64, 64);
+  const numStr = String(shirtNumber || "");
+  if (numStr) {
+    ctx.font = "900 42px 'Arial Narrow', Impact, sans-serif";
+    ctx.textAlign = "center";
+    ctx.textBaseline = "middle";
+    ctx.lineWidth = 4;
+    ctx.strokeStyle = kit.shorts || "#ffffff";
+    ctx.strokeText(numStr, 32, 34);
+    ctx.fillStyle = kit.shortsStripe || kit.numberOutline || "#0f172a";
+    ctx.fillText(numStr, 32, 34);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
+function createGkGloveTexture(accentHex) {
+  const c = document.createElement("canvas");
+  c.width = 128;
+  c.height = 128;
+  const ctx = c.getContext("2d");
+  ctx.fillStyle = "#111827";
+  ctx.fillRect(0, 0, 128, 128);
+  ctx.fillStyle = accentHex || "#facc15";
+  ctx.fillRect(0, 18, 128, 26);
+  ctx.fillRect(14, 56, 100, 18);
+  ctx.fillStyle = "#f8fafc";
+  ctx.fillRect(18, 84, 92, 32);
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  return tex;
+}
+
 function createJerseyTextures(kit, shirtNumber, surname, clubShort) {
   const makeSide = (isBack) => {
     const c = document.createElement("canvas");
@@ -1420,7 +1720,7 @@ function createJerseyTextures(kit, shirtNumber, surname, clubShort) {
     ctx.fillRect(0, 0, 256, 256);
 
     if (kit.pattern === "pinstripes") {
-      ctx.fillStyle = "rgba(255,255,255,0.12)";
+      ctx.fillStyle = "rgba(255,255,255,0.13)";
       for (let x = 20; x < 240; x += 24) ctx.fillRect(x, 0, 4, 256);
     } else if (kit.pattern === "shoulder_stripes") {
       ctx.fillStyle = kit.trim;
@@ -1429,7 +1729,7 @@ function createJerseyTextures(kit, shirtNumber, surname, clubShort) {
         ctx.fillRect(206 + s * 11, 0, 6, 48);
       }
     } else if (kit.pattern === "chevron_subtle") {
-      ctx.strokeStyle = "rgba(15, 23, 42, 0.12)";
+      ctx.strokeStyle = "rgba(15, 23, 42, 0.14)";
       ctx.lineWidth = 14;
       for (let y = 40; y < 240; y += 44) {
         ctx.beginPath();
@@ -1443,7 +1743,7 @@ function createJerseyTextures(kit, shirtNumber, surname, clubShort) {
     const shade = ctx.createLinearGradient(0, 0, 256, 0);
     shade.addColorStop(0, "rgba(0,0,0,0.22)");
     shade.addColorStop(0.18, "rgba(0,0,0,0)");
-    shade.addColorStop(0.5, "rgba(255,255,255,0.06)");
+    shade.addColorStop(0.5, "rgba(255,255,255,0.07)");
     shade.addColorStop(0.82, "rgba(0,0,0,0)");
     shade.addColorStop(1, "rgba(0,0,0,0.22)");
     ctx.fillStyle = shade;
@@ -1552,54 +1852,62 @@ function buildHairMesh(style, hairColorHex) {
   });
   const group = new THREE.Group();
 
-  // Scaled proportionally for the 1 : 7.56 head (radius 0.106)
+  // Scaled proportionally for the 1 : 7.56 head (radius 0.106); tilted back so hairline sits cleanly above brows!
   if (style === "buzz") {
-    const cap = new THREE.SphereGeometry(0.109, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.56);
+    const cap = new THREE.SphereGeometry(0.109, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.54);
     cap.scale(0.9, 1.14, 0.99);
     const m = new THREE.Mesh(cap, mat);
-    m.position.y = 0.01;
+    m.position.set(0, 0.014, -0.006);
+    m.rotation.x = -0.26;
     group.add(m);
   } else if (style === "curls") {
-    const cap = new THREE.SphereGeometry(0.114, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.62);
-    cap.scale(0.93, 1.15, 1.01);
+    const cap = new THREE.SphereGeometry(0.112, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.56);
+    cap.scale(0.92, 1.14, 1.0);
     const m = new THREE.Mesh(cap, mat);
-    m.position.set(0, 0.017, -0.006);
+    m.position.set(0, 0.022, -0.01);
+    m.rotation.x = -0.34;
     group.add(m);
     for (let i = 0; i < 10; i++) {
-      const puff = new THREE.Mesh(new THREE.SphereGeometry(0.034, 8, 8), mat);
+      const puff = new THREE.Mesh(new THREE.SphereGeometry(0.032, 8, 8), mat);
       const ang = (i / 10) * Math.PI * 2;
-      puff.position.set(Math.cos(ang) * 0.066, 0.09 + (i % 2) * 0.014, Math.sin(ang) * 0.066);
+      puff.position.set(Math.cos(ang) * 0.062, 0.102 + (i % 2) * 0.012, Math.sin(ang) * 0.06 - 0.01);
       group.add(puff);
     }
   } else if (style === "swept") {
-    const cap = new THREE.SphereGeometry(0.113, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.62);
-    cap.scale(0.92, 1.15, 1.03);
+    const cap = new THREE.SphereGeometry(0.112, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.56);
+    cap.scale(0.92, 1.14, 1.02);
     const m = new THREE.Mesh(cap, mat);
-    m.position.set(0, 0.016, -0.006);
+    m.position.set(0, 0.02, -0.01);
+    m.rotation.x = -0.32;
     group.add(m);
-    const wave = new THREE.Mesh(new THREE.SphereGeometry(0.058, 12, 10), mat);
-    wave.scale.set(1.25, 0.55, 0.95);
-    wave.position.set(0.01, 0.108, 0.036);
+    const wave = new THREE.Mesh(new THREE.SphereGeometry(0.054, 12, 10), mat);
+    wave.scale.set(1.22, 0.52, 0.92);
+    wave.position.set(0.01, 0.112, 0.028);
     wave.rotation.x = -0.22;
     group.add(wave);
   } else if (style === "bun") {
-    const cap = new THREE.SphereGeometry(0.111, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.6);
-    cap.scale(0.91, 1.15, 1.0);
-    group.add(new THREE.Mesh(cap, mat));
+    const cap = new THREE.SphereGeometry(0.11, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.56);
+    cap.scale(0.91, 1.14, 1.0);
+    const m = new THREE.Mesh(cap, mat);
+    m.position.set(0, 0.018, -0.008);
+    m.rotation.x = -0.3;
+    group.add(m);
     const bun = new THREE.Mesh(new THREE.SphereGeometry(0.038, 10, 10), mat);
     bun.position.set(0, 0.066, -0.11);
     group.add(bun);
   } else if (style === "fade") {
-    const crown = new THREE.SphereGeometry(0.102, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.48);
+    const crown = new THREE.SphereGeometry(0.102, 16, 10, 0, Math.PI * 2, 0, Math.PI * 0.46);
     crown.scale(0.91, 1.08, 0.98);
     const m = new THREE.Mesh(crown, mat);
-    m.position.set(0, 0.028, 0);
+    m.position.set(0, 0.03, -0.004);
+    m.rotation.x = -0.18;
     group.add(m);
   } else {
-    const cap = new THREE.SphereGeometry(0.112, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.58);
-    cap.scale(0.91, 1.15, 1.0);
+    const cap = new THREE.SphereGeometry(0.111, 16, 12, 0, Math.PI * 2, 0, Math.PI * 0.54);
+    cap.scale(0.91, 1.14, 1.0);
     const m = new THREE.Mesh(cap, mat);
-    m.position.y = 0.012;
+    m.position.set(0, 0.018, -0.008);
+    m.rotation.x = -0.28;
     group.add(m);
   }
   return group;
@@ -1633,27 +1941,67 @@ function resolveLikeness(footballerId, fallbackSeed, isGk) {
 // ============================================================================
 
 function createFootballerActor(spec) {
-  const { kit, shirtNumber, surname, footballerId, clubShort, isGk, side, scale = 1.06 } = spec;
-  const likeness = resolveLikeness(footballerId, shirtNumber + side * 31, isGk);
-  const soma = SOMATOTYPE_SCALES[likeness.build] || SOMATOTYPE_SCALES.athletic;
+  const {
+    kit,
+    shirtNumber,
+    surname,
+    footballerId,
+    clubShort,
+    isGk,
+    isReferee = false,
+    side,
+    scale = 1.06,
+  } = spec;
+  const likeness = resolveLikeness(footballerId, (shirtNumber || 9) + side * 31, isGk);
+  const soma = isReferee
+    ? SOMATOTYPE_SCALES.athletic
+    : SOMATOTYPE_SCALES[likeness.build] || SOMATOTYPE_SCALES.athletic;
 
-  const skinMat = new THREE.MeshStandardMaterial({ color: likeness.skinHex, roughness: 0.46 });
+  const clothNormScale = new THREE.Vector2(0.44, 0.44);
+  const skinMat = new THREE.MeshStandardMaterial({ color: likeness.skinHex, roughness: 0.45 });
   const faceTex = createFaceSkinTexture(likeness.skinHex, likeness.hairHex, likeness.beard);
-  const headFaceMat = new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.46 });
+  const headFaceMat = new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.44 });
 
-  const sleeveMat = new THREE.MeshStandardMaterial({ color: kit.sleeves, roughness: 0.58 });
-  const trimMat = new THREE.MeshStandardMaterial({ color: kit.trim, roughness: 0.52 });
-  const shortsMat = new THREE.MeshStandardMaterial({ color: kit.shorts, roughness: 0.62 });
-  const sockMat = new THREE.MeshStandardMaterial({ color: kit.socks, roughness: 0.68 });
-  const sockBandMat = new THREE.MeshStandardMaterial({ color: kit.sockBand, roughness: 0.62 });
-  const bootMat = new THREE.MeshStandardMaterial({ color: kit.boots, roughness: 0.24, metalness: 0.18 });
+  const sleeveMat = new THREE.MeshStandardMaterial({
+    color: kit.sleeves,
+    normalMap: SHARED_CLOTH_NORMAL,
+    normalScale: clothNormScale,
+    roughness: 0.56,
+  });
+  const trimMat = new THREE.MeshStandardMaterial({ color: kit.trim, roughness: 0.5 });
+  const shortsTex = createShortsTexture(kit);
+  const shortsMat = new THREE.MeshStandardMaterial({
+    color: "#ffffff",
+    map: shortsTex,
+    normalMap: SHARED_CLOTH_NORMAL,
+    normalScale: clothNormScale,
+    roughness: 0.6,
+  });
+  const sockMat = new THREE.MeshStandardMaterial({ color: kit.socks, roughness: 0.66 });
+  const sockBandMat = new THREE.MeshStandardMaterial({ color: kit.sockBand, roughness: 0.6 });
+  const bootMat = new THREE.MeshStandardMaterial({ color: kit.boots, roughness: 0.22, metalness: 0.2 });
   const bootAccentMat = new THREE.MeshStandardMaterial({ color: kit.bootAccent, roughness: 0.28 });
-  const studMat = new THREE.MeshStandardMaterial({ color: "#e2e8f0", metalness: 0.55, roughness: 0.28 });
+  const studMat = new THREE.MeshStandardMaterial({ color: "#e2e8f0", metalness: 0.58, roughness: 0.25 });
 
-  const jerseyTex = createJerseyTextures(kit, shirtNumber, surname, clubShort);
+  const jerseyTex = createJerseyTextures(
+    kit,
+    isReferee ? "" : shirtNumber,
+    isReferee ? "" : surname,
+    isReferee ? "REF" : clubShort
+  );
   const torsoMats = [
-    new THREE.MeshStandardMaterial({ map: jerseyTex.front, roughness: 0.58 }),
-    new THREE.MeshStandardMaterial({ map: jerseyTex.back, roughness: 0.58 }),
+    new THREE.MeshStandardMaterial({
+      map: jerseyTex.front,
+      normalMap: SHARED_CLOTH_NORMAL,
+      normalScale: clothNormScale,
+      roughness: 0.56,
+    }),
+    new THREE.MeshStandardMaterial({
+      map: jerseyTex.back,
+      normalMap: SHARED_CLOTH_NORMAL,
+      normalScale: clothNormScale,
+      roughness: 0.56,
+    }),
   ];
 
   const root = new THREE.Group();
@@ -1699,7 +2047,7 @@ function createFootballerActor(spec) {
   const skeleton = new THREE.Skeleton(bones);
   const identityBind = new THREE.Matrix4();
 
-  // 1. Continuous Skinned Jersey Torso
+  // 1. Continuous Skinned Jersey Torso (with cloth tension normalMap)
   const torsoMesh = new THREE.SkinnedMesh(SHARED_GEO.skinnedTorso, torsoMats);
   torsoMesh.castShadow = true;
   torsoMesh.receiveShadow = true;
@@ -1717,7 +2065,7 @@ function createFootballerActor(spec) {
   armsMesh.bind(skeleton, identityBind);
   bodyScaleGroup.add(armsMesh);
 
-  // 3. Continuous Skinned Shorts + Quads + Knees + Gastrocnemius Calves
+  // 3. Continuous Skinned Shorts + Quads + Knees + Calves
   const lowerBodyMesh = new THREE.SkinnedMesh(SHARED_GEO.skinnedLowerBody, [
     shortsMat,
     skinMat,
@@ -1729,6 +2077,25 @@ function createFootballerActor(spec) {
   lowerBodyMesh.frustumCulled = false;
   lowerBodyMesh.bind(skeleton, identityBind);
   bodyScaleGroup.add(lowerBodyMesh);
+
+  // Crisp Upright Front-Left Thigh Squad Number Patch (`IMG_0347.jpeg`, `IMG_0354.jpeg`!)
+  if (!isReferee && shirtNumber) {
+    const sNumTex = createShortsNumberTexture(kit, shirtNumber);
+    const sNumPatch = new THREE.Mesh(
+      new THREE.PlaneGeometry(0.056, 0.052),
+      new THREE.MeshStandardMaterial({
+        map: sNumTex,
+        transparent: true,
+        alphaTest: 0.08,
+        roughness: 0.62,
+        depthWrite: false,
+      })
+    );
+    sNumPatch.position.set(0.012, -0.108, 0.091);
+    sNumPatch.rotation.x = -0.06;
+    sNumPatch.rotation.y = 0.14;
+    bones[B_HIP_L].add(sNumPatch);
+  }
 
   // Apply FIFA 11 Personality+ Somatotype & Format Scale AFTER skeleton bind!
   bodyScaleGroup.scale.set(soma.w * scale, soma.h * scale, soma.d * scale);
@@ -1761,18 +2128,56 @@ function createFootballerActor(spec) {
   hair.position.set(0, 0.088, 0);
   bones[B_HEAD].add(hair);
 
-  // Hands / Goalkeeper Gloves attached to Forearm Bones
-  const gloveMat = isGk ? new THREE.MeshStandardMaterial({ color: "#f8fafc", roughness: 0.38 }) : null;
-  for (const elBone of [bones[B_EL_L], bones[B_EL_R]]) {
-    const handMesh = isGk
-      ? new THREE.Mesh(SHARED_GEO.gkGlove, gloveMat)
-      : new THREE.Mesh(SHARED_GEO.hand, skinMat);
-    handMesh.position.set(0, -0.242, 0.01);
-    handMesh.castShadow = true;
-    elBone.add(handMesh);
+  // Hands / Articulated 5-Finger Goalkeeper Gloves / Athletic Wrist Tape (`IMG_0354`, `IMG_0364`, `IMG_0366`)
+  const gloveTex = isGk ? createGkGloveTexture(kit.bootAccent || "#facc15") : null;
+  const gloveMat = isGk ? new THREE.MeshStandardMaterial({ map: gloveTex, roughness: 0.34 }) : null;
+  const tapeMat =
+    !isGk && !isReferee && (shirtNumber === 7 || shirtNumber === 10 || shirtNumber === 5 || shirtNumber % 3 === 1)
+      ? new THREE.MeshStandardMaterial({ color: "#f8fafc", roughness: 0.55 })
+      : null;
+
+  for (const [armIdx, elBone] of [
+    [1, bones[B_EL_L]],
+    [-1, bones[B_EL_R]],
+  ]) {
+    if (isGk) {
+      const gloveGroup = new THREE.Group();
+      gloveGroup.position.set(0, -0.238, 0.008);
+      const cuff = new THREE.Mesh(SHARED_GEO.gkCuff, gloveMat);
+      cuff.position.set(0, 0.036, 0);
+      gloveGroup.add(cuff);
+      const palm = new THREE.Mesh(SHARED_GEO.gkGlove, gloveMat);
+      palm.castShadow = true;
+      gloveGroup.add(palm);
+      // 4 splayed fingers + thumb (`IMG_0364.jpeg` airborne parry silhouette!)
+      for (let f = 0; f < 4; f++) {
+        const fx = (f - 1.5) * 0.021;
+        const finger = new THREE.Mesh(SHARED_GEO.gkFinger, gloveMat);
+        finger.position.set(fx, -0.056, 0.006);
+        finger.rotation.z = (f - 1.5) * -0.09;
+        finger.rotation.x = 0.14;
+        gloveGroup.add(finger);
+      }
+      const thumb = new THREE.Mesh(SHARED_GEO.gkFinger, gloveMat);
+      thumb.position.set(armIdx * -0.044, -0.024, 0.022);
+      thumb.rotation.z = armIdx * 0.62;
+      thumb.rotation.x = 0.25;
+      gloveGroup.add(thumb);
+      elBone.add(gloveGroup);
+    } else {
+      if (tapeMat) {
+        const tape = new THREE.Mesh(SHARED_GEO.wristTape, tapeMat);
+        tape.position.set(0, -0.205, 0.004);
+        elBone.add(tape);
+      }
+      const handMesh = new THREE.Mesh(SHARED_GEO.hand, skinMat);
+      handMesh.position.set(0, -0.242, 0.01);
+      handMesh.castShadow = true;
+      elBone.add(handMesh);
+    }
   }
 
-  // Flush-Sole 3D Cleats attached to Ankle Bones (Codex PR #6 fix: sole & studs land cleanly at y = 0.000!)
+  // Flush-Sole 3D Cleats attached to Ankle Bones (sole & studs land cleanly at y = 0.000!)
   for (const ankleBone of [bones[B_ANKLE_L], bones[B_ANKLE_R]]) {
     const cleat = new THREE.Mesh(SHARED_GEO.cleat, bootMat);
     cleat.position.set(0, 0, 0.018);
@@ -1790,7 +2195,7 @@ function createFootballerActor(spec) {
       [0.026, 0.082],
     ]) {
       const st = new THREE.Mesh(SHARED_GEO.stud, studMat);
-      st.position.set(sx, -0.055, sz); // Bottom of 0.014m stud reaches -0.062 = -SOLE_HEIGHT -> world y = 0!
+      st.position.set(sx, -0.055, sz);
       ankleBone.add(st);
     }
   }
@@ -1855,11 +2260,18 @@ function createFootballerActor(spec) {
   nameplate.visible = false;
   root.add(nameplate);
 
-  const phaseSeed = (shirtNumber * 1.37 + side * 2.1) % (Math.PI * 2);
+  const phaseSeed = ((shirtNumber || 1) * 1.37 + Math.max(0, side) * 2.1) % (Math.PI * 2);
 
   return {
     root,
+    bodyScaleGroup,
     bones,
+    skinMat,
+    shortsMat,
+    sockMat,
+    baseSocksColor: new THREE.Color(kit.socks),
+    dirtLevel: 0,
+    sweatLevel: 0,
     ctrlRing,
     aimWedge,
     chargeRing,
@@ -1868,6 +2280,9 @@ function createFootballerActor(spec) {
     nameplate,
     contactShadow,
     isGk,
+    isReferee,
+    footballerId,
+    shirtNumber,
     side,
     scale,
     phaseSeed,
@@ -1878,6 +2293,7 @@ function createFootballerActor(spec) {
     smoothAccelFwd: 0,
     smoothAccelLat: 0,
     smoothHipY: HIPS_BIND_Y - 0.03,
+    smoothJumpY: 0,
     footGoalL: new THREE.Vector3(0.105, SOLE_HEIGHT, 0.04),
     footGoalR: new THREE.Vector3(-0.105, SOLE_HEIGHT, -0.04),
   };
@@ -1885,6 +2301,8 @@ function createFootballerActor(spec) {
 
 const _poleL = new THREE.Vector3(0.06, 0.18, 1.0).normalize();
 const _poleR = new THREE.Vector3(-0.06, 0.18, 1.0).normalize();
+const _mudTint = new THREE.Color("#5c5332");
+const _whiteTint = new THREE.Color("#ffffff");
 
 /**
  * Continuous CMU-Mocap-Tuned Walk -> Jog -> Sprint Foot Trajectory.
@@ -1953,6 +2371,9 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     facingRad,
     action,
     charge,
+    jumpZ = 0,
+    inWall = false,
+    refSignal = 0,
     isControlled,
     isBallCarrier,
     ballX,
@@ -1971,7 +2392,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const spinExtra = action === 7 ? (nowSec * 14.0) % (Math.PI * 2) : 0;
   actor.root.rotation.y = actor.smoothYaw + spinExtra;
 
-  // Smooth tick-derived world acceleration in athlete local coordinates (zero rAF dt differentiation jitter!)
+  // Smooth tick-derived world acceleration in athlete local coordinates
   const fwdX = Math.sin(actor.smoothYaw);
   const fwdZ = Math.cos(actor.smoothYaw);
   const leftX = Math.cos(actor.smoothYaw);
@@ -1986,9 +2407,26 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const speedNorm = Math.min(1.25, speed / 6.8);
   const locoWeight = smoothstep(0.05, 0.75, speed);
 
-  // Cleat turf divot spray on sharp cuts or slide tackles
-  if (particleSystem && (Math.hypot(axTick, ayTick) > 17.5 || action === 3) && Math.random() < dt * 18) {
-    particleSystem.spawnBurst(wx, 0.04, wy, -vx * 0.22, -vy * 0.22, action === 3 ? 4 : 2);
+  // Dynamic Match Sweat & Progressive Turf-Dirt Smudges (`IMG_0366.webp`, `IMG_0357.jpeg`)
+  if (!actor.isReferee) {
+    if (speed > 3.2 && actor.sweatLevel < 1.0) {
+      actor.sweatLevel = Math.min(1.0, actor.sweatLevel + dt * 0.015);
+      actor.skinMat.roughness = 0.45 - actor.sweatLevel * 0.14;
+    }
+    if ((action === 3 || action === 5 || action === 4) && actor.dirtLevel < 0.36) {
+      actor.dirtLevel = Math.min(0.36, actor.dirtLevel + dt * 0.28);
+      actor.shortsMat.color.copy(_whiteTint).lerp(_mudTint, actor.dirtLevel);
+      actor.sockMat.color.copy(actor.baseSocksColor).lerp(_mudTint, actor.dirtLevel * 0.75);
+    }
+  }
+
+  // Cleat turf divot / wet spray on sharp cuts, slide tackles, or collision falls
+  if (
+    particleSystem &&
+    (Math.hypot(axTick, ayTick) > 17.0 || action === 3 || action === 5) &&
+    Math.random() < dt * 20
+  ) {
+    particleSystem.spawnBurst(wx, 0.04, wy, -vx * 0.22, -vy * 0.22, action === 3 ? 5 : 2);
   }
 
   // Trigger continuous proximal-to-distal kick whip follow-through on release from Charge (1)
@@ -2004,11 +2442,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   }
 
   // HUD Rings & Nameplate
-  actor.ctrlRing.visible = isControlled;
-  actor.aimWedge.visible = isControlled;
-  actor.overheadCursor.visible = isControlled;
+  actor.ctrlRing.visible = Boolean(isControlled);
+  actor.aimWedge.visible = Boolean(isControlled);
+  actor.overheadCursor.visible = Boolean(isControlled);
   if (isControlled) {
-    actor.overheadCursor.position.y = 2.16 + Math.sin(nowSec * 7.5) * 0.05;
+    actor.overheadCursor.position.y = 2.16 + actor.smoothJumpY + Math.sin(nowSec * 7.5) * 0.05;
     actor.overheadCursor.rotation.y = nowSec * 3.2;
   }
   actor.nameplate.visible = Boolean(isControlled || isBallCarrier);
@@ -2030,12 +2468,14 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const toBallAng = wrapAngleRad(Math.atan2(ballX - wx, ballY - wy) - actor.smoothYaw);
   const idleNoise = seededNoise2D(nowSec * 0.55, actor.phaseSeed * 3.1) * 0.06 * (1 - locoWeight);
   const headYawGoal = Math.max(-0.66, Math.min(0.66, toBallAng * 0.65 + yawRate * 0.045)) + idleNoise;
-  dampBoneEuler(bones[B_HEAD], 0.04 - speedNorm * 0.06, headYawGoal, 0, 0.075, dt);
+  dampBoneEuler(bones[B_HEAD], 0.04 - speedNorm * 0.06 - actor.smoothJumpY * 0.25, headYawGoal, 0, 0.075, dt);
   dampBoneEuler(bones[B_NECK], speedNorm * 0.05, headYawGoal * 0.25, 0, 0.075, dt);
 
   // Special Full-Body States (blended smoothly via dampQ so entry & exit never snap!)
   if (action === 3) {
     // Slide Tackle
+    damp(actor, "smoothJumpY", 0, 0.05, dt);
+    actor.bodyScaleGroup.position.y = actor.smoothJumpY;
     damp(actor, "smoothHipY", 0.30, 0.055, dt);
     bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
     dampBoneEuler(bones[B_HIPS], -1.16, 0, 0, 0.055, dt);
@@ -2055,30 +2495,80 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     return;
   }
 
-  if (action === 4) {
-    // Goalkeeper Full-Stretch Dive
-    const lateral = vx * Math.sin(facingRad) - vy * Math.cos(facingRad);
-    const diveSign = lateral >= 0 ? -1 : 1;
-    damp(actor, "smoothHipY", 0.58, 0.05, dt);
+  if (action === 5) {
+    // Heavy Challenge Stumble / Prone Turf Fall (`IMG_0357.jpeg`!)
+    damp(actor, "smoothJumpY", 0, 0.05, dt);
+    actor.bodyScaleGroup.position.y = actor.smoothJumpY;
+    damp(actor, "smoothHipY", 0.38, 0.06, dt);
     bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
-    dampBoneEuler(bones[B_HIPS], 0, 0, diveSign * 1.25, 0.05, dt);
-    dampBoneEuler(bones[B_SPINE], 0.05, 0, diveSign * 0.12, 0.05, dt);
-    dampBoneEuler(bones[B_CHEST], 0.05, 0, diveSign * 0.12, 0.05, dt);
-    dampBoneEuler(bones[B_SH_L], -2.58, 0, 0.22, 0.05, dt);
-    dampBoneEuler(bones[B_SH_R], -2.58, 0, -0.22, 0.05, dt);
-    dampBoneEuler(bones[B_EL_L], -0.18, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_EL_R], -0.18, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_HIP_L], -0.14, 0, 0.16, 0.05, dt);
-    dampBoneEuler(bones[B_HIP_R], -0.1, 0, -0.16, 0.05, dt);
-    dampBoneEuler(bones[B_KNEE_L], 0.4, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_KNEE_R], 0.24, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_ANKLE_L], 0.22, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_ANKLE_R], 0.22, 0, 0, 0.05, dt);
-    actor.contactShadow.scale.set(1.6, 1.2, 1);
+    dampBoneEuler(bones[B_HIPS], 0.92, 0.14, 0.26, 0.06, dt);
+    dampBoneEuler(bones[B_SPINE], 0.24, -0.08, -0.1, 0.06, dt);
+    dampBoneEuler(bones[B_CHEST], 0.18, -0.06, 0, 0.06, dt);
+    dampBoneEuler(bones[B_HIP_L], -0.68, 0, 0.14, 0.06, dt);
+    dampBoneEuler(bones[B_KNEE_L], 1.38, 0, 0, 0.06, dt);
+    dampBoneEuler(bones[B_ANKLE_L], 0.28, 0, 0, 0.06, dt);
+    dampBoneEuler(bones[B_HIP_R], 0.24, 0, -0.18, 0.06, dt);
+    dampBoneEuler(bones[B_KNEE_R], 0.95, 0, 0, 0.06, dt);
+    dampBoneEuler(bones[B_ANKLE_R], 0.32, 0, 0, 0.06, dt);
+    dampBoneEuler(bones[B_SH_L], -1.12, 0, 0.35, 0.06, dt);
+    dampBoneEuler(bones[B_EL_L], -0.32, 0, 0, 0.06, dt);
+    dampBoneEuler(bones[B_SH_R], -0.85, 0, -0.45, 0.06, dt);
+    dampBoneEuler(bones[B_EL_R], -0.48, 0, 0, 0.06, dt);
+    actor.contactShadow.scale.set(1.45, 1.35, 1);
     return;
   }
 
-  actor.contactShadow.scale.set(1, 1, 1);
+  if (action === 4) {
+    // Airborne Horizontal Goalkeeper Full-Stretch Parry (`IMG_0364.jpeg`!)
+    const lateral = vx * Math.sin(facingRad) - vy * Math.cos(facingRad);
+    const diveSign = lateral >= 0 ? -1 : 1;
+    damp(actor, "smoothJumpY", 0.28, 0.05, dt);
+    actor.bodyScaleGroup.position.y = actor.smoothJumpY;
+    damp(actor, "smoothHipY", 0.58, 0.05, dt);
+    bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
+    dampBoneEuler(bones[B_HIPS], 0, 0, diveSign * 1.32, 0.05, dt);
+    dampBoneEuler(bones[B_SPINE], 0.04, 0, diveSign * 0.14, 0.05, dt);
+    dampBoneEuler(bones[B_CHEST], 0.04, 0, diveSign * 0.14, 0.05, dt);
+    dampBoneEuler(bones[B_SH_L], -2.68, 0, 0.18, 0.05, dt);
+    dampBoneEuler(bones[B_SH_R], -2.68, 0, -0.18, 0.05, dt);
+    dampBoneEuler(bones[B_EL_L], -0.12, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_EL_R], -0.12, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_HIP_L], -0.16, 0, 0.18, 0.05, dt);
+    dampBoneEuler(bones[B_HIP_R], -0.08, 0, -0.18, 0.05, dt);
+    dampBoneEuler(bones[B_KNEE_L], diveSign > 0 ? 0.65 : 0.22, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_KNEE_R], diveSign < 0 ? 0.65 : 0.22, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_ANKLE_L], 0.26, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_ANKLE_R], 0.26, 0, 0, 0.05, dt);
+    actor.contactShadow.scale.set(1.65, 1.15, 1);
+    return;
+  }
+
+  // Smooth vertical jump elevation for Aerial Headers & Volleys (`IMG_0348.jpeg`!)
+  damp(actor, "smoothJumpY", jumpZ, 0.042, dt);
+  actor.bodyScaleGroup.position.y = actor.smoothJumpY;
+  const airborneBlend = smoothstep(0.05, 0.36, actor.smoothJumpY);
+  const shadowScale = Math.max(0.52, 1.0 - actor.smoothJumpY * 0.55);
+  actor.contactShadow.scale.set(shadowScale, shadowScale, 1);
+
+  if (airborneBlend > 0.35) {
+    // Mid-Air Athletic Header / Volley Posture (`IMG_0348.jpeg`!)
+    damp(actor, "smoothHipY", HIPS_BIND_Y - 0.02, 0.045, dt);
+    bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
+    dampBoneEuler(bones[B_HIPS], -0.14 * airborneBlend, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_SPINE], -0.12 * airborneBlend, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_CHEST], -0.10 * airborneBlend, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_HIP_L], 0.18 * airborneBlend, 0, 0.08, 0.05, dt);
+    dampBoneEuler(bones[B_KNEE_L], 0.96 * airborneBlend, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_ANKLE_L], 0.34, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_HIP_R], 0.28 * airborneBlend, 0, -0.08, 0.05, dt);
+    dampBoneEuler(bones[B_KNEE_R], 1.12 * airborneBlend, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_ANKLE_R], 0.36, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_SH_L], -1.52 * airborneBlend, 0, 0.34, 0.05, dt);
+    dampBoneEuler(bones[B_SH_R], -1.42 * airborneBlend, 0, -0.34, 0.05, dt);
+    dampBoneEuler(bones[B_EL_L], -0.48, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_EL_R], -0.52, 0, 0, 0.05, dt);
+    return;
+  }
 
   // Distance-Locked Stride Phase Integration (Zero Foot-Skating!)
   const strideLenMeters = 1.08 + speed * 0.23;
@@ -2092,7 +2582,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const leanPitch = Math.max(-0.2, Math.min(0.32, actor.smoothAccelFwd * 0.015 + speedNorm * 0.11));
   const leanRoll = Math.max(-0.24, Math.min(0.24, -actor.smoothAccelLat * 0.014 - yawRate * 0.032));
 
-  let baseHipY = actor.isGk && speed < 0.4 ? 0.84 : HIPS_BIND_Y - 0.025 - speedNorm * 0.028;
+  let baseHipY = actor.isGk && speed < 0.4 ? 0.84 : inWall ? 0.895 : HIPS_BIND_Y - 0.025 - speedNorm * 0.028;
   if (action === 2) baseHipY = 0.80;
   const idleBreathe = seededNoise2D(actor.phaseSeed, nowSec * 0.9) * 0.008 * (1 - locoWeight);
   const runBounce = -Math.cos(actor.stridePhase * 2) * 0.034 * locoWeight * Math.min(1, speedNorm + 0.18);
@@ -2103,8 +2593,6 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const pelvisHipDrop = s * 0.048 * locoWeight * Math.min(1, speedNorm + 0.2);
   dampBoneEuler(bones[B_HIPS], leanPitch * 0.36, pelvisYaw, leanRoll + pelvisHipDrop, 0.05, dt);
 
-  // Non-Skating Kick Windup Blend: player keeps running naturally during early charge,
-  // cocking the striking leg ONLY in the final strike plant window (charge > 0.52) or when stationary!
   const stationaryFactor = 1.0 - smoothstep(0.3, 2.2, speed);
   const chargeCockBlend =
     action === 1 || charge > 0.03
@@ -2113,7 +2601,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const swingProgress = actor.kickSwingTimer > 0 ? 1.0 - actor.kickSwingTimer / 0.26 : -1;
   const whipArc = swingProgress >= 0 ? Math.sin(swingProgress * Math.PI) : 0;
 
-  let spinePitch = leanPitch * 0.34 + (actor.isGk && speed < 0.4 ? 0.12 : 0.03);
+  let spinePitch = leanPitch * 0.34 + (actor.isGk && speed < 0.4 ? 0.12 : inWall ? 0.07 : 0.03);
   let spineYaw = s * 0.11 * locoWeight * Math.min(1, speedNorm + 0.25);
   let spineRoll = -pelvisHipDrop * 0.45;
 
@@ -2139,14 +2627,18 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     _tmpFootR
   );
 
-  if (action === 2) {
+  if (inWall && speed < 0.3) {
+    _tmpFootL.set(0.095, SOLE_HEIGHT, 0.01);
+    _tmpFootR.set(-0.095, SOLE_HEIGHT, -0.01);
+    pitchL = 0;
+    pitchR = 0;
+  } else if (action === 2) {
     // Standing Tactical Tackle Lunge
     _tmpFootR.set(-0.10, SOLE_HEIGHT, 0.54);
     pitchR = -0.18;
     _tmpFootL.set(0.11, SOLE_HEIGHT + 0.02, -0.36);
     pitchL = 0.42;
   } else if (chargeCockBlend > 0.01) {
-    // Smoothly blend striking leg into instep backswing while support leg continues natural plant!
     const cockR = _vEffTarget.set(-0.11, SOLE_HEIGHT + 0.34 * chargeCockBlend, -0.36 * chargeCockBlend);
     _tmpFootR.lerp(cockR, chargeCockBlend);
     pitchR = pitchR * (1 - chargeCockBlend) + 0.62 * chargeCockBlend;
@@ -2155,7 +2647,6 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       pitchL = 0;
     }
   } else if (whipArc > 0.01) {
-    // Proximal-to-distal instep whip through ball impact & cross-body follow-through
     const strikeR = _vEffTarget.set(
       -0.09 + whipArc * 0.08,
       SOLE_HEIGHT + whipArc * 0.38,
@@ -2194,7 +2685,19 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   );
 
   // Continuous Quaternion-Damped Upper-Limb Counter-Balance Kinematics
-  if (celebrating) {
+  if (inWall && speed < 0.35) {
+    // Classic FIFA Free-Kick Defensive Wall Shield Pose (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
+    dampBoneEuler(bones[B_SH_L], -0.34, 0.36, -0.22, 0.06, dt);
+    dampBoneEuler(bones[B_SH_R], -0.34, -0.36, 0.22, 0.06, dt);
+    dampBoneEuler(bones[B_EL_L], -0.46, 0, -0.28, 0.06, dt);
+    dampBoneEuler(bones[B_EL_R], -0.46, 0, 0.28, 0.06, dt);
+  } else if (refSignal > 0.05) {
+    // Match Referee Advantage / Free-Kick / Whistle Arm Signal (`IMG_0354`, `IMG_0359`)
+    dampBoneEuler(bones[B_SH_L], 0.08, 0, 0.14, 0.06, dt);
+    dampBoneEuler(bones[B_EL_L], -0.55, 0, 0, 0.06, dt);
+    dampBoneEuler(bones[B_SH_R], -2.35 * refSignal, 0, -0.22, 0.06, dt);
+    dampBoneEuler(bones[B_EL_R], -0.18, 0, 0, 0.06, dt);
+  } else if (celebrating) {
     dampBoneEuler(bones[B_SH_L], -2.35 + s * 0.22, 0, 0.44, 0.055, dt);
     dampBoneEuler(bones[B_SH_R], -2.35 - s * 0.22, 0, -0.44, 0.055, dt);
     dampBoneEuler(bones[B_EL_L], -0.26, 0, 0, 0.055, dt);
@@ -2211,7 +2714,6 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     dampBoneEuler(bones[B_EL_L], -0.7, 0, 0, 0.045, dt);
     dampBoneEuler(bones[B_EL_R], -0.8, 0, 0, 0.045, dt);
   } else {
-    // Seamless continuous blend from idle/GK ready arms into athletic sprint pump (zero speed > 0.25 snap!)
     const idleArmPitch = actor.isGk ? -0.52 : 0.04 + idleBreathe * 2.5;
     const idleArmAbd = actor.isGk ? 0.38 : 0.14;
     const idleElbow = actor.isGk ? -0.92 : -0.46;
@@ -2264,13 +2766,20 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
 
 class TurfParticleSystem {
   constructor(scene) {
-    this.capacity = 140;
-    const geo = retainGpu(new THREE.BoxGeometry(0.052, 0.052, 0.052));
-    const mat = retainGpu(new THREE.MeshLambertMaterial({ color: "#2e8b47" }));
-    this.mesh = new THREE.InstancedMesh(geo, mat, this.capacity);
+    this.capacity = 180;
+    const geo = retainGpu(new THREE.BoxGeometry(0.048, 0.048, 0.048));
+    this.mat = retainGpu(
+      new THREE.MeshLambertMaterial({
+        color: "#36782b",
+        transparent: true,
+        opacity: 0.92,
+      })
+    );
+    this.mesh = new THREE.InstancedMesh(geo, this.mat, this.capacity);
     this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
     this.mesh.frustumCulled = false;
     scene.add(this.mesh);
+    this.wetMode = false;
 
     this.cursor = 0;
     this.particles = Array.from({ length: this.capacity }, () => ({
@@ -2291,17 +2800,26 @@ class TurfParticleSystem {
     }
   }
 
+  setWetMode(wet) {
+    this.wetMode = Boolean(wet);
+    // In rain mode (`IMG_0366.webp`), cleats & ball kick up fine white-cyan water droplet spray!
+    this.mat.color.set(this.wetMode ? "#bae6fd" : "#36782b");
+    this.mat.opacity = this.wetMode ? 0.72 : 0.92;
+  }
+
   spawnBurst(x, y, z, baseVx, baseVz, count = 3) {
-    for (let k = 0; k < count; k++) {
+    const mult = this.wetMode ? 1.5 : 1.0;
+    const n = Math.min(8, Math.round(count * mult));
+    for (let k = 0; k < n; k++) {
       const p = this.particles[this.cursor];
       this.cursor = (this.cursor + 1) % this.capacity;
-      p.life = 0.36 + (k % 3) * 0.08;
-      p.x = x + (((this.cursor * 17) % 11) - 5) * 0.03;
+      p.life = (this.wetMode ? 0.30 : 0.36) + (k % 3) * 0.07;
+      p.x = x + (((this.cursor * 17) % 11) - 5) * 0.032;
       p.y = y;
-      p.z = z + (((this.cursor * 31) % 11) - 5) * 0.03;
-      p.vx = baseVx + (((this.cursor * 13) % 9) - 4) * 0.35;
-      p.vy = 1.55 + (k % 3) * 0.6;
-      p.vz = baseVz + (((this.cursor * 23) % 9) - 4) * 0.35;
+      p.z = z + (((this.cursor * 31) % 11) - 5) * 0.032;
+      p.vx = baseVx + (((this.cursor * 13) % 9) - 4) * (this.wetMode ? 0.48 : 0.35);
+      p.vy = (this.wetMode ? 1.9 : 1.55) + (k % 3) * 0.58;
+      p.vz = baseVz + (((this.cursor * 23) % 9) - 4) * (this.wetMode ? 0.48 : 0.35);
     }
   }
 
@@ -2322,7 +2840,7 @@ class TurfParticleSystem {
         p.z += p.vz * dt;
         this.dummy.position.set(p.x, p.y, p.z);
         this.dummy.rotation.set(p.life * 8, p.life * 5, 0);
-        this.dummy.scale.setScalar(Math.min(1, p.life * 2.8));
+        this.dummy.scale.setScalar(Math.min(1, p.life * 2.8) * (this.wetMode ? 0.78 : 1.0));
       }
       this.dummy.updateMatrix();
       this.mesh.setMatrixAt(i, this.dummy.matrix);
@@ -2333,11 +2851,182 @@ class TurfParticleSystem {
   }
 }
 
+/**
+ * Real-time 3D Falling Stadium Rain Streak System (`IMG_0366.webp`).
+ * Renders 1,400 wind-slanted raindrop streaks inside a volume following the active play focus.
+ */
+class RainSystem {
+  constructor(scene) {
+    this.count = 1400;
+    this.spanX = 68;
+    this.spanY = 30;
+    this.spanZ = 52;
+    const positions = new Float32Array(this.count * 6);
+    this.seeds = new Float32Array(this.count * 4);
+    let rSeed = 0x77a1beef;
+    const rand = () => {
+      rSeed = (Math.imul(rSeed, 1664525) + 1013904223) >>> 0;
+      return rSeed / 4294967296;
+    };
+
+    for (let i = 0; i < this.count; i++) {
+      this.seeds[i * 4 + 0] = (rand() - 0.5) * this.spanX;
+      this.seeds[i * 4 + 1] = rand() * this.spanY;
+      this.seeds[i * 4 + 2] = (rand() - 0.5) * this.spanZ;
+      this.seeds[i * 4 + 3] = 19.0 + rand() * 8.0; // fall speed m/s
+    }
+
+    const geo = retainGpu(new THREE.BufferGeometry());
+    geo.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const mat = retainGpu(
+      new THREE.LineBasicMaterial({
+        color: "#dbeafe",
+        transparent: true,
+        opacity: 0.34,
+        depthWrite: false,
+      })
+    );
+    this.lines = new THREE.LineSegments(geo, mat);
+    this.lines.frustumCulled = false;
+    this.lines.visible = false;
+    scene.add(this.lines);
+  }
+
+  setEnabled(enabled) {
+    this.lines.visible = Boolean(enabled);
+  }
+
+  step(dt, focusX, focusZ) {
+    if (!this.lines.visible) return;
+    const attr = this.lines.geometry.attributes.position;
+    const arr = attr.array;
+    const windX = 2.4;
+    const windZ = 0.9;
+    const streakT = 0.036;
+
+    for (let i = 0; i < this.count; i++) {
+      const b4 = i * 4;
+      let y = this.seeds[b4 + 1] - this.seeds[b4 + 3] * dt;
+      if (y < 0.05) {
+        y += this.spanY;
+      }
+      this.seeds[b4 + 1] = y;
+
+      const x = focusX + this.seeds[b4 + 0];
+      const z = focusZ + this.seeds[b4 + 2];
+      const b6 = i * 6;
+      arr[b6 + 0] = x;
+      arr[b6 + 1] = y;
+      arr[b6 + 2] = z;
+      arr[b6 + 3] = x - windX * streakT;
+      arr[b6 + 4] = y + this.seeds[b4 + 3] * streakT;
+      arr[b6 + 5] = z - windZ * streakT;
+    }
+    attr.needsUpdate = true;
+  }
+}
+
+/**
+ * GPU-Instanced 3D Shaded Grass Blade Tuft Field (`IMG_0364.jpeg`, `IMG_0366.webp`).
+ * Combines pitch-wide 3D grass tufts with a dense rolling detail patch centered around `(ballX, ballY)`
+ * so close-up cameras, set pieces, and instant replays display genuine 3D grass blades around cleats!
+ */
+class GrassBladeField {
+  constructor(halfL, halfW) {
+    this.staticCount = 1300;
+    this.detailCount = 1100;
+    this.total = this.staticCount + this.detailCount;
+    this.halfL = halfL;
+    this.halfW = halfW;
+
+    const mat = new THREE.MeshStandardMaterial({
+      color: "#ffffff",
+      roughness: 0.72,
+      metalness: 0.02,
+      side: THREE.FrontSide,
+    });
+    this.mesh = new THREE.InstancedMesh(SHARED_GEO.grassTuft, mat, this.total);
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.receiveShadow = true;
+    this.mesh.frustumCulled = false;
+
+    this.detailOffsets = new Float32Array(this.detailCount * 4);
+    const dummy = new THREE.Object3D();
+    const cLight = new THREE.Color("#56a23d");
+    const cDark = new THREE.Color("#3b8028");
+    const cTmp = new THREE.Color();
+
+    let gSeed = 0x51a72010;
+    const rand = () => {
+      gSeed = (Math.imul(gSeed, 1664525) + 1013904223) >>> 0;
+      return gSeed / 4294967296;
+    };
+
+    for (let i = 0; i < this.staticCount; i++) {
+      const x = (rand() * 2 - 1) * (halfL - 0.3);
+      const z = (rand() * 2 - 1) * (halfW - 0.3);
+      dummy.position.set(x, 0.002, z);
+      dummy.rotation.set(0, rand() * Math.PI * 2, 0);
+      const sc = 0.85 + rand() * 0.55;
+      dummy.scale.set(sc, sc, sc);
+      dummy.updateMatrix();
+      this.mesh.setMatrixAt(i, dummy.matrix);
+      cTmp.copy(cDark).lerp(cLight, rand());
+      this.mesh.setColorAt(i, cTmp);
+    }
+
+    for (let j = 0; j < this.detailCount; j++) {
+      const r = Math.sqrt(rand()) * 7.8;
+      const ang = rand() * Math.PI * 2;
+      this.detailOffsets[j * 4 + 0] = Math.cos(ang) * r;
+      this.detailOffsets[j * 4 + 1] = Math.sin(ang) * r;
+      this.detailOffsets[j * 4 + 2] = rand() * Math.PI * 2;
+      this.detailOffsets[j * 4 + 3] = 0.8 + rand() * 0.5;
+      const idx = this.staticCount + j;
+      dummy.position.set(this.detailOffsets[j * 4], 0.002, this.detailOffsets[j * 4 + 1]);
+      dummy.rotation.set(0, this.detailOffsets[j * 4 + 2], 0);
+      dummy.scale.setScalar(this.detailOffsets[j * 4 + 3]);
+      dummy.updateMatrix();
+      this.mesh.setMatrixAt(idx, dummy.matrix);
+      cTmp.copy(cDark).lerp(cLight, rand());
+      this.mesh.setColorAt(idx, cTmp);
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+    if (this.mesh.instanceColor) this.mesh.instanceColor.needsUpdate = true;
+    this.dummy = dummy;
+    this.lastPatchX = 999;
+    this.lastPatchZ = 999;
+  }
+
+  updateFocus(focusX, focusZ, nowSec) {
+    // Snap rolling detail patch on a coarse 1.5m grid + gentle wind sway so blades never crawl across grass!
+    const snapX = Math.round(focusX / 1.5) * 1.5;
+    const snapZ = Math.round(focusZ / 1.5) * 1.5;
+    const sway = Math.sin(nowSec * 2.4) * 0.08;
+    const dummy = this.dummy;
+    for (let j = 0; j < this.detailCount; j++) {
+      const b = j * 4;
+      const wx = Math.max(-this.halfL, Math.min(this.halfL, snapX + this.detailOffsets[b + 0]));
+      const wz = Math.max(-this.halfW, Math.min(this.halfW, snapZ + this.detailOffsets[b + 1]));
+      dummy.position.set(wx, 0.002, wz);
+      dummy.rotation.set(sway, this.detailOffsets[b + 2], sway * 0.5);
+      dummy.scale.setScalar(this.detailOffsets[b + 3]);
+      dummy.updateMatrix();
+      this.mesh.setMatrixAt(this.staticCount + j, dummy.matrix);
+    }
+    this.mesh.instanceMatrix.needsUpdate = true;
+  }
+}
+
+/**
+ * Builds an authentic box-stanchion Goal Assembly (`IMG_0350`, `IMG_0351`, `IMG_0352`)
+ * with subdivided 3D nylon net panels supporting localized vertex impact pocket deformation!
+ */
 function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
   const group = new THREE.Group();
   const postMat = new THREE.MeshStandardMaterial({
     color: "#ffffff",
-    roughness: 0.2,
+    roughness: 0.18,
     metalness: 0.28,
   });
   const stanchionMat = new THREE.MeshStandardMaterial({
@@ -2347,7 +3036,7 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
   });
 
   const postR = 0.068;
-  const depth = 1.75;
+  const depth = 1.85;
   const backX = goalX + sign * depth;
 
   const postGeo = new THREE.CylinderGeometry(postR, postR, goalH, 14);
@@ -2357,13 +3046,14 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
     post.castShadow = true;
     group.add(post);
 
-    const rearPost = new THREE.Mesh(new THREE.CylinderGeometry(0.035, 0.035, goalH * 0.92, 8), stanchionMat);
-    rearPost.position.set(backX, goalH * 0.46, zSign * goalHW);
+    // Classic FIFA rear stanchion poles & tension wires (`IMG_0350`, `IMG_0351`)
+    const rearPost = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.036, goalH * 1.02, 8), stanchionMat);
+    rearPost.position.set(backX + sign * 0.22, goalH * 0.51, zSign * (goalHW + 0.12));
     group.add(rearPost);
 
-    const topBar = new THREE.Mesh(new THREE.CylinderGeometry(0.03, 0.03, depth * 0.8, 8), stanchionMat);
+    const topBar = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, depth * 0.96, 8), stanchionMat);
     topBar.rotation.z = Math.PI * 0.5;
-    topBar.position.set(goalX + sign * depth * 0.4, goalH * 0.96, zSign * goalHW);
+    topBar.position.set(goalX + sign * depth * 0.48, goalH * 0.98, zSign * goalHW);
     group.add(topBar);
   }
 
@@ -2376,9 +3066,9 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
   const netMat = new THREE.MeshStandardMaterial({
     map: netTex,
     transparent: true,
-    opacity: 0.86,
+    opacity: 0.88,
     side: THREE.DoubleSide,
-    roughness: 0.85,
+    roughness: 0.82,
     depthWrite: false,
   });
 
@@ -2386,25 +3076,56 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
   netHolder.position.set(goalX, 0, 0);
   group.add(netHolder);
 
-  const roofNet = new THREE.Mesh(new THREE.PlaneGeometry(depth * 0.82, goalHW * 2), netMat);
+  const roofGeo = new THREE.PlaneGeometry(depth * 0.88, goalHW * 2, 10, 14);
+  const roofNet = new THREE.Mesh(roofGeo, netMat);
   roofNet.rotation.x = -Math.PI * 0.5;
-  roofNet.position.set(sign * depth * 0.41, goalH - 0.02, 0);
+  roofNet.position.set(sign * depth * 0.44, goalH - 0.02, 0);
   netHolder.add(roofNet);
 
-  const backSlopeLen = Math.hypot(depth * 0.18, goalH);
-  const backNet = new THREE.Mesh(new THREE.PlaneGeometry(goalHW * 2, backSlopeLen), netMat);
+  const backSlopeLen = Math.hypot(depth * 0.16, goalH);
+  const backGeo = new THREE.PlaneGeometry(goalHW * 2, backSlopeLen, 18, 12);
+  const backBase = new Float32Array(backGeo.attributes.position.array);
+  const backNet = new THREE.Mesh(backGeo, netMat);
   backNet.rotation.y = sign > 0 ? -Math.PI * 0.5 : Math.PI * 0.5;
-  backNet.rotation.x = sign * 0.16;
-  backNet.position.set(sign * depth * 0.9, goalH * 0.5, 0);
+  backNet.rotation.x = sign * 0.14;
+  backNet.position.set(sign * depth * 0.92, goalH * 0.5, 0);
   netHolder.add(backNet);
 
   for (const zSign of [-1, 1]) {
-    const sideNet = new THREE.Mesh(new THREE.PlaneGeometry(depth, goalH), netMat);
+    const sideNet = new THREE.Mesh(new THREE.PlaneGeometry(depth, goalH, 10, 8), netMat);
     sideNet.position.set(sign * depth * 0.5, goalH * 0.5, zSign * goalHW);
     netHolder.add(sideNet);
   }
 
-  return { group, netHolder };
+  // Deforms `backNet` vertices into a localized 3D pocket around `(impactY, impactZ)`!
+  const deformNet = (strength, impactZ, impactY, phaseRad) => {
+    const pos = backGeo.attributes.position;
+    const arr = pos.array;
+    if (strength <= 0.004) {
+      arr.set(backBase);
+      pos.needsUpdate = true;
+      return;
+    }
+    const localU = sign > 0 ? impactZ : -impactZ;
+    const localV = impactY - goalH * 0.5;
+    const osc = (0.62 + 0.38 * Math.sin(phaseRad)) * strength;
+    for (let i = 0; i < pos.count; i++) {
+      const bx = backBase[i * 3 + 0];
+      const by = backBase[i * 3 + 1];
+      const bz = backBase[i * 3 + 2];
+      // Pin outer frame border so net stays attached to crossbar, posts & ground!
+      const edgeU = 1.0 - Math.min(1, Math.pow(Math.abs(bx) / Math.max(0.5, goalHW), 3));
+      const edgeV = 1.0 - Math.min(1, Math.pow(Math.abs(by) / Math.max(0.5, backSlopeLen * 0.5), 3));
+      const d2 = (bx - localU) * (bx - localU) + (by - localV) * (by - localV);
+      const pocket = Math.exp(-d2 / 1.35) * 0.72 * osc * edgeU * edgeV;
+      arr[i * 3 + 0] = bx;
+      arr[i * 3 + 1] = by - pocket * 0.12;
+      arr[i * 3 + 2] = bz - pocket; // pushes outward behind goal!
+    }
+    pos.needsUpdate = true;
+  };
+
+  return { group, netHolder, deformNet, goalHW, goalH };
 }
 
 function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
@@ -2435,27 +3156,70 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
 
   const trackBorder = new THREE.Mesh(
     new THREE.PlaneGeometry(pitchLen + 17.5, pitchWid + 16.0),
-    new THREE.MeshStandardMaterial({ color: "#3b231d", roughness: 0.88 })
+    new THREE.MeshStandardMaterial({ color: "#223d1e", roughness: 0.9 })
   );
   trackBorder.rotation.x = -Math.PI * 0.5;
   trackBorder.position.y = -0.01;
   trackBorder.receiveShadow = true;
   stadium.add(trackBorder);
 
-  const { tex: pitchTex, totalW, totalH } = createPitchTexture(pitchLen, pitchWid, fmt, maxAnisotropy);
-  const pitchMesh = new THREE.Mesh(
-    new THREE.PlaneGeometry(totalW, totalH),
-    new THREE.MeshStandardMaterial({ map: pitchTex, roughness: 0.84, metalness: 0.02 })
-  );
+  const { tex: pitchTex, normalMap: pitchNorm, roughnessMap: pitchRough, totalW, totalH } =
+    createPitchPbrMaps(pitchLen, pitchWid, fmt, maxAnisotropy);
+  const pitchMat = new THREE.MeshStandardMaterial({
+    map: pitchTex,
+    normalMap: pitchNorm,
+    normalScale: new THREE.Vector2(0.38, 0.38),
+    roughnessMap: pitchRough,
+    roughness: 0.82,
+    metalness: 0.02,
+  });
+  const pitchMesh = new THREE.Mesh(new THREE.PlaneGeometry(totalW, totalH), pitchMat);
   pitchMesh.rotation.x = -Math.PI * 0.5;
   pitchMesh.receiveShadow = true;
   stadium.add(pitchMesh);
+
+  // 3D Instanced Shaded Grass Blade Tufts (`IMG_0364`, `IMG_0366`)
+  const grassField = new GrassBladeField(halfL, halfW);
+  stadium.add(grassField.mesh);
 
   const netTex = createGoalNetTexture();
   const leftGoal = buildGoalAssembly(-halfL, -1, goalHW, goalH, netTex, kits.homeOutfield.shirt);
   const rightGoal = buildGoalAssembly(halfL, 1, goalHW, goalH, netTex, kits.awayOutfield.shirt);
   stadium.add(leftGoal.group);
   stadium.add(rightGoal.group);
+
+  // Pitchside Broadcast TV & Photographer Camera Tripods behind bylines (`IMG_0351.jpeg`!)
+  const camBodyMat = new THREE.MeshStandardMaterial({ color: "#0f172a", roughness: 0.35, metalness: 0.55 });
+  const tripodLegMat = new THREE.MeshStandardMaterial({ color: "#475569", roughness: 0.4, metalness: 0.65 });
+  for (const [cx, cz, yaw] of [
+    [-halfL - 2.35, halfW * 0.58, Math.PI * 0.42],
+    [-halfL - 2.35, -halfW * 0.58, Math.PI * 0.58],
+    [halfL + 2.35, halfW * 0.58, -Math.PI * 0.42],
+    [halfL + 2.35, -halfW * 0.58, -Math.PI * 0.58],
+  ]) {
+    const camRig = new THREE.Group();
+    camRig.position.set(cx, 0, cz);
+    camRig.rotation.y = yaw;
+    for (const [lx, lz, rx, rz] of [
+      [-0.22, 0.18, 0.22, 0.24],
+      [0.22, 0.18, 0.22, -0.24],
+      [0, -0.24, -0.26, 0],
+    ]) {
+      const leg = new THREE.Mesh(new THREE.CylinderGeometry(0.018, 0.014, 0.98, 6), tripodLegMat);
+      leg.position.set(lx, 0.46, lz);
+      leg.rotation.set(rx, 0, rz);
+      camRig.add(leg);
+    }
+    const camBox = new THREE.Mesh(new THREE.BoxGeometry(0.32, 0.24, 0.54), camBodyMat);
+    camBox.position.set(0, 1.02, 0.06);
+    camBox.castShadow = true;
+    camRig.add(camBox);
+    const lens = new THREE.Mesh(new THREE.CylinderGeometry(0.085, 0.075, 0.22, 10), camBodyMat);
+    lens.rotation.x = Math.PI * 0.5;
+    lens.position.set(0, 1.02, 0.38);
+    camRig.add(lens);
+    stadium.add(camRig);
+  }
 
   const flagPoleGeo = new THREE.CylinderGeometry(0.022, 0.022, 1.45, 8);
   const flagPoleMat = new THREE.MeshStandardMaterial({ color: "#f8fafc", roughness: 0.4 });
@@ -2538,7 +3302,7 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     map: adTex,
     emissive: "#ffffff",
     emissiveMap: adTex,
-    emissiveIntensity: 0.24,
+    emissiveIntensity: 0.16,
     roughness: 0.45,
   });
 
@@ -2565,7 +3329,15 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   const concreteMat = new THREE.MeshStandardMaterial({ color: "#1e293b", roughness: 0.88 });
   const riserDarkMat = new THREE.MeshStandardMaterial({ color: "#0f172a", roughness: 0.92 });
   const stairMat = new THREE.MeshStandardMaterial({ color: "#ca8a04", roughness: 0.7 });
-  const roofMat = new THREE.MeshStandardMaterial({ color: "#0b1324", roughness: 0.65, metalness: 0.3 });
+  // Translucent Sky-Blue Glass & White Steel Truss Cantilevered Roof Canopy (`IMG_0348.jpeg`!)
+  const roofGlassMat = new THREE.MeshStandardMaterial({
+    color: "#93c5fd",
+    transparent: true,
+    opacity: 0.52,
+    roughness: 0.18,
+    metalness: 0.25,
+  });
+  const trussMat = new THREE.MeshStandardMaterial({ color: "#e2e8f0", roughness: 0.38, metalness: 0.45 });
   const fasciaMatHome = new THREE.MeshStandardMaterial({
     color: kits.homeOutfield.shirt,
     emissive: kits.homeOutfield.shirt,
@@ -2668,16 +3440,24 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
 
     if (addRoof) {
       const roofDepth = tiers * stepDepth + 3.8;
-      const canopy = new THREE.Mesh(new THREE.BoxGeometry(length + 3.2, 0.45, roofDepth), roofMat);
-      canopy.position.set(0, topY + 4.1, backZ + roofDepth * 0.5 - 0.6);
+      const canopyZ = backZ + roofDepth * 0.5 - 0.6;
+      const canopy = new THREE.Mesh(new THREE.BoxGeometry(length + 3.2, 0.22, roofDepth), roofGlassMat);
+      canopy.position.set(0, topY + 4.15, canopyZ);
       canopy.rotation.x = 0.06;
       stand.add(canopy);
 
-      const fascia = new THREE.Mesh(
-        new THREE.BoxGeometry(length + 3.2, 0.52, 0.25),
-        new THREE.MeshStandardMaterial({ color: "#e2e8f0", roughness: 0.4 })
-      );
-      fascia.position.set(0, topY + 3.9, backZ + roofDepth - 0.65);
+      // Cantilevered white steel roof ribs (`IMG_0348.jpeg`!)
+      const ribCount = Math.max(6, Math.floor(length / 9));
+      for (let rb = 0; rb <= ribCount; rb++) {
+        const rx = -length * 0.5 + (rb / ribCount) * length;
+        const rib = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.36, roofDepth + 0.2), trussMat);
+        rib.position.set(rx, topY + 4.15, canopyZ);
+        rib.rotation.x = 0.06;
+        stand.add(rib);
+      }
+
+      const fascia = new THREE.Mesh(new THREE.BoxGeometry(length + 3.2, 0.52, 0.3), trussMat);
+      fascia.position.set(0, topY + 3.88, backZ + roofDepth - 0.65);
       stand.add(fascia);
     }
 
@@ -2689,8 +3469,38 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   buildStand(standSpanX, adDistZ + 2.4, 0, 11, true, true);
   buildStand(standSpanZ, adDistX + 2.8, Math.PI * 0.5, 10, true, true);
   buildStand(standSpanZ, adDistX + 2.8, -Math.PI * 0.5, 10, true, false);
-  // Push south gantry stand far back so zoomed-out Tele Broadcast camera never clips seats!
   buildStand(standSpanX, adDistZ + 28.0, Math.PI, 4, false, false);
+
+  // Live 3D Stadium Jumbotron Scoreboards mounted on North & Goal-End Roof Fascias (`IMG_0359.jpeg`!)
+  const jumbotron = createJumbotronScoreboard(
+    snapshot.home.short_name,
+    snapshot.away.short_name,
+    kits.homeOutfield.shirt,
+    kits.awayOutfield.shirt
+  );
+  const jumboScreenMat = new THREE.MeshStandardMaterial({
+    map: jumbotron.tex,
+    emissive: "#ffffff",
+    emissiveMap: jumbotron.tex,
+    emissiveIntensity: 0.75,
+    roughness: 0.3,
+  });
+  const jumboFrameMat = new THREE.MeshStandardMaterial({ color: "#090f1c", roughness: 0.5, metalness: 0.4 });
+  for (const [jx, jy, jz, jYaw] of [
+    [0, 9.8, -(adDistZ + 11.4), 0],
+    [-(adDistX + 10.6), 7.75, 0, Math.PI * 0.5],
+    [adDistX + 10.6, 7.75, 0, -Math.PI * 0.5],
+  ]) {
+    const jGroup = new THREE.Group();
+    jGroup.position.set(jx, jy, jz);
+    jGroup.rotation.y = jYaw;
+    const housing = new THREE.Mesh(new THREE.BoxGeometry(9.6, 3.65, 0.55), jumboFrameMat);
+    jGroup.add(housing);
+    const screen = new THREE.Mesh(new THREE.PlaneGeometry(9.1, 3.32), jumboScreenMat);
+    screen.position.z = 0.3;
+    jGroup.add(screen);
+    stadium.add(jGroup);
+  }
 
   const personGeo = new THREE.CapsuleGeometry(0.21, 0.38, 4, 6);
   const crowdMat = new THREE.MeshLambertMaterial({ color: "#ffffff" });
@@ -2707,13 +3517,14 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   if (crowdMesh.instanceColor) crowdMesh.instanceColor.needsUpdate = true;
   stadium.add(crowdMesh);
 
-  // Emissive Floodlight Towers (pick up postprocessing BloomEffect!)
+  // Emissive Floodlight Towers (dynamically toggled between Night/Rain vs Sunny Day!)
   const pylonMat = new THREE.MeshStandardMaterial({ color: "#475569", metalness: 0.6, roughness: 0.4 });
   const bulbMat = new THREE.MeshStandardMaterial({
     color: "#fffbeb",
     emissive: "#fef3c7",
     emissiveIntensity: 2.6,
   });
+  const floodlightHalos = [];
   const towerH = pitchLen > 80 ? 34 : 26;
   for (const [tx, tz] of [
     [-adDistX - 6.5, -adDistZ - 6.5],
@@ -2749,6 +3560,7 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     halo.position.set(0, towerH + 0.8, 0);
     halo.scale.set(15, 15, 1);
     tower.add(halo);
+    floodlightHalos.push(halo);
 
     stadium.add(tower);
   }
@@ -2760,6 +3572,11 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     halfW,
     pitchLen,
     pitchWid,
+    pitchMat,
+    grassField,
+    jumbotron,
+    bulbMat,
+    floodlightHalos,
     leftGoal,
     rightGoal,
     cornerFlags,
@@ -2780,6 +3597,26 @@ export const CAMERA_LABELS = {
   pro: "END-TO-END PRO",
 };
 
+export const WEATHER_PRESETS = ["night", "day", "rain"];
+export const WEATHER_LABELS = {
+  night: "FLOODLIT NIGHT",
+  day: "SUNNY STADIUM DAY",
+  rain: "RAINY STORM",
+};
+
+const PHASE_BANNER_TEXT = {
+  0: "KICK OFF",
+  1: "LIVE MATCH",
+  2: "THROW-IN",
+  3: "CORNER KICK",
+  4: "GOAL KICK",
+  5: "FREE KICK",
+  6: "PENALTY KICK",
+  10: "GOAL!",
+  11: "HALF-TIME",
+  12: "FULL-TIME",
+};
+
 export class ClassicFifa3DEngine {
   constructor(canvas) {
     this.canvas = canvas;
@@ -2794,7 +3631,7 @@ export class ClassicFifa3DEngine {
     this.renderer.shadowMap.type = THREE.PCFShadowMap; // Soft PCF in Three.js r182+
 
     this.scene = new THREE.Scene();
-    this.scene.fog = new THREE.FogExp2("#0c192c", 0.0032);
+    this.scene.fog = new THREE.FogExp2("#0c192c", 0.003);
 
     // Physically-Based Image-Based Lighting (RoomEnvironment + PMREMGenerator)
     const pmrem = new THREE.PMREMGenerator(this.renderer);
@@ -2808,8 +3645,9 @@ export class ClassicFifa3DEngine {
 
     this.camera = new THREE.PerspectiveCamera(30.5, 16 / 9, 0.4, 460);
     this.cameraMode = "tele";
+    this.weatherMode = "night";
     this.viewMode = "attract";
-    this.userZoom = 1.0; // Adjustable [0.72 .. 1.45] via Mouse Wheel, - / =, or HUD Zoom buttons
+    this.userZoom = 1.0; // Adjustable [0.72 .. 1.48] via Mouse Wheel, - / =, or HUD Zoom buttons
 
     this.camPos = new THREE.Vector3(0, 21.5, 36.5);
     this.camLook = new THREE.Vector3(0, 0.55, -1.2);
@@ -2843,14 +3681,14 @@ export class ClassicFifa3DEngine {
     this.glowTex = createGlowSpriteTexture();
     this.maxAniso = this.renderer.capabilities.getMaxAnisotropy();
 
-    const skyDome = new THREE.Mesh(
-      retainGpu(new THREE.SphereGeometry(280, 28, 18)),
-      retainGpu(new THREE.MeshBasicMaterial({ map: createSkyTexture(), side: THREE.BackSide, fog: false }))
+    this.skyMat = retainGpu(
+      new THREE.MeshBasicMaterial({ map: SKY_TEXTURES.night, side: THREE.BackSide, fog: false })
     );
-    this.scene.add(skyDome);
+    this.skyDome = new THREE.Mesh(retainGpu(new THREE.SphereGeometry(280, 28, 18)), this.skyMat);
+    this.scene.add(this.skyDome);
 
-    const hemi = new THREE.HemisphereLight(0xdbeafe, 0x15803d, 0.82);
-    this.scene.add(hemi);
+    this.hemiLight = new THREE.HemisphereLight(0xdbeafe, 0x15803d, 0.82);
+    this.scene.add(this.hemiLight);
 
     this.keyLight = new THREE.DirectionalLight(0xfffbeb, 2.05);
     this.keyLight.position.set(26, 46, 32);
@@ -2861,13 +3699,13 @@ export class ClassicFifa3DEngine {
     this.keyLight.shadow.bias = -0.0004;
     this.scene.add(this.keyLight);
 
-    const rimLight = new THREE.DirectionalLight(0xbae6fd, 0.72);
-    rimLight.position.set(-30, 36, -36);
-    this.scene.add(rimLight);
+    this.rimLight = new THREE.DirectionalLight(0xbae6fd, 0.72);
+    this.rimLight.position.set(-30, 36, -36);
+    this.scene.add(this.rimLight);
 
-    const frontFillLight = new THREE.DirectionalLight(0xffedd5, 0.65);
-    frontFillLight.position.set(0, 15, 42);
-    this.scene.add(frontFillLight);
+    this.frontFillLight = new THREE.DirectionalLight(0xffedd5, 0.65);
+    this.frontFillLight.position.set(0, 15, 42);
+    this.scene.add(this.frontFillLight);
 
     this.ballRadius = 0.22;
     this.ballMesh = new THREE.Mesh(
@@ -2899,15 +3737,25 @@ export class ClassicFifa3DEngine {
     this.scene.add(this.ballShadow);
 
     this.particles = new TurfParticleSystem(this.scene);
+    this.rain = new RainSystem(this.scene);
 
     this.stadiumData = null;
+    this.lastSnapshot = null;
     this.actors = [];
+    this.refereeActor = null;
+    this.refPos = new THREE.Vector2(-3.6, -5.2);
+    this.refVel = new THREE.Vector2(0, 0);
+
     this.showcaseGroup = new THREE.Group();
     this.showcaseGroup.visible = false;
     this.scene.add(this.showcaseGroup);
     this.showcaseCaptains = null;
 
     this.netRipple = [0, 0];
+    this.netImpact = [
+      { strength: 0, z: 0, y: 1.2 },
+      { strength: 0, z: 0, y: 1.2 },
+    ];
     this.goalExcitement = 0;
     this.attractAngle = 0;
     this.prevBallZ = 0;
@@ -2946,12 +3794,103 @@ export class ClassicFifa3DEngine {
     return this.cameraMode;
   }
 
+  cycleWeatherPreset() {
+    const idx = WEATHER_PRESETS.indexOf(this.weatherMode);
+    return this.setWeatherPreset(WEATHER_PRESETS[(idx + 1) % WEATHER_PRESETS.length]);
+  }
+
+  setWeatherPreset(mode) {
+    if (WEATHER_PRESETS.includes(mode)) {
+      this.weatherMode = mode;
+    }
+    const m = this.weatherMode;
+    this.skyMat.map = SKY_TEXTURES[m] || SKY_TEXTURES.night;
+    this.skyMat.needsUpdate = true;
+
+    if (m === "day") {
+      this.scene.fog.color.set("#bfdbfe");
+      this.scene.fog.density = 0.0013;
+      this.scene.environmentIntensity = 0.56;
+      this.hemiLight.color.set("#e0f2fe");
+      this.hemiLight.groundColor.set("#2d6a22");
+      this.hemiLight.intensity = 1.12;
+      this.keyLight.color.set("#fffef2");
+      this.keyLight.intensity = 2.52;
+      this.keyLight.position.set(34, 52, 26);
+      this.rimLight.color.set("#e0f2fe");
+      this.rimLight.intensity = 0.55;
+      this.frontFillLight.color.set("#fff7ed");
+      this.frontFillLight.intensity = 0.52;
+      this.rain.setEnabled(false);
+      this.particles.setWetMode(false);
+      this.ballMesh.material.roughness = 0.28;
+    } else if (m === "rain") {
+      this.scene.fog.color.set("#0f1e32");
+      this.scene.fog.density = 0.0044;
+      this.scene.environmentIntensity = 0.52;
+      this.hemiLight.color.set("#cbd5e1");
+      this.hemiLight.groundColor.set("#14532d");
+      this.hemiLight.intensity = 0.76;
+      this.keyLight.color.set("#e0f2fe");
+      this.keyLight.intensity = 2.18;
+      this.keyLight.position.set(24, 46, 30);
+      this.rimLight.color.set("#93c5fd");
+      this.rimLight.intensity = 0.88;
+      this.frontFillLight.color.set("#dbeafe");
+      this.frontFillLight.intensity = 0.62;
+      this.rain.setEnabled(true);
+      this.particles.setWetMode(true);
+      this.ballMesh.material.roughness = 0.12;
+    } else {
+      this.scene.fog.color.set("#0c192c");
+      this.scene.fog.density = 0.003;
+      this.scene.environmentIntensity = 0.46;
+      this.hemiLight.color.set("#dbeafe");
+      this.hemiLight.groundColor.set("#15803d");
+      this.hemiLight.intensity = 0.82;
+      this.keyLight.color.set("#fffbeb");
+      this.keyLight.intensity = 2.05;
+      this.keyLight.position.set(26, 46, 32);
+      this.rimLight.color.set("#bae6fd");
+      this.rimLight.intensity = 0.72;
+      this.frontFillLight.color.set("#ffedd5");
+      this.frontFillLight.intensity = 0.65;
+      this.rain.setEnabled(false);
+      this.particles.setWetMode(false);
+      this.ballMesh.material.roughness = 0.24;
+    }
+
+    if (this.stadiumData) {
+      const { pitchMat, grassField, bulbMat, floodlightHalos } = this.stadiumData;
+      if (bulbMat) {
+        bulbMat.emissiveIntensity = m === "day" ? 0.08 : m === "rain" ? 2.85 : 2.5;
+      }
+      if (floodlightHalos) {
+        for (const h of floodlightHalos) {
+          h.visible = m !== "day";
+        }
+      }
+      if (pitchMat) {
+        pitchMat.roughness = m === "rain" ? 0.38 : m === "day" ? 0.84 : 0.78;
+        pitchMat.metalness = m === "rain" ? 0.08 : 0.02;
+      }
+      if (grassField && grassField.mesh && grassField.mesh.material) {
+        grassField.mesh.material.roughness = m === "rain" ? 0.36 : 0.72;
+      }
+    }
+
+    return this.weatherMode;
+  }
+
   setViewMode(mode) {
     const prevMode = this.viewMode;
     this.viewMode = mode;
     const showMatchActors = mode !== "showcase";
     for (const a of this.actors) {
       a.root.visible = showMatchActors;
+    }
+    if (this.refereeActor) {
+      this.refereeActor.root.visible = showMatchActors;
     }
     this.ballMesh.visible = true;
     this.ballShadow.visible = true;
@@ -2970,13 +3909,20 @@ export class ClassicFifa3DEngine {
     }
   }
 
-  triggerGoalEffect(scoringSide) {
+  triggerGoalEffect(scoringSide, impactZ = 0, impactY = 1.25) {
     this.goalExcitement = 3.5;
-    if (scoringSide === 0) this.netRipple[1] = 1.0;
-    else if (scoringSide === 1) this.netRipple[0] = 1.0;
-    else {
-      this.netRipple[0] = 0.8;
-      this.netRipple[1] = 0.8;
+    const clampedY = Math.max(0.35, Math.min(2.2, impactY));
+    if (scoringSide === 0) {
+      this.netRipple[1] = 1.0;
+      this.netImpact[1] = { strength: 1.0, z: impactZ, y: clampedY };
+    } else if (scoringSide === 1) {
+      this.netRipple[0] = 1.0;
+      this.netImpact[0] = { strength: 1.0, z: impactZ, y: clampedY };
+    } else {
+      this.netRipple[0] = 0.85;
+      this.netRipple[1] = 0.85;
+      this.netImpact[0] = { strength: 0.85, z: impactZ, y: clampedY };
+      this.netImpact[1] = { strength: 0.85, z: impactZ, y: clampedY };
     }
   }
 
@@ -2989,6 +3935,7 @@ export class ClassicFifa3DEngine {
   }
 
   loadSnapshotScene(snapshot) {
+    this.lastSnapshot = snapshot;
     if (this.stadiumData) {
       this.scene.remove(this.stadiumData.stadium);
       disposeObjectTree(this.stadiumData.stadium);
@@ -2998,6 +3945,11 @@ export class ClassicFifa3DEngine {
       disposeObjectTree(a.root);
     }
     this.actors = [];
+    if (this.refereeActor) {
+      this.scene.remove(this.refereeActor.root);
+      disposeObjectTree(this.refereeActor.root);
+      this.refereeActor = null;
+    }
 
     this.stadiumData = buildStadiumWorld(snapshot, this.maxAniso, this.glowTex);
     this.scene.add(this.stadiumData.stadium);
@@ -3049,6 +4001,91 @@ export class ClassicFifa3DEngine {
         this.actors.push(actor);
       }
     }
+
+    // 3D On-Pitch Match Official (`IMG_0354.jpeg`): high-contrast yellow or electric-cyan referee kit
+    const awayShirtLc = String(kits.awayOutfield.shirt || "").toLowerCase();
+    const homeShirtLc = String(kits.homeOutfield.shirt || "").toLowerCase();
+    const yellowClash = [awayShirtLc, homeShirtLc].some(
+      (c) => c.includes("ea") || c.includes("fa") || c.includes("fd") || c.includes("eb") || c.includes("f5")
+    );
+    const refShirtHex = yellowClash ? "#06b6d4" : "#facc15";
+    const refKit = {
+      shirt: refShirtHex,
+      sleeves: refShirtHex,
+      trim: "#0f172a",
+      shorts: "#0f172a",
+      shortsStripe: refShirtHex,
+      socks: "#0f172a",
+      sockBand: refShirtHex,
+      boots: "#0f172a",
+      bootAccent: "#f8fafc",
+      numberColor: "#0f172a",
+      numberOutline: "#f8fafc",
+      pattern: "solid",
+    };
+    this.refereeActor = createFootballerActor({
+      kit: refKit,
+      shirtNumber: 0,
+      surname: "REFEREE",
+      footballerId: "official-referee-1",
+      clubShort: "REF",
+      isGk: false,
+      isReferee: true,
+      side: -1,
+      scale: playerScale * 0.99,
+    });
+    this.refereeActor.root.visible = this.viewMode !== "showcase";
+    this.refPos.set(-3.6, -5.2);
+    this.refVel.set(0, 0);
+    this.scene.add(this.refereeActor.root);
+
+    this.setWeatherPreset(this.weatherMode);
+  }
+
+  /**
+   * Hot-swaps a single 3D player mesh during a live deterministic in-match substitution!
+   */
+  replacePlayerActor(side, idx, member, team) {
+    if (!this.stadiumData || !member) return;
+    const pps = this.lastSnapshot ? this.lastSnapshot.format.players_per_side : this.actors.length >> 1;
+    const slot = side * pps + idx;
+    const prev = this.actors[slot];
+    if (!prev) return;
+
+    const prevX = prev.root.position.x;
+    const prevZ = prev.root.position.z;
+    const prevYaw = prev.smoothYaw;
+
+    this.scene.remove(prev.root);
+    disposeObjectTree(prev.root);
+
+    const kits = this.stadiumData.kits;
+    const isGk = idx === 0 || member.role === "Goalkeeper";
+    const kit = isGk
+      ? side === 0
+        ? kits.homeGk
+        : kits.awayGk
+      : side === 0
+        ? kits.homeOutfield
+        : kits.awayOutfield;
+    const playerScale = pps <= 6 ? 1.08 : 1.01;
+
+    const nextActor = createFootballerActor({
+      kit,
+      shirtNumber: member.shirt_number,
+      surname: extractSurname(member.name),
+      footballerId: member.footballer_id,
+      clubShort: team ? team.short_name : "FC",
+      isGk,
+      side,
+      scale: playerScale,
+    });
+    nextActor.root.position.set(prevX, 0, prevZ);
+    nextActor.smoothYaw = prevYaw;
+    nextActor.root.rotation.y = prevYaw;
+    nextActor.root.visible = this.viewMode !== "showcase";
+    this.scene.add(nextActor.root);
+    this.actors[slot] = nextActor;
   }
 
   updatePreMatchShowcase(homeRoster, awayRoster) {
@@ -3122,41 +4159,27 @@ export class ClassicFifa3DEngine {
       return;
     }
 
-    const { halfL, halfW, pitchLen, leftGoal, rightGoal, cornerFlags, crowdMesh, crowdPositions } =
-      this.stadiumData;
+    const {
+      halfL,
+      halfW,
+      pitchLen,
+      grassField,
+      jumbotron,
+      leftGoal,
+      rightGoal,
+      cornerFlags,
+      crowdMesh,
+      crowdPositions,
+    } = this.stadiumData;
 
     const waveT = nowSec * 4.0;
     for (let i = 0; i < cornerFlags.length; i++) {
       cornerFlags[i].rotation.y = Math.sin(waveT + i * 1.4) * 0.28;
     }
 
-    for (let g = 0; g < 2; g++) {
-      if (this.netRipple[g] > 0.005) {
-        this.netRipple[g] *= Math.pow(0.04, dt);
-        const holder = g === 0 ? leftGoal.netHolder : rightGoal.netHolder;
-        const bulge = Math.sin(nowSec * 35) * this.netRipple[g] * 0.14;
-        holder.scale.set(1 + Math.abs(bulge), 1 + bulge * 0.3, 1 + bulge * 0.4);
-      }
-    }
-
-    if (this.goalExcitement > 0) {
-      this.goalExcitement = Math.max(0, this.goalExcitement - dt);
-    }
-    if (crowdMesh && (this.goalExcitement > 0.01 || Math.floor(now / 50) % 2 === 0)) {
-      const dummy = new THREE.Object3D();
-      const amp = this.goalExcitement > 0.01 ? 0.24 : 0.032;
-      const spd = this.goalExcitement > 0.01 ? 14.0 : 3.4;
-      for (let i = 0; i < crowdPositions.length; i += 2) {
-        const p = crowdPositions[i];
-        dummy.position.set(p.x, p.y + Math.abs(Math.sin(nowSec * spd + p.phase)) * amp, p.z);
-        dummy.updateMatrix();
-        crowdMesh.setMatrixAt(i, dummy.matrix);
-      }
-      crowdMesh.instanceMatrix.needsUpdate = true;
-    }
-
     // --- Pre-Match Showcase View ---
     if (this.viewMode === "showcase") {
+      this.rain.step(dt, 0, 0);
       this.ballMesh.position.set(0, this.ballRadius, 0.85);
       this.ballMesh.rotation.y += dt * 0.8;
       this.ballShadow.position.set(0, 0.018, 0.85);
@@ -3228,15 +4251,30 @@ export class ClassicFifa3DEngine {
     let ballZ = 0;
     let ballVx = 0;
     let ballVy = 0;
+    let phase = 1;
+    let ownerSide = -1;
+    let pps = 5;
+    let gk0X = -halfL;
+    let gk1X = halfL;
 
     if (currPacked) {
       const p0 = prevPacked && prevPacked.length === currPacked.length ? prevPacked : currPacked;
       const tInterp = Math.max(0, Math.min(1, alpha));
 
-      const phase = currPacked[3];
-      const pps = currPacked[6];
+      const clockTicks = currPacked[1];
+      phase = currPacked[3];
+      const hScore = currPacked[4];
+      const aScore = currPacked[5];
+      pps = currPacked[6];
       const homeCtrl = currPacked[7];
       const awayCtrl = currPacked[8];
+
+      if (jumbotron) {
+        const totSec = Math.floor(clockTicks / 60);
+        const mm = String(Math.floor(totSec / 60)).padStart(2, "0");
+        const ss = String(totSec % 60).padStart(2, "0");
+        jumbotron.update(hScore, aScore, `${mm}:${ss}`, PHASE_BANNER_TEXT[phase] || "LIVE");
+      }
 
       const bx0 = p0[9] / 1000;
       const by0 = p0[10] / 1000;
@@ -3252,13 +4290,32 @@ export class ClassicFifa3DEngine {
       ballVx = (p0[12] + (currPacked[12] - p0[12]) * tInterp) / 1000;
       ballVy = (p0[13] + (currPacked[13] - p0[13]) * tInterp) / 1000;
 
-      const ownerSide = currPacked[15];
+      ownerSide = currPacked[15];
       const ownerIdx = currPacked[16];
 
+      if (pps > 0 && currPacked.length >= 18 + pps * 20) {
+        gk0X = currPacked[18 + 4] / 1000;
+        gk1X = currPacked[18 + pps * 10 + 4] / 1000;
+      }
+
       if (this.prevBallZ > 0.28 && ballZ <= 0.06) {
-        this.particles.spawnBurst(ballX, 0.04, ballY, ballVx * 0.15, ballVy * 0.15, 4);
+        this.particles.spawnBurst(ballX, 0.04, ballY, ballVx * 0.15, ballVy * 0.15, 5);
       }
       this.prevBallZ = ballZ;
+
+      // Detect physical ball-into-net contact to deform localized 3D goal mesh pocket!
+      if (Math.abs(ballX) >= halfL - 0.08 && Math.abs(ballY) < leftGoal.goalHW && ballZ < leftGoal.goalH) {
+        const gIdx = ballX > 0 ? 1 : 0;
+        const hitPow = Math.min(1.15, 0.45 + Math.hypot(ballVx, ballVy) * 0.04);
+        if (hitPow > this.netImpact[gIdx].strength * 0.75) {
+          this.netImpact[gIdx] = {
+            strength: hitPow,
+            z: ballY,
+            y: Math.max(0.32, Math.min(leftGoal.goalH - 0.2, ballZ + this.ballRadius)),
+          };
+          this.netRipple[gIdx] = Math.max(this.netRipple[gIdx], hitPow);
+        }
+      }
 
       this.ballMesh.position.set(ballX, this.ballRadius + Math.max(0, ballZ), ballY);
       const bSpeed = Math.hypot(ballVx, ballVy);
@@ -3272,6 +4329,7 @@ export class ClassicFifa3DEngine {
       this.ballShadow.scale.set(shadowShrink, shadowShrink, 1);
 
       const showHudIndicators = this.viewMode === "match" && !(replayOpts && replayOpts.active);
+      const wallTargetDist = pitchLen > 80 ? 9.15 : 4.6;
 
       for (let n = 0; n < Math.min(pps * 2, this.actors.length); n++) {
         const b = 18 + n * 10;
@@ -3302,10 +4360,14 @@ export class ClassicFifa3DEngine {
         const f1 = (currPacked[b + 8] * Math.PI * 2) / 65536;
         const facingRad = teleported ? f1 : lerpAngleRad(f0, f1, tInterp);
 
-        const flags = currPacked[b + 9];
+        const flags0 = p0[b + 9] >>> 0;
+        const flags = currPacked[b + 9] >>> 0;
         const action = flags & 0xf;
-        const charge = ((flags >> 15) & 0x7ff) / 1000;
-        const sentOff = ((flags >> 26) & 1) === 1;
+        const charge = ((flags >>> 15) & 0x7ff) / 1000;
+        const sentOff = ((flags >>> 26) & 1) === 1;
+        const jz0 = ((flags0 >>> 28) & 0xf) * 0.06;
+        const jz1 = ((flags >>> 28) & 0xf) * 0.06;
+        const jumpZ = teleported ? jz1 : jz0 + (jz1 - jz0) * tInterp;
 
         const actor = this.actors[n];
         if (sentOff) {
@@ -3317,6 +4379,12 @@ export class ClassicFifa3DEngine {
         const isControlled = showHudIndicators && (side === 0 ? idx === homeCtrl : idx === awayCtrl);
         const isBallCarrier = showHudIndicators && ownerSide === side && ownerIdx === idx;
         const celebrating = phase === 10 && ownerSide === side;
+        const inWall =
+          phase === 5 &&
+          ownerSide >= 0 &&
+          side !== ownerSide &&
+          idx > 0 &&
+          Math.abs(Math.hypot(wx - ballX, wy - ballY) - wallTargetDist) < 1.45;
 
         animateFootballerActor(
           actor,
@@ -3330,6 +4398,8 @@ export class ClassicFifa3DEngine {
             facingRad,
             action,
             charge,
+            jumpZ,
+            inWall,
             isControlled,
             isBallCarrier,
             ballX,
@@ -3340,11 +4410,102 @@ export class ClassicFifa3DEngine {
           nowSec,
           replayOpts && replayOpts.active ? null : this.particles
         );
+        if (phase === 3 || phase === 5 || phase === 6) {
+          actor.nameplate.visible = false;
+        }
+      }
+
+      // Animate 3D On-Pitch Referee (`IMG_0354.jpeg`): smooth diagonal officiating run + restart whistle signal
+      if (this.refereeActor) {
+        this.refereeActor.root.visible = true;
+        let goalRefX = Math.max(-halfL + 3.0, Math.min(halfL - 3.0, ballX * 0.64 - 3.8));
+        let goalRefY = Math.max(-halfW + 2.2, Math.min(halfW - 2.2, ballY * 0.48 - 5.4));
+        const dBall = Math.hypot(goalRefX - ballX, goalRefY - ballY);
+        if (dBall < 3.4) {
+          goalRefY = ballY >= 0 ? Math.max(-halfW + 2.0, ballY - 4.8) : Math.min(halfW - 2.0, ballY + 4.8);
+        }
+        const prevRx = this.refPos.x;
+        const prevRy = this.refPos.y;
+        const stepBlend = 1.0 - Math.exp(-dt * 2.8);
+        const nextRx = prevRx + (goalRefX - prevRx) * stepBlend;
+        const nextRy = prevRy + (goalRefY - prevRy) * stepBlend;
+        const rvx = (nextRx - prevRx) / Math.max(0.004, dt);
+        const rvy = (nextRy - prevRy) / Math.max(0.004, dt);
+        const rax = (rvx - this.refVel.x) / Math.max(0.01, dt);
+        const ray = (rvy - this.refVel.y) / Math.max(0.01, dt);
+        this.refPos.set(nextRx, nextRy);
+        this.refVel.set(rvx, rvy);
+
+        const refFacing = Math.atan2(-(ballY - nextRy), ballX - nextRx);
+        const refSignal = phase === 2 || phase === 3 || phase === 4 || phase === 5 || phase === 6 ? 1 : 0;
+        animateFootballerActor(
+          this.refereeActor,
+          {
+            wx: nextRx,
+            wy: nextRy,
+            vx: rvx,
+            vy: rvy,
+            axTick: rax,
+            ayTick: ray,
+            facingRad: refFacing,
+            action: 0,
+            charge: 0,
+            jumpZ: 0,
+            inWall: false,
+            refSignal,
+            isControlled: false,
+            isBallCarrier: false,
+            ballX,
+            ballY,
+            celebrating: false,
+          },
+          dt,
+          nowSec,
+          null
+        );
       }
     }
 
-    // --- EA FIFA 10–12 Zoomed-Out Gantry Camera Controller (with maath.damp3) ---
-    // Velocity-predicted play focus damped smoothly so ping-pong passes flow across screen without camera whip
+    this.rain.step(dt, ballX, ballY);
+    if (grassField) {
+      grassField.updateFocus(ballX, ballY, nowSec);
+    }
+
+    // 3D Goal-Net Vertex Pocket Deformation + Stanchion Ripple
+    for (let g = 0; g < 2; g++) {
+      const goalObj = g === 0 ? leftGoal : rightGoal;
+      const imp = this.netImpact[g];
+      if (imp.strength > 0.004) {
+        imp.strength *= Math.pow(0.05, dt);
+        goalObj.deformNet(imp.strength, imp.z, imp.y, nowSec * 28.0);
+      } else if (imp.strength > 0) {
+        imp.strength = 0;
+        goalObj.deformNet(0, 0, 1.2, 0);
+      }
+      if (this.netRipple[g] > 0.005) {
+        this.netRipple[g] *= Math.pow(0.04, dt);
+        const bulge = Math.sin(nowSec * 32) * this.netRipple[g] * 0.08;
+        goalObj.netHolder.scale.set(1 + Math.abs(bulge), 1 + bulge * 0.25, 1 + bulge * 0.25);
+      }
+    }
+
+    if (this.goalExcitement > 0) {
+      this.goalExcitement = Math.max(0, this.goalExcitement - dt);
+    }
+    if (crowdMesh && (this.goalExcitement > 0.01 || Math.floor(now / 50) % 2 === 0)) {
+      const dummy = new THREE.Object3D();
+      const amp = this.goalExcitement > 0.01 ? 0.24 : 0.032;
+      const spd = this.goalExcitement > 0.01 ? 14.0 : 3.4;
+      for (let i = 0; i < crowdPositions.length; i += 2) {
+        const p = crowdPositions[i];
+        dummy.position.set(p.x, p.y + Math.abs(Math.sin(nowSec * spd + p.phase)) * amp, p.z);
+        dummy.updateMatrix();
+        crowdMesh.setMatrixAt(i, dummy.matrix);
+      }
+      crowdMesh.instanceMatrix.needsUpdate = true;
+    }
+
+    // --- EA FIFA 10–12 Zoomed-Out Gantry & Dynamic Set-Piece Camera Controller ---
     const focusGoalX = ballX + Math.max(-2.8, Math.min(2.8, ballVx * 0.16));
     const focusGoalZ = ballY + Math.max(-1.8, Math.min(1.8, ballVy * 0.12));
     damp3(this.smoothPlayFocus, [focusGoalX, 0, focusGoalZ], 0.24, dt);
@@ -3357,6 +4518,7 @@ export class ClassicFifa3DEngine {
     let targetLook;
     let desiredFov = 30.5;
     let camSmoothTime = 0.22;
+    let setPieceCamKey = 0;
 
     if (replayOpts && replayOpts.active) {
       camSmoothTime = 0.12;
@@ -3384,43 +4546,85 @@ export class ClassicFifa3DEngine {
       targetLook = [fx * 0.4, 0.8, fz * 0.2 - 1.2];
     } else {
       const is11 = pitchLen > 80;
-      const clampX = halfL * (is11 ? 0.54 : 0.36);
-      const leadX = Math.max(-clampX, Math.min(clampX, fx * (is11 ? 0.62 : 0.44)));
+      const targetGoalSign =
+        ownerSide === 0 ? Math.sign(gk1X || 1) : ownerSide === 1 ? Math.sign(gk0X || -1) : Math.sign(ballX || 1);
+      const targetGoalX = targetGoalSign * halfL;
+      const distToAttGoal = Math.hypot(targetGoalX - ballX, ballY);
 
-      if (this.cameraMode === "dynamic") {
-        desiredFov = 30;
-        const heightY = (is11 ? 15.8 : 13.2) * zScale;
-        const distZ = (is11 ? 29.5 : 23.8) * zScale;
-        targetPos = [leadX, heightY, fz * 0.32 + distZ];
-        targetLook = [fx * 0.74, 0.72, fz * 0.35 - 0.8];
-      } else if (this.cameraMode === "pro") {
-        desiredFov = 35;
-        targetPos = [fx - (is11 ? 24.5 : 18.8) * zScale, (is11 ? 13.5 : 10.6) * zScale, fz * 0.58];
-        targetLook = [fx + 9.5, 0.8, fz * 0.4];
-      } else if (this.cameraMode === "wide") {
-        // Classic FIFA Co-Op Tactical (full goal-to-goal tactical overview!)
-        desiredFov = 31.5;
-        const heightY = (is11 ? 37.0 : 29.2) * zScale;
-        const distZ = (is11 ? 59.5 : 48.0) * zScale;
-        targetPos = [leadX * 0.38, heightY, distZ];
-        targetLook = [leadX * 0.42, 0.45, -1.0];
+      if (phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
+        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg`!)
+        setPieceCamKey = 3;
+        const penSpotX = Math.sign(ballX) * (halfL - (is11 ? 11.0 : 6.2));
+        const dx = penSpotX - ballX;
+        const dz = -ballY;
+        const inv = 1.0 / Math.max(0.1, Math.hypot(dx, dz));
+        const ux = dx * inv;
+        const uz = dz * inv;
+        desiredFov = 34;
+        camSmoothTime = 0.14;
+        targetPos = [ballX - ux * 6.2 * zScale, 3.35 * zScale, ballY - uz * 6.2 * zScale];
+        targetLook = [ballX + ux * 11.5, 1.05, ballY + uz * 11.5];
+      } else if (phase === 6 || (phase === 5 && distToAttGoal < halfL * 0.92)) {
+        // Authentic Behind-the-Free-Kick / Penalty-Taker Camera (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
+        setPieceCamKey = phase;
+        const dx = targetGoalX - ballX;
+        const dz = -ballY;
+        const inv = 1.0 / Math.max(0.1, Math.hypot(dx, dz));
+        const ux = dx * inv;
+        const uz = dz * inv;
+        const backDist = (phase === 6 ? 5.8 : 6.8) * zScale;
+        const camH = (phase === 6 ? 2.25 : 2.55) * zScale;
+        desiredFov = 33.5;
+        camSmoothTime = 0.14;
+        targetPos = [ballX - ux * backDist, camH, ballY - uz * backDist];
+        targetLook = [targetGoalX, 1.38, 0];
       } else {
-        // Default EA FIFA 10–12 Tele Broadcast Gantry (frames both penalty arcs & passing lanes!)
-        desiredFov = 30.5;
-        const heightY = (is11 ? 31.5 : 24.8) * zScale;
-        const distZ = (is11 ? 52.0 : 41.5) * zScale;
-        targetPos = [leadX * 0.85, heightY, fz * 0.18 + distZ];
-        targetLook = [leadX * 0.9, 0.52, fz * 0.18 - 1.15];
+        const clampX = halfL * (is11 ? 0.54 : 0.36);
+        const leadX = Math.max(-clampX, Math.min(clampX, fx * (is11 ? 0.62 : 0.44)));
+
+        if (this.cameraMode === "dynamic") {
+          desiredFov = 30;
+          const heightY = (is11 ? 15.8 : 13.2) * zScale;
+          const distZ = (is11 ? 29.5 : 23.8) * zScale;
+          targetPos = [leadX, heightY, fz * 0.32 + distZ];
+          targetLook = [fx * 0.74, 0.72, fz * 0.35 - 0.8];
+        } else if (this.cameraMode === "pro") {
+          desiredFov = 35;
+          targetPos = [fx - (is11 ? 24.5 : 18.8) * zScale, (is11 ? 13.5 : 10.6) * zScale, fz * 0.58];
+          targetLook = [fx + 9.5, 0.8, fz * 0.4];
+        } else if (this.cameraMode === "wide") {
+          // Classic FIFA Co-Op Tactical (full goal-to-goal tactical overview!)
+          desiredFov = 31.5;
+          const heightY = (is11 ? 37.0 : 29.2) * zScale;
+          const distZ = (is11 ? 59.5 : 48.0) * zScale;
+          targetPos = [leadX * 0.38, heightY, distZ];
+          targetLook = [leadX * 0.42, 0.45, -1.0];
+        } else {
+          // Default EA FIFA 10–12 Tele Broadcast Gantry (frames both penalty arcs & passing lanes!)
+          desiredFov = 30.5;
+          const heightY = (is11 ? 31.5 : 24.8) * zScale;
+          const distZ = (is11 ? 52.0 : 41.5) * zScale;
+          targetPos = [leadX * 0.85, heightY, fz * 0.18 + distZ];
+          targetLook = [leadX * 0.9, 0.52, fz * 0.18 - 1.15];
+        }
       }
     }
 
-    if (Math.abs(this.camera.fov - desiredFov) > 0.02) {
-      damp(this.camera, "fov", desiredFov, 0.16, dt);
+    if (setPieceCamKey !== (this.prevSetPieceCamKey || 0)) {
+      this.prevSetPieceCamKey = setPieceCamKey;
+      this.camPos.set(targetPos[0], targetPos[1], targetPos[2]);
+      this.camLook.set(targetLook[0], targetLook[1], targetLook[2]);
+      this.camera.fov = desiredFov;
       this.camera.updateProjectionMatrix();
+    } else {
+      if (Math.abs(this.camera.fov - desiredFov) > 0.02) {
+        damp(this.camera, "fov", desiredFov, 0.16, dt);
+        this.camera.updateProjectionMatrix();
+      }
+      damp3(this.camPos, targetPos, camSmoothTime, dt);
+      damp3(this.camLook, targetLook, camSmoothTime, dt);
     }
 
-    damp3(this.camPos, targetPos, camSmoothTime, dt);
-    damp3(this.camLook, targetLook, camSmoothTime, dt);
     this.camera.position.copy(this.camPos);
     this.camera.lookAt(this.camLook);
 

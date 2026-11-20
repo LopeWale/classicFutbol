@@ -48,9 +48,16 @@ struct ExportedSummary<'a> {
     went_to_extra_time: bool,
     shootout_score: Option<[u8; 2]>,
     possession_ticks: [u32; 2],
-    home_player_stats: &'a [psfc_sim::PlayerMatchStats],
-    away_player_stats: &'a [psfc_sim::PlayerMatchStats],
+    home_player_stats: Vec<psfc_sim::PlayerMatchStats>,
+    away_player_stats: Vec<psfc_sim::PlayerMatchStats>,
     events: &'a [psfc_sim::MatchEvent],
+}
+
+#[derive(Serialize)]
+struct ExportedTeams<'a> {
+    home: &'a psfc_sim::TeamSnapshot,
+    away: &'a psfc_sim::TeamSnapshot,
+    subs_used: [u8; 2],
 }
 
 thread_local! {
@@ -198,6 +205,7 @@ pub extern "C" fn sim_init_from_snapshot_json() -> i32 {
 }
 
 /// Advance one 60 Hz tick and record the exact `[home, away]` input frames.
+/// Upper 16 bits of `h_btns` / `a_btns` carry `InputFrame.reserved` (e.g. deterministic substitution command).
 #[no_mangle]
 pub extern "C" fn sim_tick(
     h_mx: i32,
@@ -217,7 +225,7 @@ pub extern "C" fn sim_tick(
         aim_x: h_ax.clamp(-127, 127) as i8,
         aim_y: h_ay.clamp(-127, 127) as i8,
         buttons: (h_btns & 0xFFFF) as u16,
-        reserved: 0,
+        reserved: ((h_btns >> 16) & 0xFFFF) as u16,
     };
     let away = InputFrame {
         move_x: a_mx.clamp(-127, 127) as i8,
@@ -225,7 +233,7 @@ pub extern "C" fn sim_tick(
         aim_x: a_ax.clamp(-127, 127) as i8,
         aim_y: a_ay.clamp(-127, 127) as i8,
         buttons: (a_btns & 0xFFFF) as u16,
-        reserved: 0,
+        reserved: ((a_btns >> 16) & 0xFFFF) as u16,
     };
 
     SESSION.with(|cell| {
@@ -297,7 +305,13 @@ pub extern "C" fn sim_auto_step(steps: u32) -> u32 {
 /// `[15]=ball_owner_side (-1,0,1)`, `[16]=ball_owner_idx`, `[17]=pending_event_count`
 /// Followed by `2 * players_per_side` blocks of 10 `i32`s:
 /// `[side, idx, shirt_no, role_code, x_mm, y_mm, vx_mm, vy_mm, facing_bam, flags_stamina_charge]`
-/// where `flags_stamina_charge = (action_code & 0xF) | ((stamina_permille & 0x7FF) << 4) | ((charge_permille & 0x7FF) << 15) | ((sent_off as i32) << 26)`.
+/// where `flags_stamina_charge`:
+/// - bits `0..=3`: `action_code` (`0..7`)
+/// - bits `4..=14`: `stamina_permille` (`0..=1000`)
+/// - bits `15..=25`: `charge_permille` (`0..=1000`)
+/// - bit `26`: `sent_off` (`0..1`)
+/// - bit `27`: `has_yellow_card` (`0..1`)
+/// - bits `28..=31`: `jump_z_steps` (`0..=15`, `60mm` per step -> `0..=900mm` aerial header elevation!)
 #[no_mangle]
 pub extern "C" fn sim_pack_render_state() -> usize {
     SESSION.with(|cell| {
@@ -359,10 +373,14 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                     };
                     let stamina = p.stamina_permille.clamp(0, 1000);
                     let charge = (p.charge_ratio_permille() as i32).clamp(0, 1000);
+                    let has_yellow = i32::from(p.yellow_cards > 0);
+                    let jump_step = ((p.z.to_milli().clamp(0, 900)) / 60) as i32;
                     let packed = (action_code & 0xF)
                         | ((stamina & 0x7FF) << 4)
                         | ((charge & 0x7FF) << 15)
-                        | ((i32::from(p.sent_off)) << 26);
+                        | ((i32::from(p.sent_off)) << 26)
+                        | (has_yellow << 27)
+                        | ((jump_step & 0xF) << 28);
 
                     out.extend_from_slice(&[
                         s as i32,
@@ -392,6 +410,24 @@ pub extern "C" fn sim_drain_events_json() -> usize {
         };
         let events = sess.sim.drain_events();
         let json = serde_json::to_vec(&events).unwrap_or_else(|_| b"[]".to_vec());
+        set_output_bytes(json)
+    })
+}
+
+#[no_mangle]
+pub extern "C" fn sim_export_teams_json() -> usize {
+    SESSION.with(|cell| {
+        let guard = cell.borrow();
+        let Some(sess) = guard.as_ref() else {
+            return set_output_bytes(b"{}".to_vec());
+        };
+        let st = sess.sim.state();
+        let dto = ExportedTeams {
+            home: &st.teams[0],
+            away: &st.teams[1],
+            subs_used: st.subs_used,
+        };
+        let json = serde_json::to_vec(&dto).unwrap_or_else(|_| b"{}".to_vec());
         set_output_bytes(json)
     })
 }
@@ -450,8 +486,8 @@ pub extern "C" fn sim_export_summary_json() -> usize {
             went_to_extra_time: st.went_to_extra_time,
             shootout_score: st.shootout_score,
             possession_ticks: st.possession_ticks,
-            home_player_stats: &st.player_stats[0],
-            away_player_stats: &st.player_stats[1],
+            home_player_stats: st.combined_player_stats(TeamSide::Home),
+            away_player_stats: st.combined_player_stats(TeamSide::Away),
             events: &st.recorded_events,
         };
         let json = serde_json::to_vec(&summary).unwrap_or_else(|_| b"{}".to_vec());

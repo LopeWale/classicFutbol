@@ -1,4 +1,9 @@
-import { ClassicFifa3DEngine, CAMERA_LABELS, resolveMatchKits } from "./engine3d.js";
+import {
+  ClassicFifa3DEngine,
+  CAMERA_LABELS,
+  WEATHER_LABELS,
+  resolveMatchKits,
+} from "./engine3d.js";
 
 // InputFrame button bitmasks (must match sim/psfc-sim/src/input.rs)
 const BTN_PASS = 1 << 0;
@@ -78,11 +83,13 @@ const DEFAULT_WORLD_ID = "world-prem-2026";
 const DEFAULT_CUP_ID = "comp-facup-2026";
 const REPLAY_CAPACITY = 360;
 
-// --- Procedural WebAudio Console & Stadium Sound Engine ---
+// --- Spatial Stereo WebAudio Console & Stadium Sound Engine ---
 
 const GameAudio = (() => {
   let audioCtx = null;
   let enabled = true;
+  let ambienceGain = null;
+  let ambienceWanted = false;
 
   function ensureCtx() {
     if (!enabled) return null;
@@ -94,7 +101,55 @@ const GameAudio = (() => {
     if (audioCtx.state === "suspended") {
       audioCtx.resume().catch(() => {});
     }
+    if (ambienceWanted && !ambienceGain && audioCtx.state === "running") {
+      startAmbienceBed(audioCtx);
+    }
     return audioCtx;
+  }
+
+  function connectSpatial(ac, node, pan = 0) {
+    if (ac.createStereoPanner) {
+      const panner = ac.createStereoPanner();
+      panner.pan.setValueAtTime(Math.max(-0.78, Math.min(0.78, pan)), ac.currentTime);
+      node.connect(panner).connect(ac.destination);
+    } else {
+      node.connect(ac.destination);
+    }
+  }
+
+  function startAmbienceBed(ac) {
+    if (ambienceGain) return;
+    const dur = 3.0;
+    const bufSize = Math.floor(ac.sampleRate * dur);
+    const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+    const ch = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < bufSize; i++) {
+      const w = Math.random() * 2 - 1;
+      last = (last + 0.03 * w) / 1.03;
+      const seam = Math.sin((i / bufSize) * Math.PI);
+      ch[i] = last * (0.7 + 0.3 * seam) * 2.2;
+    }
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    src.loop = true;
+    const lp = ac.createBiquadFilter();
+    lp.type = "bandpass";
+    lp.frequency.setValueAtTime(420, ac.currentTime);
+    lp.Q.setValueAtTime(0.65, ac.currentTime);
+    ambienceGain = ac.createGain();
+    ambienceGain.gain.setValueAtTime(enabled && ambienceWanted ? 0.028 : 0.0, ac.currentTime);
+    src.connect(lp).connect(ambienceGain).connect(ac.destination);
+    src.start();
+  }
+
+  function setMatchAmbience(active) {
+    ambienceWanted = Boolean(active);
+    if (audioCtx && ambienceGain) {
+      ambienceGain.gain.setTargetAtTime(enabled && ambienceWanted ? 0.028 : 0.0, audioCtx.currentTime, 0.25);
+    } else if (ambienceWanted && audioCtx && audioCtx.state === "running") {
+      startAmbienceBed(audioCtx);
+    }
   }
 
   function uiTick(freq = 520) {
@@ -118,27 +173,28 @@ const GameAudio = (() => {
     setTimeout(() => uiTick(880), 45);
   }
 
-  function playKick(power = 0.65) {
+  function playKick(power = 0.65, pan = 0) {
     const ac = ensureCtx();
     if (!ac) return;
     const now = ac.currentTime;
     const osc = ac.createOscillator();
     const gain = ac.createGain();
     osc.type = "triangle";
-    osc.frequency.setValueAtTime(140 + power * 48, now);
-    osc.frequency.exponentialRampToValueAtTime(40, now + 0.09);
-    gain.gain.setValueAtTime(0.2 * Math.min(1.25, power + 0.35), now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.095);
-    osc.connect(gain).connect(ac.destination);
+    osc.frequency.setValueAtTime(142 + power * 52, now);
+    osc.frequency.exponentialRampToValueAtTime(38, now + 0.095);
+    gain.gain.setValueAtTime(0.21 * Math.min(1.25, power + 0.35), now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.1);
+    osc.connect(gain);
+    connectSpatial(ac, gain, pan);
     osc.start(now);
-    osc.stop(now + 0.1);
+    osc.stop(now + 0.105);
   }
 
-  function playWhistle(longBlast = false) {
+  function playWhistle(longBlast = false, pan = 0) {
     const ac = ensureCtx();
     if (!ac) return;
     const now = ac.currentTime;
-    const dur = longBlast ? 0.4 : 0.18;
+    const dur = longBlast ? 0.42 : 0.18;
     for (const freq of [2780, 2945]) {
       const osc = ac.createOscillator();
       const gain = ac.createGain();
@@ -147,33 +203,81 @@ const GameAudio = (() => {
       osc.frequency.linearRampToValueAtTime(freq - 55, now + dur);
       gain.gain.setValueAtTime(0.055, now);
       gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
-      osc.connect(gain).connect(ac.destination);
+      osc.connect(gain);
+      connectSpatial(ac, gain, pan * 0.4);
       osc.start(now);
       osc.stop(now + dur + 0.01);
     }
   }
 
-  function playSaveSlap() {
+  function playSaveSlap(pan = 0) {
     const ac = ensureCtx();
     if (!ac) return;
     const now = ac.currentTime;
     const osc = ac.createOscillator();
     const gain = ac.createGain();
     osc.type = "square";
-    osc.frequency.setValueAtTime(310, now);
-    osc.frequency.exponentialRampToValueAtTime(88, now + 0.075);
-    gain.gain.setValueAtTime(0.11, now);
-    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
-    osc.connect(gain).connect(ac.destination);
+    osc.frequency.setValueAtTime(320, now);
+    osc.frequency.exponentialRampToValueAtTime(86, now + 0.08);
+    gain.gain.setValueAtTime(0.115, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.085);
+    osc.connect(gain);
+    connectSpatial(ac, gain, pan);
     osc.start(now);
-    osc.stop(now + 0.085);
+    osc.stop(now + 0.09);
   }
 
-  function playGoalCrowdRoar() {
+  function playWoodworkClang(pan = 0) {
     const ac = ensureCtx();
     if (!ac) return;
     const now = ac.currentTime;
-    const dur = 1.45;
+    for (const [freq, amp, dur] of [
+      [780, 0.12, 0.26],
+      [1290, 0.075, 0.19],
+    ]) {
+      const osc = ac.createOscillator();
+      const gain = ac.createGain();
+      osc.type = "triangle";
+      osc.frequency.setValueAtTime(freq, now);
+      osc.frequency.exponentialRampToValueAtTime(freq * 0.94, now + dur);
+      gain.gain.setValueAtTime(amp, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+      osc.connect(gain);
+      connectSpatial(ac, gain, pan);
+      osc.start(now);
+      osc.stop(now + dur + 0.01);
+    }
+  }
+
+  function playNetSwish(pan = 0) {
+    const ac = ensureCtx();
+    if (!ac) return;
+    const now = ac.currentTime;
+    const dur = 0.22;
+    const len = Math.floor(ac.sampleRate * dur);
+    const buf = ac.createBuffer(1, len, ac.sampleRate);
+    const ch = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) ch[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    const bp = ac.createBiquadFilter();
+    bp.type = "bandpass";
+    bp.frequency.setValueAtTime(2100, now);
+    bp.Q.setValueAtTime(1.4, now);
+    const gain = ac.createGain();
+    gain.gain.setValueAtTime(0.14, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
+    src.connect(bp).connect(gain);
+    connectSpatial(ac, gain, pan);
+    src.start(now);
+  }
+
+  function playGoalCrowdRoar(pan = 0) {
+    const ac = ensureCtx();
+    if (!ac) return;
+    playNetSwish(pan);
+    const now = ac.currentTime;
+    const dur = 1.55;
     const bufSize = Math.floor(ac.sampleRate * dur);
     const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
     const ch = buf.getChannelData(0);
@@ -191,7 +295,7 @@ const GameAudio = (() => {
     filter.Q.setValueAtTime(0.85, now);
     const gain = ac.createGain();
     gain.gain.setValueAtTime(0.01, now);
-    gain.gain.linearRampToValueAtTime(0.24, now + 0.18);
+    gain.gain.linearRampToValueAtTime(0.25, now + 0.18);
     gain.gain.exponentialRampToValueAtTime(0.002, now + dur);
     src.connect(filter).connect(gain).connect(ac.destination);
     src.start(now);
@@ -199,16 +303,21 @@ const GameAudio = (() => {
 
   function toggle() {
     enabled = !enabled;
+    if (audioCtx && ambienceGain) {
+      ambienceGain.gain.setTargetAtTime(enabled && ambienceWanted ? 0.028 : 0.0, audioCtx.currentTime, 0.15);
+    }
     return enabled;
   }
 
   return {
     ensureCtx,
+    setMatchAmbience,
     uiTick,
     uiConfirm,
     playKick,
     playWhistle,
     playSaveSlap,
+    playWoodworkClang,
     playGoalCrowdRoar,
     toggle,
   };
@@ -246,7 +355,7 @@ let pmDurIdx = 1; // 2 min default
 let pmDiffIdx = 1; // Professional (Normal)
 let pendingOfficialFixture = null; // Set when entering Pre-Match from an Official Parallel Fixture!
 
-// Live match state
+// Live match & deterministic substitution state
 let activeOfficialSession = null;
 let paused = false;
 let fulltimeShown = false;
@@ -255,6 +364,10 @@ let lastShootoutScore = null;
 let homePossTicks = 1;
 let awayPossTicks = 1;
 let matchEventsLog = [];
+let queuedSubReserved = [0, 0]; // 16-bit encoded substitution per side for next sim_tick!
+let subsUsedCount = [0, 0];
+let subsSide = 0;
+let subsArmedSlot = null;
 
 // Instant Replay Theater
 let replayBuffer = [];
@@ -335,6 +448,7 @@ function navigateTo(screen) {
 
   document.body.classList.toggle("in-live-match", screen === "match");
   document.body.classList.toggle("in-prematch-showcase", screen === "prematch");
+  GameAudio.setMatchAmbience(screen === "match");
 
   if (screen === "title" || screen === "menu" || screen === "season" || screen === "controllers") {
     engine3d.setViewMode("attract");
@@ -693,6 +807,11 @@ window.addEventListener("keydown", (ev) => {
       cycleMatchCamera();
       return;
     }
+    if (ev.code === "KeyM") {
+      ev.preventDefault();
+      cycleMatchWeather();
+      return;
+    }
     if (ev.code === "Minus" || ev.code === "NumpadSubtract") {
       ev.preventDefault();
       engine3d.adjustZoom(0.08);
@@ -886,13 +1005,22 @@ function setupLiveMatchHud(snapshot, contextLabel) {
   homePossTicks = 1;
   awayPossTicks = 1;
   matchEventsLog = [];
+  queuedSubReserved = [0, 0];
+  subsUsedCount = [0, 0];
+  subsArmedSlot = null;
+  subsSide = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? 1 : 0;
 
   document.getElementById("pause-modal").hidden = true;
+  document.getElementById("pause-subs-panel").hidden = true;
+  document.getElementById("pause-modal-card").classList.remove("subs-open");
   document.getElementById("fulltime-modal").hidden = true;
   document.getElementById("replay-bar").hidden = true;
   document.getElementById("radar-wrap").hidden = false;
   document.getElementById("goal-banner").hidden = true;
   document.getElementById("verify-banner").hidden = true;
+  document.getElementById("hud-home-card").hidden = true;
+  document.getElementById("hud-away-card").hidden = true;
+  syncWeatherLabels();
 
   const kits = resolveMatchKits(
     snapshot.home.club_id,
@@ -1153,17 +1281,35 @@ function renderPreMatchScreen() {
   document.getElementById("pm-dur-val").textContent = DURATION_OPTIONS[pmDurIdx].label;
   document.getElementById("pm-diff-val").textContent = DIFF_OPTIONS[pmDiffIdx].label;
   document.getElementById("pm-cam-val").textContent = CAMERA_LABELS[engine3d.cameraMode];
+  syncWeatherLabels();
 
   engine3d.updatePreMatchShowcase(hRoster, aRoster);
 }
 
-// --- Match HUD, Radar, Pause & Instant Replay ---
+// --- Match HUD, Weather, Live Substitutions, Radar, Pause & Instant Replay ---
 
 function showGoalBroadcastBanner(title, sub, ticks = 150) {
   document.getElementById("goal-banner-title").textContent = title;
   document.getElementById("goal-banner-sub").textContent = sub;
   document.getElementById("goal-banner").hidden = false;
   goalBannerTicks = ticks;
+}
+
+function syncWeatherLabels() {
+  const mode = engine3d.weatherMode || "night";
+  const full = WEATHER_LABELS[mode] || "FLOODLIT NIGHT";
+  const pmEl = document.getElementById("pm-wx-val");
+  if (pmEl) pmEl.textContent = full;
+  const hudEl = document.getElementById("btn-hud-wx");
+  if (hudEl) hudEl.textContent = `WX: ${mode.toUpperCase()}`;
+  const pauseEl = document.getElementById("btn-pause-wx");
+  if (pauseEl) pauseEl.textContent = `WEATHER: ${full}`;
+}
+
+function cycleMatchWeather() {
+  engine3d.cycleWeatherPreset();
+  syncWeatherLabels();
+  GameAudio.uiTick(580);
 }
 
 function cycleMatchCamera() {
@@ -1181,8 +1327,186 @@ function togglePauseModal() {
   if (paused && currentSnapshot) {
     document.getElementById("pause-scoreline").textContent =
       `${currentSnapshot.home.short_name} ${document.getElementById("sb-score").textContent} ${currentSnapshot.away.short_name}`;
+    if (!document.getElementById("pause-subs-panel").hidden) {
+      renderPauseSubsPanel();
+    }
   }
   GameAudio.uiTick(paused ? 420 : 620);
+}
+
+function togglePauseSubsDrawer(forceOpen = null) {
+  const panel = document.getElementById("pause-subs-panel");
+  const card = document.getElementById("pause-modal-card");
+  const nextOpen = forceOpen !== null ? forceOpen : panel.hidden;
+  panel.hidden = !nextOpen;
+  card.classList.toggle("subs-open", nextOpen);
+  if (nextOpen) {
+    subsArmedSlot = null;
+    renderPauseSubsPanel();
+  }
+  GameAudio.uiTick(540);
+}
+
+function renderPauseSubsPanel() {
+  if (!currentSnapshot) return;
+  if (wasm && wasm.sim_export_teams_json && wasm.sim_export_teams_json() > 2) {
+    try {
+      const liveTeams = JSON.parse(wasmReadText());
+      if (liveTeams.home && liveTeams.away) {
+        currentSnapshot.home = liveTeams.home;
+        currentSnapshot.away = liveTeams.away;
+        if (Array.isArray(liveTeams.subs_used)) subsUsedCount = liveTeams.subs_used;
+      }
+    } catch (_e) {
+      // Keep snapshot teams
+    }
+  }
+
+  const homeBtn = document.getElementById("btn-subs-home");
+  const awayBtn = document.getElementById("btn-subs-away");
+  homeBtn.textContent = currentSnapshot.home.short_name || "HOME";
+  awayBtn.textContent = currentSnapshot.away.short_name || "AWAY";
+  homeBtn.classList.toggle("active", subsSide === 0);
+  awayBtn.classList.toggle("active", subsSide === 1);
+
+  const used = subsUsedCount[subsSide] || 0;
+  const rem = Math.max(0, 3 - used);
+  document.getElementById("subs-remaining-pill").textContent = `SUBS LEFT: ${rem} / 3`;
+
+  const team = subsSide === 0 ? currentSnapshot.home : currentSnapshot.away;
+  const starters = team.starters || [];
+  const bench = team.substitutes || team.bench || [];
+  const packed = currSimPacked || readPackedState();
+  const pps = packed ? packed[6] : starters.length;
+
+  const hintEl = document.getElementById("subs-status-hint");
+  if (!bench.length) {
+    hintEl.textContent = "All 11 official squad members are already on the pitch in 11v11 mode.";
+  } else if (rem <= 0) {
+    hintEl.textContent = `${team.short_name} has used all 3 substitutions in this match.`;
+  } else if (subsArmedSlot !== null && starters[subsArmedSlot]) {
+    const outM = starters[subsArmedSlot];
+    const reqRole = subsArmedSlot === 0 ? "Goalkeeper" : "Outfielder";
+    hintEl.textContent = `Subbing OFF #${outM.shirt_number} ${outM.name} — click a ${reqRole} on the bench to bring ON!`;
+  } else {
+    hintEl.textContent = "Click any active player on the pitch, then click a 100% fresh bench reserve to swap.";
+  }
+
+  const sList = document.getElementById("subs-starters-list");
+  sList.innerHTML = "";
+  starters.slice(0, pps).forEach((m, slotIdx) => {
+    let stamPct = 100;
+    let sentOff = false;
+    let hasYellow = false;
+    if (packed && packed.length >= 18 + (subsSide * pps + slotIdx + 1) * 10) {
+      const flags = packed[18 + (subsSide * pps + slotIdx) * 10 + 9] >>> 0;
+      stamPct = Math.round(((flags >>> 4) & 0x7ff) / 10);
+      sentOff = ((flags >>> 26) & 1) === 1;
+      hasYellow = ((flags >>> 27) & 1) === 1;
+    }
+    const rb = roleBadgeMeta(m.role);
+    const stamCol = stamPct < 35 ? "#ef4444" : stamPct < 60 ? "#facc15" : "#22c55e";
+    const cardBadge = sentOff
+      ? `<span class="fph-card card-red" title="Sent Off"></span>`
+      : hasYellow
+        ? `<span class="fph-card" title="Yellow Card"></span>`
+        : "";
+    const disabled = sentOff || rem <= 0 || !bench.length;
+
+    const row = document.createElement("div");
+    row.className = `subs-row${subsArmedSlot === slotIdx ? " armed" : ""}${disabled ? " disabled" : ""}`;
+    row.innerHTML = `
+      <div class="subs-row-left">
+        <strong>#${m.shirt_number}</strong>
+        <span class="role-tag ${rb.cls}">${rb.label}</span>
+        <span class="subs-row-name">${m.name}</span>
+        ${cardBadge}
+      </div>
+      <div class="subs-row-right">
+        <span>${stamPct}%</span>
+        <span class="subs-stam-mini"><span style="width:${stamPct}%;background:${stamCol}"></span></span>
+      </div>
+    `;
+    if (!disabled) {
+      row.addEventListener("click", () => {
+        subsArmedSlot = subsArmedSlot === slotIdx ? null : slotIdx;
+        GameAudio.uiTick(520);
+        renderPauseSubsPanel();
+      });
+    }
+    sList.appendChild(row);
+  });
+
+  const bList = document.getElementById("subs-bench-list");
+  bList.innerHTML = "";
+  if (!bench.length) {
+    bList.innerHTML = `<div class="subs-row disabled"><span>No unused reserves in 11v11</span></div>`;
+    return;
+  }
+
+  bench.forEach((m, benchIdx) => {
+    const rb = roleBadgeMeta(m.role);
+    const isGk = m.role === "Goalkeeper";
+    const a = m.attributes || {};
+    const ovr =
+      m.overall ||
+      (isGk
+        ? Math.round(((a.goalkeeping || 84) * 2 + (a.positioning || 82) + (a.passing || 76)) / 4)
+        : Math.round(
+            ((a.pace || 82) +
+              (a.shooting || 80) +
+              (a.passing || 82) +
+              (a.dribbling || 82) +
+              (a.tackling || 75) +
+              (a.positioning || 82)) /
+              6
+          ));
+    const roleMismatch =
+      subsArmedSlot !== null && ((subsArmedSlot === 0 && !isGk) || (subsArmedSlot > 0 && isGk));
+    const disabled = rem <= 0 || roleMismatch;
+
+    const row = document.createElement("div");
+    row.className = `subs-row${disabled ? " disabled" : ""}`;
+    row.innerHTML = `
+      <div class="subs-row-left">
+        <strong>#${m.shirt_number}</strong>
+        <span class="role-tag ${rb.cls}">${rb.label}</span>
+        <span class="subs-row-name">${m.name}</span>
+      </div>
+      <div class="subs-row-right">
+        <span class="ovr-pill">${ovr}</span>
+        <span style="color:#4ade80;font-weight:800">100%</span>
+      </div>
+    `;
+    if (!disabled) {
+      row.addEventListener("click", () => {
+        let targetSlot = subsArmedSlot;
+        if (targetSlot === null) {
+          // Auto-pick the most fatigued legal starter if user clicked bench directly!
+          if (isGk) {
+            targetSlot = 0;
+          } else {
+            let minStam = 9999;
+            targetSlot = 1;
+            for (let k = 1; k < pps; k++) {
+              const fl = packed ? packed[18 + (subsSide * pps + k) * 10 + 9] >>> 0 : 1000 << 4;
+              if (((fl >>> 26) & 1) === 1) continue;
+              const st = (fl >>> 4) & 0x7ff;
+              if (st < minStam) {
+                minStam = st;
+                targetSlot = k;
+              }
+            }
+          }
+        }
+        queuedSubReserved[subsSide] = 0x8000 | ((targetSlot & 0x1f) << 5) | (benchIdx & 0x1f);
+        subsArmedSlot = null;
+        GameAudio.uiConfirm();
+        togglePauseModal(); // Unpauses immediately so next 60Hz tick applies the substitution!
+      });
+    }
+    bList.appendChild(row);
+  });
 }
 
 function toggleInstantReplay() {
@@ -1257,30 +1581,63 @@ function drainLiveMatchEvents(packed) {
   const events = JSON.parse(wasmReadText());
   if (isAttractMatch) return;
 
+  const halfLmm = currentSnapshot ? currentSnapshot.format.pitch_length_mm * 0.5 : 21000;
+  const pan = packed ? Math.max(-0.78, Math.min(0.78, packed[9] / Math.max(1000, halfLmm))) : 0;
+
   for (const ev of events) {
     const kind = String(ev.event_type || "").toLowerCase();
     matchEventsLog.unshift(ev);
 
     if (kind === "goal" || kind === "shootout_goal") {
-      GameAudio.playGoalCrowdRoar();
-      engine3d.triggerGoalEffect(packed ? packed[15] : -1);
+      GameAudio.playGoalCrowdRoar(pan);
+      const impZ = packed ? packed[10] / 1000 : 0;
+      const impY = packed ? packed[11] / 1000 : 1.25;
+      engine3d.triggerGoalEffect(packed ? packed[15] : -1, impZ, impY);
       showGoalBroadcastBanner(kind === "shootout_goal" ? "PENALTY SCORED!" : "GOAL!", `${ev.minute}' · ${ev.detail}`, 175);
+    } else if (kind === "woodwork") {
+      GameAudio.playWoodworkClang(pan);
+      showGoalBroadcastBanner("OFF THE WOODWORK!", `${ev.minute}' · ${ev.detail}`, 75);
+    } else if (kind === "yellow_card") {
+      GameAudio.playWhistle(true, pan);
+      showGoalBroadcastBanner("YELLOW CARD", `${ev.minute}' · ${ev.detail}`, 115);
+    } else if (kind === "red_card") {
+      GameAudio.playWhistle(true, pan);
+      showGoalBroadcastBanner("RED CARD — SENT OFF!", `${ev.minute}' · ${ev.detail}`, 140);
+    } else if (kind === "substitution") {
+      GameAudio.uiConfirm();
+      if (wasm.sim_export_teams_json && wasm.sim_export_teams_json() > 2 && currentSnapshot) {
+        try {
+          const live = JSON.parse(wasmReadText());
+          currentSnapshot.home = live.home;
+          currentSnapshot.away = live.away;
+          if (Array.isArray(live.subs_used)) subsUsedCount = live.subs_used;
+          const subSide = ev.team === "Away" ? 1 : 0;
+          const teamObj = subSide === 0 ? currentSnapshot.home : currentSnapshot.away;
+          const slotIdx = (teamObj.starters || []).findIndex((p) => p.footballer_id === ev.player_id);
+          if (slotIdx >= 0) {
+            engine3d.replacePlayerActor(subSide, slotIdx, teamObj.starters[slotIdx], teamObj);
+          }
+        } catch (_e) {
+          // Ignore JSON sync error
+        }
+      }
+      showGoalBroadcastBanner("SUBSTITUTION", `${ev.minute}' · ${ev.detail}`, 130);
     } else if (kind === "shot") {
-      GameAudio.playKick(0.95);
+      GameAudio.playKick(0.95, pan);
     } else if (kind === "pass") {
-      GameAudio.playKick(0.45);
+      GameAudio.playKick(0.45, pan);
     } else if (kind === "save") {
-      GameAudio.playSaveSlap();
+      GameAudio.playSaveSlap(pan);
     } else if (kind === "extra_time_start") {
-      GameAudio.playWhistle(true);
+      GameAudio.playWhistle(true, pan);
       showGoalBroadcastBanner("EXTRA TIME", ev.detail, 120);
     } else if (kind === "penalty_shootout_start") {
-      GameAudio.playWhistle(true);
+      GameAudio.playWhistle(true, pan);
       showGoalBroadcastBanner("PENALTY SHOOTOUT", ev.detail, 140);
     } else if (kind === "foul" || kind === "kick_off" || kind === "half_time") {
-      GameAudio.playWhistle(false);
+      GameAudio.playWhistle(false, pan);
     } else if (kind === "full_time") {
-      GameAudio.playWhistle(true);
+      GameAudio.playWhistle(true, 0);
       openFullTimeSummaryModal();
     }
   }
@@ -1297,9 +1654,11 @@ function updatePlayerCornerHuds(packed) {
     if (n < 0 || n >= pps * 2) return;
     const b = 18 + n * 10;
     const shirt = packed[b + 2];
-    const flags = packed[b + 9];
-    const stamina = ((flags >> 4) & 0x7ff) / 1000;
-    const charge = ((flags >> 15) & 0x7ff) / 1000;
+    const flags = packed[b + 9] >>> 0;
+    const stamina = ((flags >>> 4) & 0x7ff) / 1000;
+    const charge = ((flags >>> 15) & 0x7ff) / 1000;
+    const sentOff = ((flags >>> 26) & 1) === 1;
+    const hasYellow = ((flags >>> 27) & 1) === 1;
 
     const team = side === 0 ? currentSnapshot.home : currentSnapshot.away;
     const member = team.starters && team.starters[ctrlIdx];
@@ -1307,6 +1666,11 @@ function updatePlayerCornerHuds(packed) {
 
     document.getElementById(`hud-${prefix}-num`).textContent = String(shirt);
     document.getElementById(`hud-${prefix}-name`).textContent = surname;
+    const cardEl = document.getElementById(`hud-${prefix}-card`);
+    if (cardEl) {
+      cardEl.hidden = !(sentOff || hasYellow);
+      cardEl.classList.toggle("card-red", sentOff);
+    }
     const stamEl = document.getElementById(`hud-${prefix}-stam`);
     stamEl.style.width = `${Math.round(stamina * 100)}%`;
     stamEl.style.background = stamina < 0.3 ? "#ef4444" : stamina < 0.55 ? "#facc15" : "#22c55e";
@@ -1325,19 +1689,31 @@ function drawPitchRadar(packed) {
   const halfW = currentSnapshot.format.pitch_width_mm / 2000;
 
   radarCtx.clearRect(0, 0, W, H);
-  radarCtx.fillStyle = "rgba(16, 85, 42, 0.72)";
-  radarCtx.fillRect(0, 0, W, H);
 
-  radarCtx.strokeStyle = "rgba(248, 250, 252, 0.45)";
-  radarCtx.lineWidth = 1.2;
+  // Alternating botanical mower stripes (`IMG_0350.webp`!)
+  const stripes = 8;
+  const sw = (W - 8) / stripes;
+  for (let s = 0; s < stripes; s++) {
+    radarCtx.fillStyle = s % 2 === 0 ? "rgba(32, 96, 36, 0.78)" : "rgba(42, 114, 45, 0.78)";
+    radarCtx.fillRect(4 + s * sw, 4, sw + 0.5, H - 8);
+  }
+
+  radarCtx.strokeStyle = "rgba(248, 250, 252, 0.58)";
+  radarCtx.lineWidth = 1.25;
   radarCtx.strokeRect(4, 4, W - 8, H - 8);
   radarCtx.beginPath();
   radarCtx.moveTo(W * 0.5, 4);
   radarCtx.lineTo(W * 0.5, H - 4);
   radarCtx.stroke();
   radarCtx.beginPath();
-  radarCtx.arc(W * 0.5, H * 0.5, 15, 0, Math.PI * 2);
+  radarCtx.arc(W * 0.5, H * 0.5, 14, 0, Math.PI * 2);
   radarCtx.stroke();
+
+  // Penalty boxes on radar
+  const boxW = (W - 8) * 0.16;
+  const boxH = (H - 8) * 0.54;
+  radarCtx.strokeRect(4, (H - boxH) * 0.5, boxW, boxH);
+  radarCtx.strokeRect(W - 4 - boxW, (H - boxH) * 0.5, boxW, boxH);
 
   const mapX = (wx) => 4 + ((wx + halfL) / (halfL * 2)) * (W - 8);
   const mapY = (wy) => 4 + ((wy + halfW) / (halfW * 2)) * (H - 8);
@@ -1354,34 +1730,38 @@ function drawPitchRadar(packed) {
     const b = 18 + n * 10;
     const side = packed[b];
     const idx = packed[b + 1];
-    const sentOff = ((packed[b + 9] >> 26) & 1) === 1;
+    const flags = packed[b + 9] >>> 0;
+    const sentOff = ((flags >>> 26) & 1) === 1;
     if (sentOff) continue;
     const px = mapX(packed[b + 4] / 1000);
     const py = mapY(packed[b + 5] / 1000);
 
     const isCtrl = side === 0 ? idx === homeCtrl : idx === awayCtrl;
     if (isCtrl) {
-      radarCtx.strokeStyle = "#ffffff";
-      radarCtx.lineWidth = 1.4;
+      radarCtx.strokeStyle = "#facc15";
+      radarCtx.lineWidth = 1.5;
       radarCtx.beginPath();
-      radarCtx.arc(px, py, 5.2, 0, Math.PI * 2);
+      radarCtx.arc(px, py, 5.4, 0, Math.PI * 2);
       radarCtx.stroke();
     }
 
     radarCtx.fillStyle = side === 0 ? homeCol : awayCol;
     radarCtx.beginPath();
-    radarCtx.arc(px, py, 3.6, 0, Math.PI * 2);
+    radarCtx.arc(px, py, 3.7, 0, Math.PI * 2);
     radarCtx.fill();
+    radarCtx.strokeStyle = "rgba(9, 15, 28, 0.8)";
+    radarCtx.lineWidth = 0.9;
+    radarCtx.stroke();
   }
 
   const bx = mapX(packed[9] / 1000);
   const by = mapY(packed[10] / 1000);
   radarCtx.fillStyle = "#ffffff";
   radarCtx.beginPath();
-  radarCtx.arc(bx, by, 3.3, 0, Math.PI * 2);
+  radarCtx.arc(bx, by, 3.4, 0, Math.PI * 2);
   radarCtx.fill();
   radarCtx.strokeStyle = "#090f1c";
-  radarCtx.lineWidth = 1;
+  radarCtx.lineWidth = 1.1;
   radarCtx.stroke();
 }
 
@@ -1489,7 +1869,12 @@ function mainLoop(nowMs) {
 
         for (let s = 0; s < steps; s++) {
           if (currSimPacked) prevSimPacked = currSimPacked;
-          wasm.sim_tick(hIn.mx, hIn.my, hIn.ax, hIn.ay, hIn.btns, aIn.mx, aIn.my, aIn.ax, aIn.ay, aIn.btns);
+          const hBtns = ((hIn.btns & 0xffff) | ((queuedSubReserved[0] & 0xffff) << 16)) >>> 0;
+          const aBtns = ((aIn.btns & 0xffff) | ((queuedSubReserved[1] & 0xffff) << 16)) >>> 0;
+          queuedSubReserved[0] = 0;
+          queuedSubReserved[1] = 0;
+
+          wasm.sim_tick(hIn.mx, hIn.my, hIn.ax, hIn.ay, hBtns, aIn.mx, aIn.my, aIn.ax, aIn.ay, aBtns);
           const subPacked = readPackedState();
           if (subPacked) {
             currSimPacked = new Int32Array(subPacked);
@@ -2170,6 +2555,16 @@ document.getElementById("pm-cam-next").addEventListener("click", () => {
   cycleMatchCamera();
   renderPreMatchScreen();
 });
+document.getElementById("pm-wx-prev").addEventListener("click", () => {
+  const modes = ["night", "day", "rain"];
+  const cur = modes.indexOf(engine3d.weatherMode);
+  engine3d.setWeatherPreset(modes[(cur - 1 + modes.length) % modes.length]);
+  syncWeatherLabels();
+  GameAudio.uiTick(560);
+});
+document.getElementById("pm-wx-next").addEventListener("click", () => {
+  cycleMatchWeather();
+});
 
 document.getElementById("btn-pm-back").addEventListener("click", () => {
   GameAudio.uiTick(380);
@@ -2412,13 +2807,28 @@ document.getElementById("btn-hud-zoom-in").addEventListener("click", () => {
   engine3d.adjustZoom(-0.09);
   GameAudio.uiTick(560);
 });
+document.getElementById("btn-hud-wx").addEventListener("click", cycleMatchWeather);
 document.getElementById("btn-hud-cam").addEventListener("click", cycleMatchCamera);
 document.getElementById("btn-hud-replay").addEventListener("click", toggleInstantReplay);
 document.getElementById("btn-hud-pause").addEventListener("click", togglePauseModal);
 
 document.getElementById("btn-pause-resume").addEventListener("click", togglePauseModal);
+document.getElementById("btn-pause-subs-toggle").addEventListener("click", () => togglePauseSubsDrawer());
 document.getElementById("btn-pause-replay").addEventListener("click", toggleInstantReplay);
 document.getElementById("btn-pause-cam").addEventListener("click", cycleMatchCamera);
+document.getElementById("btn-pause-wx").addEventListener("click", cycleMatchWeather);
+document.getElementById("btn-subs-home").addEventListener("click", () => {
+  subsSide = 0;
+  subsArmedSlot = null;
+  GameAudio.uiTick(500);
+  renderPauseSubsPanel();
+});
+document.getElementById("btn-subs-away").addEventListener("click", () => {
+  subsSide = 1;
+  subsArmedSlot = null;
+  GameAudio.uiTick(500);
+  renderPauseSubsPanel();
+});
 document.getElementById("btn-pause-sim").addEventListener("click", () => {
   if (!wasm) return;
   paused = false;
@@ -2472,5 +2882,58 @@ async function bootGame() {
 
   requestAnimationFrame(mainLoop);
 }
+
+window.__psfcDiagnostics = {
+  engine3d,
+  getWasm: () => wasm,
+  getSnapshot: () => currentSnapshot,
+  getSubsUsed: () => subsUsedCount,
+  stepTicks(count = 180) {
+    if (!wasm || !currentSnapshot) return;
+    for (let i = 0; i < count; i++) {
+      wasm.sim_tick(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      const p = readPackedState();
+      if (!p) break;
+      if (p[3] !== 12) {
+        if (replayBuffer.length >= REPLAY_CAPACITY) replayBuffer.shift();
+        replayBuffer.push(new Int32Array(p));
+      }
+      if (p[17] > 0) drainLiveMatchEvents(p);
+      if (p[3] === 12) break;
+    }
+    resetSimInterpState();
+  },
+  fastStepToPhase(targetPhase, maxTicks = 28000, requireAttackingHalf = false) {
+    if (!wasm || !currentSnapshot) return false;
+    const halfLmm = currentSnapshot.format.pitch_length_mm * 0.5;
+    for (let i = 0; i < maxTicks; i++) {
+      wasm.sim_tick(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      const p = readPackedState();
+      if (!p) break;
+      if (p[17] > 0) drainLiveMatchEvents(p);
+      if (p[3] === 12) return false;
+      if (p[3] === targetPhase) {
+        if (!requireAttackingHalf) {
+          resetSimInterpState();
+          return true;
+        }
+        const pps = p[6];
+        const ownerSide = p[15];
+        const gk0X = p[18 + 4];
+        const gk1X = p[18 + pps * 10 + 4];
+        const attGoalX = (ownerSide === 0 ? Math.sign(gk1X || 1) : Math.sign(gk0X || -1)) * halfLmm;
+        const dist = Math.hypot(attGoalX - p[9], p[10]);
+        if (dist < halfLmm * 0.85) {
+          // Step 4 ticks so wall defenders & taker settle cleanly on their marks!
+          for (let k = 0; k < 4; k++) wasm.sim_tick(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+          resetSimInterpState();
+          return true;
+        }
+      }
+    }
+    resetSimInterpState();
+    return false;
+  },
+};
 
 bootGame();

@@ -166,6 +166,182 @@ pub fn compute_goalkeeper_intent(
     }
 }
 
+/// Deterministically projects the ball's `(x, y)` ground coordinates `ticks_ahead` into the future
+/// (`6`-tick / `100ms` coarse steps) accounting for velocity, horizontal Magnus curve, and turf/air drag.
+pub fn predict_ball_xy_at_ticks(state: &MatchState, ticks_ahead: u32) -> Vec2 {
+    if ticks_ahead == 0 {
+        return state.ball.pos.xy();
+    }
+    if let Some((owner_side, owner_idx)) = state.ball.owner {
+        let p = &state.players[owner_side.index()][owner_idx];
+        let dt_total = Fp::from_ratio(ticks_ahead.min(18) as i64, 60);
+        return (state.ball.pos.xy() + p.vel.scale(dt_total)).clamp_box(
+            state.format.half_length(),
+            state.format.half_width(),
+        );
+    }
+
+    let mut pos = state.ball.pos.xy();
+    let mut vel = state.ball.vel.xy();
+    let mut z = state.ball.pos.z;
+    let mut vz = state.ball.vel.z;
+    let mut spin_side = state.ball.spin_side;
+    let is_5v5 = state.format.players_per_side <= 6;
+    let half_len = state.format.half_length();
+    let half_wid = state.format.half_width();
+
+    let mut rem = ticks_ahead.min(90);
+    while rem > 0 {
+        let step = rem.min(6);
+        rem -= step;
+        let dt = Fp::from_ratio(step as i64, 60);
+
+        let speed = vel.len();
+        if speed > Fp::from_milli(2_000) && spin_side.abs() > Fp::from_milli(50) {
+            let perp = Vec2::new(-vel.y, vel.x).normalize_or_zero();
+            let mag = spin_side.mul(Fp::from_milli(980));
+            vel += perp.scale(mag.mul(dt));
+            spin_side = spin_side.mul(Fp::from_milli(942));
+        }
+
+        if z > Fp::from_milli(60) {
+            vel = vel.scale(Fp::from_milli(965));
+            vz -= Fp::from_milli(9_810).mul(dt);
+        } else {
+            let decel = Fp::from_milli(if is_5v5 { 2_250 } else { 2_450 }).mul(dt);
+            if speed <= decel {
+                vel = Vec2::ZERO;
+            } else {
+                vel = (vel - vel.normalize_or_zero().scale(decel)).scale(Fp::from_milli(970));
+            }
+            z = Fp::ZERO;
+            if vz < Fp::ZERO {
+                vz = Fp::ZERO;
+            }
+        }
+
+        pos = (pos + vel.scale(dt)).clamp_box(half_len, half_wid);
+        z += vz.mul(dt);
+        if z < Fp::ZERO {
+            z = Fp::ZERO;
+            if vz < Fp::from_milli(-850) {
+                vz = (-vz).mul(Fp::from_milli(610));
+                vel = vel.scale(Fp::from_milli(880));
+            } else {
+                vz = Fp::ZERO;
+            }
+        }
+        if vel.len_sq() < Fp::from_milli(40) {
+            break;
+        }
+    }
+    pos
+}
+
+/// Two-phase agile time-to-ball estimator (Bastiaan Konings' momentum phase -> max sprint circle).
+pub fn estimate_ticks_to_point(p: &crate::state::PlayerState, target: Vec2, is_5v5: bool) -> u32 {
+    // Phase 1: ~8 ticks (133ms) carrying current momentum vector while turning hips
+    let momentum_end = p.pos + p.vel.scale(Fp::from_milli(95));
+    let rem_dist = momentum_end.dist(target);
+    if rem_dist <= Fp::from_milli(650) {
+        return 4;
+    }
+    let pace_mm_s = 5_450 + (p.attributes.pace as i64) * 26;
+    let stam_scale = 760 + (p.stamina_permille as i64) * 240 / 1_000;
+    let sprint_mult = if is_5v5 { 1_205 } else { 1_220 };
+    let max_speed_mm_s = (((pace_mm_s * stam_scale) / 1_000) * sprint_mult) / 1_000;
+    let eff_dist_mm = (rem_dist.to_milli() - 550).max(0);
+    let sprint_ticks = ((eff_dist_mm * 60) / max_speed_mm_s.max(3_500)) as u32;
+    6 + sprint_ticks
+}
+
+/// Computes the earliest reachable future ball intercept `(point, ticks)` for `players[side][idx]`.
+pub fn best_ball_intercept_for_player(
+    state: &MatchState,
+    side: TeamSide,
+    idx: usize,
+) -> (Vec2, u32) {
+    let p = &state.players[side.index()][idx];
+    let is_5v5 = state.format.players_per_side <= 6;
+    if state.ball.owner.is_some() {
+        let pt = predict_ball_xy_at_ticks(state, 10);
+        let t = estimate_ticks_to_point(p, pt, is_5v5);
+        return (pt, t);
+    }
+    let mut fallback = (state.ball.pos.xy(), 90_u32);
+    let mut t = 6_u32;
+    while t <= 78 {
+        let pt = predict_ball_xy_at_ticks(state, t);
+        let need = estimate_ticks_to_point(p, pt, is_5v5);
+        fallback = (pt, need);
+        if need <= t {
+            return (pt, t);
+        }
+        t += 6;
+    }
+    fallback
+}
+
+/// Dynamic Formation Slot Assignment: maps outfielders `1..count` to tactical formation slots
+/// minimizing total squared travel distance so overlapping defenders are covered by midfielders!
+fn dynamically_assigned_anchor(
+    state: &MatchState,
+    side: TeamSide,
+    idx: usize,
+    shift_norm: Fp,
+) -> Vec2 {
+    let players = &state.players[side.index()];
+    let count = players.len();
+    if idx == 0 || idx >= count {
+        return world_anchor_for_player(state, side, idx, shift_norm);
+    }
+
+    // Exact minimum squared-distance permutation across the 4 outfield slots in 5v5 (`4! = 24`)
+    if count == 5
+        && !players[1].sent_off
+        && !players[2].sent_off
+        && !players[3].sent_off
+        && !players[4].sent_off
+    {
+        let anchors = [
+            world_anchor_for_player(state, side, 1, shift_norm),
+            world_anchor_for_player(state, side, 2, shift_norm),
+            world_anchor_for_player(state, side, 3, shift_norm),
+            world_anchor_for_player(state, side, 4, shift_norm),
+        ];
+        const PERMS: [[usize; 4]; 24] = [
+            [0, 1, 2, 3], [0, 1, 3, 2], [0, 2, 1, 3], [0, 2, 3, 1], [0, 3, 1, 2], [0, 3, 2, 1],
+            [1, 0, 2, 3], [1, 0, 3, 2], [1, 2, 0, 3], [1, 2, 3, 0], [1, 3, 0, 2], [1, 3, 2, 0],
+            [2, 0, 1, 3], [2, 0, 3, 1], [2, 1, 0, 3], [2, 1, 3, 0], [2, 3, 0, 1], [2, 3, 1, 0],
+            [3, 0, 1, 2], [3, 0, 2, 1], [3, 1, 0, 2], [3, 1, 2, 0], [3, 2, 0, 1], [3, 2, 1, 0],
+        ];
+        let mut best_cost = i64::MAX;
+        let mut best_slot = idx - 1;
+        for perm in &PERMS {
+            let mut cost: i64 = 0;
+            for p_off in 0..4 {
+                let slot = perm[p_off];
+                let d = players[p_off + 1].pos - anchors[slot];
+                let dx_dm = d.x.to_milli() / 100;
+                let dy_dm = d.y.to_milli() / 100;
+                let mut sq = dx_dm * dx_dm + dy_dm * dy_dm;
+                // Hysteresis bonus (`~2.2 m^2`) for staying in natural home role unless overlap warrants cover
+                if slot != p_off {
+                    sq += 220;
+                }
+                cost += sq;
+            }
+            if cost < best_cost {
+                best_cost = cost;
+                best_slot = perm[idx - 1];
+            }
+        }
+        return anchors[best_slot];
+    }
+
+    world_anchor_for_player(state, side, idx, shift_norm)
+}
+
 /// Computes tactical movement for a non-controlled outfield player `players[side][idx]`.
 pub fn compute_outfield_ai_intent(
     state: &MatchState,
@@ -179,10 +355,11 @@ pub fn compute_outfield_ai_intent(
     let half_wid = state.format.half_width();
     let ball_xy = state.ball.pos.xy();
 
-    // 1. If a pass is in flight to this player, sprint to meet the target/ball!
+    // 1. If a pass is in flight to this player, sprint directly to the predicted ball intercept!
     if let Some(ref pass) = state.ball.pass_in_flight {
         if pass.team == side && pass.intended_receiver_idx == idx {
-            let meet = pass.target_pos.lerp(ball_xy, Fp::from_milli(350));
+            let (intercept_pt, _) = best_ball_intercept_for_player(state, side, idx);
+            let meet = intercept_pt.lerp(pass.target_pos, Fp::from_milli(280));
             return AiMoveIntent {
                 move_dir: (meet - p.pos).normalize_or_zero(),
                 sprint: true,
@@ -192,7 +369,7 @@ pub fn compute_outfield_ai_intent(
         }
     }
 
-    // 2. During non-OpenPlay phases, drift smoothly toward tactical home anchor.
+    // 2. During non-OpenPlay phases, drift smoothly toward tactical home anchor (unless in FreeKick wall).
     if !matches!(state.phase, MatchPhase::OpenPlay) {
         let anchor = world_anchor_for_player(state, side, idx, Fp::ZERO);
         let delta = anchor - p.pos;
@@ -212,24 +389,25 @@ pub fn compute_outfield_ai_intent(
         };
     }
 
-    // 3. Loose ball pursuit if this AI teammate is closest on their side (and human isn't right on it).
+    // 3. Loose ball pursuit using Two-Phase Time-To-Ball Intercept (not raw static distance!)
     if state.ball.owner.is_none() {
         let controlled = state.controlled_idx[side.index()];
-        let ctrl_dist = state.players[side.index()][controlled].pos.dist(ball_xy);
-        let my_dist = p.pos.dist(ball_xy);
-        let mut closest_outfield = true;
+        let (_, ctrl_ticks) = best_ball_intercept_for_player(state, side, controlled);
+        let (my_intercept, my_ticks) = best_ball_intercept_for_player(state, side, idx);
+        let mut fastest_outfield = true;
         for (other_idx, other) in state.players[side.index()].iter().enumerate() {
             if other_idx == 0 || other_idx == idx || other.sent_off {
                 continue;
             }
-            if other.pos.dist(ball_xy) + Fp::from_milli(200) < my_dist {
-                closest_outfield = false;
+            let (_, other_ticks) = best_ball_intercept_for_player(state, side, other_idx);
+            if other_ticks + 2 < my_ticks {
+                fastest_outfield = false;
                 break;
             }
         }
-        if closest_outfield && my_dist + Fp::from_milli(1_200) < ctrl_dist {
+        if fastest_outfield && my_ticks + 7 < ctrl_ticks {
             return AiMoveIntent {
-                move_dir: (ball_xy - p.pos).normalize_or_zero(),
+                move_dir: (my_intercept - p.pos).normalize_or_zero(),
                 sprint: true,
                 jockey: false,
                 trigger_dive: None,
@@ -237,10 +415,10 @@ pub fn compute_outfield_ai_intent(
         }
     }
 
-    let own_team_has_ball = match state.ball.owner {
-        Some((owner_side, _)) => owner_side == side,
-        None => state.ball.last_touch_team == Some(side),
-    };
+    // Smoothed ("laggy") team possession blend in `[0, 1000]` (`1000` = full attack, `0` = full defense)
+    let side_bal_sign = if side == TeamSide::Home { 1 } else { -1 };
+    let signed_bal = (state.possession_balance_permille * side_bal_sign).clamp(-1_000, 1_000);
+    let attack_blend = Fp::from_milli(((signed_bal + 1_000) / 2) as i64);
 
     // Normalized ball progression in `[-1, +1]` along this team's attacking axis.
     let ball_attack_norm = ball_xy
@@ -249,105 +427,109 @@ pub fn compute_outfield_ai_intent(
         .div(half_len)
         .clamp(Fp::NEG_ONE, Fp::ONE);
 
-    if own_team_has_ball {
-        // Attacking shape: shift anchors forward with ball progression (livelier Fluidity in 5v5)
-        let shift = if is_5v5 {
-            ball_attack_norm.mul(Fp::from_milli(440)) + Fp::from_milli(170)
-        } else {
-            ball_attack_norm.mul(Fp::from_milli(380)) + Fp::from_milli(140)
-        };
-        let mut target = world_anchor_for_player(state, side, idx, shift);
+    // Compute Defensive Target (compact goal-side block + dynamic slot cover)
+    let def_shift = ball_attack_norm.mul(Fp::from_milli(330)) - Fp::from_milli(185);
+    let mut def_target = dynamically_assigned_anchor(state, side, idx, def_shift);
+    def_target.y = def_target.y.lerp(ball_xy.y, Fp::from_milli(330));
 
-        // Lateral ball attraction for passing triangles — preserve width if carrier is on same flank
-        let lateral_pull = if is_5v5 {
-            Fp::from_milli(210)
-        } else {
-            Fp::from_milli(260)
-        };
-        target.y = target.y.lerp(ball_xy.y, lateral_pull);
+    let controlled = state.controlled_idx[side.index()];
+    let ctrl_dist = state.players[side.index()][controlled].pos.dist(ball_xy);
+    let my_dist = p.pos.dist(ball_xy);
+    if signed_bal < 150 && my_dist < Fp::from_milli(9_200) && my_dist + Fp::from_milli(1_500) < ctrl_dist {
+        let own_goal = Vec2::new(Fp::from_milli(-attack_sign * half_len.to_milli()), Fp::ZERO);
+        let goal_side_offset = (own_goal - ball_xy).normalize_or_zero().scale(Fp::from_milli(1_650));
+        def_target = ball_xy + goal_side_offset;
+    }
 
-        // In 5v5, avoid crowding the ball carrier so clean one-two triangles stay open
-        if is_5v5 {
-            let to_target_from_ball = target - ball_xy;
-            if to_target_from_ball.len() < Fp::from_milli(4_800) {
-                let spread_sign = if idx.is_multiple_of(2) { Fp::ONE } else { Fp::NEG_ONE };
-                target.y += spread_sign.mul(Fp::from_milli(3_600));
+    // Compute Attacking Target (dynamic slot + weighted open-space pocket + off-ball channel runs)
+    let att_shift = if is_5v5 {
+        ball_attack_norm.mul(Fp::from_milli(450)) + Fp::from_milli(180)
+    } else {
+        ball_attack_norm.mul(Fp::from_milli(390)) + Fp::from_milli(145)
+    };
+    let mut att_target = dynamically_assigned_anchor(state, side, idx, att_shift);
+    let lateral_pull = if is_5v5 {
+        Fp::from_milli(205)
+    } else {
+        Fp::from_milli(250)
+    };
+    att_target.y = att_target.y.lerp(ball_xy.y, lateral_pull);
+
+    // Weighted Space Pocket: step out of opponent shadow so passing lanes open cleanly!
+    let mut best_pocket = att_target;
+    let mut best_pocket_score = Fp::from_int(-999);
+    let cand_offsets = [
+        Vec2::ZERO,
+        Vec2::from_milli(attack_sign * 2_200, 1_800),
+        Vec2::from_milli(attack_sign * 2_200, -1_800),
+        Vec2::from_milli(-attack_sign * 1_600, if idx.is_multiple_of(2) { 2_600 } else { -2_600 }),
+    ];
+    for (c_i, off) in cand_offsets.iter().enumerate() {
+        let cand = att_target + *off;
+        if cand.dist(ball_xy) < Fp::from_milli(4_200) {
+            continue;
+        }
+        let mut nearest_opp = Fp::from_int(30);
+        for opp in &state.players[side.opponent().index()] {
+            if !opp.sent_off {
+                nearest_opp = nearest_opp.min(cand.dist(opp.pos));
             }
         }
-
-        // Forward darting run if triggered (`run_boost_ticks > 0`) or striker/midfielder in final half
-        let auto_overlap = p.role == PlayerRole::Forward && ball_attack_norm > Fp::from_milli(-180);
-        if p.run_boost_ticks > 0 || auto_overlap {
-            let onside_limit_x = compute_onside_limit_x(state, side);
-            let run_push = Fp::from_milli(if p.run_boost_ticks > 0 {
-                if is_5v5 { 7_800 } else { 9_500 }
-            } else if is_5v5 {
-                4_600
-            } else {
-                5_500
-            });
-            let desired_x = target.x + Fp::from_int(attack_sign as i32).mul(run_push);
-            target.x = if attack_sign > 0 {
-                desired_x.min(onside_limit_x)
-            } else {
-                desired_x.max(onside_limit_x)
-            };
+        let anchor_bias = if c_i == 0 { Fp::from_milli(1_100) } else { Fp::ZERO };
+        let sc = nearest_opp + anchor_bias;
+        if sc > best_pocket_score {
+            best_pocket_score = sc;
+            best_pocket = cand;
         }
+    }
+    att_target = best_pocket;
 
-        target.x = target.x.clamp(
-            -(half_len - Fp::from_milli(1_500)),
-            half_len - Fp::from_milli(1_500),
-        );
-        target.y = target.y.clamp(
-            -(half_wid - Fp::from_milli(1_500)),
-            half_wid - Fp::from_milli(1_500),
-        );
-
-        let delta = target - p.pos;
-        let dist = delta.len();
-        let sprint_thresh = if is_5v5 {
-            Fp::from_milli(4_200)
+    // Forward darting channel run if triggered (`run_boost_ticks > 0`) or forward in final two-thirds
+    let auto_overlap = p.role == PlayerRole::Forward && ball_attack_norm > Fp::from_milli(-220);
+    if p.run_boost_ticks > 0 || auto_overlap {
+        let onside_limit_x = compute_onside_limit_x(state, side);
+        let run_push = Fp::from_milli(if p.run_boost_ticks > 0 {
+            if is_5v5 { 8_000 } else { 9_800 }
+        } else if is_5v5 {
+            4_800
         } else {
-            Fp::from_milli(6_000)
+            5_800
+        });
+        let desired_x = att_target.x + Fp::from_int(attack_sign as i32).mul(run_push);
+        att_target.x = if attack_sign > 0 {
+            desired_x.min(onside_limit_x)
+        } else {
+            desired_x.max(onside_limit_x)
         };
-        AiMoveIntent {
-            move_dir: if dist > Fp::from_milli(320) {
-                delta.normalize_or_zero()
-            } else {
-                Vec2::ZERO
-            },
-            sprint: p.run_boost_ticks > 0 || dist > sprint_thresh,
-            jockey: false,
-            trigger_dive: None,
-        }
+    }
+
+    // Smoothly blend defensive and attacking targets by `attack_blend` (`0..=1`)
+    let mut target = def_target.lerp(att_target, attack_blend);
+    target.x = target.x.clamp(
+        -(half_len - Fp::from_milli(1_500)),
+        half_len - Fp::from_milli(1_500),
+    );
+    target.y = target.y.clamp(
+        -(half_wid - Fp::from_milli(1_500)),
+        half_wid - Fp::from_milli(1_500),
+    );
+
+    let delta = target - p.pos;
+    let dist = delta.len();
+    let sprint_thresh = if is_5v5 {
+        Fp::from_milli(4_200)
     } else {
-        // Defending shape: drop deeper toward own goal and compact laterally
-        let shift = ball_attack_norm.mul(Fp::from_milli(340)) - Fp::from_milli(180);
-        let mut target = world_anchor_for_player(state, side, idx, shift);
-        target.y = target.y.lerp(ball_xy.y, Fp::from_milli(340));
-
-        // If human controlled defender is far from ball carrier, nearest AI midfielder/defender contains goal-side
-        let controlled = state.controlled_idx[side.index()];
-        let ctrl_dist = state.players[side.index()][controlled].pos.dist(ball_xy);
-        let my_dist = p.pos.dist(ball_xy);
-        if my_dist < Fp::from_milli(9_000) && my_dist + Fp::from_milli(1_500) < ctrl_dist {
-            let own_goal = Vec2::new(Fp::from_milli(-attack_sign * half_len.to_milli()), Fp::ZERO);
-            let goal_side_offset = (own_goal - ball_xy).normalize_or_zero().scale(Fp::from_milli(1_600));
-            target = ball_xy + goal_side_offset;
-        }
-
-        let delta = target - p.pos;
-        let dist = delta.len();
-        AiMoveIntent {
-            move_dir: if dist > Fp::from_milli(300) {
-                delta.normalize_or_zero()
-            } else {
-                Vec2::ZERO
-            },
-            sprint: dist > Fp::from_milli(4_500),
-            jockey: my_dist < Fp::from_milli(2_600),
-            trigger_dive: None,
-        }
+        Fp::from_milli(5_800)
+    };
+    AiMoveIntent {
+        move_dir: if dist > Fp::from_milli(310) {
+            delta.normalize_or_zero()
+        } else {
+            Vec2::ZERO
+        },
+        sprint: (p.run_boost_ticks > 0 && signed_bal >= 0) || dist > sprint_thresh,
+        jockey: signed_bal < -150 && my_dist < Fp::from_milli(2_600),
+        trigger_dive: None,
     }
 }
 
@@ -546,35 +728,37 @@ pub fn generate_cpu_input(
         );
     }
 
-    // CPU does NOT own ball on `ctrl_idx`: defend or chase loose ball!
+    // CPU does NOT own ball on `ctrl_idx`: defend or intercept loose ball!
     let ball_xy = state.ball.pos.xy();
     let my_dist = me.pos.dist(ball_xy);
+    let (my_intercept, my_ticks) = best_ball_intercept_for_player(state, side, ctrl_idx);
 
-    // Switch to a closer outfield defender if needed
+    // Switch to a faster-intercepting outfield defender if needed
     if state.switch_cooldown[side_idx] == 0 && state.tick.is_multiple_of(decision_cadence) {
         for (idx, mate) in state.players[side_idx].iter().enumerate() {
             if idx == 0 || idx == ctrl_idx || mate.sent_off {
                 continue;
             }
-            if mate.pos.dist(ball_xy) + Fp::from_milli(1_800) < my_dist {
+            let (_, mate_ticks) = best_ball_intercept_for_player(state, side, idx);
+            if mate_ticks + 6 < my_ticks {
                 return vec_and_buttons_to_input(Vec2::ZERO, Vec2::ZERO, BTN_SWITCH);
             }
         }
     }
 
-    // Approach goal-side and tackle when within reach
+    // Approach goal-side when opponent carries ball, or sprint to future trajectory intercept on loose balls!
     let goal_side_pt = if state.ball.owner.is_some() {
-        let to_own_goal = (Vec2::new(own_goal_x, Fp::ZERO) - ball_xy)
+        let to_own_goal = (Vec2::new(own_goal_x, Fp::ZERO) - my_intercept)
             .normalize_or_zero()
             .scale(Fp::from_milli(750));
-        ball_xy + to_own_goal
+        my_intercept + to_own_goal
     } else {
-        ball_xy
+        my_intercept
     };
 
     let move_dir = (goal_side_pt - me.pos).normalize_or_zero();
     let mut buttons = 0_u16;
-    if my_dist > Fp::from_milli(2_500) {
+    if my_dist > Fp::from_milli(2_500) || state.ball.owner.is_none() {
         buttons |= BTN_SPRINT;
     } else {
         buttons |= BTN_JOCKEY;

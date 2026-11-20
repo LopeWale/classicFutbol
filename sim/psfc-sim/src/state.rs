@@ -194,6 +194,14 @@ impl MatchPhase {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BufferedAction {
+    pub button: u16,
+    pub aim: Vec2,
+    pub finesse: bool,
+    pub ttl_ticks: u8,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MatchState {
     pub fixture_id: String,
@@ -207,14 +215,25 @@ pub struct MatchState {
     pub half: u8,
     pub score: [u16; 2],
     pub possession_ticks: [u32; 2],
+    /// Smoothed ("laggy") team possession balance in `[-1000, +1000]` (`+1000` = Home, `-1000` = Away)
+    /// preventing 1-tick offensive/defensive jitter on 50/50 loose balls.
+    #[serde(default)]
+    pub possession_balance_permille: i32,
     pub phase: MatchPhase,
     /// `[home_controlled_idx, away_controlled_idx]`.
     pub controlled_idx: [usize; 2],
     pub prev_buttons: [u16; 2],
     pub switch_cooldown: [u8; 2],
+    /// Pre-contact `~233ms` (`14`-tick) input lookahead buffer per team for crisp one-touch play.
+    #[serde(default)]
+    pub input_buffer: [Option<BufferedAction>; 2],
+    #[serde(default)]
+    pub subs_used: [u8; 2],
     /// `[home_players, away_players]`.
     pub players: [Vec<PlayerState>; 2],
     pub player_stats: [Vec<PlayerMatchStats>; 2],
+    #[serde(default)]
+    pub archived_player_stats: [Vec<PlayerMatchStats>; 2],
     pub ball: BallState,
     pub rng: DeterministicRng,
     #[serde(default)]
@@ -230,6 +249,15 @@ impl MatchState {
     #[inline]
     pub const fn second_half_swapped(&self) -> bool {
         self.half.is_multiple_of(2)
+    }
+
+    /// Returns stats for all starters and substitutes who appeared for `side`.
+    pub fn combined_player_stats(&self, side: TeamSide) -> Vec<PlayerMatchStats> {
+        let s = side.index();
+        let mut out = Vec::with_capacity(self.player_stats[s].len() + self.archived_player_stats[s].len());
+        out.extend(self.archived_player_stats[s].iter().cloned());
+        out.extend(self.player_stats[s].iter().cloned());
+        out
     }
 
     /// Approximate football match minute (`1..=90` in regulation, `91..=120` in extra time) scaled to configured match length.
@@ -267,12 +295,28 @@ impl MatchState {
         }
         h.u32(self.possession_ticks[0]);
         h.u32(self.possession_ticks[1]);
+        h.i32(self.possession_balance_permille);
         h.u32(self.controlled_idx[0] as u32);
         h.u32(self.controlled_idx[1] as u32);
         h.u16(self.prev_buttons[0]);
         h.u16(self.prev_buttons[1]);
         h.u8(self.switch_cooldown[0]);
         h.u8(self.switch_cooldown[1]);
+        h.u8(self.subs_used[0]);
+        h.u8(self.subs_used[1]);
+        for slot in &self.input_buffer {
+            match slot {
+                Some(buf) => {
+                    h.u8(1);
+                    h.u16(buf.button);
+                    h.i64(buf.aim.x.raw());
+                    h.i64(buf.aim.y.raw());
+                    h.u8(u8::from(buf.finesse));
+                    h.u8(buf.ttl_ticks);
+                }
+                None => h.u8(0),
+            }
+        }
 
         for w in self.rng.state_words() {
             h.u64(w);
@@ -341,6 +385,9 @@ impl MatchState {
         for side_players in &self.players {
             h.u32(side_players.len() as u32);
             for p in side_players {
+                h.u32(p.footballer_id.len() as u32);
+                h.bytes(p.footballer_id.as_bytes());
+                h.u8(p.shirt_number);
                 h.i64(p.pos.x.raw());
                 h.i64(p.pos.y.raw());
                 h.i64(p.vel.x.raw());

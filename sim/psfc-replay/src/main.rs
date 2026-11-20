@@ -204,8 +204,8 @@ fn run_verify(snapshot_path: &str, inputs_path: &str, out_path: Option<&str>) ->
         elapsed_ms: started.elapsed().as_millis(),
         hash_checkpoints: checkpoints,
         events: st.recorded_events.clone(),
-        home_player_stats: st.player_stats[0].clone(),
-        away_player_stats: st.player_stats[1].clone(),
+        home_player_stats: st.combined_player_stats(psfc_sim::TeamSide::Home),
+        away_player_stats: st.combined_player_stats(psfc_sim::TeamSide::Away),
     };
 
     let json_out = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
@@ -339,8 +339,8 @@ fn run_simulate_demo(args: &[String]) -> Result<(), String> {
         elapsed_ms: started.elapsed().as_millis(),
         hash_checkpoints: checkpoints,
         events: st.recorded_events.clone(),
-        home_player_stats: st.player_stats[0].clone(),
-        away_player_stats: st.player_stats[1].clone(),
+        home_player_stats: st.combined_player_stats(psfc_sim::TeamSide::Home),
+        away_player_stats: st.combined_player_stats(psfc_sim::TeamSide::Away),
     };
     let json_out = serde_json::to_string_pretty(&result).map_err(|e| e.to_string())?;
     if let Some(ref p) = out_result {
