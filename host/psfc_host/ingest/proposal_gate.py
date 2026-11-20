@@ -265,7 +265,7 @@ class ProposalGate:
         provider: str = "real_football_feed_v1",
     ) -> dict[str, Any]:
         """Apply a squad transfer interval to future snapshots without mutating frozen snapshots."""
-        self.store.get_world(world_id)
+        world = self.store.get_world(world_id)
         ts = utc_now_iso()
         raw = {
             "footballer_id": footballer_id,
@@ -273,6 +273,17 @@ class ProposalGate:
             "to_club_id": to_club_id,
             "new_shirt": new_shirt,
         }
+        if world.get("status") == "completed":
+            payload_id = self._record_raw_payload(provider, "/transfers", raw)
+            return self._record_proposal(
+                payload_id=payload_id,
+                world_id=world_id,
+                target_type="footballer",
+                target_id=footballer_id,
+                proposed=raw,
+                decision="parked",
+                reason="world_completed",
+            )
         world_cat = self.catalogue.for_world(self.store, world_id)
         joined = world_cat.record_transfer(
             footballer_id=footballer_id,
