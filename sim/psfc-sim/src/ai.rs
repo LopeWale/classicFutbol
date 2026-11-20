@@ -429,14 +429,29 @@ pub fn generate_cpu_input(
         CpuDifficulty::Hard => 5,
     };
 
-    // If already charging a pass/shot, release at target charge ticks!
-    if let PlayerActionState::Charging { button, ticks, .. } = me.action {
-        let target_charge: u16 = if (button & BTN_SHOOT) != 0 { 13 } else { 9 };
-        let aim = Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO);
-        if ticks >= target_charge {
-            return vec_and_buttons_to_input(aim, Vec2::ZERO, 0);
+    // If already charging a pass/shot, preserve diagonal aim & stride glide until release!
+    if let PlayerActionState::Charging {
+        button,
+        ticks,
+        aim: stored_aim,
+        ..
+    } = me.action
+    {
+        let target_charge: u16 = if (button & BTN_SHOOT) != 0 { 12 } else { 8 };
+        let hold_aim = if stored_aim.len() > Fp::from_milli(120) {
+            stored_aim.normalize_or_zero()
         } else {
-            return vec_and_buttons_to_input(aim, Vec2::ZERO, button);
+            Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO)
+        };
+        let glide_dir = if me.vel.len() > Fp::from_milli(450) {
+            me.vel.normalize_or_zero()
+        } else {
+            hold_aim
+        };
+        if ticks >= target_charge {
+            return vec_and_buttons_to_input(glide_dir, hold_aim, 0);
+        } else {
+            return vec_and_buttons_to_input(glide_dir, hold_aim, button);
         }
     }
 
