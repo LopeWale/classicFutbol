@@ -234,6 +234,8 @@ let activeCompFilter = "all";
 let latestOverview = null;
 let currentSnapshot = null;
 let isAttractMatch = true;
+let matchSessionSeq = 0;
+let attractRestartInFlight = false;
 
 // Match setup selections (Pre-Match Screen)
 let pmHomeClub = "man-utd";
@@ -762,7 +764,9 @@ function pollGamepadMenuActions(nowMs) {
 // --- Background Attract Match & Match Session Lifecycle ---
 
 async function startAttractBackgroundMatch() {
-  if (!wasm) return;
+  if (!wasm || attractRestartInFlight) return;
+  attractRestartInFlight = true;
+  const seq = ++matchSessionSeq;
   isAttractMatch = true;
   activeOfficialSession = null;
   paused = false;
@@ -770,36 +774,43 @@ async function startAttractBackgroundMatch() {
 
   const seedLo = 20261120;
   try {
-    const res = await fetch("/api/exhibition/snapshot", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        world_id: activeWorldId,
-        home_club_id: "man-utd",
-        away_club_id: "arsenal",
-        format_name: "5v5",
-        half_duration_ticks: 14400,
-        home_controller: { kind: "Cpu", difficulty: "Hard" },
-        away_controller: { kind: "Cpu", difficulty: "Hard" },
-        seed: seedLo,
-      }),
-    });
-    if (res.ok) {
-      const data = await res.json();
-      wasmWriteInputText(JSON.stringify(data.snapshot));
-      if (wasm.sim_init_from_snapshot_json()) {
-        currentSnapshot = data.snapshot;
-        engine3d.loadSnapshotScene(currentSnapshot);
-        return;
+    try {
+      const res = await fetch("/api/exhibition/snapshot", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          world_id: activeWorldId,
+          home_club_id: "man-utd",
+          away_club_id: "arsenal",
+          format_name: "5v5",
+          half_duration_ticks: 14400,
+          home_controller: { kind: "Cpu", difficulty: "Hard" },
+          away_controller: { kind: "Cpu", difficulty: "Hard" },
+          seed: seedLo,
+        }),
+      });
+      if (seq !== matchSessionSeq || !isAttractMatch || currentScreen === "match") return;
+      if (res.ok) {
+        const data = await res.json();
+        if (seq !== matchSessionSeq || !isAttractMatch || currentScreen === "match") return;
+        wasmWriteInputText(JSON.stringify(data.snapshot));
+        if (wasm.sim_init_from_snapshot_json()) {
+          currentSnapshot = data.snapshot;
+          engine3d.loadSnapshotScene(currentSnapshot);
+          return;
+        }
       }
+    } catch (_e) {
+      // Offline fallback
     }
-  } catch (_e) {
-    // Offline fallback
-  }
 
-  if (wasm.sim_init_preset(0, seedLo, 0, 14400, 3, 3)) {
-    currentSnapshot = JSON.parse(wasmReadText());
-    engine3d.loadSnapshotScene(currentSnapshot);
+    if (seq !== matchSessionSeq || !isAttractMatch || currentScreen === "match") return;
+    if (wasm.sim_init_preset(0, seedLo, 0, 14400, 3, 3)) {
+      currentSnapshot = JSON.parse(wasmReadText());
+      engine3d.loadSnapshotScene(currentSnapshot);
+    }
+  } finally {
+    attractRestartInFlight = false;
   }
 }
 
@@ -839,6 +850,7 @@ function resolvePreMatchControllers() {
 }
 
 function setupLiveMatchHud(snapshot, contextLabel) {
+  ++matchSessionSeq;
   currentSnapshot = snapshot;
   isAttractMatch = false;
   paused = false;
@@ -878,6 +890,7 @@ function setupLiveMatchHud(snapshot, contextLabel) {
 
 async function launchSelectedMatch() {
   if (!wasm) return;
+  ++matchSessionSeq;
   GameAudio.uiConfirm();
 
   const fmtName = FORMAT_OPTIONS[pmFmtIdx].id;
@@ -1397,7 +1410,7 @@ function mainLoop(nowMs) {
       }
       const p = readPackedState();
       if (p && p[17] > 0) wasm.sim_drain_events_json();
-      if (p && p[3] === 12) {
+      if (p && p[3] === 12 && !attractRestartInFlight) {
         startAttractBackgroundMatch();
       }
       engine3d.renderFrame(p, null);

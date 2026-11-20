@@ -948,6 +948,15 @@ impl MatchSimulation {
                         top_speed = top_speed.mul(Fp::from_milli(drib_keep.min(975)));
                     }
 
+                    // Anisotropic human speed envelope: 100% forward along heading, ~85% lateral strafe, ~75% backpedal
+                    if moving && !matches!(p.action, PlayerActionState::SkillMove { .. }) {
+                        let heading = Vec2::from_bam(p.facing_bam, Fp::ONE);
+                        let move_norm = move_dir.normalize_or_zero();
+                        let align_milli = move_norm.dot(heading).to_milli(); // [-1000, +1000]
+                        let dir_scale_milli = (865 + (align_milli * 135) / 1_000).clamp(740, 1_000);
+                        top_speed = top_speed.mul(Fp::from_milli(dir_scale_milli));
+                    }
+
                     let desired_vel = match p.action {
                         PlayerActionState::Sliding { ticks_left, dir } => {
                             let burst = Fp::from_milli(4_200 + (ticks_left as i64) * 220);
@@ -972,16 +981,20 @@ impl MatchSimulation {
                         _ => move_dir.scale(top_speed),
                     };
 
-                    // Acceleration / deceleration blend (crisper 5v5 foot-plant cuts when changing direction)
+                    // Biomechanical Hill force-velocity launch boost + eccentric foot-plant braking cut
                     let base_accel = if is_5v5 {
                         30_500 + (p.attributes.acceleration as i64) * 220
                     } else {
                         24_000 + (p.attributes.acceleration as i64) * 180
                     };
+                    let cur_speed = p.vel.len();
                     let dv = desired_vel - p.vel;
-                    let cutting_or_braking = p.vel.len() > Fp::from_milli(900) && dv.dot(p.vel) < Fp::ZERO;
+                    let cutting_or_braking = cur_speed > Fp::from_milli(900) && dv.dot(p.vel) < Fp::ZERO;
+                    let explosive_start = moving && !cutting_or_braking && cur_speed < Fp::from_milli(3_200);
                     let accel_rate_mm_s2 = if cutting_or_braking {
-                        (base_accel * 135) / 100
+                        (base_accel * 152) / 100
+                    } else if explosive_start {
+                        (base_accel * 118) / 100
                     } else {
                         base_accel
                     };
@@ -1005,7 +1018,7 @@ impl MatchSimulation {
                         }
                     }
 
-                    // Facing orientation (agile 5v5 sole-turn vs 11v11 stride turn)
+                    // Centripetal traction turn bound: agile forefoot pivot at low speed vs tighter sprint radius
                     let face_target = if jockey && !has_ball {
                         let to_ball = ball_xy_now - p.pos;
                         if to_ball.len() > Fp::from_milli(100) {
@@ -1020,8 +1033,12 @@ impl MatchSimulation {
                     } else {
                         p.facing_bam
                     };
-                    let max_turn_bam: u16 = if is_5v5 { 4_200 } else { 2_900 };
-                    p.facing_bam = turn_toward_bam(p.facing_bam, face_target, max_turn_bam);
+                    let spd_mm = p.vel.len().to_milli().clamp(0, 8_500);
+                    let pivot_bam: i64 = if is_5v5 { 5_400 } else { 3_900 };
+                    let sprint_min_bam: i64 = if is_5v5 { 2_850 } else { 2_100 };
+                    let dyn_turn = (pivot_bam - (spd_mm * (pivot_bam - sprint_min_bam)) / 8_500)
+                        .clamp(sprint_min_bam, pivot_bam) as u16;
+                    p.facing_bam = turn_toward_bam(p.facing_bam, face_target, dyn_turn);
                 }
 
                 if let Some((fid, pname, kind)) = skill_move_triggered {
@@ -1628,12 +1645,17 @@ impl MatchSimulation {
             self.state.ball.spin_side = self.state.ball.spin_side.mul(Fp::from_milli(990));
         }
 
-        // Air drag vs grass rolling friction
+        // Air drag, vertical Magnus lift/dip (backspin floats lobs, topspin dips shots), vs grass rolling friction
         if self.state.ball.pos.z > Fp::from_milli(60) {
-            // In air: gravity + light aerodynamic drag
             let drag = Fp::from_milli(994);
             self.state.ball.vel.x = self.state.ball.vel.x.mul(drag);
             self.state.ball.vel.y = self.state.ball.vel.y.mul(drag);
+            // Vertical Magnus force: negative spin_top (backspin) lifts upward; positive spin_top (topspin) dips downward
+            if speed_xy > Fp::from_milli(2_500) && self.state.ball.spin_top.abs() > Fp::from_milli(40) {
+                let vert_magnus = (-self.state.ball.spin_top).mul(Fp::from_milli(680));
+                self.state.ball.vel.z += vert_magnus.mul(dt);
+                self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(992));
+            }
             self.state.ball.vel.z -= Fp::from_milli(9_810).mul(dt);
         } else {
             // Rolling on turf: crisp short-cut 5v5 turf glide (~2.85 m/s^2) vs 11v11 grass (~3.1 m/s^2)
@@ -1648,6 +1670,7 @@ impl MatchSimulation {
                 self.state.ball.vel.x = next_xy.x.mul(Fp::from_milli(994));
                 self.state.ball.vel.y = next_xy.y.mul(Fp::from_milli(994));
             }
+            self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(920));
             if self.state.ball.vel.z < Fp::ZERO {
                 self.state.ball.vel.z = Fp::ZERO;
             }
@@ -1657,7 +1680,7 @@ impl MatchSimulation {
         // Advance position
         self.state.ball.pos = self.state.ball.pos + self.state.ball.vel.scale(dt);
 
-        // Ground bounce
+        // Ground bounce with spin-to-turf friction coupling (backspin checks up; topspin skids forward)
         if self.state.ball.pos.z < Fp::ZERO {
             self.state.ball.pos.z = Fp::ZERO;
             if self.state.ball.vel.z < Fp::from_milli(-850) {
@@ -1666,9 +1689,17 @@ impl MatchSimulation {
                 } else {
                     Fp::from_milli(600)
                 };
+                let horiz_keep = if self.state.ball.spin_top < Fp::from_milli(-300) {
+                    Fp::from_milli(805)
+                } else if self.state.ball.spin_top > Fp::from_milli(400) {
+                    Fp::from_milli(915)
+                } else {
+                    Fp::from_milli(885)
+                };
                 self.state.ball.vel.z = (-self.state.ball.vel.z).mul(restitution);
-                self.state.ball.vel.x = self.state.ball.vel.x.mul(Fp::from_milli(890));
-                self.state.ball.vel.y = self.state.ball.vel.y.mul(Fp::from_milli(890));
+                self.state.ball.vel.x = self.state.ball.vel.x.mul(horiz_keep);
+                self.state.ball.vel.y = self.state.ball.vel.y.mul(horiz_keep);
+                self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(650));
             } else {
                 self.state.ball.vel.z = Fp::ZERO;
             }
@@ -1948,9 +1979,24 @@ impl MatchSimulation {
                     } else {
                         Vec2::new(Fp::ONE, Fp::ZERO)
                     };
-                    let half_overlap = (min_sep - dist).mul(Fp::HALF);
-                    self.state.players[sa][ia].pos -= push_dir.scale(half_overlap);
-                    self.state.players[sb][ib].pos += push_dir.scale(half_overlap);
+                    let overlap = min_sep - dist;
+                    let str_a = (45 + self.state.players[sa][ia].attributes.strength as i64).max(50);
+                    let str_b = (45 + self.state.players[sb][ib].attributes.strength as i64).max(50);
+                    let total_str = str_a + str_b;
+                    // Stronger player yields less ground in shoulder-to-shoulder jostling!
+                    let share_a = Fp::from_ratio(str_b, total_str);
+                    let share_b = Fp::from_ratio(str_a, total_str);
+                    self.state.players[sa][ia].pos -= push_dir.scale(overlap.mul(share_a));
+                    self.state.players[sb][ib].pos += push_dir.scale(overlap.mul(share_b));
+
+                    // Damp inward closing normal velocity so bodies don't jitter through each other
+                    let rel_v = self.state.players[sb][ib].vel - self.state.players[sa][ia].vel;
+                    let closing = rel_v.dot(push_dir);
+                    if closing < Fp::ZERO {
+                        let impulse = (-closing).mul(Fp::from_milli(750));
+                        self.state.players[sa][ia].vel -= push_dir.scale(impulse.mul(share_a));
+                        self.state.players[sb][ib].vel += push_dir.scale(impulse.mul(share_b));
+                    }
                 }
             }
         }
