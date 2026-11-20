@@ -792,17 +792,17 @@ impl MatchSimulation {
                             } else {
                                 let still_held = (side_input.buttons & button) != 0;
                                 let next_ticks = ticks + 1;
-                                let aim = if side_input.move_vec().len() > Fp::from_milli(120) {
-                                    side_input.move_vec()
-                                } else if side_input.aim_vec().len() > Fp::from_milli(150) {
+                                let aim = if side_input.aim_vec().len() > Fp::from_milli(150) {
                                     side_input.aim_vec()
+                                } else if side_input.move_vec().len() > Fp::from_milli(120) {
+                                    side_input.move_vec()
                                 } else if prev_aim.len() > Fp::from_milli(120) {
                                     prev_aim
                                 } else {
                                     Vec2::from_bam(p.facing_bam, Fp::ONE)
                                 };
                                 if !still_held || next_ticks >= MAX_CHARGE_TICKS {
-                                    p.action = PlayerActionState::Cooldown { ticks_left: 8 };
+                                    p.action = PlayerActionState::Cooldown { ticks_left: 6 };
                                     kick_to_execute = Some((button, next_ticks, finesse, aim));
                                 } else {
                                     p.action = PlayerActionState::Charging {
@@ -848,10 +848,10 @@ impl MatchSimulation {
                                         } else {
                                             BTN_PASS
                                         };
-                                        let init_aim = if side_input.move_vec().len() > Fp::from_milli(120) {
-                                            side_input.move_vec()
-                                        } else if side_input.aim_vec().len() > Fp::from_milli(150) {
+                                        let init_aim = if side_input.aim_vec().len() > Fp::from_milli(150) {
                                             side_input.aim_vec()
+                                        } else if side_input.move_vec().len() > Fp::from_milli(120) {
+                                            side_input.move_vec()
                                         } else {
                                             Vec2::from_bam(p.facing_bam, Fp::ONE)
                                         };
@@ -1256,19 +1256,20 @@ impl MatchSimulation {
                 .clamp(Fp::from_milli(5_000), Fp::from_milli(9_200));
             (spd, lift)
         } else {
-            let spd = (Fp::from_milli(12_400)
-                + dist.mul(Fp::from_milli(430))
-                + charge_norm.mul(Fp::from_milli(6_000)))
-            .clamp(Fp::from_milli(12_000), Fp::from_milli(22_800));
-            (spd, Fp::from_milli(220))
+            let spd = (Fp::from_milli(13_100)
+                + dist.mul(Fp::from_milli(445))
+                + charge_norm.mul(Fp::from_milli(6_200)))
+            .clamp(Fp::from_milli(12_800), Fp::from_milli(23_400));
+            let skim_vz = Fp::from_milli(320) + charge_norm.mul(Fp::from_milli(520));
+            (spd, skim_vz)
         };
 
         self.state.ball.vel = Vec3::new(dir.x.mul(horiz_speed), dir.y.mul(horiz_speed), vz);
         self.state.ball.spin_side = Fp::ZERO;
         self.state.ball.spin_top = if is_lob {
-            Fp::from_milli(-1_200)
+            Fp::from_milli(-1_350)
         } else {
-            Fp::from_milli(600)
+            Fp::from_milli(-780)
         };
         self.state.ball.pass_in_flight = Some(PassInFlight {
             team: side,
@@ -1608,25 +1609,51 @@ impl MatchSimulation {
                 return;
             }
 
-            // Outfield / foot dribble: tight sole-roll on BTN_JOCKEY vs stride knock-on on BTN_SPRINT
+            // FIFA 10–12 360° & Precision Dribbling: continuous rhythmic stride touches + true rolling ball velocity
             let inp = inputs[side.index()];
             let drib_skill = p.attributes.dribbling as i64;
-            let stride_pulse = if (self.state.tick / 9).is_multiple_of(2) {
-                70_i64
+            let p_speed = p.vel.len();
+            let facing_dir = Vec2::from_bam(p.facing_bam, Fp::ONE);
+            let carry_dir = if p_speed > Fp::from_milli(450) {
+                facing_dir
+                    .lerp(p.vel.normalize_or_zero(), Fp::from_milli(420))
+                    .normalize_or_zero()
             } else {
-                0_i64
+                facing_dir
             };
-            let (carry_dist_mm, follow_lerp) = if inp.pressed(BTN_JOCKEY) {
-                (310, Fp::from_milli(650))
-            } else if inp.pressed(BTN_SPRINT) && p.vel.len() > Fp::from_milli(4_200) {
-                (770 + stride_pulse, Fp::from_milli(440))
+
+            // Continuous triangle wave in [0, 1000] synced to stride cadence (zero square-wave snap!)
+            let (period_ticks, min_lead_mm, touch_amp_mm, follow_lerp) = if inp.pressed(BTN_JOCKEY) {
+                // FIFA 12 Precision Dribbling: rapid close touches right on the laces
+                (12_u32, 305_i64, 55_i64, Fp::from_milli(340))
+            } else if inp.pressed(BTN_SPRINT) && p_speed > Fp::from_milli(4_000) {
+                // Open-field Sprint Knock-On: rhythmic longer touches ahead into space
+                (20_u32, 620_i64, 240_i64, Fp::from_milli(240))
             } else {
-                let tight_base = (520 - (drib_skill - 75) * 2).clamp(420, 560);
-                (tight_base, Fp::from_milli(560))
+                // Balanced 360° Stride Carry (Personality+ dribbling tightness)
+                let tight_base = (485 - (drib_skill - 75) * 2).clamp(400, 525);
+                (16_u32, tight_base, 115_i64, Fp::from_milli(285))
             };
-            let target_xy = p.pos + Vec2::from_bam(p.facing_bam, Fp::from_milli(carry_dist_mm));
-            let next_xy = self.state.ball.pos.xy().lerp(target_xy, follow_lerp);
-            self.state.ball.vel = Vec3::new(p.vel.x, p.vel.y, Fp::ZERO);
+
+            let half_p = period_ticks / 2;
+            let phase_t = (self.state.tick + (idx as u32) * 5) % period_ticks;
+            let tri_permille = if phase_t <= half_p {
+                ((phase_t as i64) * 1_000) / (half_p as i64)
+            } else {
+                (((period_ticks - phase_t) as i64) * 1_000) / (half_p as i64)
+            };
+            let dynamic_lead_mm = if p_speed > Fp::from_milli(350) {
+                min_lead_mm + (touch_amp_mm * tri_permille) / 1_000
+            } else {
+                min_lead_mm
+            };
+
+            let prev_ball_xy = self.state.ball.pos.xy();
+            let target_xy = p.pos + carry_dir.scale(Fp::from_milli(dynamic_lead_mm));
+            let free_step_xy = prev_ball_xy + p.vel.scale(dt.mul(Fp::from_milli(650)));
+            let next_xy = free_step_xy.lerp(target_xy, follow_lerp);
+            let actual_vel_xy = (next_xy - prev_ball_xy).scale(Fp::from_int(TICKS_PER_SECOND as i32));
+            self.state.ball.vel = Vec3::new(actual_vel_xy.x, actual_vel_xy.y, Fp::ZERO);
             self.state.ball.pos = Vec3::new(next_xy.x, next_xy.y, Fp::ZERO);
             return;
         }
@@ -1658,8 +1685,8 @@ impl MatchSimulation {
             }
             self.state.ball.vel.z -= Fp::from_milli(9_810).mul(dt);
         } else {
-            // Rolling on turf: crisp short-cut 5v5 turf glide (~2.85 m/s^2) vs 11v11 grass (~3.1 m/s^2)
-            let decel = Fp::from_milli(if is_5v5 { 2_850 } else { 3_100 }).mul(dt);
+            // FIFA 10–12 non-linear turf glide: viscous grass-blade drag at high speed + smooth weighted settle
+            let decel = Fp::from_milli(if is_5v5 { 2_250 } else { 2_450 }).mul(dt);
             let v_xy = self.state.ball.vel.xy();
             let len = v_xy.len();
             if len <= decel {
@@ -1667,8 +1694,13 @@ impl MatchSimulation {
                 self.state.ball.vel.y = Fp::ZERO;
             } else {
                 let next_xy = v_xy - v_xy.normalize_or_zero().scale(decel);
-                self.state.ball.vel.x = next_xy.x.mul(Fp::from_milli(994));
-                self.state.ball.vel.y = next_xy.y.mul(Fp::from_milli(994));
+                let grass_viscous = if len > Fp::from_milli(11_000) {
+                    Fp::from_milli(991)
+                } else {
+                    Fp::from_milli(995)
+                };
+                self.state.ball.vel.x = next_xy.x.mul(grass_viscous);
+                self.state.ball.vel.y = next_xy.y.mul(grass_viscous);
             }
             self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(920));
             if self.state.ball.vel.z < Fp::ZERO {
@@ -1942,10 +1974,20 @@ impl MatchSimulation {
             self.state.ball.assist_candidate = None;
         }
 
+        let incoming_xy = self.state.ball.vel.xy();
+        let recv_vel = self.state.players[s_idx][idx].vel;
+        let drib_attr = self.state.players[s_idx][idx].attributes.dribbling as i64;
+        let cushion_keep = Fp::from_milli((290 - drib_attr).clamp(155, 255));
+        let cushioned_xy = if idx == 0 && in_own_box {
+            Vec2::ZERO
+        } else {
+            incoming_xy.scale(cushion_keep) + recv_vel.scale(Fp::from_milli(720))
+        };
+
         self.state.ball.owner = Some((side, idx));
         self.state.ball.gk_hold_ticks = if idx == 0 && in_own_box { 75 } else { 0 };
         self.state.ball.pos.z = Fp::ZERO;
-        self.state.ball.vel = Vec3::ZERO;
+        self.state.ball.vel = Vec3::new(cushioned_xy.x, cushioned_xy.y, Fp::ZERO);
         self.state.ball.last_touch_team = Some(side);
         self.state.ball.last_touch_player = Some((side, idx));
 

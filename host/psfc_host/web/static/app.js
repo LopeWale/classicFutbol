@@ -693,12 +693,34 @@ window.addEventListener("keydown", (ev) => {
       cycleMatchCamera();
       return;
     }
+    if (ev.code === "Minus" || ev.code === "NumpadSubtract") {
+      ev.preventDefault();
+      engine3d.adjustZoom(0.08);
+      GameAudio.uiTick(440);
+      return;
+    }
+    if (ev.code === "Equal" || ev.code === "NumpadAdd") {
+      ev.preventDefault();
+      engine3d.adjustZoom(-0.08);
+      GameAudio.uiTick(560);
+      return;
+    }
     if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.code)) {
       ev.preventDefault();
     }
     keysDown.add(ev.code);
   }
 });
+
+window.addEventListener(
+  "wheel",
+  (ev) => {
+    if (currentScreen === "match" && !paused) {
+      engine3d.adjustZoom(ev.deltaY > 0 ? 0.06 : -0.06);
+    }
+  },
+  { passive: true }
+);
 
 window.addEventListener("keyup", (ev) => keysDown.delete(ev.code));
 window.addEventListener("blur", () => keysDown.clear());
@@ -797,6 +819,7 @@ async function startAttractBackgroundMatch() {
         if (wasm.sim_init_from_snapshot_json()) {
           currentSnapshot = data.snapshot;
           engine3d.loadSnapshotScene(currentSnapshot);
+          resetSimInterpState();
           return;
         }
       }
@@ -808,6 +831,7 @@ async function startAttractBackgroundMatch() {
     if (wasm.sim_init_preset(0, seedLo, 0, 14400, 3, 3)) {
       currentSnapshot = JSON.parse(wasmReadText());
       engine3d.loadSnapshotScene(currentSnapshot);
+      resetSimInterpState();
     }
   } finally {
     attractRestartInFlight = false;
@@ -884,6 +908,7 @@ function setupLiveMatchHud(snapshot, contextLabel) {
   document.getElementById("sb-away-swatch").style.background = kits.awayOutfield.shirt;
 
   engine3d.loadSnapshotScene(snapshot);
+  resetSimInterpState();
   navigateTo("match");
   GameAudio.playWhistle(false);
 }
@@ -1371,7 +1396,21 @@ function formatHalfBadge(half, phase) {
 
 let lastLoopMs = performance.now();
 let simAccumMs = 0;
+let prevSimPacked = null;
+let currSimPacked = null;
 const SIM_STEP_MS = 1000 / 60;
+
+function resetSimInterpState() {
+  simAccumMs = 0;
+  const p = readPackedState();
+  if (p) {
+    currSimPacked = new Int32Array(p);
+    prevSimPacked = new Int32Array(p);
+  } else {
+    currSimPacked = null;
+    prevSimPacked = null;
+  }
+}
 
 function mainLoop(nowMs) {
   const frameDelta = Math.min(100, Math.max(0, nowMs - lastLoopMs));
@@ -1382,14 +1421,20 @@ function mainLoop(nowMs) {
 
   if (wasm && currentSnapshot) {
     if (currentScreen === "match" && replayActive && replayBuffer.length > 0) {
-      const idx = Math.min(replayBuffer.length - 1, Math.floor(replayCursor));
-      const snapPacked = replayBuffer[idx];
+      const idx0 = Math.min(replayBuffer.length - 1, Math.floor(replayCursor));
+      const idx1 = Math.min(replayBuffer.length - 1, idx0 + 1);
+      const rAlpha = Math.max(0, Math.min(1, replayCursor - idx0));
       const camMode = REPLAY_CAM_MODES[replayCamIdx];
-      engine3d.renderFrame(snapPacked, {
-        active: true,
-        camMode,
-        orbitAngle: replayCursor * 0.025 + 0.65,
-      });
+      engine3d.renderFrame(
+        replayBuffer[idx1],
+        {
+          active: true,
+          camMode,
+          orbitAngle: replayCursor * 0.025 + 0.65,
+        },
+        replayBuffer[idx0],
+        rAlpha
+      );
       replayCursor += (frameDelta / SIM_STEP_MS) * 0.5;
       if (replayCursor >= replayBuffer.length) {
         replayCursor = 0;
@@ -1399,21 +1444,34 @@ function mainLoop(nowMs) {
       return;
     }
 
-    simAccumMs += frameDelta;
-    const steps = Math.min(6, Math.floor(simAccumMs / SIM_STEP_MS));
-    simAccumMs -= steps * SIM_STEP_MS;
+    if (!paused) {
+      simAccumMs += frameDelta;
+    }
+    const steps = paused ? 0 : Math.min(6, Math.floor(simAccumMs / SIM_STEP_MS));
+    if (!paused) {
+      simAccumMs -= steps * SIM_STEP_MS;
+    }
+    const interpAlpha = paused ? 1.0 : Math.min(1.0, Math.max(0.0, simAccumMs / SIM_STEP_MS));
 
     // Advance simulation ticks at deterministic 60.0 Hz wall-clock pace
     if (isAttractMatch) {
-      for (let s = 0; s < Math.max(1, steps); s++) {
+      for (let s = 0; s < steps; s++) {
+        if (currSimPacked) prevSimPacked = currSimPacked;
         wasm.sim_tick(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+        const sub = readPackedState();
+        if (sub) {
+          currSimPacked = new Int32Array(sub);
+          if (!prevSimPacked || prevSimPacked[3] !== currSimPacked[3]) {
+            prevSimPacked = currSimPacked;
+          }
+          if (sub[17] > 0) wasm.sim_drain_events_json();
+        }
       }
-      const p = readPackedState();
-      if (p && p[17] > 0) wasm.sim_drain_events_json();
+      const p = currSimPacked || readPackedState();
       if (p && p[3] === 12 && !attractRestartInFlight) {
         startAttractBackgroundMatch();
       }
-      engine3d.renderFrame(p, null);
+      engine3d.renderFrame(p, null, prevSimPacked || p, interpAlpha);
     } else {
       if (!paused && currentScreen === "match" && steps > 0) {
         const sideMode = SIDE_MODES[pmSideIdx].id;
@@ -1430,8 +1488,15 @@ function mainLoop(nowMs) {
         }
 
         for (let s = 0; s < steps; s++) {
+          if (currSimPacked) prevSimPacked = currSimPacked;
           wasm.sim_tick(hIn.mx, hIn.my, hIn.ax, hIn.ay, hIn.btns, aIn.mx, aIn.my, aIn.ax, aIn.ay, aIn.btns);
           const subPacked = readPackedState();
+          if (subPacked) {
+            currSimPacked = new Int32Array(subPacked);
+            if (!prevSimPacked || prevSimPacked[3] !== currSimPacked[3]) {
+              prevSimPacked = currSimPacked;
+            }
+          }
           if (subPacked && subPacked[3] !== 12) {
             if (replayBuffer.length >= REPLAY_CAPACITY) replayBuffer.shift();
             replayBuffer.push(new Int32Array(subPacked));
@@ -1444,7 +1509,7 @@ function mainLoop(nowMs) {
         }
       }
 
-      const packed = readPackedState();
+      const packed = currSimPacked || readPackedState();
       if (packed) {
         const clockTicks = packed[1];
         const half = packed[2];
@@ -1477,7 +1542,7 @@ function mainLoop(nowMs) {
           }
         }
 
-        engine3d.renderFrame(packed, null);
+        engine3d.renderFrame(packed, null, prevSimPacked || packed, interpAlpha);
       }
     }
   } else {
@@ -2339,6 +2404,14 @@ document.getElementById("btn-ctrl-back").addEventListener("click", () => {
 });
 
 // Match HUD, Pause & Replay Buttons
+document.getElementById("btn-hud-zoom-out").addEventListener("click", () => {
+  engine3d.adjustZoom(0.09);
+  GameAudio.uiTick(440);
+});
+document.getElementById("btn-hud-zoom-in").addEventListener("click", () => {
+  engine3d.adjustZoom(-0.09);
+  GameAudio.uiTick(560);
+});
 document.getElementById("btn-hud-cam").addEventListener("click", cycleMatchCamera);
 document.getElementById("btn-hud-replay").addEventListener("click", toggleInstantReplay);
 document.getElementById("btn-hud-pause").addEventListener("click", togglePauseModal);
@@ -2351,6 +2424,7 @@ document.getElementById("btn-pause-sim").addEventListener("click", () => {
   paused = false;
   document.getElementById("pause-modal").hidden = true;
   wasm.sim_auto_step(90000);
+  resetSimInterpState();
   const p = readPackedState();
   drainLiveMatchEvents(p);
   openFullTimeSummaryModal();
