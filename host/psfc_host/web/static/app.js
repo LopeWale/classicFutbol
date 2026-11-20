@@ -1205,7 +1205,7 @@ function computeClubRatings(roster) {
   };
 }
 
-function renderPreMatchTeamCard(prefix, clubId, kitColorHex) {
+function renderPreMatchTeamCard(prefix, clubId, kitColorHex, kitTextColorHex) {
   const rosters = (latestOverview && latestOverview.rosters) || {};
   const r = rosters[clubId];
   if (!r) return;
@@ -1213,6 +1213,7 @@ function renderPreMatchTeamCard(prefix, clubId, kitColorHex) {
   const crest = document.getElementById(`pm-${prefix}-crest`);
   crest.textContent = r.short_name;
   crest.style.background = kitColorHex || r.primary_color;
+  crest.style.color = kitTextColorHex || "#ffffff";
 
   document.getElementById(`pm-${prefix}-name`).textContent = r.name;
   document.getElementById(`pm-${prefix}-stadium`).textContent = r.stadium;
@@ -1273,8 +1274,8 @@ function renderPreMatchScreen() {
   const isAwayClash = aRoster && kits.awayOutfield.shirt.toLowerCase() !== aRoster.primary_color.toLowerCase();
   document.getElementById("pm-away-kit-tag").textContent = isAwayClash ? "CLASH AWAY KIT" : "HOME KIT";
 
-  renderPreMatchTeamCard("home", pmHomeClub, kits.homeOutfield.shirt);
-  renderPreMatchTeamCard("away", pmAwayClub, kits.awayOutfield.shirt);
+  renderPreMatchTeamCard("home", pmHomeClub, kits.homeOutfield.shirt, kits.homeOutfield.numberColor);
+  renderPreMatchTeamCard("away", pmAwayClub, kits.awayOutfield.shirt, kits.awayOutfield.numberColor);
 
   document.getElementById("pm-side-val").textContent = SIDE_MODES[pmSideIdx].label;
   document.getElementById("pm-fmt-val").textContent = FORMAT_OPTIONS[pmFmtIdx].label;
@@ -1613,7 +1614,8 @@ function drainLiveMatchEvents(packed) {
           if (Array.isArray(live.subs_used)) subsUsedCount = live.subs_used;
           const subSide = ev.team === "Away" ? 1 : 0;
           const teamObj = subSide === 0 ? currentSnapshot.home : currentSnapshot.away;
-          const slotIdx = (teamObj.starters || []).findIndex((p) => p.footballer_id === ev.player_id);
+          const subInId = ev.footballer_id || ev.player_id;
+          const slotIdx = (teamObj.starters || []).findIndex((p) => p.footballer_id === subInId);
           if (slotIdx >= 0) {
             engine3d.replacePlayerActor(subSide, slotIdx, teamObj.starters[slotIdx], teamObj);
           }

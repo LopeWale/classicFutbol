@@ -337,7 +337,7 @@ pub extern "C" fn sim_pack_render_state() -> usize {
         PACKED_STATE.with(|buf| {
             let mut out = buf.borrow_mut();
             out.clear();
-            out.reserve(18 + pps * 2 * 10);
+            out.reserve(20 + pps * 2 * 10);
             out.extend_from_slice(&[
                 st.tick as i32,
                 st.clock_ticks as i32,
@@ -396,6 +396,11 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                     ]);
                 }
             }
+            // Trailing spin words `[spin_side_milli, spin_top_milli]` preserve all header & player offsets
+            out.extend_from_slice(&[
+                st.ball.spin_side.to_milli() as i32,
+                st.ball.spin_top.to_milli() as i32,
+            ]);
             out.len()
         })
     })

@@ -95,6 +95,10 @@ impl PlayerState {
 pub struct PassInFlight {
     pub team: TeamSide,
     pub passer_idx: usize,
+    #[serde(default)]
+    pub passer_id: String,
+    #[serde(default)]
+    pub passer_name: String,
     pub intended_receiver_idx: usize,
     pub target_pos: Vec2,
     pub launched_tick: u32,
@@ -106,7 +110,13 @@ pub struct PassInFlight {
 pub struct AssistCandidate {
     pub team: TeamSide,
     pub passer_idx: usize,
+    #[serde(default)]
+    pub passer_id: String,
+    #[serde(default)]
+    pub passer_name: String,
     pub receiver_idx: usize,
+    #[serde(default)]
+    pub receiver_id: String,
     pub completed_tick: u32,
 }
 
@@ -122,8 +132,14 @@ pub struct BallState {
     pub owner: Option<(TeamSide, usize)>,
     /// Non-zero while Goalkeeper holds a caught shot inside the box.
     pub gk_hold_ticks: u16,
+    /// Countdown ticks between discrete stride touches while dribbling.
+    #[serde(default)]
+    pub dribble_touch_cd: u8,
     pub last_touch_team: Option<TeamSide>,
     pub last_touch_player: Option<(TeamSide, usize)>,
+    /// Substitution-safe `(TeamSide, footballer_id, name)` of the last player who touched the ball.
+    #[serde(default)]
+    pub last_touch_meta: Option<(TeamSide, String, String)>,
     pub pass_in_flight: Option<PassInFlight>,
     pub assist_candidate: Option<AssistCandidate>,
 }
@@ -260,6 +276,25 @@ impl MatchState {
         out
     }
 
+    /// Mutable lookup by `footballer_id` across active pitch slots and archived bench stats,
+    /// ensuring goals, assists, and completed passes credit the exact athlete even after a live substitution.
+    pub fn player_stats_mut_by_id(
+        &mut self,
+        side: TeamSide,
+        footballer_id: &str,
+    ) -> Option<&mut PlayerMatchStats> {
+        let s = side.index();
+        if let Some(st) = self.player_stats[s]
+            .iter_mut()
+            .find(|st| st.footballer_id == footballer_id)
+        {
+            return Some(st);
+        }
+        self.archived_player_stats[s]
+            .iter_mut()
+            .find(|st| st.footballer_id == footballer_id)
+    }
+
     /// Approximate football match minute (`1..=90` in regulation, `91..=120` in extra time) scaled to configured match length.
     pub fn display_minute(&self) -> u16 {
         let reg_ticks = (self.rules.half_duration_ticks.saturating_mul(2)).max(1);
@@ -380,6 +415,7 @@ impl MatchState {
             None => h.u8(0),
         }
         h.u16(self.ball.gk_hold_ticks);
+        h.u8(self.ball.dribble_touch_cd);
 
         // Players
         for side_players in &self.players {
