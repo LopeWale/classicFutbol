@@ -116,6 +116,7 @@ impl MatchSimulation {
                     last_touch_team: None,
                     last_touch_player: None,
                     last_touch_meta: None,
+                    last_team_touch_meta: [None, None],
                     pass_in_flight: None,
                     assist_candidate: None,
                 },
@@ -142,6 +143,7 @@ impl MatchSimulation {
         let p = &self.state.players[side.index()][idx];
         let fid = p.footballer_id.clone();
         let pname = p.name.clone();
+        self.state.ball.last_team_touch_meta[side.index()] = Some((fid.clone(), pname.clone()));
         self.state.ball.last_touch_team = Some(side);
         self.state.ball.last_touch_player = Some((side, idx));
         self.state.ball.last_touch_meta = Some((side, fid, pname));
@@ -497,6 +499,7 @@ impl MatchSimulation {
             last_touch_team: Some(kicking_team),
             last_touch_player: None,
             last_touch_meta: None,
+            last_team_touch_meta: [None, None],
             pass_in_flight: None,
             assist_candidate: None,
         };
@@ -579,13 +582,13 @@ impl MatchSimulation {
             }
         };
 
-        let taker_meta = (
-            team,
-            self.state.players[team.index()][taker_idx]
-                .footballer_id
-                .clone(),
-            self.state.players[team.index()][taker_idx].name.clone(),
-        );
+        let taker_fid = self.state.players[team.index()][taker_idx]
+            .footballer_id
+            .clone();
+        let taker_fname = self.state.players[team.index()][taker_idx].name.clone();
+        let mut set_piece_team_meta: [Option<(String, String)>; 2] = [None, None];
+        set_piece_team_meta[team.index()] = Some((taker_fid.clone(), taker_fname.clone()));
+        let taker_meta = (team, taker_fid, taker_fname);
         self.state.ball = BallState {
             pos: Vec3::new(spot.x, spot.y, Fp::ZERO),
             vel: Vec3::ZERO,
@@ -597,6 +600,7 @@ impl MatchSimulation {
             last_touch_team: Some(team),
             last_touch_player: Some((team, taker_idx)),
             last_touch_meta: Some(taker_meta),
+            last_team_touch_meta: set_piece_team_meta,
             pass_in_flight: None,
             assist_candidate: None,
         };
@@ -1999,7 +2003,8 @@ impl MatchSimulation {
             // Trigger discrete boot touch when stride cadence fires, or when cutting/turning or ball crowds the feet
             let cut_trigger = p_speed > Fp::from_milli(320) && align_with_carry < Fp::from_milli(700);
             let crowd_trigger = rel_dist < Fp::from_milli(235);
-            if self.state.ball.dribble_touch_cd == 0 || cut_trigger || crowd_trigger {
+            let did_touch = self.state.ball.dribble_touch_cd == 0 || cut_trigger || crowd_trigger;
+            if did_touch {
                 let ideal_xy = p.pos + carry_dir.scale(Fp::from_milli(lead_mm));
                 if p_speed <= Fp::from_milli(220) && rel_dist <= Fp::from_milli(440) {
                     // Standing shield / sole trap: settle ball gently in front of laces
@@ -2033,6 +2038,9 @@ impl MatchSimulation {
 
             self.state.ball.vel = Vec3::new(vel_xy.x, vel_xy.y, next_vz);
             self.state.ball.pos = Vec3::new(next_xy.x, next_xy.y, next_z);
+            if did_touch {
+                self.set_last_touch(side, idx);
+            }
             return;
         }
 
@@ -2618,7 +2626,8 @@ impl MatchSimulation {
         self.state.ball.owner = None;
         self.state.ball.vel = self.state.ball.vel.scale(Fp::from_milli(250));
 
-        // Credit scorer using substitution-safe `last_touch_meta` (or fallback to slot / nearest forward)
+        // Credit scorer using substitution-safe `last_touch_meta`, then per-team `last_team_touch_meta`
+        // (so shots deflected off an opponent GK/defender still credit an outgoing substituted shooter!)
         let (scorer_id, scorer_name, scorer_idx) = match self.state.ball.last_touch_meta.clone() {
             Some((touch_side, fid, fname)) if touch_side == scoring_team && !fid.is_empty() => {
                 let cur_slot = self.state.players[s_idx]
@@ -2634,27 +2643,44 @@ impl MatchSimulation {
                 (fid, fname, cur_slot)
             }
             _ => {
-                let slot = match self.state.ball.last_touch_player {
-                    Some((touch_side, idx)) if touch_side == scoring_team => idx,
-                    _ => {
-                        let ball_xy = self.state.ball.pos.xy();
-                        let mut best = (self.state.players[s_idx].len() - 1).max(1);
-                        let mut best_d = Fp::from_int(9999);
-                        for (i, p) in self.state.players[s_idx].iter().enumerate().skip(1) {
-                            let d = p.pos.dist(ball_xy);
-                            if d < best_d {
-                                best_d = d;
-                                best = i;
-                            }
-                        }
-                        best
+                if let Some((fid, fname)) = self.state.ball.last_team_touch_meta[s_idx].clone() {
+                    if !fid.is_empty() {
+                        let cur_slot = self.state.players[s_idx]
+                            .iter()
+                            .position(|p| p.footballer_id == fid)
+                            .unwrap_or((self.state.players[s_idx].len() - 1).max(1));
+                        (fid, fname, cur_slot)
+                    } else {
+                        let slot = (self.state.players[s_idx].len() - 1).max(1);
+                        (
+                            self.state.players[s_idx][slot].footballer_id.clone(),
+                            self.state.players[s_idx][slot].name.clone(),
+                            slot,
+                        )
                     }
-                };
-                (
-                    self.state.players[s_idx][slot].footballer_id.clone(),
-                    self.state.players[s_idx][slot].name.clone(),
-                    slot,
-                )
+                } else {
+                    let slot = match self.state.ball.last_touch_player {
+                        Some((touch_side, idx)) if touch_side == scoring_team => idx,
+                        _ => {
+                            let ball_xy = self.state.ball.pos.xy();
+                            let mut best = (self.state.players[s_idx].len() - 1).max(1);
+                            let mut best_d = Fp::from_int(9999);
+                            for (i, p) in self.state.players[s_idx].iter().enumerate().skip(1) {
+                                let d = p.pos.dist(ball_xy);
+                                if d < best_d {
+                                    best_d = d;
+                                    best = i;
+                                }
+                            }
+                            best
+                        }
+                    };
+                    (
+                        self.state.players[s_idx][slot].footballer_id.clone(),
+                        self.state.players[s_idx][slot].name.clone(),
+                        slot,
+                    )
+                }
             }
         };
 
@@ -3525,5 +3551,33 @@ mod tests {
         assert_eq!(orig_passer_st.assists, 1, "outgoing passer must get assist");
         assert_eq!(orig_scorer_st.goals, 1, "outgoing shooter must get goal");
         assert_eq!(sub_scorer_st.goals, 0, "incoming substitute must NOT steal in-flight goal");
+
+        // 4. Deflected-shot edge case: Shooter (`slot 2`) shoots, is subbed off, Away GK touches/deflects
+        // on the way into the net -> outgoing Shooter (`slot 2`) STILL gets the goal rather than incoming sub!
+        sim.state.phase = MatchPhase::OpenPlay;
+        let defl_shooter_id = sim.state().players[0][2].footballer_id.clone();
+        sim.set_last_touch(TeamSide::Home, 2);
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(27_600, 0, 200);
+        sim.state.ball.vel = Vec3::from_milli(19_000, 0, 0);
+        assert!(sim.apply_substitution(TeamSide::Home, 2, 1));
+        // Simulate Away GK grazing the shot (`last_touch_meta` becomes Away, while `last_team_touch_meta[0]` stays `defl_shooter_id`)
+        sim.set_last_touch(TeamSide::Away, 0);
+        for _ in 0..10 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().score[0] >= 2 {
+                break;
+            }
+        }
+        assert_eq!(sim.state().score[0], 2);
+        let combined2 = sim.state().combined_player_stats(TeamSide::Home);
+        let defl_shooter_st = combined2
+            .iter()
+            .find(|s| s.footballer_id == defl_shooter_id)
+            .expect("archived deflected-shot shooter stats present");
+        assert_eq!(
+            defl_shooter_st.goals, 1,
+            "outgoing shooter must still be credited when shot deflects off opponent GK into net"
+        );
     }
 }

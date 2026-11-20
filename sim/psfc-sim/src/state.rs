@@ -140,6 +140,9 @@ pub struct BallState {
     /// Substitution-safe `(TeamSide, footballer_id, name)` of the last player who touched the ball.
     #[serde(default)]
     pub last_touch_meta: Option<(TeamSide, String, String)>,
+    /// Per-team substitution-safe `(footballer_id, name)` so shots deflected off an opponent/GK still credit an outgoing shooter.
+    #[serde(default)]
+    pub last_team_touch_meta: [Option<(String, String)>; 2],
     pub pass_in_flight: Option<PassInFlight>,
     pub assist_candidate: Option<AssistCandidate>,
 }
@@ -416,6 +419,48 @@ impl MatchState {
         }
         h.u16(self.ball.gk_hold_ticks);
         h.u8(self.ball.dribble_touch_cd);
+        match &self.ball.last_touch_meta {
+            Some((ts, fid, _)) => {
+                h.u8(1);
+                h.u8(ts.index() as u8);
+                h.u32(fid.len() as u32);
+                h.bytes(fid.as_bytes());
+            }
+            None => h.u8(0),
+        }
+        for team_meta in &self.ball.last_team_touch_meta {
+            match team_meta {
+                Some((fid, _)) => {
+                    h.u8(1);
+                    h.u32(fid.len() as u32);
+                    h.bytes(fid.as_bytes());
+                }
+                None => h.u8(0),
+            }
+        }
+        match &self.ball.pass_in_flight {
+            Some(pf) => {
+                h.u8(1);
+                h.u8(pf.team.index() as u8);
+                h.u32(pf.passer_id.len() as u32);
+                h.bytes(pf.passer_id.as_bytes());
+                h.u32(pf.intended_receiver_idx as u32);
+                h.u8(u8::from(pf.receiver_was_offside));
+            }
+            None => h.u8(0),
+        }
+        match &self.ball.assist_candidate {
+            Some(ac) => {
+                h.u8(1);
+                h.u8(ac.team.index() as u8);
+                h.u32(ac.passer_id.len() as u32);
+                h.bytes(ac.passer_id.as_bytes());
+                h.u32(ac.receiver_id.len() as u32);
+                h.bytes(ac.receiver_id.as_bytes());
+                h.u32(ac.completed_tick);
+            }
+            None => h.u8(0),
+        }
 
         // Players
         for side_players in &self.players {
