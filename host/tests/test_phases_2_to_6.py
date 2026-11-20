@@ -899,3 +899,14 @@ def test_codex_pr3_stale_saved_lineup_fallback_and_rollover_transfer_inheritance
     mun = client.get(f"/api/worlds/{child_id}/clubs/man-utd/squad").json()["roster"]["squad"]
     assert any(p["footballer_id"] == "mun-fwd-1" for p in che)
     assert not any(p["footballer_id"] == "mun-fwd-1" for p in mun)
+
+    # Late transfer import against the completed parent world is parked and never leaks into child_id
+    r_late = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/transfer",
+        json={"footballer_id": "mun-mid-1", "from_club_id": "man-utd", "to_club_id": "liverpool", "new_shirt": 80},
+    )
+    assert r_late.status_code == 200
+    assert r_late.json()["decision"] == "parked"
+    assert r_late.json()["reason"] == "world_completed"
+    child_mun_after = client.get(f"/api/worlds/{child_id}/clubs/man-utd/squad").json()["roster"]["squad"]
+    assert any(p["footballer_id"] == "mun-mid-1" for p in child_mun_after)

@@ -3,279 +3,418 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>classicFutbol — Parallel Season FC (5v5 + GK Live Pitch &amp; World Host)</title>
+  <meta name="description" content="classicFutbol — Parallel Season FC: 3D 5v5 &amp; 11v11 Football Console Game &amp; Shared Season World" />
+  <title>classicFutbol — Parallel Season FC</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:ital,wght@0,600;0,700;0,800;0,900;1,800;1,900&amp;family=Inter:wght@500;600;700;800&amp;display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="/static/styles.css" />
 </head>
 <body>
-  <header class="topbar">
-    <div class="brand">
-      <span class="brand-mark">PSFC</span>
-      <div>
-        <h1>classicFutbol <span class="brand-sub">Parallel Season FC</span></h1>
-        <p class="brand-meta">Deterministic Q32.32 Engine · 5v5 (4 Outfield + 1 GK) Primary · Cup Divergence, Cartridges &amp; Event Ledger</p>
+  <!-- FULLSCREEN 3D WEBGL STADIUM & FOOTBALLER ENGINE CANVAS -->
+  <canvas id="pitch-canvas"></canvas>
+
+  <!-- SUBTLE VIGNETTE FOR MENU SCREENS (DISABLED IN LIVE MATCH) -->
+  <div id="menu-backdrop-scrim" class="menu-scrim"></div>
+
+  <!-- PERSISTENT TOP CONSOLE CHROME (HIDDEN DURING LIVE MATCH & TITLE) -->
+  <header id="console-topbar" class="console-topbar" hidden>
+    <div class="ct-brand" id="btn-home-logo" title="Return to Main Menu">
+      <span class="ct-badge">PSFC</span>
+      <div class="ct-titles">
+        <span class="ct-name">classicFutbol</span>
+        <span class="ct-sub">PARALLEL SEASON FC</span>
       </div>
     </div>
-    <div class="topbar-status">
-      <div class="pill pill-emerald" id="wasm-status-pill">WASM Sim: Loading…</div>
-      <div class="pill pill-slate" id="gamepad-status-pill">Controller: Keyboard + Gamepad Ready</div>
-      <button class="pill pill-btn" id="btn-audio-toggle" title="Toggle procedural WebAudio stadium sound effects">Audio: Stadium FX</button>
-      <div class="pill pill-mono" id="hash-status-pill">State Hash: ----------------</div>
+
+    <div class="ct-center" id="ct-screen-title">MAIN MENU</div>
+
+    <div class="ct-status">
+      <div class="ct-chip" id="top-world-chip">2026/27 PREMIER PARALLEL</div>
+      <div class="ct-chip ct-chip-pad" id="gamepad-status-pill">PAD / KEYBOARD READY</div>
+      <button class="ct-chip ct-chip-btn" id="btn-audio-toggle" type="button">SFX: ON</button>
     </div>
   </header>
 
-  <main class="workspace">
-    <!-- LEFT / PRIMARY: 3D Broadcast Pitch & Match Controls -->
-    <section class="pitch-column">
-      <div class="match-toolbar">
-        <div class="toolbar-group">
-          <label for="format-select">Format</label>
-          <select id="format-select">
-            <option value="5v5" selected>5v5 (4 + GK · 56m×36m)</option>
-            <option value="11v11">11v11 (10 + GK · 105m×68m)</option>
-          </select>
+  <!-- ===================================================================== -->
+  <!-- SCREEN 0: TITLE / PRESS START BOOT SCREEN                             -->
+  <!-- ===================================================================== -->
+  <section id="screen-title" class="game-screen active" data-screen="title">
+    <div class="title-center">
+      <div class="title-season-tag">OFFICIAL SHARED-WORLD FOOTBALL · 2026/27 EDITION</div>
+      <h1 class="title-logo">
+        <span class="title-logo-top">CLASSIC FUTBOL</span>
+        <span class="title-logo-main">PARALLEL SEASON FC</span>
+      </h1>
+      <p class="title-tagline">5v5 Arena &amp; 11v11 Stadium · Official Club Squads · Verified Season Ledger</p>
+
+      <button id="btn-press-start" class="press-start-btn" type="button">
+        <span class="ps-glyph">START</span>
+        <span>PRESS START / ENTER OR CLICK TO PLAY</span>
+      </button>
+
+      <div class="title-footer-pills">
+        <span id="title-engine-pill" class="t-pill">INITIALIZING 3D STADIUM &amp; 60HZ ENGINE…</span>
+        <span id="title-pad-pill" class="t-pill">GAMEPAD &amp; KEYBOARD SUPPORTED</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- SCREEN 1: CONSOLE MAIN MENU HUB                                       -->
+  <!-- ===================================================================== -->
+  <section id="screen-menu" class="game-screen" data-screen="menu" hidden>
+    <div class="hub-layout">
+      <nav class="hub-blades" aria-label="Game Modes">
+        <button class="hub-blade focused" data-nav="prematch-exhibition" type="button">
+          <span class="blade-kicker">EXHIBITION MATCH</span>
+          <span class="blade-title">KICK OFF</span>
+          <span class="blade-desc">Instant 5v5 or 11v11 floodlit match — 1P vs CPU, 2P Couch, or CPU Spectate</span>
+        </button>
+
+        <button class="hub-blade" data-nav="season" type="button">
+          <span class="blade-kicker">SHARED WORLD CAMPAIGN</span>
+          <span class="blade-title">PARALLEL SEASON</span>
+          <span class="blade-desc">Play official league &amp; FA Cup ties, track Inherited + Earned stats &amp; honours</span>
+        </button>
+
+        <button class="hub-blade" data-nav="squad" type="button">
+          <span class="blade-kicker">11 → 5 TACTICAL BOARD</span>
+          <span class="blade-title">TEAM MANAGEMENT</span>
+          <span class="blade-desc">Pick your 1 GK + 4 Outfield starters &amp; 5v5 shape from the official 11-man squad</span>
+        </button>
+
+        <button class="hub-blade" data-nav="controllers" type="button">
+          <span class="blade-kicker">HARDWARE &amp; PROFILE</span>
+          <span class="blade-title">CONTROLLERS &amp; CARTRIDGE</span>
+          <span class="blade-desc">Live USB/Bluetooth gamepad tester, button profiles &amp; Ed25519 profile cartridge</span>
+        </button>
+      </nav>
+
+      <aside class="hub-spotlight">
+        <div class="spotlight-card" id="hub-next-match-card">
+          <div class="sp-eyebrow">NEXT OFFICIAL PARALLEL FIXTURE</div>
+          <div class="sp-matchup" id="hub-next-matchup">MAN UTD vs LIVERPOOL</div>
+          <div class="sp-meta" id="hub-next-meta">Premier League · Playable Official Session</div>
+          <button class="console-btn console-btn-gold" id="btn-hub-play-official" type="button">
+            PLAY OFFICIAL MATCH ▶
+          </button>
         </div>
 
-        <div class="toolbar-group">
-          <label for="home-club-select">Matchup</label>
-          <select id="home-club-select" title="Home Club (Exhibition)">
-            <option value="man-utd" selected>MUN</option>
-            <option value="arsenal">ARS</option>
-            <option value="liverpool">LIV</option>
-            <option value="chelsea">CHE</option>
-          </select>
-          <span class="vs-sep">vs</span>
-          <select id="away-club-select" title="Away Club (Exhibition)">
-            <option value="man-utd">MUN</option>
-            <option value="arsenal" selected>ARS</option>
-            <option value="liverpool">LIV</option>
-            <option value="chelsea">CHE</option>
-          </select>
+        <div class="spotlight-card spotlight-table-card">
+          <div class="sp-header-row">
+            <span class="sp-eyebrow">PARALLEL LEAGUE STANDINGS</span>
+            <button class="link-btn" id="btn-hub-full-table" type="button">FULL HUB →</button>
+          </div>
+          <table class="mini-standings" id="hub-mini-standings">
+            <thead>
+              <tr><th>#</th><th>CLUB</th><th>P</th><th>GD</th><th>PTS</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </aside>
+    </div>
+
+    <footer class="console-prompt-bar">
+      <span><kbd>D-PAD / ARROWS</kbd> Navigate</span>
+      <span><kbd>A / ENTER</kbd> Select</span>
+      <span><kbd>CLICK</kbd> Direct Select</span>
+    </footer>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- SCREEN 2: PRE-MATCH SELECT SIDES, CLUBS & 3D KIT SHOWCASE             -->
+  <!-- ===================================================================== -->
+  <section id="screen-prematch" class="game-screen" data-screen="prematch" hidden>
+    <div class="prematch-grid">
+      <!-- HOME TEAM CARD -->
+      <div class="pm-team-card pm-home">
+        <div class="pm-card-label">HOME CLUB</div>
+        <div class="pm-club-switcher" id="pm-home-switcher">
+          <button class="step-arrow" id="pm-home-prev" type="button" aria-label="Previous Home Club">◀</button>
+          <div class="pm-club-identity">
+            <div class="pm-crest" id="pm-home-crest">MUN</div>
+            <div>
+              <div class="pm-club-name" id="pm-home-name">Manchester United</div>
+              <div class="pm-club-stadium" id="pm-home-stadium">Old Trafford</div>
+            </div>
+          </div>
+          <button class="step-arrow" id="pm-home-next" type="button" aria-label="Next Home Club">▶</button>
         </div>
 
-        <div class="toolbar-group">
-          <label for="mode-select">Control</label>
-          <select id="mode-select">
-            <option value="p1_cpu_normal" selected>1P vs CPU (Normal)</option>
-            <option value="p1_cpu_hard">1P vs CPU (Hard)</option>
-            <option value="p1_cpu_easy">1P vs CPU (Easy)</option>
-            <option value="cpu_vs_cpu">CPU vs CPU (Spectate)</option>
-            <option value="local_2p">2P Local Couch</option>
-          </select>
-        </div>
+        <div class="pm-ratings" id="pm-home-ratings"></div>
 
-        <div class="toolbar-group">
-          <label for="duration-select">Half</label>
-          <select id="duration-select">
-            <option value="1800">30s</option>
-            <option value="3600" selected>1m</option>
-            <option value="7200">2m</option>
-          </select>
-        </div>
-
-        <div class="toolbar-actions">
-          <button class="btn btn-secondary" id="btn-exhibition">New Exhibition</button>
-          <button class="btn btn-secondary" id="btn-pause">Pause</button>
-          <button class="btn btn-secondary" id="btn-instant-replay" title="Watch 6-second 0.5x slow-motion orbiting instant replay">Replay (6s)</button>
-          <button class="btn btn-amber" id="btn-sim-rest" title="Deterministically fast-forward remaining match ticks (including Extra Time &amp; Shootout)">Fast-Forward FT</button>
-          <button class="btn btn-primary" id="btn-submit-session" hidden>Verify &amp; Record Result</button>
+        <div class="pm-lineup-box">
+          <div class="pm-lineup-hdr">
+            <span>STARTING LINEUP</span>
+            <span class="pm-fmt-badge" id="pm-home-fmt">1-2-1</span>
+          </div>
+          <ul class="pm-starters-list" id="pm-home-starters"></ul>
         </div>
       </div>
 
-      <div class="viewport-card">
-        <canvas id="pitch-canvas" width="1120" height="630"></canvas>
+      <!-- CENTER: 3D CAPTAIN VIEWPORT WINDOW + CONTROLLER SIDE SELECT & RULES -->
+      <div class="pm-center-col">
+        <div class="pm-context-banner" id="pm-context-banner">EXHIBITION MATCH</div>
 
-        <!-- Classic Broadcast Scorebug -->
-        <div class="scorebug">
-          <div class="sb-mode" id="sb-context">EXHIBITION · 5v5</div>
-          <div class="sb-teams">
-            <span class="sb-swatch" id="sb-home-swatch"></span>
-            <span class="sb-code" id="sb-home-code">MUN</span>
-            <span class="sb-score" id="sb-score">0 - 0</span>
-            <span class="sb-code" id="sb-away-code">ARS</span>
-            <span class="sb-swatch" id="sb-away-swatch"></span>
-          </div>
-          <div class="sb-clock">
-            <span id="sb-half">1H</span>
-            <span id="sb-time">00:00</span>
-          </div>
-          <div class="sb-phase" id="sb-phase">KICK OFF</div>
+        <!-- Open window in center lets the 3D Home & Away Captains shine clearly! -->
+        <div class="pm-3d-stage-spacer">
+          <div class="pm-vs-pill">VS</div>
         </div>
 
-        <!-- Instant Replay Live Indicator -->
-        <div class="replay-pill" id="replay-pill" hidden>INSTANT REPLAY · 0.5x ORBIT CAM</div>
-
-        <!-- Goal / Event Broadcast Banner -->
-        <div class="goal-banner" id="goal-banner" hidden>
-          <div class="goal-banner-title" id="goal-banner-title">GOAL!</div>
-          <div class="goal-banner-sub" id="goal-banner-sub">M. Rashford</div>
-        </div>
-
-        <!-- Official Replay Verification Receipt Toast -->
-        <div class="verify-banner" id="verify-banner" hidden></div>
-      </div>
-
-      <!-- Controls Reference & Live Match Feed -->
-      <div class="under-pitch-grid">
-        <div class="panel controls-panel">
-          <div class="panel-header">
-            <h2>Gamepad (Xbox / PS5 / 8BitDo / USB) &amp; Keyboard</h2>
-            <select id="pad-profile-select" title="Off-the-shelf USB / Bluetooth Controller Button Layout">
-              <option value="auto" selected>Pad: Auto (Xbox / PS / 8BitDo)</option>
-              <option value="switch">Pad: Switch Pro (Swap AB/XY)</option>
-              <option value="dinput">Pad: Generic USB DirectInput</option>
-            </select>
+        <div class="pm-settings-dock">
+          <div class="pm-setting-row">
+            <span class="pm-s-label">SIDES</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-side-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-side-val">P1 HOME vs CPU</span>
+              <button class="step-arrow" id="pm-side-next" type="button">▶</button>
+            </div>
           </div>
-          <div class="controls-grid">
-            <div><kbd>L-Stick</kbd> / <kbd>D-Pad</kbd> / <kbd>WASD</kbd> Move &amp; Aim</div>
-            <div><kbd>A / Cross</kbd> · <kbd>Space</kbd> Pass / Tackle</div>
-            <div><kbd>Y / Tri</kbd> · <kbd>K</kbd> Through Ball</div>
-            <div><kbd>X / Sq</kbd> · <kbd>U / C</kbd> Lob / Slide</div>
-            <div><kbd>B / Cir</kbd> · <kbd>L / Enter</kbd> Shoot (Hold)</div>
-            <div><kbd>R-Stick Flick</kbd> / <kbd>R3</kbd> / <kbd>Z</kbd> Skill Move</div>
-            <div><kbd>RT / R2</kbd> · <kbd>Shift</kbd> Sprint Knock-On</div>
-            <div><kbd>LT / L2</kbd> · <kbd>F</kbd> Sole-Roll / Finesse</div>
-            <div><kbd>LB / L1</kbd> · <kbd>Q</kbd> Goal-Side Switch</div>
-            <div><kbd>RB / R1</kbd> · <kbd>R</kbd> Trigger Run / GK Rush</div>
-          </div>
-        </div>
 
-        <div class="panel feed-panel">
-          <div class="panel-header">
-            <h2>Live Match Event Ticker</h2>
-            <span class="badge" id="possession-badge">Possession 50% - 50%</span>
+          <div class="pm-setting-row">
+            <span class="pm-s-label">FORMAT</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-fmt-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-fmt-val">5v5 (4 + GK)</span>
+              <button class="step-arrow" id="pm-fmt-next" type="button">▶</button>
+            </div>
           </div>
-          <ul class="event-feed" id="match-event-feed"></ul>
-        </div>
-      </div>
-    </section>
 
-    <!-- RIGHT: Parallel Season World Host, 5v5 Squad Builder, Competitions, Cartridges & Ledger -->
-    <aside class="world-column">
-      <div class="panel world-header-panel">
-        <div class="world-title-row">
-          <div>
-            <span class="eyebrow">ACTIVE PARALLEL WORLD</span>
-            <h2 id="world-name">Friends Premier Parallel Season</h2>
-            <p id="world-meta" class="muted">2026/27 · Represented: MUN (Alex), ARS (Sam)</p>
+          <div class="pm-setting-row">
+            <span class="pm-s-label">HALF LENGTH</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-dur-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-dur-val">2 MIN</span>
+              <button class="step-arrow" id="pm-dur-next" type="button">▶</button>
+            </div>
           </div>
-          <div class="world-header-actions">
-            <select id="world-select" title="Switch Parallel Season World"></select>
-            <button class="btn btn-ghost" id="btn-reset-world" title="Reset demo world to Round 3">Reset</button>
+
+          <div class="pm-setting-row">
+            <span class="pm-s-label">CPU SKILL</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-diff-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-diff-val">PROFESSIONAL</span>
+              <button class="step-arrow" id="pm-diff-next" type="button">▶</button>
+            </div>
           </div>
-        </div>
 
-        <div id="honours-strip" class="honours-strip" hidden></div>
-
-        <div class="tabs" role="tablist">
-          <button class="tab active" data-tab="fixtures">Fixtures &amp; Cup</button>
-          <button class="tab" data-tab="squads">Squads (11→5)</button>
-          <button class="tab" data-tab="standings">Standings</button>
-          <button class="tab" data-tab="players">Inh / Earned</button>
-          <button class="tab" data-tab="cartridge">Cartridge</button>
-          <button class="tab" data-tab="ledger">Ledger</button>
+          <div class="pm-setting-row">
+            <span class="pm-s-label">CAMERA</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-cam-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-cam-val">TELE BROADCAST</span>
+              <button class="step-arrow" id="pm-cam-next" type="button">▶</button>
+            </div>
+          </div>
         </div>
       </div>
 
-      <!-- TAB 1: Fixtures, Knockout Cup Divergence & Official Session Launcher -->
-      <div class="tab-pane active" id="tab-fixtures">
-        <div class="comp-filter-row">
+      <!-- AWAY TEAM CARD -->
+      <div class="pm-team-card pm-away">
+        <div class="pm-card-label">AWAY CLUB <span id="pm-away-kit-tag" class="kit-pill">HOME KIT</span></div>
+        <div class="pm-club-switcher" id="pm-away-switcher">
+          <button class="step-arrow" id="pm-away-prev" type="button" aria-label="Previous Away Club">◀</button>
+          <div class="pm-club-identity">
+            <div class="pm-crest" id="pm-away-crest">ARS</div>
+            <div>
+              <div class="pm-club-name" id="pm-away-name">Arsenal</div>
+              <div class="pm-club-stadium" id="pm-away-stadium">Emirates Stadium</div>
+            </div>
+          </div>
+          <button class="step-arrow" id="pm-away-next" type="button" aria-label="Next Away Club">▶</button>
+        </div>
+
+        <div class="pm-ratings" id="pm-away-ratings"></div>
+
+        <div class="pm-lineup-box">
+          <div class="pm-lineup-hdr">
+            <span>STARTING LINEUP</span>
+            <span class="pm-fmt-badge" id="pm-away-fmt">1-2-1</span>
+          </div>
+          <ul class="pm-starters-list" id="pm-away-starters"></ul>
+        </div>
+      </div>
+    </div>
+
+    <footer class="console-action-bar">
+      <button class="console-btn console-btn-ghost" id="btn-pm-back" type="button">
+        <kbd>ESC / B</kbd> BACK
+      </button>
+      <button class="console-btn console-btn-secondary" id="btn-pm-squads" type="button">
+        <kbd>Y</kbd> TEAM MANAGEMENT (11→5)
+      </button>
+      <button class="console-btn console-btn-primary console-btn-lg" id="btn-pm-kickoff" type="button">
+        <kbd>ENTER / A</kbd> KICK OFF MATCH ▶
+      </button>
+    </footer>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- SCREEN 3: TEAM MANAGEMENT (VISUAL PITCH 11 → 5 FORMATION BOARD)       -->
+  <!-- ===================================================================== -->
+  <section id="screen-squad" class="game-screen" data-screen="squad" hidden>
+    <div class="squad-screen-shell">
+      <div class="sq-top-controls">
+        <div class="sq-club-tabs" id="sq-club-tabs">
+          <button class="sq-club-tab active" data-club="man-utd" type="button">MANCHESTER UNITED</button>
+          <button class="sq-club-tab" data-club="arsenal" type="button">ARSENAL</button>
+          <button class="sq-club-tab" data-club="liverpool" type="button">LIVERPOOL</button>
+          <button class="sq-club-tab" data-club="chelsea" type="button">CHELSEA</button>
+        </div>
+
+        <div class="sq-formation-pills" id="sq-formation-pills">
+          <span class="sq-fmt-label">5v5 TACTICS:</span>
+          <button class="sq-fmt-pill active" data-fmt="1-2-1" type="button">1-2-1 DIAMOND</button>
+          <button class="sq-fmt-pill" data-fmt="2-2" type="button">2-2 BOX</button>
+          <button class="sq-fmt-pill" data-fmt="1-1-2" type="button">1-1-2 ATTACK</button>
+        </div>
+      </div>
+
+      <div class="sq-main-split">
+        <!-- LEFT: VISUAL TACTICAL PITCH DIAGRAM -->
+        <div class="sq-pitch-panel">
+          <div class="tactical-pitch" id="tactical-pitch-board">
+            <div class="tp-half-line"></div>
+            <div class="tp-center-circle"></div>
+            <div class="tp-box tp-box-top"></div>
+            <div class="tp-box tp-box-bot"></div>
+            <div id="tp-tokens-layer" class="tp-tokens-layer"></div>
+          </div>
+          <div class="sq-pitch-caption" id="sq-swap-hint">
+            Click any starter on the pitch or player in the 11-man squad list to swap your 5v5 lineup (1 GK + 4 Outfield).
+          </div>
+        </div>
+
+        <!-- RIGHT: FULL 11-MAN OFFICIAL SQUAD LIST & ATTRIBUTE BARS -->
+        <div class="sq-roster-panel">
+          <div class="sq-roster-hdr">
+            <span>OFFICIAL 11-MAN SQUAD</span>
+            <span class="ct-chip" id="squad-count-pill">5 / 5 READY</span>
+          </div>
+          <div class="sq-roster-scroll" id="squad-roster-list"></div>
+          <div id="squad-save-msg" class="console-toast" hidden></div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="console-action-bar">
+      <button class="console-btn console-btn-ghost" id="btn-sq-back" type="button">
+        <kbd>ESC / B</kbd> BACK
+      </button>
+      <button class="console-btn console-btn-secondary" id="btn-reset-lineup-default" type="button">
+        RESET DEFAULT 5
+      </button>
+      <button class="console-btn console-btn-secondary" id="btn-save-lineup" type="button">
+        SAVE LINEUP TO WORLD
+      </button>
+      <button class="console-btn console-btn-primary" id="btn-play-with-squad" type="button">
+        PLAY EXHIBITION WITH CLUB ▶
+      </button>
+    </footer>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- SCREEN 4: PARALLEL SEASON MODE HUB                                    -->
+  <!-- ===================================================================== -->
+  <section id="screen-season" class="game-screen" data-screen="season" hidden>
+    <div class="season-shell">
+      <div class="season-subnav">
+        <div class="season-tabs">
+          <button class="season-tab active" data-stab="fixtures" type="button">MATCHDAY &amp; FIXTURES</button>
+          <button class="season-tab" data-stab="cup" type="button">FA PARALLEL CUP</button>
+          <button class="season-tab" data-stab="standings" type="button">LEAGUE TABLE</button>
+          <button class="season-tab" data-stab="scorers" type="button">PLAYER STATS (INH + EARN)</button>
+          <button class="season-tab" data-stab="commissioner" type="button">WORLD &amp; COMMISSIONER</button>
+        </div>
+
+        <div class="season-world-picker">
+          <label for="world-select">SEASON:</label>
+          <select id="world-select" class="console-select"></select>
+        </div>
+      </div>
+
+      <div id="honours-strip" class="honours-banner" hidden></div>
+
+      <!-- SUB-VIEW A: FIXTURES -->
+      <div class="season-pane" id="spane-fixtures">
+        <div class="season-filter-bar">
           <div class="comp-pills" id="comp-filter-pills">
-            <button class="comp-pill active" data-comp="all">All Fixtures</button>
-            <button class="comp-pill" data-comp="league">Premier League</button>
-            <button class="comp-pill" data-comp="knockout">FA Parallel Cup</button>
+            <button class="comp-pill active" data-comp="all" type="button">ALL COMPETITIONS</button>
+            <button class="comp-pill" data-comp="league" type="button">PREMIER LEAGUE</button>
+            <button class="comp-pill" data-comp="knockout" type="button">FA PARALLEL CUP</button>
           </div>
-          <button class="btn btn-amber" id="btn-advance-cup" title="Generate FA Parallel Cup Final from Semi-Final winners (diverges if winners differ from Real LIV vs ARS!)">Advance Cup</button>
+          <span class="season-meta-note" id="world-meta">Represented Clubs: MUN (Alex), ARS (Sam)</span>
         </div>
-        <div id="cup-divergence-msg" class="gate-msg" hidden></div>
-        <div class="fixture-list" id="fixture-list"></div>
+        <div class="season-fixtures-grid" id="fixture-list"></div>
       </div>
 
-      <!-- TAB 1B: Interactive 5v5 Lineup Picker (Select 1 GK + 4 Outfield from Official 11-Man Squad) -->
-      <div class="tab-pane" id="tab-squads" hidden>
-        <div class="pane-note">
-          Each club carries its full <strong>11-player official lineup</strong>. Pick any <strong>1 Goalkeeper + 4 Outfielders</strong> and your 5v5 tactical shape for Official Fixtures &amp; Exhibition!
-        </div>
-        <div class="squad-controls-row">
-          <div class="toolbar-group">
-            <label for="squad-club-select">Club</label>
-            <select id="squad-club-select">
-              <option value="man-utd">Manchester United</option>
-              <option value="arsenal">Arsenal</option>
-              <option value="liverpool">Liverpool</option>
-              <option value="chelsea">Chelsea</option>
-            </select>
+      <!-- SUB-VIEW B: FA PARALLEL CUP BRACKET -->
+      <div class="season-pane" id="spane-cup" hidden>
+        <div class="cup-header-bar">
+          <div>
+            <h2 class="pane-h2">FA PARALLEL CUP KNOCKOUT BRACKET</h2>
+            <p class="pane-sub">Extra Time &amp; Penalty Shootouts enabled · Diverges automatically if Parallel winners differ from real football</p>
           </div>
-          <div class="toolbar-group">
-            <label for="squad-formation-select">5v5 Shape</label>
-            <select id="squad-formation-select">
-              <option value="1-2-1">1-2-1 Diamond</option>
-              <option value="2-2">2-2 Box</option>
-              <option value="1-1-2">1-1-2 Attack</option>
-            </select>
-          </div>
-          <span class="pill pill-emerald" id="squad-count-pill">5 / 5 (1 GK + 4 Out)</span>
+          <button class="console-btn console-btn-gold" id="btn-advance-cup" type="button">
+            ADVANCE CUP TO FINAL ▶
+          </button>
         </div>
-
-        <div class="squad-roster-list" id="squad-roster-list"></div>
-
-        <div class="squad-actions-row">
-          <button class="btn btn-primary" id="btn-save-lineup">Save 5v5 Lineup to World</button>
-          <button class="btn btn-secondary" id="btn-play-with-squad">Play Exhibition w/ Club</button>
-          <button class="btn btn-ghost" id="btn-reset-lineup-default">Default 5</button>
-        </div>
-        <div id="squad-save-msg" class="gate-msg" hidden></div>
+        <div id="cup-divergence-msg" class="console-toast" hidden></div>
+        <div class="cup-bracket-grid" id="cup-bracket-container"></div>
       </div>
 
-      <!-- TAB 2: Parallel Standings vs Real Reference + Season Rollover -->
-      <div class="tab-pane" id="tab-standings" hidden>
-        <div class="pane-note">
-          League table projected strictly from <code>stage = "league"</code> events. Compare Parallel points (<code>Inh + Earn</code>) against real football, or complete the season &amp; roll over!
+      <!-- SUB-VIEW C: LEAGUE STANDINGS -->
+      <div class="season-pane" id="spane-standings" hidden>
+        <div class="cup-header-bar">
+          <div>
+            <h2 class="pane-h2" id="world-name">FRIENDS PREMIER PARALLEL SEASON</h2>
+            <p class="pane-sub">Projected strictly from League stage results · Inherited real-world baseline + Earned 5v5 points</p>
+          </div>
+          <button class="console-btn console-btn-gold" id="btn-rollover-season" type="button">
+            COMPLETE SEASON &amp; ROLLOVER →
+          </button>
         </div>
-        <div class="table-wrap">
-          <table class="data-table">
+        <div id="rollover-msg" class="console-toast" hidden></div>
+        <div class="console-table-wrap">
+          <table class="console-table">
             <thead>
               <tr>
-                <th>#</th>
-                <th>Club</th>
+                <th>POS</th>
+                <th>CLUB</th>
                 <th>P</th>
-                <th>W-D-L</th>
+                <th>W - D - L</th>
                 <th>GD</th>
-                <th>Inh</th>
-                <th>Earn</th>
-                <th>Pts</th>
-                <th>vs Real</th>
+                <th>INHERITED</th>
+                <th>EARNED</th>
+                <th>TOTAL PTS</th>
+                <th>VS REAL</th>
               </tr>
             </thead>
             <tbody id="standings-tbody"></tbody>
           </table>
         </div>
-        <div class="rollover-box">
-          <div class="rollover-row">
-            <div>
-              <strong>Season Honours &amp; Rollover</strong>
-              <p class="muted">Awards League Champion, Cup Winner, Golden Boot &amp; Glove, and creates 2027/28 preserving club ownership.</p>
-            </div>
-            <button class="btn btn-primary" id="btn-rollover-season">Complete &amp; Rollover</button>
-          </div>
-          <div id="rollover-msg" class="gate-msg" hidden></div>
-        </div>
       </div>
 
-      <!-- TAB 3: Player Statistics (Inherited vs Earned vs Combined) -->
-      <div class="tab-pane" id="tab-players" hidden>
-        <div class="pane-note">
-          <strong>Strict Provenance Separation:</strong> Real-world provider totals never overwrite Parallel Season stats (<code>Combined = Inherited + Earned</code>).
+      <!-- SUB-VIEW D: TOP SCORERS & PLAYER STATS -->
+      <div class="season-pane" id="spane-scorers" hidden>
+        <div class="cup-header-bar">
+          <div>
+            <h2 class="pane-h2">GOLDEN BOOT &amp; PLAYER RECORDS</h2>
+            <p class="pane-sub">Inherited real-world stats combined cleanly with your Parallel 5v5 goals, assists, skill moves &amp; saves</p>
+          </div>
         </div>
-        <div class="table-wrap">
-          <table class="data-table">
+        <div class="console-table-wrap">
+          <table class="console-table">
             <thead>
               <tr>
-                <th>Player</th>
-                <th>Club</th>
-                <th>Inh G/A</th>
-                <th>Earn G/A</th>
-                <th>Comb G/A</th>
-                <th>Skill/Sv</th>
+                <th>PLAYER</th>
+                <th>CLUB</th>
+                <th>INHERITED (REAL)</th>
+                <th>EARNED (PARALLEL)</th>
+                <th>COMBINED TOTAL</th>
+                <th>SKILLS / SAVES</th>
               </tr>
             </thead>
             <tbody id="players-tbody"></tbody>
@@ -283,49 +422,254 @@
         </div>
       </div>
 
-      <!-- TAB 4: Cartridge Sync (`PSFC-CART-V1`) & Kickoff Appointments -->
-      <div class="tab-pane" id="tab-cartridge" hidden>
-        <div class="gate-tester">
-          <h3>Removable Profile Cartridge (<code>PSFC-CART-V1</code>)</h3>
-          <p class="muted">Issue an HMAC-SHA256 signed cartridge manifest for Alex's RP2040 controller dock (non-authoritative portable cache + button mapping).</p>
-          <div class="cart-actions-row">
-            <select id="cart-device-select">
-              <option value="part-alex|dev-alex-01">Alex · dev-alex-01 (MUN)</option>
-              <option value="part-sam|dev-sam-02">Sam · dev-sam-02 (ARS)</option>
-            </select>
-            <button class="btn btn-primary" id="btn-sync-cartridge">Sync Cartridge</button>
-            <button class="btn btn-secondary" id="btn-verify-cartridge" disabled>Verify Sig</button>
-            <button class="btn btn-ghost" id="btn-download-cartridge" disabled>Download</button>
+      <!-- SUB-VIEW E: COMMISSIONER & APPEND-ONLY LEDGER -->
+      <div class="season-pane" id="spane-commissioner" hidden>
+        <div class="comm-grid">
+          <div class="comm-card">
+            <h3>KICKOFF APPOINTMENTS &amp; WORLD ADMIN</h3>
+            <p class="pane-sub">Schedule friend-vs-friend match windows or test Proposal Gate takeover protection.</p>
+            <div class="comm-btn-row">
+              <button class="console-btn console-btn-secondary" id="btn-propose-appt" type="button">Propose MUN vs ARS Kickoff</button>
+              <button class="console-btn console-btn-secondary" id="btn-test-gate" type="button">Test Takeover Gate</button>
+              <button class="console-btn console-btn-ghost" id="btn-reset-world" type="button">Reset Demo World</button>
+            </div>
+            <div id="gate-msg" class="console-toast" hidden></div>
+            <ul class="comm-list" id="appointment-list"></ul>
           </div>
-          <div id="cartridge-msg" class="gate-msg" hidden></div>
+
+          <div class="comm-card">
+            <h3>APPEND-ONLY WORLD EVENT LEDGER (<span id="event-count">0</span>)</h3>
+            <ul class="comm-list ledger-scroll" id="ledger-list"></ul>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="console-action-bar">
+      <button class="console-btn console-btn-ghost" id="btn-season-back" type="button">
+        <kbd>ESC / B</kbd> MAIN MENU
+      </button>
+    </footer>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- SCREEN 5: CONTROLLERS & PROFILE CARTRIDGE                             -->
+  <!-- ===================================================================== -->
+  <section id="screen-controllers" class="game-screen" data-screen="controllers" hidden>
+    <div class="ctrl-screen-grid">
+      <div class="ctrl-card">
+        <div class="ctrl-card-hdr">
+          <h2>USB / BLUETOOTH CONTROLLER LIVE TESTER</h2>
+          <select id="pad-profile-select" class="console-select">
+            <option value="auto" selected>Layout: Auto (Xbox / PlayStation / 8BitDo)</option>
+            <option value="switch">Layout: Switch Pro (Swap A-B / X-Y)</option>
+            <option value="dinput">Layout: Generic USB DirectInput</option>
+          </select>
         </div>
 
-        <div class="gate-tester">
-          <h3>Fixture Kickoff Appointments</h3>
-          <p class="muted">Negotiate head-to-head kickoff slots between represented participants.</p>
-          <button class="btn btn-secondary btn-full" id="btn-propose-appt">Propose MUN vs ARS Kickoff (Tonight 20:00 UTC)</button>
-          <ul class="ledger-list appt-list" id="appointment-list"></ul>
+        <div class="pad-visualizer">
+          <div class="pad-stick-box">
+            <div class="stick-well"><div class="stick-dot" id="vis-lstick"></div></div>
+            <span>LEFT STICK / MOVE</span>
+          </div>
+          <div class="pad-buttons-cluster">
+            <span class="vis-btn" id="vis-btn-north">Y / △</span>
+            <div class="vis-mid-row">
+              <span class="vis-btn" id="vis-btn-west">X / □</span>
+              <span class="vis-btn" id="vis-btn-east">B / ○</span>
+            </div>
+            <span class="vis-btn" id="vis-btn-south">A / ✕</span>
+          </div>
+          <div class="pad-stick-box">
+            <div class="stick-well"><div class="stick-dot" id="vis-rstick"></div></div>
+            <span>RIGHT STICK / SKILL</span>
+          </div>
+        </div>
+
+        <div class="controls-two-col">
+          <div class="ctrl-map-box">
+            <h3>ON THE BALL (ATTACKING)</h3>
+            <ul>
+              <li><span>Move / Aim</span> <strong>L-Stick / D-Pad / WASD</strong></li>
+              <li><span>Ground Pass</span> <strong>A / Cross / Space</strong></li>
+              <li><span>Through Ball</span> <strong>Y / Triangle / K</strong></li>
+              <li><span>Lob / Cross</span> <strong>X / Square / U</strong></li>
+              <li><span>Shoot (Hold Power)</span> <strong>B / Circle / L / Enter</strong></li>
+              <li><span>Sprint Knock-On</span> <strong>RT / R2 / Shift</strong></li>
+              <li><span>Finesse / Sole-Roll</span> <strong>LT / L2 / F</strong></li>
+              <li><span>360° Roulette Skill</span> <strong>R3 / Z</strong></li>
+            </ul>
+          </div>
+          <div class="ctrl-map-box">
+            <h3>OFF THE BALL (DEFENDING)</h3>
+            <ul>
+              <li><span>Switch Defender</span> <strong>LB / L1 / Q</strong></li>
+              <li><span>Standing Tackle</span> <strong>A / Cross / E / Space</strong></li>
+              <li><span>Sliding Tackle</span> <strong>X / Square / C</strong></li>
+              <li><span>Jockey Contain</span> <strong>LT / L2 / F</strong></li>
+              <li><span>Team Press / GK Rush</span> <strong>RB / R1 / R</strong></li>
+              <li><span>Pause / Replay</span> <strong>Start / Esc / Tab</strong></li>
+            </ul>
+          </div>
         </div>
       </div>
 
-      <!-- TAB 5: Append-Only Ledger, Proposal Gate & Identity Queue -->
-      <div class="tab-pane" id="tab-ledger" hidden>
-        <div class="gate-tester">
-          <h3>Proposal Gate &amp; Provider Identity Queue</h3>
-          <p class="muted">Test <code>world_precedence</code> parking on represented fixtures or queue an unknown external club ID for commissioner mapping.</p>
-          <div class="cart-actions-row">
-            <button class="btn btn-secondary" id="btn-test-gate">Test Feed on MUN vs ARS</button>
-            <button class="btn btn-secondary" id="btn-test-id-queue">Test Unknown Club Feed</button>
+      <div class="ctrl-card">
+        <h2>PROFILE CARTRIDGE SLOT (PSFC-CART-V1)</h2>
+        <p class="pane-sub">Portable signed profile envelope storing your club representation, camera preference &amp; world sequence checkpoint.</p>
+
+        <div class="cart-slot-graphic">
+          <div class="cart-shell">
+            <div class="cart-grip"></div>
+            <div class="cart-label">
+              <span class="cart-tag">PARALLEL SEASON FC</span>
+              <strong id="cart-title-display">ALEX · MANCHESTER UNITED</strong>
+              <span id="cart-rev-display">READY TO SYNC</span>
+            </div>
           </div>
-          <div id="gate-result-msg" class="gate-msg" hidden></div>
         </div>
 
-        <h3 class="section-subhead">Append-Only <code>world_event</code> Log (<span id="event-count">0</span>)</h3>
-        <ul class="ledger-list" id="ledger-list"></ul>
+        <div class="cart-controls-stack">
+          <select id="cart-device-select" class="console-select">
+            <option value="part-alex|cart-alex-01">Alex's Cartridge (cart-alex-01 · MUN)</option>
+            <option value="part-sam|cart-sam-01">Sam's Cartridge (cart-sam-01 · ARS)</option>
+          </select>
+          <div class="comm-btn-row">
+            <button class="console-btn console-btn-primary" id="btn-sync-cartridge" type="button">SYNC CARTRIDGE</button>
+            <button class="console-btn console-btn-secondary" id="btn-verify-cartridge" type="button" disabled>VERIFY</button>
+            <button class="console-btn console-btn-secondary" id="btn-download-cartridge" type="button" disabled>EXPORT .JSON</button>
+          </div>
+          <div id="cartridge-msg" class="console-toast" hidden></div>
+        </div>
       </div>
-    </aside>
-  </main>
+    </div>
 
-  <script src="/static/app.js"></script>
+    <footer class="console-action-bar">
+      <button class="console-btn console-btn-ghost" id="btn-ctrl-back" type="button">
+        <kbd>ESC / B</kbd> MAIN MENU
+      </button>
+    </footer>
+  </section>
+
+  <!-- ===================================================================== -->
+  <!-- SCREEN 6: FULLSCREEN 3D LIVE MATCH HUD & BROADCAST OVERLAYS           -->
+  <!-- ===================================================================== -->
+  <section id="screen-match" class="game-screen match-hud-screen" data-screen="match" hidden>
+    <!-- TOP-LEFT CLASSIC TV BROADCAST SCOREBUG -->
+    <div class="tv-scorebug">
+      <div class="tv-comp-tag" id="sb-context">PREMIER PARALLEL · 5v5</div>
+      <div class="tv-main-bar">
+        <div class="tv-team tv-home">
+          <span class="tv-kit-bar" id="sb-home-swatch"></span>
+          <span class="tv-code" id="sb-home-code">MUN</span>
+        </div>
+        <div class="tv-score" id="sb-score">0 - 0</div>
+        <div class="tv-team tv-away">
+          <span class="tv-code" id="sb-away-code">ARS</span>
+          <span class="tv-kit-bar" id="sb-away-swatch"></span>
+        </div>
+        <div class="tv-clock">
+          <span class="tv-half" id="sb-half">1H</span>
+          <span class="tv-time" id="sb-time">00:00</span>
+        </div>
+      </div>
+      <div class="tv-phase-pill" id="sb-phase">KICK OFF</div>
+    </div>
+
+    <!-- TOP-RIGHT DISCRETE QUICK MATCH BUTTONS -->
+    <div class="match-top-right">
+      <button class="hud-mini-btn" id="btn-hud-cam" type="button" title="Cycle Broadcast Camera (C)">CAM: TELE</button>
+      <button class="hud-mini-btn" id="btn-hud-replay" type="button" title="Instant Replay (Tab)">REPLAY</button>
+      <button class="hud-mini-btn" id="btn-hud-pause" type="button" title="Pause Match (Esc / Start)">PAUSE</button>
+    </div>
+
+    <!-- GOAL / EVENT BROADCAST LOWER-THIRD WIPE -->
+    <div class="broadcast-banner" id="goal-banner" hidden>
+      <div class="bb-accent"></div>
+      <div class="bb-body">
+        <div class="bb-title" id="goal-banner-title">GOAL!</div>
+        <div class="bb-sub" id="goal-banner-sub">10 M. RASHFORD</div>
+      </div>
+    </div>
+
+    <!-- BOTTOM-LEFT HOME PLAYER FIFA NAMEPLATE + STAMINA + SHOT POWER BAR -->
+    <div class="fifa-player-hud fifa-hud-left">
+      <div class="fph-top">
+        <span class="fph-num" id="hud-home-num">10</span>
+        <span class="fph-name" id="hud-home-name">RASHFORD</span>
+      </div>
+      <div class="fph-bars">
+        <div class="fph-bar-track" title="Stamina"><div class="fph-stamina-fill" id="hud-home-stam"></div></div>
+        <div class="fph-bar-track fph-power-track" title="Shot / Pass Power"><div class="fph-power-fill" id="hud-home-pow"></div></div>
+      </div>
+    </div>
+
+    <!-- BOTTOM-CENTER TRANSLUCENT 2D PITCH RADAR -->
+    <div class="fifa-radar-wrap" id="radar-wrap">
+      <canvas id="radar-canvas" width="210" height="130"></canvas>
+    </div>
+
+    <!-- BOTTOM-RIGHT AWAY PLAYER FIFA NAMEPLATE -->
+    <div class="fifa-player-hud fifa-hud-right">
+      <div class="fph-top">
+        <span class="fph-name" id="hud-away-name">SAKA</span>
+        <span class="fph-num" id="hud-away-num">7</span>
+      </div>
+      <div class="fph-bars">
+        <div class="fph-bar-track" title="Stamina"><div class="fph-stamina-fill" id="hud-away-stam"></div></div>
+        <div class="fph-bar-track fph-power-track" title="Shot / Pass Power"><div class="fph-power-fill" id="hud-away-pow"></div></div>
+      </div>
+    </div>
+
+    <!-- INSTANT REPLAY THEATER DOCK -->
+    <div class="replay-theater-bar" id="replay-bar" hidden>
+      <span class="rt-badge">INSTANT REPLAY · 3D ACTION CAM</span>
+      <input type="range" id="replay-scrub" min="0" max="100" value="0" />
+      <button class="hud-mini-btn" id="btn-replay-cam" type="button">CAM: ORBIT 360°</button>
+      <button class="hud-mini-btn" id="btn-replay-exit" type="button">EXIT REPLAY [TAB]</button>
+    </div>
+
+    <!-- PAUSE MENU OVERLAY -->
+    <div class="match-modal-backdrop" id="pause-modal" hidden>
+      <div class="match-modal-card">
+        <div class="mm-eyebrow">MATCH PAUSED</div>
+        <h2 class="mm-scoreline" id="pause-scoreline">MUN 0 - 0 ARS</h2>
+        <div class="mm-menu-stack">
+          <button class="console-btn console-btn-primary" id="btn-pause-resume" type="button">RESUME MATCH</button>
+          <button class="console-btn console-btn-secondary" id="btn-pause-replay" type="button">INSTANT REPLAY THEATER</button>
+          <button class="console-btn console-btn-secondary" id="btn-pause-cam" type="button">CAMERA ANGLE: TELE BROADCAST</button>
+          <button class="console-btn console-btn-gold" id="btn-pause-sim" type="button">FAST-FORWARD TO FULL-TIME</button>
+          <button class="console-btn console-btn-ghost" id="btn-pause-quit" type="button">QUIT TO MAIN MENU</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- FULL-TIME MATCH SUMMARY & OFFICIAL RESULT VERIFICATION OVERLAY -->
+    <div class="match-modal-backdrop" id="fulltime-modal" hidden>
+      <div class="match-modal-card mm-wide">
+        <div class="mm-eyebrow" id="ft-comp-label">FULL-TIME · OFFICIAL MATCH SUMMARY</div>
+        <div class="ft-big-scoreboard">
+          <span class="ft-club" id="ft-home-name">MAN UTD</span>
+          <span class="ft-score" id="ft-score">2 - 1</span>
+          <span class="ft-club" id="ft-away-name">ARSENAL</span>
+        </div>
+
+        <div class="ft-stats-grid" id="ft-stats-grid"></div>
+        <ul class="ft-events-summary" id="ft-events-list"></ul>
+
+        <div id="verify-banner" class="console-toast" hidden></div>
+
+        <div class="mm-actions-row">
+          <button class="console-btn console-btn-gold" id="btn-submit-session" type="button" hidden>
+            VERIFY &amp; RECORD OFFICIAL RESULT
+          </button>
+          <button class="console-btn console-btn-primary" id="btn-ft-rematch" type="button">PLAY REMATCH</button>
+          <button class="console-btn console-btn-secondary" id="btn-ft-hub" type="button">EXIT TO HUB</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <script type="module" src="/static/app.js"></script>
 </body>
 </html>

@@ -1,290 +1,684 @@
-(() => {
-  "use strict";
+import { ClassicFifa3DEngine, CAMERA_LABELS, resolveMatchKits } from "./engine3d.js";
 
-  // InputFrame button bitmasks (must match sim/psfc-sim/src/input.rs)
-  const BTN_PASS = 1 << 0;
-  const BTN_THROUGH = 1 << 1;
-  const BTN_LOB = 1 << 2;
-  const BTN_SHOOT = 1 << 3;
-  const BTN_SPRINT = 1 << 4;
-  const BTN_SWITCH = 1 << 5;
-  const BTN_JOCKEY = 1 << 6;
-  const BTN_TACKLE = 1 << 7;
-  const BTN_SLIDE = 1 << 8;
-  const BTN_CALL_RUN = 1 << 9;
-  const BTN_SKILL = 1 << 10;
+// InputFrame button bitmasks (must match sim/psfc-sim/src/input.rs)
+const BTN_PASS = 1 << 0;
+const BTN_THROUGH = 1 << 1;
+const BTN_LOB = 1 << 2;
+const BTN_SHOOT = 1 << 3;
+const BTN_SPRINT = 1 << 4;
+const BTN_SWITCH = 1 << 5;
+const BTN_JOCKEY = 1 << 6;
+const BTN_TACKLE = 1 << 7;
+const BTN_SLIDE = 1 << 8;
+const BTN_CALL_RUN = 1 << 9;
+const BTN_SKILL = 1 << 10;
 
-  const PHASE_LABELS = {
-    0: "KICK OFF",
-    1: "OPEN PLAY",
-    2: "THROW-IN",
-    3: "CORNER KICK",
-    4: "GOAL KICK",
-    5: "FREE KICK",
-    6: "PENALTY KICK",
-    10: "GOAL!",
-    11: "BREAK",
-    12: "FULL-TIME",
-  };
+const PHASE_LABELS = {
+  0: "KICK OFF",
+  1: "OPEN PLAY",
+  2: "THROW-IN",
+  3: "CORNER KICK",
+  4: "GOAL KICK",
+  5: "FREE KICK",
+  6: "PENALTY KICK",
+  10: "GOAL!",
+  11: "HALF-TIME",
+  12: "FULL-TIME",
+};
 
-  const DEFAULT_WORLD_ID = "world-prem-2026";
-  const DEFAULT_CUP_ID = "comp-facup-2026";
-  const REPLAY_CAPACITY = 360; // 6.0 seconds at 60 Hz
+const CLUB_ORDER = ["man-utd", "arsenal", "liverpool", "chelsea"];
+const SIDE_MODES = [
+  { id: "home_vs_cpu", label: "P1 HOME vs CPU" },
+  { id: "away_vs_cpu", label: "CPU vs P1 AWAY" },
+  { id: "local_2p", label: "2P LOCAL COUCH" },
+  { id: "cpu_vs_cpu", label: "CPU vs CPU SPECTATE" },
+];
+const FORMAT_OPTIONS = [
+  { id: "5v5", label: "5v5 ARENA (4 + GK)" },
+  { id: "11v11", label: "11v11 FULL STADIUM" },
+];
+const DURATION_OPTIONS = [
+  { ticks: 3600, label: "1 MIN HALVES" },
+  { ticks: 7200, label: "2 MIN HALVES" },
+  { ticks: 14400, label: "4 MIN HALVES" },
+  { ticks: 1800, label: "30 SEC QUICK" },
+];
+const DIFF_OPTIONS = [
+  { code: 1, name: "Easy", label: "AMATEUR" },
+  { code: 2, name: "Normal", label: "PROFESSIONAL" },
+  { code: 3, name: "Hard", label: "WORLD CLASS" },
+];
 
-  // DOM References
-  const canvas = document.getElementById("pitch-canvas");
-  const ctx = canvas.getContext("2d");
-  const wasmPill = document.getElementById("wasm-status-pill");
-  const gamepadPill = document.getElementById("gamepad-status-pill");
-  const hashPill = document.getElementById("hash-status-pill");
-  const btnAudioToggle = document.getElementById("btn-audio-toggle");
+// Normalized (x%, y%) coordinates on the vertical 2D tactical pitch board (bottom = own goal, top = opponent goal)
+const FORMATION_COORDS_5V5 = {
+  "1-2-1": [
+    [50, 86], // GK
+    [50, 66], // Pivot Defender
+    [23, 44], // Left Wing
+    [77, 44], // Right Wing
+    [50, 21], // Striker
+  ],
+  "2-2": [
+    [50, 86], // GK
+    [28, 64], // Left Back
+    [72, 64], // Right Back
+    [28, 28], // Left Forward
+    [72, 28], // Right Forward
+  ],
+  "1-1-2": [
+    [50, 86], // GK
+    [50, 68], // Sweeper
+    [50, 47], // Playmaker
+    [27, 22], // Left Striker
+    [73, 22], // Right Striker
+  ],
+};
 
-  const formatSelect = document.getElementById("format-select");
-  const homeClubSelect = document.getElementById("home-club-select");
-  const awayClubSelect = document.getElementById("away-club-select");
-  const modeSelect = document.getElementById("mode-select");
-  const durationSelect = document.getElementById("duration-select");
-  const padProfileSelect = document.getElementById("pad-profile-select");
-  const btnExhibition = document.getElementById("btn-exhibition");
-  const btnPause = document.getElementById("btn-pause");
-  const btnInstantReplay = document.getElementById("btn-instant-replay");
-  const btnSimRest = document.getElementById("btn-sim-rest");
-  const btnSubmitSession = document.getElementById("btn-submit-session");
+const DEFAULT_WORLD_ID = "world-prem-2026";
+const DEFAULT_CUP_ID = "comp-facup-2026";
+const REPLAY_CAPACITY = 360;
 
-  const squadClubSelect = document.getElementById("squad-club-select");
-  const squadFormationSelect = document.getElementById("squad-formation-select");
-  const squadCountPill = document.getElementById("squad-count-pill");
-  const squadRosterList = document.getElementById("squad-roster-list");
-  const btnSaveLineup = document.getElementById("btn-save-lineup");
-  const btnPlayWithSquad = document.getElementById("btn-play-with-squad");
-  const btnResetLineupDefault = document.getElementById("btn-reset-lineup-default");
-  const squadSaveMsg = document.getElementById("squad-save-msg");
+// --- Procedural WebAudio Console & Stadium Sound Engine ---
 
-  const sbContext = document.getElementById("sb-context");
-  const sbHomeSwatch = document.getElementById("sb-home-swatch");
-  const sbAwaySwatch = document.getElementById("sb-away-swatch");
-  const sbHomeCode = document.getElementById("sb-home-code");
-  const sbAwayCode = document.getElementById("sb-away-code");
-  const sbScore = document.getElementById("sb-score");
-  const sbHalf = document.getElementById("sb-half");
-  const sbTime = document.getElementById("sb-time");
-  const sbPhase = document.getElementById("sb-phase");
-  const replayPill = document.getElementById("replay-pill");
+const GameAudio = (() => {
+  let audioCtx = null;
+  let enabled = true;
 
-  const goalBanner = document.getElementById("goal-banner");
-  const goalBannerTitle = document.getElementById("goal-banner-title");
-  const goalBannerSub = document.getElementById("goal-banner-sub");
-  const verifyBanner = document.getElementById("verify-banner");
-  const eventFeed = document.getElementById("match-event-feed");
-  const possessionBadge = document.getElementById("possession-badge");
-  const worldSelect = document.getElementById("world-select");
-
-  // Runtime state
-  let wasm = null;
-  let activeWorldId = DEFAULT_WORLD_ID;
-  let activeCompFilter = "all"; // "all" | "league" | "knockout"
-  let currentSnapshot = null;
-  let activeOfficialSession = null;
-  let paused = false;
-  let goalBannerTicks = 0;
-  let lastShootoutScore = null;
-  let camX = 0.0;
-  let camY = 0.0;
-  let ballTrail = [];
-  let homePossTicks = 1;
-  let awayPossTicks = 1;
-
-  // Interactive 11->5 squad builder state per club
-  const draftLineups = {};
-
-  // Instant Replay ring buffer
-  let replayBuffer = [];
-  let replayActive = false;
-  let replayCursor = 0.0;
-
-  // Synced Cartridge envelope in browser memory
-  let latestSyncedEnvelope = null;
-
-  const keysDown = new Set();
-  const enc = new TextEncoder();
-  const dec = new TextDecoder();
-
-  // --- Procedural WebAudio Stadium Sound Engine (Zero External Audio Assets) ---
-
-  const StadiumAudio = (() => {
-    let audioCtx = null;
-    let enabled = true;
-
-    function ensureCtx() {
-      if (!enabled) return null;
-      if (!audioCtx) {
-        const Ctor = window.AudioContext || window.webkitAudioContext;
-        if (!Ctor) return null;
-        audioCtx = new Ctor();
-      }
-      if (audioCtx.state === "suspended") {
-        audioCtx.resume().catch(() => {});
-      }
-      return audioCtx;
+  function ensureCtx() {
+    if (!enabled) return null;
+    if (!audioCtx) {
+      const Ctor = window.AudioContext || window.webkitAudioContext;
+      if (!Ctor) return null;
+      audioCtx = new Ctor();
     }
-
-    function playKick(power = 0.6) {
-      const ac = ensureCtx();
-      if (!ac) return;
-      const now = ac.currentTime;
-      const osc = ac.createOscillator();
-      const gain = ac.createGain();
-      osc.type = "triangle";
-      osc.frequency.setValueAtTime(135 + power * 45, now);
-      osc.frequency.exponentialRampToValueAtTime(42, now + 0.085);
-      gain.gain.setValueAtTime(0.18 * Math.min(1.2, power + 0.35), now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.09);
-      osc.connect(gain).connect(ac.destination);
-      osc.start(now);
-      osc.stop(now + 0.095);
+    if (audioCtx.state === "suspended") {
+      audioCtx.resume().catch(() => {});
     }
+    return audioCtx;
+  }
 
-    function playWhistle(longBlast = false) {
-      const ac = ensureCtx();
-      if (!ac) return;
-      const now = ac.currentTime;
-      const dur = longBlast ? 0.38 : 0.18;
-      for (const freq of [2780, 2940]) {
-        const osc = ac.createOscillator();
-        const gain = ac.createGain();
-        osc.type = "sine";
-        osc.frequency.setValueAtTime(freq, now);
-        osc.frequency.linearRampToValueAtTime(freq - 60, now + dur);
-        gain.gain.setValueAtTime(0.055, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
-        osc.connect(gain).connect(ac.destination);
-        osc.start(now);
-        osc.stop(now + dur + 0.01);
-      }
-    }
+  function uiTick(freq = 520) {
+    const ac = ensureCtx();
+    if (!ac) return;
+    const now = ac.currentTime;
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(freq, now);
+    osc.frequency.exponentialRampToValueAtTime(freq * 1.25, now + 0.04);
+    gain.gain.setValueAtTime(0.06, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.045);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(now);
+    osc.stop(now + 0.05);
+  }
 
-    function playSaveSlap() {
-      const ac = ensureCtx();
-      if (!ac) return;
-      const now = ac.currentTime;
-      const osc = ac.createOscillator();
-      const gain = ac.createGain();
-      osc.type = "square";
-      osc.frequency.setValueAtTime(320, now);
-      osc.frequency.exponentialRampToValueAtTime(90, now + 0.07);
-      gain.gain.setValueAtTime(0.11, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.075);
-      osc.connect(gain).connect(ac.destination);
-      osc.start(now);
-      osc.stop(now + 0.08);
-    }
+  function uiConfirm() {
+    uiTick(660);
+    setTimeout(() => uiTick(880), 45);
+  }
 
-    function playGoalCrowdRoar() {
-      const ac = ensureCtx();
-      if (!ac) return;
-      const now = ac.currentTime;
-      const dur = 1.35;
-      const bufSize = Math.floor(ac.sampleRate * dur);
-      const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
-      const ch = buf.getChannelData(0);
-      let last = 0;
-      for (let i = 0; i < bufSize; i++) {
-        const white = Math.random() * 2 - 1;
-        last = (last + 0.06 * white) / 1.06;
-        ch[i] = last * 3.0;
-      }
-      const src = ac.createBufferSource();
-      src.buffer = buf;
-      const filter = ac.createBiquadFilter();
-      filter.type = "bandpass";
-      filter.frequency.setValueAtTime(640, now);
-      filter.Q.setValueAtTime(0.85, now);
-      const gain = ac.createGain();
-      gain.gain.setValueAtTime(0.01, now);
-      gain.gain.linearRampToValueAtTime(0.22, now + 0.18);
-      gain.gain.exponentialRampToValueAtTime(0.002, now + dur);
-      src.connect(filter).connect(gain).connect(ac.destination);
-      src.start(now);
-    }
+  function playKick(power = 0.65) {
+    const ac = ensureCtx();
+    if (!ac) return;
+    const now = ac.currentTime;
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = "triangle";
+    osc.frequency.setValueAtTime(140 + power * 48, now);
+    osc.frequency.exponentialRampToValueAtTime(40, now + 0.09);
+    gain.gain.setValueAtTime(0.2 * Math.min(1.25, power + 0.35), now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.095);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(now);
+    osc.stop(now + 0.1);
+  }
 
-    function playSkillWhoosh() {
-      const ac = ensureCtx();
-      if (!ac) return;
-      const now = ac.currentTime;
+  function playWhistle(longBlast = false) {
+    const ac = ensureCtx();
+    if (!ac) return;
+    const now = ac.currentTime;
+    const dur = longBlast ? 0.4 : 0.18;
+    for (const freq of [2780, 2945]) {
       const osc = ac.createOscillator();
       const gain = ac.createGain();
       osc.type = "sine";
-      osc.frequency.setValueAtTime(360, now);
-      osc.frequency.exponentialRampToValueAtTime(720, now + 0.09);
-      gain.gain.setValueAtTime(0.06, now);
-      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.095);
+      osc.frequency.setValueAtTime(freq, now);
+      osc.frequency.linearRampToValueAtTime(freq - 55, now + dur);
+      gain.gain.setValueAtTime(0.055, now);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + dur);
       osc.connect(gain).connect(ac.destination);
       osc.start(now);
-      osc.stop(now + 0.1);
+      osc.stop(now + dur + 0.01);
     }
+  }
 
-    function toggle() {
-      enabled = !enabled;
-      return enabled;
+  function playSaveSlap() {
+    const ac = ensureCtx();
+    if (!ac) return;
+    const now = ac.currentTime;
+    const osc = ac.createOscillator();
+    const gain = ac.createGain();
+    osc.type = "square";
+    osc.frequency.setValueAtTime(310, now);
+    osc.frequency.exponentialRampToValueAtTime(88, now + 0.075);
+    gain.gain.setValueAtTime(0.11, now);
+    gain.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+    osc.connect(gain).connect(ac.destination);
+    osc.start(now);
+    osc.stop(now + 0.085);
+  }
+
+  function playGoalCrowdRoar() {
+    const ac = ensureCtx();
+    if (!ac) return;
+    const now = ac.currentTime;
+    const dur = 1.45;
+    const bufSize = Math.floor(ac.sampleRate * dur);
+    const buf = ac.createBuffer(1, bufSize, ac.sampleRate);
+    const ch = buf.getChannelData(0);
+    let last = 0;
+    for (let i = 0; i < bufSize; i++) {
+      const white = Math.random() * 2 - 1;
+      last = (last + 0.06 * white) / 1.06;
+      ch[i] = last * 3.1;
     }
+    const src = ac.createBufferSource();
+    src.buffer = buf;
+    const filter = ac.createBiquadFilter();
+    filter.type = "bandpass";
+    filter.frequency.setValueAtTime(650, now);
+    filter.Q.setValueAtTime(0.85, now);
+    const gain = ac.createGain();
+    gain.gain.setValueAtTime(0.01, now);
+    gain.gain.linearRampToValueAtTime(0.24, now + 0.18);
+    gain.gain.exponentialRampToValueAtTime(0.002, now + dur);
+    src.connect(filter).connect(gain).connect(ac.destination);
+    src.start(now);
+  }
 
-    return {
-      ensureCtx,
-      playKick,
-      playWhistle,
-      playSaveSlap,
-      playGoalCrowdRoar,
-      playSkillWhoosh,
-      toggle,
-    };
-  })();
+  function toggle() {
+    enabled = !enabled;
+    return enabled;
+  }
 
-  window.addEventListener("pointerdown", () => StadiumAudio.ensureCtx(), { once: true });
+  return {
+    ensureCtx,
+    uiTick,
+    uiConfirm,
+    playKick,
+    playWhistle,
+    playSaveSlap,
+    playGoalCrowdRoar,
+    toggle,
+  };
+})();
 
-  btnAudioToggle.addEventListener("click", () => {
-    const on = StadiumAudio.toggle();
-    btnAudioToggle.textContent = on ? "Audio: Stadium FX" : "Audio: Muted";
-    btnAudioToggle.classList.toggle("muted-audio", !on);
+// --- Application State ---
+
+const canvas = document.getElementById("pitch-canvas");
+const radarCanvas = document.getElementById("radar-canvas");
+const radarCtx = radarCanvas.getContext("2d");
+const engine3d = new ClassicFifa3DEngine(canvas);
+
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+let wasm = null;
+let currentScreen = "title"; // "title" | "menu" | "prematch" | "squad" | "season" | "controllers" | "match"
+let previousScreen = "menu";
+let focusedBladeIdx = 0;
+
+let activeWorldId = DEFAULT_WORLD_ID;
+let activeCompFilter = "all";
+let latestOverview = null;
+let currentSnapshot = null;
+let isAttractMatch = true;
+
+// Match setup selections (Pre-Match Screen)
+let pmHomeClub = "man-utd";
+let pmAwayClub = "arsenal";
+let pmSideIdx = 0; // 0 = P1 Home vs CPU, 1 = CPU vs P1 Away, 2 = 2P Couch, 3 = CPU Spectate
+let pmFmtIdx = 0; // 0 = 5v5, 1 = 11v11
+let pmDurIdx = 1; // 2 min default
+let pmDiffIdx = 1; // Professional (Normal)
+let pendingOfficialFixture = null; // Set when entering Pre-Match from an Official Parallel Fixture!
+
+// Live match state
+let activeOfficialSession = null;
+let paused = false;
+let fulltimeShown = false;
+let goalBannerTicks = 0;
+let lastShootoutScore = null;
+let homePossTicks = 1;
+let awayPossTicks = 1;
+let matchEventsLog = [];
+
+// Instant Replay Theater
+let replayBuffer = [];
+let replayActive = false;
+let replayCursor = 0.0;
+let replayCamIdx = 0;
+const REPLAY_CAM_MODES = ["orbit", "closeup", "broadcast"];
+const REPLAY_CAM_LABELS = {
+  orbit: "CAM: ORBIT 360°",
+  closeup: "CAM: ACTION CLOSE",
+  broadcast: "CAM: TV REPLAY",
+};
+
+// Squad Builder state
+let activeSquadClub = "man-utd";
+let swapArmedStarterId = null;
+const draftLineups = {};
+
+// Cartridge state
+let latestSyncedEnvelope = null;
+
+// Input tracking
+const keysDown = new Set();
+let prevPadNavTick = 0;
+let prevStartBtn = false;
+
+// --- WASM Helpers ---
+
+function wasmReadText() {
+  if (!wasm) return "";
+  const ptr = wasm.wasm_output_ptr();
+  const len = wasm.wasm_output_len();
+  return dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+}
+
+function wasmWriteInputText(str) {
+  const bytes = enc.encode(str);
+  const ptr = wasm.wasm_prepare_input_buf(bytes.length);
+  new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+}
+
+function readPackedState() {
+  if (!wasm) return null;
+  const count = wasm.sim_pack_render_state();
+  if (!count) return null;
+  const ptr = wasm.wasm_packed_state_ptr();
+  return new Int32Array(wasm.memory.buffer, ptr, count);
+}
+
+// --- Screen Router ---
+
+const SCREEN_TITLES = {
+  menu: "MAIN MENU",
+  prematch: "MATCH SETUP & SELECT SIDES",
+  squad: "TEAM MANAGEMENT (11 → 5)",
+  season: "PARALLEL SEASON HUB",
+  controllers: "CONTROLLERS & PROFILE CARTRIDGE",
+};
+
+function navigateTo(screen) {
+  if (currentScreen !== screen && currentScreen !== "match" && currentScreen !== "title") {
+    previousScreen = currentScreen;
+  }
+  currentScreen = screen;
+
+  document.querySelectorAll(".game-screen").forEach((el) => {
+    const match = el.getAttribute("data-screen") === screen;
+    el.hidden = !match;
+    el.classList.toggle("active", match);
   });
 
-  // --- WASM Bridge Helpers ---
-
-  function wasmReadText() {
-    if (!wasm) return "";
-    const ptr = wasm.wasm_output_ptr();
-    const len = wasm.wasm_output_len();
-    return dec.decode(new Uint8Array(wasm.memory.buffer, ptr, len));
+  const topbar = document.getElementById("console-topbar");
+  const showTopbar = screen !== "title" && screen !== "match";
+  topbar.hidden = !showTopbar;
+  if (showTopbar) {
+    document.getElementById("ct-screen-title").textContent = SCREEN_TITLES[screen] || "PARALLEL SEASON FC";
   }
 
-  function wasmWriteInputText(str) {
-    const bytes = enc.encode(str);
-    const ptr = wasm.wasm_prepare_input_buf(bytes.length);
-    new Uint8Array(wasm.memory.buffer, ptr, bytes.length).set(bytes);
+  document.body.classList.toggle("in-live-match", screen === "match");
+  document.body.classList.toggle("in-prematch-showcase", screen === "prematch");
+
+  if (screen === "title" || screen === "menu" || screen === "season" || screen === "controllers") {
+    engine3d.setViewMode("attract");
+    if (!isAttractMatch) {
+      startAttractBackgroundMatch();
+    }
+  } else if (screen === "prematch") {
+    engine3d.setViewMode("showcase");
+    renderPreMatchScreen();
+  } else if (screen === "squad") {
+    engine3d.setViewMode("squad");
+    renderSquadBuilder();
+  } else if (screen === "match") {
+    engine3d.setViewMode("match");
+  }
+}
+
+// --- Gamepad & Keyboard Input ---
+
+function classifyGamepadVendor(idStr) {
+  const s = String(idStr || "").toLowerCase();
+  if (s.includes("psfc") || s.includes("rp2040") || s.includes("2e8a")) return "PSFC RP2040 PAD";
+  if (s.includes("045e") || s.includes("xbox") || s.includes("xinput")) return "XBOX CONTROLLER";
+  if (s.includes("054c") || s.includes("dualsense") || s.includes("dualshock") || s.includes("wireless controller")) {
+    return "PLAYSTATION PAD";
+  }
+  if (s.includes("2dc8") || s.includes("8bitdo")) return "8BITDO PAD";
+  if (s.includes("057e") || s.includes("pro controller") || s.includes("nintendo")) return "SWITCH PRO PAD";
+  if (s.includes("046d") || s.includes("logitech")) return "LOGITECH PAD";
+  return "USB GAMEPAD";
+}
+
+function updateGamepadBadges() {
+  const pads = navigator.getGamepads ? Array.from(navigator.getGamepads()).filter((p) => p && p.connected) : [];
+  const pill = document.getElementById("gamepad-status-pill");
+  const titlePad = document.getElementById("title-pad-pill");
+  if (pads.length > 0) {
+    const label = classifyGamepadVendor(pads[0].id);
+    const extra = pads.length > 1 ? ` +${pads.length - 1}` : "";
+    pill.textContent = `${label}${extra}`;
+    pill.classList.add("pad-connected");
+    if (titlePad) titlePad.textContent = `${label} CONNECTED`;
+  } else {
+    pill.textContent = "PAD / KEYBOARD READY";
+    pill.classList.remove("pad-connected");
+    if (titlePad) titlePad.textContent = "PLUG IN ANY XBOX / PS5 / USB PAD OR USE KEYBOARD";
+  }
+}
+
+window.addEventListener("gamepadconnected", updateGamepadBadges);
+window.addEventListener("gamepaddisconnected", updateGamepadBadges);
+
+function sampleRawGamepad(padIndex) {
+  const pads = navigator.getGamepads ? navigator.getGamepads() : [];
+  const pad = pads[padIndex];
+  if (!pad || !pad.connected) return null;
+
+  const profileSel = document.getElementById("pad-profile-select");
+  const profile = profileSel ? profileSel.value : "auto";
+  const idLc = String(pad.id || "").toLowerCase();
+  const isDirectInput =
+    profile === "dinput" ||
+    (profile === "auto" &&
+      pad.mapping !== "standard" &&
+      !idLc.includes("xbox") &&
+      !idLc.includes("xinput") &&
+      !idLc.includes("045e") &&
+      !idLc.includes("054c") &&
+      !idLc.includes("dualsense") &&
+      !idLc.includes("dualshock") &&
+      !idLc.includes("2dc8") &&
+      !idLc.includes("8bitdo"));
+  const isSwitchSwap = profile === "switch";
+
+  const dz = (v) => (Math.abs(v) < 0.16 ? 0 : v);
+  let lx = dz(pad.axes[0] || 0);
+  let ly = dz(pad.axes[1] || 0);
+  const rx = dz(pad.axes[2] || 0);
+  const rawRy =
+    isDirectInput && pad.axes.length >= 6 && Math.abs(pad.axes[3] || 0) < 0.05
+      ? pad.axes[5] || 0
+      : pad.axes[3] || 0;
+  const ry = dz(rawRy);
+
+  const b = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.45));
+  const trig = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.22));
+
+  let dpadX = 0;
+  let dpadY = 0;
+  if (b(14)) dpadX -= 1;
+  if (b(15)) dpadX += 1;
+  if (b(12)) dpadY -= 1;
+  if (b(13)) dpadY += 1;
+
+  if (dpadX === 0 && dpadY === 0 && isDirectInput && pad.axes.length > 9) {
+    const hat = pad.axes[9];
+    if (hat >= -1.05 && hat <= 1.05 && Math.abs(hat) > 0.05) {
+      const step = Math.round(((hat + 1.0) * 7.0) / 2.0) % 8;
+      const dirs = [
+        [0, -1],
+        [1, -1],
+        [1, 0],
+        [1, 1],
+        [0, 1],
+        [-1, 1],
+        [-1, 0],
+        [-1, -1],
+      ];
+      if (dirs[step]) {
+        dpadX = dirs[step][0];
+        dpadY = dirs[step][1];
+      }
+    }
   }
 
-  function readPackedState() {
-    if (!wasm) return null;
-    const count = wasm.sim_pack_render_state();
-    if (!count) return null;
-    const ptr = wasm.wasm_packed_state_ptr();
-    return new Int32Array(wasm.memory.buffer, ptr, count);
+  if (lx === 0 && ly === 0 && (dpadX !== 0 || dpadY !== 0)) {
+    lx = dpadX;
+    ly = dpadY;
+    if (lx !== 0 && ly !== 0) {
+      lx *= Math.SQRT1_2;
+      ly *= Math.SQRT1_2;
+    }
   }
 
-  function toggleInstantReplay() {
-    if (replayBuffer.length < 20) return;
-    replayActive = !replayActive;
-    replayCursor = 0.0;
-    replayPill.hidden = !replayActive;
-    btnInstantReplay.textContent = replayActive ? "Exit Replay" : "Instant Replay (6s)";
+  let south, east, west, north;
+  if (isSwitchSwap) {
+    south = b(1);
+    east = b(0);
+    west = b(3);
+    north = b(2);
+  } else if (isDirectInput) {
+    south = b(1);
+    east = b(2);
+    west = b(0);
+    north = b(3);
+  } else {
+    south = b(0);
+    east = b(1);
+    west = b(2);
+    north = b(3);
   }
 
-  // --- Controller Sampling (Keyboard + HTML5 Gamepad API) ---
+  let buttons = 0;
+  if (south) buttons |= BTN_PASS | BTN_TACKLE;
+  if (north) buttons |= BTN_THROUGH;
+  if (west) buttons |= BTN_LOB | BTN_SLIDE;
+  if (east) buttons |= BTN_SHOOT;
+  if (trig(7)) buttons |= BTN_SPRINT;
+  if (trig(6)) buttons |= BTN_JOCKEY;
+  if (b(4)) buttons |= BTN_SWITCH;
+  if (b(5)) buttons |= BTN_CALL_RUN | BTN_TACKLE;
+  if (b(11) || b(10)) buttons |= BTN_SKILL;
 
-  window.addEventListener("keydown", (ev) => {
-    if (
-      document.activeElement &&
-      ["SELECT", "INPUT", "TEXTAREA"].includes(document.activeElement.tagName)
-    ) {
+  return {
+    mx: Math.max(-127, Math.min(127, Math.round(lx * 127))),
+    my: Math.max(-127, Math.min(127, Math.round(ly * 127))),
+    ax: Math.max(-127, Math.min(127, Math.round(rx * 127))),
+    ay: Math.max(-127, Math.min(127, Math.round(ry * 127))),
+    btns: buttons,
+    south,
+    east,
+    west,
+    north,
+    start: b(9),
+    lx,
+    ly,
+    rx,
+    ry,
+    id: pad.id,
+  };
+}
+
+function samplePrimaryHumanInput(allowArrows) {
+  const gp = sampleRawGamepad(0);
+  if (gp && (gp.mx !== 0 || gp.my !== 0 || gp.ax !== 0 || gp.ay !== 0 || gp.btns !== 0)) {
+    return gp;
+  }
+
+  let dx = 0;
+  let dy = 0;
+  if (keysDown.has("KeyA") || (allowArrows && keysDown.has("ArrowLeft"))) dx -= 1;
+  if (keysDown.has("KeyD") || (allowArrows && keysDown.has("ArrowRight"))) dx += 1;
+  if (keysDown.has("KeyW") || (allowArrows && keysDown.has("ArrowUp"))) dy -= 1;
+  if (keysDown.has("KeyS") || (allowArrows && keysDown.has("ArrowDown"))) dy += 1;
+  if (dx !== 0 && dy !== 0) {
+    dx *= Math.SQRT1_2;
+    dy *= Math.SQRT1_2;
+  }
+
+  let btns = 0;
+  if (keysDown.has("Space") || keysDown.has("KeyJ")) btns |= BTN_PASS | BTN_TACKLE;
+  if (keysDown.has("KeyK")) btns |= BTN_THROUGH;
+  if (keysDown.has("KeyU")) btns |= BTN_LOB | BTN_SLIDE;
+  if (keysDown.has("KeyL") || keysDown.has("Enter")) btns |= BTN_SHOOT;
+  if (keysDown.has("ShiftLeft") || keysDown.has("ShiftRight")) btns |= BTN_SPRINT;
+  if (keysDown.has("KeyQ")) btns |= BTN_SWITCH;
+  if (keysDown.has("KeyF")) btns |= BTN_JOCKEY;
+  if (keysDown.has("KeyE")) btns |= BTN_TACKLE;
+  if (keysDown.has("KeyC")) btns |= BTN_SLIDE;
+  if (keysDown.has("KeyR")) btns |= BTN_CALL_RUN;
+  if (keysDown.has("KeyZ")) btns |= BTN_SKILL;
+
+  const mx = Math.round(dx * 127);
+  const my = Math.round(dy * 127);
+  const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
+  return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
+}
+
+function sampleSecondaryHumanInput() {
+  const gp2 = sampleRawGamepad(1);
+  if (gp2 && (gp2.mx !== 0 || gp2.my !== 0 || gp2.ax !== 0 || gp2.ay !== 0 || gp2.btns !== 0)) {
+    return gp2;
+  }
+
+  let dx = 0;
+  let dy = 0;
+  if (keysDown.has("ArrowLeft")) dx -= 1;
+  if (keysDown.has("ArrowRight")) dx += 1;
+  if (keysDown.has("ArrowUp")) dy -= 1;
+  if (keysDown.has("ArrowDown")) dy += 1;
+  if (dx !== 0 && dy !== 0) {
+    dx *= Math.SQRT1_2;
+    dy *= Math.SQRT1_2;
+  }
+
+  let btns = 0;
+  if (keysDown.has("Numpad1") || keysDown.has("Period")) btns |= BTN_PASS | BTN_TACKLE;
+  if (keysDown.has("Numpad2") || keysDown.has("Slash")) btns |= BTN_SHOOT;
+  if (keysDown.has("Numpad3")) btns |= BTN_THROUGH;
+  if (keysDown.has("Numpad0")) btns |= BTN_SKILL;
+  if (keysDown.has("ControlRight") || keysDown.has("RightControl")) btns |= BTN_SPRINT;
+  if (keysDown.has("Comma")) btns |= BTN_SWITCH | BTN_TACKLE;
+
+  const mx = Math.round(dx * 127);
+  const my = Math.round(dy * 127);
+  const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
+  return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
+}
+
+// Update live Controller Visualizer when on SCREEN_CONTROLLERS
+function updateControllerVisualizer() {
+  if (currentScreen !== "controllers") return;
+  const gp = sampleRawGamepad(0);
+  const lDot = document.getElementById("vis-lstick");
+  const rDot = document.getElementById("vis-rstick");
+  const lx = gp ? gp.lx : (keysDown.has("KeyD") ? 1 : keysDown.has("KeyA") ? -1 : 0);
+  const ly = gp ? gp.ly : (keysDown.has("KeyS") ? 1 : keysDown.has("KeyW") ? -1 : 0);
+  const rx = gp ? gp.rx : 0;
+  const ry = gp ? gp.ry : 0;
+
+  lDot.style.transform = `translate(calc(-50% + ${lx * 20}px), calc(-50% + ${ly * 20}px))`;
+  rDot.style.transform = `translate(calc(-50% + ${rx * 20}px), calc(-50% + ${ry * 20}px))`;
+
+  document.getElementById("vis-btn-south").classList.toggle("lit", Boolean((gp && gp.south) || keysDown.has("Space")));
+  document.getElementById("vis-btn-east").classList.toggle("lit", Boolean((gp && gp.east) || keysDown.has("KeyL")));
+  document.getElementById("vis-btn-west").classList.toggle("lit", Boolean((gp && gp.west) || keysDown.has("KeyU")));
+  document.getElementById("vis-btn-north").classList.toggle("lit", Boolean((gp && gp.north) || keysDown.has("KeyK")));
+}
+
+// --- Console Keyboard & Gamepad Screen Navigation ---
+
+function updateFocusedHubBlade(newIdx) {
+  const blades = Array.from(document.querySelectorAll(".hub-blade"));
+  if (!blades.length) return;
+  focusedBladeIdx = (newIdx + blades.length) % blades.length;
+  blades.forEach((b, i) => b.classList.toggle("focused", i === focusedBladeIdx));
+  GameAudio.uiTick(480);
+}
+
+function triggerHubBlade(navKey) {
+  GameAudio.uiConfirm();
+  if (navKey === "prematch-exhibition") {
+    pendingOfficialFixture = null;
+    navigateTo("prematch");
+  } else {
+    navigateTo(navKey);
+  }
+}
+
+window.addEventListener("pointerdown", () => GameAudio.ensureCtx(), { once: true });
+
+window.addEventListener("keydown", (ev) => {
+  if (document.activeElement && ["SELECT", "INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
+    return;
+  }
+  GameAudio.ensureCtx();
+
+  if (currentScreen === "title") {
+    if (["Enter", "Space"].includes(ev.code)) {
+      ev.preventDefault();
+      GameAudio.uiConfirm();
+      navigateTo("menu");
+    }
+    return;
+  }
+
+  if (currentScreen === "menu") {
+    if (ev.code === "ArrowDown" || ev.code === "KeyS") {
+      ev.preventDefault();
+      updateFocusedHubBlade(focusedBladeIdx + 1);
+    } else if (ev.code === "ArrowUp" || ev.code === "KeyW") {
+      ev.preventDefault();
+      updateFocusedHubBlade(focusedBladeIdx - 1);
+    } else if (ev.code === "Enter" || ev.code === "Space") {
+      ev.preventDefault();
+      const blades = document.querySelectorAll(".hub-blade");
+      const active = blades[focusedBladeIdx];
+      if (active) triggerHubBlade(active.getAttribute("data-nav"));
+    }
+    return;
+  }
+
+  if (currentScreen === "prematch") {
+    if (ev.code === "Escape") {
+      ev.preventDefault();
+      GameAudio.uiTick(360);
+      navigateTo(pendingOfficialFixture ? "season" : "menu");
+    } else if (ev.code === "KeyY") {
+      ev.preventDefault();
+      activeSquadClub = pmHomeClub;
+      navigateTo("squad");
+    } else if (ev.code === "Enter") {
+      ev.preventDefault();
+      launchSelectedMatch();
+    }
+    return;
+  }
+
+  if (currentScreen === "squad" || currentScreen === "season" || currentScreen === "controllers") {
+    if (ev.code === "Escape") {
+      ev.preventDefault();
+      GameAudio.uiTick(360);
+      navigateTo(currentScreen === "squad" && previousScreen === "prematch" ? "prematch" : "menu");
+    }
+    return;
+  }
+
+  // Live Match Keys
+  if (currentScreen === "match") {
+    if (ev.code === "Escape") {
+      ev.preventDefault();
+      if (replayActive) {
+        exitInstantReplay();
+      } else if (!fulltimeShown) {
+        togglePauseModal();
+      }
       return;
     }
     if (ev.code === "Tab") {
@@ -292,1924 +686,1704 @@
       toggleInstantReplay();
       return;
     }
+    if (ev.code === "KeyV") {
+      ev.preventDefault();
+      cycleMatchCamera();
+      return;
+    }
     if (["Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight"].includes(ev.code)) {
       ev.preventDefault();
     }
-    StadiumAudio.ensureCtx();
     keysDown.add(ev.code);
-  });
+  }
+});
 
-  window.addEventListener("keyup", (ev) => {
-    keysDown.delete(ev.code);
-  });
+window.addEventListener("keyup", (ev) => keysDown.delete(ev.code));
+window.addEventListener("blur", () => keysDown.clear());
 
-  window.addEventListener("blur", () => keysDown.clear());
-
-  function classifyGamepadVendor(idStr) {
-    const s = String(idStr || "").toLowerCase();
-    if (s.includes("psfc") || s.includes("rp2040") || s.includes("2e8a")) return "PSFC RP2040 Pad";
-    if (s.includes("045e") || s.includes("xbox") || s.includes("xinput")) return "Xbox Pad";
-    if (s.includes("054c") || s.includes("dualsense") || s.includes("dualshock") || s.includes("wireless controller")) {
-      return "PlayStation Pad";
-    }
-    if (s.includes("2dc8") || s.includes("8bitdo")) return "8BitDo Pad";
-    if (s.includes("057e") || s.includes("pro controller") || s.includes("nintendo")) return "Switch Pro Pad";
-    if (s.includes("046d") || s.includes("logitech") || s.includes("f310") || s.includes("f710")) return "Logitech Pad";
-    return "USB Gamepad";
+function pollGamepadMenuActions(nowMs) {
+  const gp = sampleRawGamepad(0);
+  if (!gp) {
+    prevStartBtn = false;
+    return;
   }
 
-  function updateConnectedGamepadBadge() {
-    const pads = navigator.getGamepads ? Array.from(navigator.getGamepads()).filter((p) => p && p.connected) : [];
-    if (pads.length > 0) {
-      const label = classifyGamepadVendor(pads[0].id);
-      const countSuffix = pads.length > 1 ? ` (+${pads.length - 1})` : "";
-      gamepadPill.textContent = `Controller: ${label}${countSuffix} Ready`;
-      gamepadPill.className = "pill pill-emerald";
-    } else {
-      gamepadPill.textContent = "Controller: Keyboard + Gamepad Ready";
-      gamepadPill.className = "pill pill-slate";
+  const startEdge = gp.start && !prevStartBtn;
+  prevStartBtn = gp.start;
+
+  if (currentScreen === "title") {
+    if (startEdge || gp.south) {
+      prevPadNavTick = nowMs + 320;
+      GameAudio.uiConfirm();
+      navigateTo("menu");
     }
+    return;
   }
 
-  window.addEventListener("gamepadconnected", updateConnectedGamepadBadge);
-  window.addEventListener("gamepaddisconnected", updateConnectedGamepadBadge);
-
-  function sampleGamepad(padIndex) {
-    const pads = navigator.getGamepads ? navigator.getGamepads() : [];
-    const pad = pads[padIndex];
-    if (!pad || !pad.connected) return null;
-
-    const profile = padProfileSelect ? padProfileSelect.value : "auto";
-    const idLc = String(pad.id || "").toLowerCase();
-    const isDirectInput =
-      profile === "dinput" ||
-      (profile === "auto" &&
-        pad.mapping !== "standard" &&
-        !idLc.includes("xbox") &&
-        !idLc.includes("xinput") &&
-        !idLc.includes("045e") &&
-        !idLc.includes("054c") &&
-        !idLc.includes("dualsense") &&
-        !idLc.includes("dualshock") &&
-        !idLc.includes("2dc8") &&
-        !idLc.includes("8bitdo"));
-    const isSwitchSwap = profile === "switch";
-
-    const deadzone = (v) => (Math.abs(v) < 0.15 ? 0 : v);
-    let lx = deadzone(pad.axes[0] || 0);
-    let ly = deadzone(pad.axes[1] || 0);
-    const rx = deadzone(pad.axes[2] || 0);
-    const rawRy =
-      isDirectInput && pad.axes.length >= 6 && Math.abs(pad.axes[3] || 0) < 0.05
-        ? pad.axes[5] || 0
-        : pad.axes[3] || 0;
-    const ry = deadzone(rawRy);
-
-    const b = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.45));
-    const trig = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.22));
-
-    // D-Pad fallback (Standard buttons 12..15 + DirectInput 8-way POV hat on axes[9])
-    if (lx === 0 && ly === 0) {
-      let dx = 0;
-      let dy = 0;
-      if (b(14)) dx -= 1;
-      if (b(15)) dx += 1;
-      if (b(12)) dy -= 1;
-      if (b(13)) dy += 1;
-
-      if (dx === 0 && dy === 0 && isDirectInput && pad.axes.length > 9) {
-        const hat = pad.axes[9];
-        if (hat >= -1.05 && hat <= 1.05 && Math.abs(hat) > 0.05) {
-          // POV hat angle: -1.0 is North (-Y), advancing clockwise in 45-deg steps of 2/7
-          const step = Math.round(((hat + 1.0) * 7.0) / 2.0) % 8;
-          const dirs = [
-            [0, -1],
-            [1, -1],
-            [1, 0],
-            [1, 1],
-            [0, 1],
-            [-1, 1],
-            [-1, 0],
-            [-1, -1],
-          ];
-          if (dirs[step]) {
-            dx = dirs[step][0];
-            dy = dirs[step][1];
-          }
-        }
-      }
-      if (dx !== 0 && dy !== 0) {
-        dx *= Math.SQRT1_2;
-        dy *= Math.SQRT1_2;
-      }
-      lx = dx;
-      ly = dy;
+  if (currentScreen === "match") {
+    if (startEdge && !fulltimeShown) {
+      togglePauseModal();
     }
+    return;
+  }
 
-    // Face buttons: South (Pass/Tackle), East (Shoot), West (Lob/Slide), North (Through)
-    let southPressed, eastPressed, westPressed, northPressed;
-    if (isSwitchSwap) {
-      southPressed = b(1);
-      eastPressed = b(0);
-      westPressed = b(3);
-      northPressed = b(2);
-    } else if (isDirectInput) {
-      southPressed = b(1);
-      eastPressed = b(2);
-      westPressed = b(0);
-      northPressed = b(3);
-    } else {
-      southPressed = b(0);
-      eastPressed = b(1);
-      westPressed = b(2);
-      northPressed = b(3);
+  if (nowMs < prevPadNavTick) return;
+
+  if (currentScreen === "menu") {
+    if (gp.ly > 0.55) {
+      prevPadNavTick = nowMs + 220;
+      updateFocusedHubBlade(focusedBladeIdx + 1);
+    } else if (gp.ly < -0.55) {
+      prevPadNavTick = nowMs + 220;
+      updateFocusedHubBlade(focusedBladeIdx - 1);
+    } else if (gp.south || startEdge) {
+      prevPadNavTick = nowMs + 320;
+      const active = document.querySelectorAll(".hub-blade")[focusedBladeIdx];
+      if (active) triggerHubBlade(active.getAttribute("data-nav"));
     }
+  } else if (currentScreen === "prematch") {
+    if (gp.south || startEdge) {
+      prevPadNavTick = nowMs + 350;
+      launchSelectedMatch();
+    } else if (gp.east) {
+      prevPadNavTick = nowMs + 320;
+      navigateTo(pendingOfficialFixture ? "season" : "menu");
+    } else if (gp.north) {
+      prevPadNavTick = nowMs + 320;
+      activeSquadClub = pmHomeClub;
+      navigateTo("squad");
+    }
+  } else if (gp.east) {
+    prevPadNavTick = nowMs + 320;
+    navigateTo("menu");
+  }
+}
 
-    let buttons = 0;
-    if (southPressed) buttons |= BTN_PASS | BTN_TACKLE;
-    if (northPressed) buttons |= BTN_THROUGH;
-    if (westPressed) buttons |= BTN_LOB | BTN_SLIDE;
-    if (eastPressed) buttons |= BTN_SHOOT;
-    if (trig(7)) buttons |= BTN_SPRINT;
-    if (trig(6)) buttons |= BTN_JOCKEY;
-    if (b(4)) buttons |= BTN_SWITCH;
-    if (b(5)) buttons |= BTN_CALL_RUN | BTN_TACKLE;
-    if (b(11) || b(10)) buttons |= BTN_SKILL; // R3 / L3 click -> 360 Roulette skill move
+// --- Background Attract Match & Match Session Lifecycle ---
 
+async function startAttractBackgroundMatch() {
+  if (!wasm) return;
+  isAttractMatch = true;
+  activeOfficialSession = null;
+  paused = false;
+  fulltimeShown = false;
+
+  const seedLo = 20261120;
+  try {
+    const res = await fetch("/api/exhibition/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        world_id: activeWorldId,
+        home_club_id: "man-utd",
+        away_club_id: "arsenal",
+        format_name: "5v5",
+        half_duration_ticks: 14400,
+        home_controller: { kind: "Cpu", difficulty: "Hard" },
+        away_controller: { kind: "Cpu", difficulty: "Hard" },
+        seed: seedLo,
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      wasmWriteInputText(JSON.stringify(data.snapshot));
+      if (wasm.sim_init_from_snapshot_json()) {
+        currentSnapshot = data.snapshot;
+        engine3d.loadSnapshotScene(currentSnapshot);
+        return;
+      }
+    }
+  } catch (_e) {
+    // Offline fallback
+  }
+
+  if (wasm.sim_init_preset(0, seedLo, 0, 14400, 3, 3)) {
+    currentSnapshot = JSON.parse(wasmReadText());
+    engine3d.loadSnapshotScene(currentSnapshot);
+  }
+}
+
+function resolvePreMatchControllers() {
+  const diff = DIFF_OPTIONS[pmDiffIdx];
+  const sideMode = SIDE_MODES[pmSideIdx].id;
+  if (sideMode === "local_2p") {
     return {
-      mx: Math.max(-127, Math.min(127, Math.round(lx * 127))),
-      my: Math.max(-127, Math.min(127, Math.round(ly * 127))),
-      ax: Math.max(-127, Math.min(127, Math.round(rx * 127))),
-      ay: Math.max(-127, Math.min(127, Math.round(ry * 127))),
-      btns: buttons,
-      id: pad.id,
+      homeSpec: { kind: "Human" },
+      awaySpec: { kind: "Human" },
+      homeCode: 0,
+      awayCode: 0,
     };
   }
-
-  function sampleHomeInput(allowArrowKeys) {
-    const gp = sampleGamepad(0);
-    if (gp && (gp.mx !== 0 || gp.my !== 0 || gp.ax !== 0 || gp.ay !== 0 || gp.btns !== 0)) {
-      gamepadPill.textContent = `${classifyGamepadVendor(gp.id)} Active`;
-      gamepadPill.className = "pill pill-emerald";
-      return gp;
-    }
-
-    let dx = 0;
-    let dy = 0;
-    if (keysDown.has("KeyA") || (allowArrowKeys && keysDown.has("ArrowLeft"))) dx -= 1;
-    if (keysDown.has("KeyD") || (allowArrowKeys && keysDown.has("ArrowRight"))) dx += 1;
-    if (keysDown.has("KeyW") || (allowArrowKeys && keysDown.has("ArrowUp"))) dy -= 1;
-    if (keysDown.has("KeyS") || (allowArrowKeys && keysDown.has("ArrowDown"))) dy += 1;
-
-    if (dx !== 0 && dy !== 0) {
-      dx *= Math.SQRT1_2;
-      dy *= Math.SQRT1_2;
-    }
-
-    let btns = 0;
-    if (keysDown.has("Space") || keysDown.has("KeyJ")) btns |= BTN_PASS | BTN_TACKLE;
-    if (keysDown.has("KeyK")) btns |= BTN_THROUGH;
-    if (keysDown.has("KeyU")) btns |= BTN_LOB | BTN_SLIDE;
-    if (keysDown.has("KeyL") || keysDown.has("Enter")) btns |= BTN_SHOOT;
-    if (keysDown.has("ShiftLeft") || keysDown.has("ShiftRight")) btns |= BTN_SPRINT;
-    if (keysDown.has("KeyQ")) btns |= BTN_SWITCH;
-    if (keysDown.has("KeyF")) btns |= BTN_JOCKEY;
-    if (keysDown.has("KeyE")) btns |= BTN_TACKLE;
-    if (keysDown.has("KeyC")) btns |= BTN_SLIDE;
-    if (keysDown.has("KeyR")) btns |= BTN_CALL_RUN;
-    if (keysDown.has("KeyZ")) btns |= BTN_SKILL;
-
-    const mx = Math.round(dx * 127);
-    const my = Math.round(dy * 127);
-    // Keep aim neutral unless charging/passing so right-stick step-over flick isn't spammed by WASD
-    const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
-    return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
+  if (sideMode === "away_vs_cpu") {
+    return {
+      homeSpec: { kind: "Cpu", difficulty: diff.name },
+      awaySpec: { kind: "Human" },
+      homeCode: diff.code,
+      awayCode: 0,
+    };
   }
-
-  function sampleAwayLocalInput() {
-    const gp2 = sampleGamepad(1);
-    if (gp2 && (gp2.mx !== 0 || gp2.my !== 0 || gp2.ax !== 0 || gp2.ay !== 0 || gp2.btns !== 0)) {
-      return gp2;
-    }
-    let dx = 0;
-    let dy = 0;
-    if (keysDown.has("ArrowLeft")) dx -= 1;
-    if (keysDown.has("ArrowRight")) dx += 1;
-    if (keysDown.has("ArrowUp")) dy -= 1;
-    if (keysDown.has("ArrowDown")) dy += 1;
-    if (dx !== 0 && dy !== 0) {
-      dx *= Math.SQRT1_2;
-      dy *= Math.SQRT1_2;
-    }
-    let btns = 0;
-    if (keysDown.has("Numpad1") || keysDown.has("Period")) btns |= BTN_PASS | BTN_TACKLE;
-    if (keysDown.has("Numpad2") || keysDown.has("Slash")) btns |= BTN_SHOOT;
-    if (keysDown.has("Numpad3")) btns |= BTN_THROUGH;
-    if (keysDown.has("Numpad0")) btns |= BTN_SKILL;
-    if (keysDown.has("RightControl") || keysDown.has("ControlRight")) btns |= BTN_SPRINT;
-    if (keysDown.has("Comma")) btns |= BTN_SWITCH | BTN_TACKLE;
-
-    const mx = Math.round(dx * 127);
-    const my = Math.round(dy * 127);
-    const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
-    return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
+  if (sideMode === "cpu_vs_cpu") {
+    return {
+      homeSpec: { kind: "Cpu", difficulty: diff.name },
+      awaySpec: { kind: "Cpu", difficulty: diff.name },
+      homeCode: diff.code,
+      awayCode: diff.code,
+    };
   }
+  return {
+    homeSpec: { kind: "Human" },
+    awaySpec: { kind: "Cpu", difficulty: diff.name },
+    homeCode: 0,
+    awayCode: diff.code,
+  };
+}
 
-  // --- Match Initialization (Exhibition & Official Host Session) ---
+function setupLiveMatchHud(snapshot, contextLabel) {
+  currentSnapshot = snapshot;
+  isAttractMatch = false;
+  paused = false;
+  fulltimeShown = false;
+  replayBuffer = [];
+  replayActive = false;
+  goalBannerTicks = 0;
+  lastShootoutScore = null;
+  homePossTicks = 1;
+  awayPossTicks = 1;
+  matchEventsLog = [];
 
-  function decodeModeControllers() {
-    const val = modeSelect.value;
-    if (val === "p1_cpu_easy") return { home: 0, away: 1 };
-    if (val === "p1_cpu_hard") return { home: 0, away: 3 };
-    if (val === "cpu_vs_cpu") return { home: 3, away: 3 };
-    if (val === "local_2p") return { home: 0, away: 0 };
-    return { home: 0, away: 2 };
-  }
+  document.getElementById("pause-modal").hidden = true;
+  document.getElementById("fulltime-modal").hidden = true;
+  document.getElementById("replay-bar").hidden = true;
+  document.getElementById("radar-wrap").hidden = false;
+  document.getElementById("goal-banner").hidden = true;
+  document.getElementById("verify-banner").hidden = true;
 
-  function controllerSpecFromCode(code) {
-    if (code === 0) return { kind: "Human" };
-    if (code === 1) return { kind: "Cpu", difficulty: "Easy" };
-    if (code === 3) return { kind: "Cpu", difficulty: "Hard" };
-    return { kind: "Cpu", difficulty: "Normal" };
-  }
+  const kits = resolveMatchKits(
+    snapshot.home.club_id,
+    snapshot.away.club_id,
+    snapshot.home.primary_color,
+    snapshot.away.primary_color
+  );
 
-  function resetMatchUiForSnapshot(snapshot, contextLabel) {
-    currentSnapshot = snapshot;
-    ballTrail = [];
-    replayBuffer = [];
-    replayActive = false;
-    replayPill.hidden = true;
-    btnInstantReplay.textContent = "Instant Replay (6s)";
-    lastShootoutScore = null;
-    homePossTicks = 1;
-    awayPossTicks = 1;
-    camX = 0;
-    camY = 0;
-    eventFeed.innerHTML = "";
-    verifyBanner.hidden = true;
-    goalBanner.hidden = true;
+  document.getElementById("sb-context").textContent = contextLabel;
+  document.getElementById("sb-home-code").textContent = snapshot.home.short_name;
+  document.getElementById("sb-away-code").textContent = snapshot.away.short_name;
+  document.getElementById("sb-home-swatch").style.background = kits.homeOutfield.shirt;
+  document.getElementById("sb-away-swatch").style.background = kits.awayOutfield.shirt;
 
-    sbContext.textContent = contextLabel;
-    sbHomeCode.textContent = snapshot.home.short_name;
-    sbAwayCode.textContent = snapshot.away.short_name;
-    sbHomeSwatch.style.background = snapshot.home.primary_color;
-    sbAwaySwatch.style.background = snapshot.away.primary_color;
-    btnSubmitSession.hidden = !activeOfficialSession;
-  }
+  engine3d.loadSnapshotScene(snapshot);
+  navigateTo("match");
+  GameAudio.playWhistle(false);
+}
 
-  async function startExhibitionMatch() {
-    if (!wasm) return;
-    activeOfficialSession = null;
-    paused = false;
-    btnPause.textContent = "Pause";
+async function launchSelectedMatch() {
+  if (!wasm) return;
+  GameAudio.uiConfirm();
 
-    const fmtName = formatSelect.value === "11v11" ? "11v11" : "5v5";
-    const fmtCode = fmtName === "11v11" ? 1 : 0;
-    const halfTicks = parseInt(durationSelect.value, 10) || 3600;
-    const ctrls = decodeModeControllers();
-    const seedLo = (Date.now() & 0x7fffffff) >>> 0;
-    const homeClubId = homeClubSelect ? homeClubSelect.value : "man-utd";
-    const awayClubId = awayClubSelect ? awayClubSelect.value : "arsenal";
+  const fmtName = FORMAT_OPTIONS[pmFmtIdx].id;
+  const fmtCode = fmtName === "11v11" ? 1 : 0;
+  const halfTicks = DURATION_OPTIONS[pmDurIdx].ticks;
+  const ctrls = resolvePreMatchControllers();
 
-    try {
-      const res = await fetch("/api/exhibition/snapshot", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          world_id: activeWorldId,
-          home_club_id: homeClubId,
-          away_club_id: awayClubId,
-          format_name: fmtName,
-          half_duration_ticks: halfTicks,
-          home_controller: controllerSpecFromCode(ctrls.home),
-          away_controller: controllerSpecFromCode(ctrls.away),
-          seed: seedLo,
-        }),
-      });
-      if (res.ok) {
-        const data = await res.json();
-        wasmWriteInputText(JSON.stringify(data.snapshot));
-        if (wasm.sim_init_from_snapshot_json()) {
-          const snap = data.snapshot;
-          resetMatchUiForSnapshot(
-            snap,
-            `EXHIBITION · ${snap.format.name} · ${snap.home.formation} vs ${snap.away.formation}`
-          );
-          renderWorldOverviewCardsHighlight();
-          return;
-        }
-      }
-    } catch (_err) {
-      // Fallback to built-in WASM preset if offline
-    }
-
-    const ok = wasm.sim_init_preset(fmtCode, seedLo, 0, halfTicks, ctrls.home, ctrls.away);
-    if (!ok) {
-      console.error("sim_init_preset error:", wasmReadText());
-      return;
-    }
-    const snap = JSON.parse(wasmReadText());
-    resetMatchUiForSnapshot(
-      snap,
-      `EXHIBITION · ${snap.format.name} (${snap.format.players_per_side}v${snap.format.players_per_side})`
-    );
-    renderWorldOverviewCardsHighlight();
-  }
-
-  async function launchOfficialFixtureSession(fixtureId, resultSource, stageLabel) {
-    if (!wasm) return;
-    const fmtName = formatSelect.value;
-    const halfTicks = parseInt(durationSelect.value, 10) || 3600;
-    const ctrls = decodeModeControllers();
-
+  // Official Parallel Season Fixture Session
+  if (pendingOfficialFixture) {
+    const fx = pendingOfficialFixture;
     const awayCtrl =
-      resultSource === "played_vs_friend" && modeSelect.value === "local_2p"
+      fx.result_source === "played_vs_friend" && SIDE_MODES[pmSideIdx].id === "local_2p"
         ? { kind: "Human" }
-        : controllerSpecFromCode(ctrls.away === 0 ? 2 : ctrls.away);
+        : ctrls.awaySpec.kind === "Human" && fx.result_source !== "played_vs_friend"
+          ? { kind: "Cpu", difficulty: DIFF_OPTIONS[pmDiffIdx].name }
+          : ctrls.awaySpec;
 
-    const res = await fetch(`/api/fixtures/${encodeURIComponent(fixtureId)}/sessions`, {
+    const res = await fetch(`/api/fixtures/${encodeURIComponent(fx.id)}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         actor_id: "part-alex",
         format_name: fmtName,
         half_duration_ticks: halfTicks,
-        home_controller: controllerSpecFromCode(ctrls.home),
+        home_controller: ctrls.homeSpec,
         away_controller: awayCtrl,
       }),
     });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
-      alert(`Could not open session: ${err.detail || res.statusText}`);
+      alert(`Could not open official match session: ${err.detail || res.statusText}`);
       return;
     }
-
     const payload = await res.json();
-    const snapJson = JSON.stringify(payload.snapshot);
-    wasmWriteInputText(snapJson);
-    const ok = wasm.sim_init_from_snapshot_json();
-    if (!ok) {
-      alert(`WASM snapshot load failed: ${wasmReadText()}`);
+    wasmWriteInputText(JSON.stringify(payload.snapshot));
+    if (!wasm.sim_init_from_snapshot_json()) {
+      alert(`Engine snapshot error: ${wasmReadText()}`);
       return;
     }
-
     activeOfficialSession = {
       sessionId: payload.session_id,
       fixtureId: payload.fixture_id,
       submitting: false,
       completed: false,
     };
-    paused = false;
-    btnPause.textContent = "Pause";
-    const etTag = payload.snapshot.rules.extra_time_enabled ? " · ET+PENS" : "";
-    resetMatchUiForSnapshot(
-      payload.snapshot,
-      `OFFICIAL ${stageLabel.toUpperCase()} · ${payload.snapshot.format.name}${etTag}`
-    );
-    StadiumAudio.playWhistle(false);
-    await refreshWorldOverview();
-    window.scrollTo({ top: 0, behavior: "smooth" });
+    const etTag = payload.snapshot.rules.extra_time_enabled ? " · ET + PENS" : "";
+    setupLiveMatchHud(payload.snapshot, `OFFICIAL ${fx.stageLabel} · ${payload.snapshot.format.name}${etTag}`);
+    refreshWorldOverview();
+    return;
   }
 
-  async function submitOfficialSessionResult() {
-    if (!wasm || !activeOfficialSession || activeOfficialSession.submitting || activeOfficialSession.completed) {
-      return;
-    }
-    wasm.sim_export_summary_json();
-    let summary = JSON.parse(wasmReadText());
-    if (!summary.finished) {
-      wasm.sim_auto_step(90000);
-      wasm.sim_export_summary_json();
-      summary = JSON.parse(wasmReadText());
-    }
-    lastShootoutScore = summary.shootout_score || null;
-
-    activeOfficialSession.submitting = true;
-    btnSubmitSession.textContent = "Verifying via psfc-replay…";
-
-    wasm.sim_export_input_log_json();
-    const log = JSON.parse(wasmReadText());
-
-    try {
-      const res = await fetch(
-        `/api/sessions/${encodeURIComponent(activeOfficialSession.sessionId)}/complete`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            actor_id: "part-alex",
-            frames_hex: log.frames_hex,
-            claimed_final_hash_hex: log.claimed_final_hash_hex,
-            claimed_score: log.claimed_score,
-            hash_checkpoints: log.hash_checkpoints,
-          }),
-        }
-      );
-      const data = await res.json();
-      if (!res.ok) {
-        throw new Error(data.detail || "Replay verification failed");
-      }
-
-      activeOfficialSession.completed = true;
-      btnSubmitSession.hidden = true;
-      const rep = data.replay_report;
-      const ar = data.accepted_result;
-      const penTag =
-        ar.shootout_home !== null && ar.shootout_home !== undefined
-          ? ` (Pens ${ar.shootout_home}-${ar.shootout_away})`
-          : ar.went_to_extra_time
-            ? " (AET)"
-            : "";
-
-      verifyBanner.hidden = false;
-      verifyBanner.innerHTML = `
-        <strong>psfc-replay Authoritative Verification Passed (${rep ? rep.elapsed_ms : 0} ms)</strong><br/>
-        Accepted: <strong>${currentSnapshot.home.short_name} ${ar.home_goals} - ${ar.away_goals} ${currentSnapshot.away.short_name}${penTag}</strong>
-        · Final Hash <code>#${ar.final_hash_hex}</code>
-      `;
-      await refreshWorldOverview();
-    } catch (err) {
-      verifyBanner.hidden = false;
-      verifyBanner.innerHTML = `<strong>Verification Error:</strong> ${err.message}`;
-    } finally {
-      activeOfficialSession.submitting = false;
-      btnSubmitSession.textContent = "Verify & Record Result";
-    }
-  }
-
-  // --- 3D Broadcast & Orbiting Replay Camera Projection ---
-
-  function makeProjector(W, H, pitchLenM, pitchWidM, ballX, ballY, orbitAngleRad) {
-    let eyeX, eyeY, eyeZ, targetX, targetY, targetZ;
-
-    if (orbitAngleRad !== null) {
-      const radius = pitchLenM > 80 ? 28.0 : 18.5;
-      eyeX = ballX + Math.sin(orbitAngleRad) * radius;
-      eyeY = ballY + Math.cos(orbitAngleRad) * radius;
-      eyeZ = 12.5;
-      targetX = ballX;
-      targetY = ballY;
-      targetZ = 0.65;
-    } else {
-      eyeX = camX;
-      eyeY = camY * 0.28 + (pitchWidM * 0.78 + 13.0);
-      eyeZ = pitchLenM > 80 ? 33.5 : 20.5;
-      targetX = camX;
-      targetY = camY * 0.18 - 1.2;
-      targetZ = 0.0;
-    }
-
-    let fx = targetX - eyeX;
-    let fy = targetY - eyeY;
-    let fz = targetZ - eyeZ;
-    const fl = Math.hypot(fx, fy, fz) || 1;
-    fx /= fl;
-    fy /= fl;
-    fz /= fl;
-
-    let rx = fy;
-    let ry2 = -fx;
-    let rz = 0;
-    const rl = Math.hypot(rx, ry2, rz) || 1;
-    rx /= rl;
-    ry2 /= rl;
-
-    const ux = ry2 * fz - rz * fy;
-    const uy = rz * fx - rx * fz;
-    const uz = rx * fy - ry2 * fx;
-
-    const focal = H * 1.32;
-    const screenCenterY = orbitAngleRad !== null ? H * 0.52 : H * 0.43;
-
-    return function project(wx, wy, wz) {
-      const dx = wx - eyeX;
-      const dy = wy - eyeY;
-      const dz = wz - eyeZ;
-
-      const cx = dx * rx + dy * ry2 + dz * rz;
-      const cy = dx * ux + dy * uy + dz * uz;
-      const cz = dx * fx + dy * fy + dz * fz;
-      const depth = Math.max(2.0, cz);
-      const scale = focal / depth;
-
-      return {
-        x: W * 0.5 + cx * scale,
-        y: screenCenterY - cy * scale,
-        s: scale,
-        depth,
-      };
-    };
-  }
-
-  function poly3D(project, pts, fillStyle, strokeStyle, lineWidth = 1.5) {
-    ctx.beginPath();
-    for (let i = 0; i < pts.length; i++) {
-      const p = project(pts[i][0], pts[i][1], pts[i][2] || 0);
-      if (i === 0) ctx.moveTo(p.x, p.y);
-      else ctx.lineTo(p.x, p.y);
-    }
-    if (fillStyle) {
-      ctx.closePath();
-      ctx.fillStyle = fillStyle;
-      ctx.fill();
-    }
-    if (strokeStyle) {
-      ctx.strokeStyle = strokeStyle;
-      ctx.lineWidth = lineWidth;
-      ctx.stroke();
-    }
-  }
-
-  function line3D(project, x1, y1, z1, x2, y2, z2, color, width = 1.8) {
-    const a = project(x1, y1, z1);
-    const b = project(x2, y2, z2);
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = width;
-    ctx.stroke();
-  }
-
-  function drawGoal3D(project, goalX, sign, goalHalfW, goalH) {
-    const depth = sign * 1.65;
-    const backX = goalX + depth;
-
-    poly3D(
-      project,
-      [
-        [goalX, -goalHalfW, 0],
-        [backX, -goalHalfW, 0],
-        [backX, -goalHalfW, goalH],
-        [goalX, -goalHalfW, goalH],
-      ],
-      "rgba(226, 232, 240, 0.14)",
-      "rgba(226, 232, 240, 0.32)",
-      1
-    );
-    poly3D(
-      project,
-      [
-        [goalX, goalHalfW, 0],
-        [backX, goalHalfW, 0],
-        [backX, goalHalfW, goalH],
-        [goalX, goalHalfW, goalH],
-      ],
-      "rgba(226, 232, 240, 0.14)",
-      "rgba(226, 232, 240, 0.32)",
-      1
-    );
-    poly3D(
-      project,
-      [
-        [backX, -goalHalfW, 0],
-        [backX, goalHalfW, 0],
-        [backX, goalHalfW, goalH],
-        [backX, -goalHalfW, goalH],
-      ],
-      "rgba(226, 232, 240, 0.12)",
-      "rgba(226, 232, 240, 0.28)",
-      1
-    );
-    poly3D(
-      project,
-      [
-        [goalX, -goalHalfW, goalH],
-        [backX, -goalHalfW, goalH],
-        [backX, goalHalfW, goalH],
-        [goalX, goalHalfW, goalH],
-      ],
-      "rgba(226, 232, 240, 0.10)",
-      null
-    );
-
-    line3D(project, goalX, -goalHalfW, 0, goalX, -goalHalfW, goalH, "#ffffff", 3.4);
-    line3D(project, goalX, goalHalfW, 0, goalX, goalHalfW, goalH, "#ffffff", 3.4);
-    line3D(project, goalX, -goalHalfW, goalH, goalX, goalHalfW, goalH, "#ffffff", 3.6);
-  }
-
-  function drawScene(packed, orbitAngleRad = null) {
-    const W = canvas.width;
-    const H = canvas.height;
-
-    const sky = ctx.createLinearGradient(0, 0, 0, H);
-    sky.addColorStop(0, "#050912");
-    sky.addColorStop(0.26, "#0d1a28");
-    sky.addColorStop(0.45, "#0b1a15");
-    sky.addColorStop(1, "#08140e");
-    ctx.fillStyle = sky;
-    ctx.fillRect(0, 0, W, H);
-
-    // Subtle stadium floodlight cones in upper night sky
-    for (const lx of [W * 0.18, W * 0.82]) {
-      const glow = ctx.createRadialGradient(lx, H * 0.06, 4, lx, H * 0.08, W * 0.28);
-      glow.addColorStop(0, "rgba(224, 242, 254, 0.16)");
-      glow.addColorStop(0.45, "rgba(56, 189, 248, 0.05)");
-      glow.addColorStop(1, "rgba(6, 11, 18, 0)");
-      ctx.fillStyle = glow;
-      ctx.fillRect(0, 0, W, H * 0.45);
-    }
-
-    if (!packed || !currentSnapshot) return;
-
-    const fmt = currentSnapshot.format;
-    const pitchLen = fmt.pitch_length_mm / 1000;
-    const pitchWid = fmt.pitch_width_mm / 1000;
-    const halfL = pitchLen / 2;
-    const halfW = pitchWid / 2;
-    const boxD = fmt.penalty_box_depth_mm / 1000;
-    const boxHW = fmt.penalty_box_width_mm / 2000;
-    const goalHW = fmt.goal_width_mm / 2000;
-    const goalH = fmt.goal_height_mm / 1000;
-    const circleR = fmt.center_circle_radius_mm / 1000;
-
-    const tick = packed[0];
-    const ballX = packed[9] / 1000;
-    const ballY = packed[10] / 1000;
-    const ballZ = packed[11] / 1000;
-
-    if (orbitAngleRad === null) {
-      const maxPanX = halfL * 0.44;
-      const targetCamX = Math.max(-maxPanX, Math.min(maxPanX, ballX * 0.62));
-      camX += (targetCamX - camX) * 0.1;
-      camY += (ballY - camY) * 0.08;
-    }
-
-    const project = makeProjector(W, H, pitchLen, pitchWid, ballX, ballY, orbitAngleRad);
-
-    // Far-side stadium terrace tier & club supporter fascia
-    if (orbitAngleRad === null) {
-      poly3D(
-        project,
-        [
-          [-halfL - 5, -halfW - 4.5, 0],
-          [halfL + 5, -halfW - 4.5, 0],
-          [halfL + 7.5, -halfW - 12.0, 5.8],
-          [-halfL - 7.5, -halfW - 12.0, 5.8],
-        ],
-        "#0c1522",
-        "rgba(148, 163, 184, 0.22)",
-        1.2
-      );
-      line3D(
-        project,
-        -halfL - 5.2,
-        -halfW - 6.8,
-        1.8,
-        0,
-        -halfW - 6.8,
-        1.8,
-        currentSnapshot.home.primary_color,
-        2.4
-      );
-      line3D(
-        project,
-        0,
-        -halfW - 6.8,
-        1.8,
-        halfL + 5.2,
-        -halfW - 6.8,
-        1.8,
-        currentSnapshot.away.primary_color,
-        2.4
-      );
-    }
-
-    poly3D(
-      project,
-      [
-        [-halfL - 5, -halfW - 4.5, 0],
-        [halfL + 5, -halfW - 4.5, 0],
-        [halfL + 5, halfW + 4.5, 0],
-        [-halfL - 5, halfW + 4.5, 0],
-      ],
-      "#0d2318",
-      "#1b3b2b",
-      2
-    );
-
-    const stripeCount = fmt.players_per_side <= 6 ? 10 : 16;
-    const stripeW = pitchLen / stripeCount;
-    for (let i = 0; i < stripeCount; i++) {
-      const x0 = -halfL + i * stripeW;
-      const x1 = x0 + stripeW;
-      const fill = i % 2 === 0 ? "#155e38" : "#186b40";
-      poly3D(
-        project,
-        [
-          [x0, -halfW, 0],
-          [x1, -halfW, 0],
-          [x1, halfW, 0],
-          [x0, halfW, 0],
-        ],
-        fill,
-        null
-      );
-    }
-
-    poly3D(
-      project,
-      [
-        [-halfL - 1.5, -halfW - 1.6, 0],
-        [halfL + 1.5, -halfW - 1.6, 0],
-        [halfL + 1.5, -halfW - 1.6, 0.95],
-        [-halfL - 1.5, -halfW - 1.6, 0.95],
-      ],
-      "#101c2b",
-      "rgba(56, 189, 248, 0.4)",
-      1.2
-    );
-
-    const lineCol = "rgba(245, 250, 255, 0.84)";
-    poly3D(
-      project,
-      [
-        [-halfL, -halfW, 0.01],
-        [halfL, -halfW, 0.01],
-        [halfL, halfW, 0.01],
-        [-halfL, halfW, 0.01],
-      ],
-      null,
-      lineCol,
-      2.1
-    );
-    line3D(project, 0, -halfW, 0.01, 0, halfW, 0.01, lineCol, 1.9);
-
-    ctx.beginPath();
-    for (let s = 0; s <= 40; s++) {
-      const a = (s / 40) * Math.PI * 2;
-      const p = project(Math.cos(a) * circleR, Math.sin(a) * circleR, 0.01);
-      if (s === 0) ctx.moveTo(p.x, p.y);
-      else ctx.lineTo(p.x, p.y);
-    }
-    ctx.strokeStyle = lineCol;
-    ctx.lineWidth = 1.8;
-    ctx.stroke();
-
-    for (const sign of [-1, 1]) {
-      const gx = sign * halfL;
-      const ix = gx - sign * boxD;
-      poly3D(
-        project,
-        [
-          [gx, -boxHW, 0.01],
-          [ix, -boxHW, 0.01],
-          [ix, boxHW, 0.01],
-          [gx, boxHW, 0.01],
-        ],
-        null,
-        lineCol,
-        1.8
-      );
-      const penSpot = project(gx - sign * ((boxD * 2) / 3), 0, 0.01);
-      ctx.fillStyle = "#ffffff";
-      ctx.beginPath();
-      ctx.arc(penSpot.x, penSpot.y, 2.6, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    const pps = packed[6];
-    const homeCtrl = packed[7];
-    const awayCtrl = packed[8];
-    const drawables = [];
-
-    for (let n = 0; n < pps * 2; n++) {
-      const b = 18 + n * 10;
-      const side = packed[b + 0];
-      const idx = packed[b + 1];
-      const shirt = packed[b + 2];
-      const role = packed[b + 3];
-      const x = packed[b + 4] / 1000;
-      const y = packed[b + 5] / 1000;
-      const vx = packed[b + 6] / 1000;
-      const vy = packed[b + 7] / 1000;
-      const facingRad = (packed[b + 8] * Math.PI * 2) / 65536;
-      const flags = packed[b + 9];
-      const action = flags & 0xf;
-      const stamina = ((flags >> 4) & 0x7ff) / 1000;
-      const charge = ((flags >> 15) & 0x7ff) / 1000;
-      const sentOff = ((flags >> 26) & 1) === 1;
-      if (sentOff) continue;
-
-      const projDepth = project(x, y, 0).depth;
-      drawables.push({
-        kind: "player",
-        depth: projDepth,
-        side,
-        idx,
-        shirt,
-        role,
-        x,
-        y,
-        vx,
-        vy,
-        facingRad,
-        action,
-        stamina,
-        charge,
-        isControlled: side === 0 ? idx === homeCtrl : idx === awayCtrl,
-      });
-    }
-
-    drawables.push({
-      kind: "ball",
-      depth: project(ballX, ballY, ballZ).depth,
-      x: ballX,
-      y: ballY,
-      z: ballZ,
+  // Exhibition Kick Off Match
+  activeOfficialSession = null;
+  const seedLo = (Date.now() & 0x7fffffff) >>> 0;
+  try {
+    const res = await fetch("/api/exhibition/snapshot", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        world_id: activeWorldId,
+        home_club_id: pmHomeClub,
+        away_club_id: pmAwayClub,
+        format_name: fmtName,
+        half_duration_ticks: halfTicks,
+        home_controller: ctrls.homeSpec,
+        away_controller: ctrls.awaySpec,
+        seed: seedLo,
+      }),
     });
-    drawables.sort((a, b) => b.depth - a.depth);
-
-    drawGoal3D(project, -halfL, -1, goalHW, goalH);
-    drawGoal3D(project, halfL, 1, goalHW, goalH);
-
-    if (ballTrail.length > 1 && orbitAngleRad === null) {
-      ctx.beginPath();
-      for (let i = 0; i < ballTrail.length; i++) {
-        const tp = project(ballTrail[i].x, ballTrail[i].y, ballTrail[i].z);
-        if (i === 0) ctx.moveTo(tp.x, tp.y);
-        else ctx.lineTo(tp.x, tp.y);
-      }
-      ctx.strokeStyle = "rgba(255, 255, 255, 0.28)";
-      ctx.lineWidth = 2.2;
-      ctx.stroke();
-    }
-
-    for (const item of drawables) {
-      if (item.kind === "ball") {
-        const gnd = project(item.x, item.y, 0);
-        const air = project(item.x, item.y, item.z);
-        const r = Math.max(4.0, air.s * 0.22);
-
-        ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
-        ctx.beginPath();
-        ctx.ellipse(gnd.x, gnd.y, r * 1.1, r * 0.55, 0, 0, Math.PI * 2);
-        ctx.fill();
-
-        const grad = ctx.createRadialGradient(
-          air.x - r * 0.3,
-          air.y - r * 0.3,
-          r * 0.15,
-          air.x,
-          air.y,
-          r
+    if (res.ok) {
+      const data = await res.json();
+      wasmWriteInputText(JSON.stringify(data.snapshot));
+      if (wasm.sim_init_from_snapshot_json()) {
+        setupLiveMatchHud(
+          data.snapshot,
+          `EXHIBITION · ${data.snapshot.format.name} · ${data.snapshot.home.formation} vs ${data.snapshot.away.formation}`
         );
-        grad.addColorStop(0, "#ffffff");
-        grad.addColorStop(0.75, "#e2e8f0");
-        grad.addColorStop(1, "#64748b");
-        ctx.fillStyle = grad;
-        ctx.beginPath();
-        ctx.arc(air.x, air.y, r, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.strokeStyle = "#0f172a";
-        ctx.lineWidth = 1.1;
-        ctx.stroke();
-        continue;
-      }
-
-      const foot = project(item.x, item.y, 0);
-      const head = project(item.x, item.y, item.action === 4 ? 0.65 : 1.75);
-      const pxRadius = Math.max(4.5, foot.s * 0.38);
-
-      // Skill Move (`action === 7`) golden roulette flourish!
-      if (item.action === 7) {
-        const spinStart = (tick * 0.45) % (Math.PI * 2);
-        ctx.strokeStyle = "#fde047";
-        ctx.lineWidth = 2.8;
-        ctx.beginPath();
-        ctx.ellipse(foot.x, foot.y, pxRadius * 2.35, pxRadius * 1.15, 0, spinStart, spinStart + Math.PI * 1.45);
-        ctx.stroke();
-      }
-
-      if (item.isControlled) {
-        const ringColor = item.side === 0 ? "#fbbf24" : "#38bdf8";
-        ctx.strokeStyle = ringColor;
-        ctx.lineWidth = 2.4;
-        ctx.beginPath();
-        ctx.ellipse(foot.x, foot.y, pxRadius * 1.9, pxRadius * 0.95, 0, 0, Math.PI * 2);
-        ctx.stroke();
-
-        const fx = item.x + Math.cos(item.facingRad) * 1.05;
-        const fy = item.y + Math.sin(item.facingRad) * 1.05;
-        const fp = project(fx, fy, 0.02);
-        ctx.fillStyle = ringColor;
-        ctx.beginPath();
-        ctx.arc(fp.x, fp.y, 3.0, 0, Math.PI * 2);
-        ctx.fill();
-      } else if (item.role === 0) {
-        ctx.strokeStyle = "rgba(16, 185, 129, 0.55)";
-        ctx.lineWidth = 1.4;
-        ctx.beginPath();
-        ctx.ellipse(foot.x, foot.y, pxRadius * 1.45, pxRadius * 0.7, 0, 0, Math.PI * 2);
-        ctx.stroke();
-      }
-
-      ctx.fillStyle = "rgba(0, 0, 0, 0.38)";
-      ctx.beginPath();
-      ctx.ellipse(foot.x, foot.y, pxRadius * 1.15, pxRadius * 0.55, 0, 0, Math.PI * 2);
-      ctx.fill();
-
-      let jerseyColor =
-        item.side === 0
-          ? currentSnapshot.home.primary_color
-          : currentSnapshot.away.primary_color;
-      let trimColor =
-        item.side === 0
-          ? currentSnapshot.home.secondary_color
-          : currentSnapshot.away.secondary_color;
-
-      if (
-        item.side === 1 &&
-        currentSnapshot.home.primary_color.startsWith("#D") &&
-        (currentSnapshot.away.primary_color.startsWith("#E") ||
-          currentSnapshot.away.primary_color.startsWith("#C"))
-      ) {
-        jerseyColor = "#facc15";
-        trimColor = "#0f172a";
-      }
-      if (item.role === 0) {
-        jerseyColor = item.side === 0 ? "#10b981" : "#a855f7";
-        trimColor = "#ffffff";
-      }
-
-      const bodyH = Math.max(10, foot.y - head.y);
-      ctx.fillStyle = jerseyColor;
-      ctx.strokeStyle = item.action === 7 ? "#fde047" : trimColor;
-      ctx.lineWidth = item.action === 7 ? 2.2 : 1.5;
-
-      const spinOffset = item.action === 7 ? Math.sin(tick * 0.6) * pxRadius * 0.35 : 0;
-
-      ctx.beginPath();
-      if (item.action === 4 || item.action === 3) {
-        ctx.ellipse(foot.x, foot.y - pxRadius * 0.8, pxRadius * 1.9, pxRadius * 0.85, 0, 0, Math.PI * 2);
-      } else {
-        ctx.roundRect(
-          foot.x - pxRadius * 0.85 + spinOffset,
-          head.y + bodyH * 0.24,
-          pxRadius * 1.7,
-          bodyH * 0.72,
-          pxRadius * 0.55
-        );
-      }
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = "#f1c27d";
-      ctx.beginPath();
-      ctx.arc(head.x + spinOffset * 0.5, head.y + bodyH * 0.16, Math.max(3.2, pxRadius * 0.58), 0, Math.PI * 2);
-      ctx.fill();
-
-      ctx.fillStyle = item.side === 1 && jerseyColor === "#facc15" ? "#0f172a" : "#ffffff";
-      ctx.font = `700 ${Math.max(9, Math.round(pxRadius * 1.05))}px Inter, sans-serif`;
-      ctx.textAlign = "center";
-      ctx.fillText(String(item.shirt), foot.x + spinOffset, head.y + bodyH * 0.68);
-
-      const isBallCarrier = packed[15] === item.side && packed[16] === item.idx;
-      if (item.isControlled || isBallCarrier) {
-        const teamSnap = item.side === 0 ? currentSnapshot.home : currentSnapshot.away;
-        const member = teamSnap.starters && teamSnap.starters[item.idx];
-        if (member && member.name) {
-          const parts = member.name.trim().split(/\s+/);
-          const surname = parts[parts.length - 1];
-          ctx.font = "600 10px Inter, sans-serif";
-          const tw = ctx.measureText(surname).width;
-          const pillW = tw + 10;
-          const pillH = 14;
-          const pillX = head.x - pillW * 0.5;
-          const pillY = head.y - (item.charge > 0.02 ? 27 : 18);
-          ctx.fillStyle = "rgba(9, 14, 21, 0.82)";
-          ctx.strokeStyle = item.side === 0 ? "rgba(251, 191, 36, 0.65)" : "rgba(56, 189, 248, 0.65)";
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.roundRect(pillX, pillY, pillW, pillH, 4);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = "#f8fafc";
-          ctx.textAlign = "center";
-          ctx.fillText(surname, head.x, pillY + 10.5);
-        }
-      }
-
-      if (item.charge > 0.02) {
-        const bw = 32;
-        const bh = 5;
-        const bx = head.x - bw / 2;
-        const by = head.y - 11;
-        ctx.fillStyle = "rgba(9, 14, 21, 0.85)";
-        ctx.fillRect(bx - 1, by - 1, bw + 2, bh + 2);
-        ctx.fillStyle = item.charge > 0.78 ? "#ef4444" : "#fbbf24";
-        ctx.fillRect(bx, by, bw * Math.min(1, item.charge), bh);
-      }
-    }
-
-    drawTacticalRadar(W, H, packed, halfL, halfW);
-  }
-
-  function drawTacticalRadar(W, H, packed, halfL, halfW) {
-    const rw = 186;
-    const rh = 112;
-    const rx = (W - rw) * 0.5;
-    const ry = H - rh - 10;
-
-    ctx.fillStyle = "rgba(9, 14, 21, 0.76)";
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.25)";
-    ctx.lineWidth = 1.2;
-    ctx.beginPath();
-    ctx.roundRect(rx, ry, rw, rh, 6);
-    ctx.fill();
-    ctx.stroke();
-
-    ctx.beginPath();
-    ctx.moveTo(rx + rw * 0.5, ry + 4);
-    ctx.lineTo(rx + rw * 0.5, ry + rh - 4);
-    ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
-    ctx.stroke();
-
-    const pps = packed[6];
-    const mapX = (wx) => rx + ((wx + halfL) / (halfL * 2)) * rw;
-    const mapY = (wy) => ry + ((wy + halfW) / (halfW * 2)) * rh;
-
-    for (let n = 0; n < pps * 2; n++) {
-      const b = 18 + n * 10;
-      const side = packed[b];
-      const role = packed[b + 3];
-      const sentOff = ((packed[b + 9] >> 26) & 1) === 1;
-      if (sentOff) continue;
-      const px = mapX(packed[b + 4] / 1000);
-      const py = mapY(packed[b + 5] / 1000);
-
-      ctx.fillStyle =
-        role === 0 ? "#10b981" : side === 0 ? "#ef4444" : "#38bdf8";
-      ctx.beginPath();
-      ctx.arc(px, py, role === 0 ? 3.5 : 3.0, 0, Math.PI * 2);
-      ctx.fill();
-    }
-
-    const bx = mapX(packed[9] / 1000);
-    const by = mapY(packed[10] / 1000);
-    ctx.fillStyle = "#ffffff";
-    ctx.beginPath();
-    ctx.arc(bx, by, 3.3, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
-  // --- Main 60 Hz Simulation & Render Loop ---
-
-  function showBanner(title, sub, ticks = 120) {
-    goalBannerTitle.textContent = title;
-    goalBannerSub.textContent = sub;
-    goalBanner.hidden = false;
-    goalBannerTicks = ticks;
-  }
-
-  function drainAndRenderMatchEvents() {
-    const len = wasm.sim_drain_events_json();
-    if (len <= 2) return;
-    const events = JSON.parse(wasmReadText());
-    for (const ev of events) {
-      const kind = String(ev.event_type || "").toLowerCase();
-      const li = document.createElement("li");
-      li.innerHTML = `<span class="ev-min">${ev.minute}'</span><span>${ev.detail}</span>`;
-      eventFeed.prepend(li);
-      while (eventFeed.children.length > 20) {
-        eventFeed.removeChild(eventFeed.lastChild);
-      }
-
-      if (kind === "goal" || kind === "shootout_goal") {
-        StadiumAudio.playGoalCrowdRoar();
-        showBanner(kind === "shootout_goal" ? "PENALTY SCORED!" : "GOAL!", ev.detail, 135);
-      } else if (kind === "shot") {
-        StadiumAudio.playKick(0.95);
-      } else if (kind === "pass") {
-        StadiumAudio.playKick(0.45);
-      } else if (kind === "save") {
-        StadiumAudio.playSaveSlap();
-      } else if (kind === "skill_move") {
-        StadiumAudio.playSkillWhoosh();
-      } else if (kind === "advantage") {
-        showBanner("ADVANTAGE!", ev.detail, 75);
-      } else if (kind === "extra_time_start") {
-        StadiumAudio.playWhistle(true);
-        showBanner("EXTRA TIME!", ev.detail, 110);
-      } else if (kind === "penalty_shootout_start") {
-        StadiumAudio.playWhistle(true);
-        showBanner("PENALTY SHOOTOUT!", ev.detail, 130);
-      } else if (kind === "foul" || kind === "kick_off" || kind === "half_time") {
-        StadiumAudio.playWhistle(false);
-      } else if (kind === "full_time") {
-        StadiumAudio.playWhistle(true);
-        wasm.sim_export_summary_json();
-        const summary = JSON.parse(wasmReadText());
-        lastShootoutScore = summary.shootout_score || null;
-        if (activeOfficialSession && !activeOfficialSession.completed) {
-          submitOfficialSessionResult();
-        }
-      }
-    }
-  }
-
-  function formatHalfBadge(half, phase) {
-    if (phase === 12) return "FT";
-    if (half === 3) return "ET1";
-    if (half === 4) return "ET2";
-    return `${half}H`;
-  }
-
-  function frameLoop() {
-    if (wasm && currentSnapshot) {
-      if (replayActive && replayBuffer.length > 0) {
-        const idx = Math.min(replayBuffer.length - 1, Math.floor(replayCursor));
-        const snapPacked = replayBuffer[idx];
-        const orbitAngle = replayCursor * 0.022;
-        drawScene(snapPacked, orbitAngle);
-        replayCursor += 0.5; // 0.5x slow-motion playback
-        if (replayCursor >= replayBuffer.length) {
-          replayActive = false;
-          replayPill.hidden = true;
-          btnInstantReplay.textContent = "Instant Replay (6s)";
-        }
-        requestAnimationFrame(frameLoop);
         return;
       }
+    }
+  } catch (_e) {
+    // Fallback preset
+  }
 
-      if (!paused) {
-        const is2P = modeSelect.value === "local_2p";
-        const hIn = sampleHomeInput(!is2P);
-        const aIn = is2P ? sampleAwayLocalInput() : { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
+  if (wasm.sim_init_preset(fmtCode, seedLo, 0, halfTicks, ctrls.homeCode, ctrls.awayCode)) {
+    const snap = JSON.parse(wasmReadText());
+    setupLiveMatchHud(snap, `EXHIBITION · ${snap.format.name}`);
+  }
+}
 
-        wasm.sim_tick(
-          hIn.mx,
-          hIn.my,
-          hIn.ax,
-          hIn.ay,
-          hIn.btns,
-          aIn.mx,
-          aIn.my,
-          aIn.ax,
-          aIn.ay,
-          aIn.btns
-        );
+async function submitOfficialSessionResult() {
+  if (!wasm || !activeOfficialSession || activeOfficialSession.submitting || activeOfficialSession.completed) {
+    return;
+  }
+  wasm.sim_export_summary_json();
+  let summary = JSON.parse(wasmReadText());
+  if (!summary.finished) {
+    wasm.sim_auto_step(90000);
+    wasm.sim_export_summary_json();
+    summary = JSON.parse(wasmReadText());
+  }
+  lastShootoutScore = summary.shootout_score || null;
+
+  const btn = document.getElementById("btn-submit-session");
+  activeOfficialSession.submitting = true;
+  btn.textContent = "VERIFYING REPLAY LOG…";
+
+  wasm.sim_export_input_log_json();
+  const log = JSON.parse(wasmReadText());
+  const verifyBanner = document.getElementById("verify-banner");
+
+  try {
+    const res = await fetch(`/api/sessions/${encodeURIComponent(activeOfficialSession.sessionId)}/complete`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        actor_id: "part-alex",
+        frames_hex: log.frames_hex,
+        claimed_final_hash_hex: log.claimed_final_hash_hex,
+        claimed_score: log.claimed_score,
+        hash_checkpoints: log.hash_checkpoints,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      throw new Error(data.detail || "Host psfc-replay unavailable or rejected log");
+    }
+    activeOfficialSession.completed = true;
+    btn.hidden = true;
+    const ar = data.accepted_result;
+    const penTag =
+      ar.shootout_home !== null && ar.shootout_home !== undefined
+        ? ` (${ar.shootout_home}-${ar.shootout_away} PENS)`
+        : ar.went_to_extra_time
+          ? " (AET)"
+          : "";
+    verifyBanner.hidden = false;
+    verifyBanner.innerHTML = `<strong>OFFICIAL RESULT VERIFIED &amp; RECORDED:</strong> ${currentSnapshot.home.short_name} ${ar.home_goals} - ${ar.away_goals} ${currentSnapshot.away.short_name}${penTag}`;
+    await refreshWorldOverview();
+  } catch (err) {
+    verifyBanner.hidden = false;
+    verifyBanner.innerHTML = `<strong>Verification Notice:</strong> ${err.message}`;
+  } finally {
+    activeOfficialSession.submitting = false;
+    btn.textContent = "VERIFY & RECORD OFFICIAL RESULT";
+  }
+}
+
+// --- Pre-Match Screen Renderer ---
+
+function computeClubRatings(roster) {
+  if (!roster || !roster.squad) return { att: 82, mid: 82, def: 81 };
+  const byRole = (r) => roster.squad.filter((p) => p.role === r).map((p) => p.overall);
+  const avg = (arr, fb) => (arr.length ? Math.round(arr.reduce((a, b) => a + b, 0) / arr.length) : fb);
+  return {
+    att: avg(byRole("Forward"), 83),
+    mid: avg(byRole("Midfielder"), 83),
+    def: avg([...byRole("Defender"), ...byRole("Goalkeeper")], 82),
+  };
+}
+
+function renderPreMatchTeamCard(prefix, clubId, kitColorHex) {
+  const rosters = (latestOverview && latestOverview.rosters) || {};
+  const r = rosters[clubId];
+  if (!r) return;
+
+  const crest = document.getElementById(`pm-${prefix}-crest`);
+  crest.textContent = r.short_name;
+  crest.style.background = kitColorHex || r.primary_color;
+
+  document.getElementById(`pm-${prefix}-name`).textContent = r.name;
+  document.getElementById(`pm-${prefix}-stadium`).textContent = r.stadium;
+
+  const fmtName = FORMAT_OPTIONS[pmFmtIdx].id;
+  document.getElementById(`pm-${prefix}-fmt`).textContent =
+    fmtName === "11v11" ? r.formation_11v11 : r.formation_5v5;
+
+  const rat = computeClubRatings(r);
+  document.getElementById(`pm-${prefix}-ratings`).innerHTML = `
+    <div class="pm-rat-box"><div class="pm-rat-num">${rat.att}</div><div class="pm-rat-lbl">ATT</div></div>
+    <div class="pm-rat-box"><div class="pm-rat-num">${rat.mid}</div><div class="pm-rat-lbl">MID</div></div>
+    <div class="pm-rat-box"><div class="pm-rat-num">${rat.def}</div><div class="pm-rat-lbl">DEF</div></div>
+  `;
+
+  const starters = fmtName === "11v11" ? r.squad : r.squad.filter((p) => p.selected_5v5);
+  const ul = document.getElementById(`pm-${prefix}-starters`);
+  ul.innerHTML = starters
+    .map(
+      (p) => `
+      <li>
+        <span><strong>#${p.shirt_number}</strong> ${p.name}</span>
+        <span class="ovr-pill">${p.overall}</span>
+      </li>`
+    )
+    .join("");
+}
+
+function renderPreMatchScreen() {
+  const rosters = (latestOverview && latestOverview.rosters) || {};
+  const locked = Boolean(pendingOfficialFixture);
+
+  if (locked) {
+    pmHomeClub = pendingOfficialFixture.homeClubId;
+    pmAwayClub = pendingOfficialFixture.awayClubId;
+  } else if (pmAwayClub === pmHomeClub) {
+    pmAwayClub = CLUB_ORDER.find((c) => c !== pmHomeClub) || "arsenal";
+  }
+
+  document.getElementById("pm-home-prev").disabled = locked;
+  document.getElementById("pm-home-next").disabled = locked;
+  document.getElementById("pm-away-prev").disabled = locked;
+  document.getElementById("pm-away-next").disabled = locked;
+
+  document.getElementById("pm-context-banner").textContent = locked
+    ? `OFFICIAL · ${pendingOfficialFixture.stageLabel}`
+    : "EXHIBITION MATCH";
+
+  const hRoster = rosters[pmHomeClub];
+  const aRoster = rosters[pmAwayClub];
+  const kits = resolveMatchKits(
+    pmHomeClub,
+    pmAwayClub,
+    hRoster && hRoster.primary_color,
+    aRoster && aRoster.primary_color
+  );
+
+  const isAwayClash = aRoster && kits.awayOutfield.shirt.toLowerCase() !== aRoster.primary_color.toLowerCase();
+  document.getElementById("pm-away-kit-tag").textContent = isAwayClash ? "CLASH AWAY KIT" : "HOME KIT";
+
+  renderPreMatchTeamCard("home", pmHomeClub, kits.homeOutfield.shirt);
+  renderPreMatchTeamCard("away", pmAwayClub, kits.awayOutfield.shirt);
+
+  document.getElementById("pm-side-val").textContent = SIDE_MODES[pmSideIdx].label;
+  document.getElementById("pm-fmt-val").textContent = FORMAT_OPTIONS[pmFmtIdx].label;
+  document.getElementById("pm-dur-val").textContent = DURATION_OPTIONS[pmDurIdx].label;
+  document.getElementById("pm-diff-val").textContent = DIFF_OPTIONS[pmDiffIdx].label;
+  document.getElementById("pm-cam-val").textContent = CAMERA_LABELS[engine3d.cameraMode];
+
+  engine3d.updatePreMatchShowcase(hRoster, aRoster);
+}
+
+// --- Match HUD, Radar, Pause & Instant Replay ---
+
+function showGoalBroadcastBanner(title, sub, ticks = 150) {
+  document.getElementById("goal-banner-title").textContent = title;
+  document.getElementById("goal-banner-sub").textContent = sub;
+  document.getElementById("goal-banner").hidden = false;
+  goalBannerTicks = ticks;
+}
+
+function cycleMatchCamera() {
+  const mode = engine3d.cycleCameraPreset();
+  const label = CAMERA_LABELS[mode];
+  document.getElementById("btn-hud-cam").textContent = `CAM: ${mode.toUpperCase()}`;
+  document.getElementById("btn-pause-cam").textContent = `CAMERA ANGLE: ${label}`;
+  GameAudio.uiTick(600);
+}
+
+function togglePauseModal() {
+  paused = !paused;
+  const modal = document.getElementById("pause-modal");
+  modal.hidden = !paused;
+  if (paused && currentSnapshot) {
+    document.getElementById("pause-scoreline").textContent =
+      `${currentSnapshot.home.short_name} ${document.getElementById("sb-score").textContent} ${currentSnapshot.away.short_name}`;
+  }
+  GameAudio.uiTick(paused ? 420 : 620);
+}
+
+function toggleInstantReplay() {
+  if (replayBuffer.length < 2) return;
+  if (replayActive) {
+    exitInstantReplay();
+    return;
+  }
+  paused = true;
+  document.getElementById("pause-modal").hidden = true;
+  replayActive = true;
+  replayCursor = Math.max(0, replayBuffer.length - 180);
+  const bar = document.getElementById("replay-bar");
+  const scrub = document.getElementById("replay-scrub");
+  scrub.max = String(Math.max(1, replayBuffer.length - 1));
+  scrub.value = String(Math.floor(replayCursor));
+  bar.hidden = false;
+  document.getElementById("radar-wrap").hidden = true;
+  GameAudio.uiConfirm();
+}
+
+function exitInstantReplay() {
+  replayActive = false;
+  paused = false;
+  document.getElementById("replay-bar").hidden = true;
+  document.getElementById("radar-wrap").hidden = false;
+  GameAudio.uiTick(500);
+}
+
+function openFullTimeSummaryModal() {
+  if (fulltimeShown || !wasm || !currentSnapshot) return;
+  fulltimeShown = true;
+  wasm.sim_export_summary_json();
+  const summary = JSON.parse(wasmReadText());
+  lastShootoutScore = summary.shootout_score || null;
+
+  const penStr = lastShootoutScore ? ` (${lastShootoutScore[0]}-${lastShootoutScore[1]}P)` : "";
+  document.getElementById("ft-home-name").textContent = currentSnapshot.home.short_name;
+  document.getElementById("ft-away-name").textContent = currentSnapshot.away.short_name;
+  document.getElementById("ft-score").textContent = `${summary.score[0]} - ${summary.score[1]}${penStr}`;
+
+  const hPct = Math.round((homePossTicks / (homePossTicks + awayPossTicks)) * 100);
+  const sumStat = (arr, field) => (arr || []).reduce((acc, s) => acc + (s[field] || 0), 0);
+  const hShots = sumStat(summary.home_player_stats, "shots");
+  const aShots = sumStat(summary.away_player_stats, "shots");
+  const hSaves = sumStat(summary.home_player_stats, "saves");
+  const aSaves = sumStat(summary.away_player_stats, "saves");
+
+  document.getElementById("ft-stats-grid").innerHTML = `
+    <div class="ft-stat-box"><div class="ft-stat-val">${hPct}% - ${100 - hPct}%</div><div class="ft-stat-lbl">Possession</div></div>
+    <div class="ft-stat-box"><div class="ft-stat-val">${hShots} - ${aShots}</div><div class="ft-stat-lbl">Total Shots</div></div>
+    <div class="ft-stat-box"><div class="ft-stat-val">${hSaves} - ${aSaves}</div><div class="ft-stat-lbl">GK Saves</div></div>
+  `;
+
+  const evUl = document.getElementById("ft-events-list");
+  evUl.innerHTML = matchEventsLog.length
+    ? matchEventsLog.slice(0, 8).map((e) => `<li><strong>${e.minute}'</strong> ${e.detail}</li>`).join("")
+    : "<li>Clean tactical contest — no goals recorded in regulation.</li>";
+
+  const submitBtn = document.getElementById("btn-submit-session");
+  submitBtn.hidden = !(activeOfficialSession && !activeOfficialSession.completed);
+  document.getElementById("fulltime-modal").hidden = false;
+
+  if (activeOfficialSession && !activeOfficialSession.completed) {
+    submitOfficialSessionResult();
+  }
+}
+
+function drainLiveMatchEvents(packed) {
+  const len = wasm.sim_drain_events_json();
+  if (len <= 2) return;
+  const events = JSON.parse(wasmReadText());
+  if (isAttractMatch) return;
+
+  for (const ev of events) {
+    const kind = String(ev.event_type || "").toLowerCase();
+    matchEventsLog.unshift(ev);
+
+    if (kind === "goal" || kind === "shootout_goal") {
+      GameAudio.playGoalCrowdRoar();
+      engine3d.triggerGoalEffect(packed ? packed[15] : -1);
+      showGoalBroadcastBanner(kind === "shootout_goal" ? "PENALTY SCORED!" : "GOAL!", `${ev.minute}' · ${ev.detail}`, 175);
+    } else if (kind === "shot") {
+      GameAudio.playKick(0.95);
+    } else if (kind === "pass") {
+      GameAudio.playKick(0.45);
+    } else if (kind === "save") {
+      GameAudio.playSaveSlap();
+    } else if (kind === "extra_time_start") {
+      GameAudio.playWhistle(true);
+      showGoalBroadcastBanner("EXTRA TIME", ev.detail, 120);
+    } else if (kind === "penalty_shootout_start") {
+      GameAudio.playWhistle(true);
+      showGoalBroadcastBanner("PENALTY SHOOTOUT", ev.detail, 140);
+    } else if (kind === "foul" || kind === "kick_off" || kind === "half_time") {
+      GameAudio.playWhistle(false);
+    } else if (kind === "full_time") {
+      GameAudio.playWhistle(true);
+      openFullTimeSummaryModal();
+    }
+  }
+}
+
+function updatePlayerCornerHuds(packed) {
+  if (!currentSnapshot) return;
+  const pps = packed[6];
+  const homeCtrl = packed[7];
+  const awayCtrl = packed[8];
+
+  const updateCorner = (side, ctrlIdx, prefix) => {
+    const n = side * pps + ctrlIdx;
+    if (n < 0 || n >= pps * 2) return;
+    const b = 18 + n * 10;
+    const shirt = packed[b + 2];
+    const flags = packed[b + 9];
+    const stamina = ((flags >> 4) & 0x7ff) / 1000;
+    const charge = ((flags >> 15) & 0x7ff) / 1000;
+
+    const team = side === 0 ? currentSnapshot.home : currentSnapshot.away;
+    const member = team.starters && team.starters[ctrlIdx];
+    const surname = member && member.name ? member.name.trim().split(/\s+/).slice(-1)[0].toUpperCase() : `PLAYER ${shirt}`;
+
+    document.getElementById(`hud-${prefix}-num`).textContent = String(shirt);
+    document.getElementById(`hud-${prefix}-name`).textContent = surname;
+    const stamEl = document.getElementById(`hud-${prefix}-stam`);
+    stamEl.style.width = `${Math.round(stamina * 100)}%`;
+    stamEl.style.background = stamina < 0.3 ? "#ef4444" : stamina < 0.55 ? "#facc15" : "#22c55e";
+    document.getElementById(`hud-${prefix}-pow`).style.width = `${Math.round(charge * 100)}%`;
+  };
+
+  updateCorner(0, homeCtrl, "home");
+  updateCorner(1, awayCtrl, "away");
+}
+
+function drawPitchRadar(packed) {
+  if (!currentSnapshot) return;
+  const W = radarCanvas.width;
+  const H = radarCanvas.height;
+  const halfL = currentSnapshot.format.pitch_length_mm / 2000;
+  const halfW = currentSnapshot.format.pitch_width_mm / 2000;
+
+  radarCtx.clearRect(0, 0, W, H);
+  radarCtx.fillStyle = "rgba(16, 85, 42, 0.72)";
+  radarCtx.fillRect(0, 0, W, H);
+
+  radarCtx.strokeStyle = "rgba(248, 250, 252, 0.45)";
+  radarCtx.lineWidth = 1.2;
+  radarCtx.strokeRect(4, 4, W - 8, H - 8);
+  radarCtx.beginPath();
+  radarCtx.moveTo(W * 0.5, 4);
+  radarCtx.lineTo(W * 0.5, H - 4);
+  radarCtx.stroke();
+  radarCtx.beginPath();
+  radarCtx.arc(W * 0.5, H * 0.5, 15, 0, Math.PI * 2);
+  radarCtx.stroke();
+
+  const mapX = (wx) => 4 + ((wx + halfL) / (halfL * 2)) * (W - 8);
+  const mapY = (wy) => 4 + ((wy + halfW) / (halfW * 2)) * (H - 8);
+
+  const kits = engine3d.stadiumData ? engine3d.stadiumData.kits : null;
+  const homeCol = kits ? kits.homeOutfield.shirt : "#ef4444";
+  const awayCol = kits ? kits.awayOutfield.shirt : "#38bdf8";
+
+  const pps = packed[6];
+  const homeCtrl = packed[7];
+  const awayCtrl = packed[8];
+
+  for (let n = 0; n < pps * 2; n++) {
+    const b = 18 + n * 10;
+    const side = packed[b];
+    const idx = packed[b + 1];
+    const sentOff = ((packed[b + 9] >> 26) & 1) === 1;
+    if (sentOff) continue;
+    const px = mapX(packed[b + 4] / 1000);
+    const py = mapY(packed[b + 5] / 1000);
+
+    const isCtrl = side === 0 ? idx === homeCtrl : idx === awayCtrl;
+    if (isCtrl) {
+      radarCtx.strokeStyle = "#ffffff";
+      radarCtx.lineWidth = 1.4;
+      radarCtx.beginPath();
+      radarCtx.arc(px, py, 5.2, 0, Math.PI * 2);
+      radarCtx.stroke();
+    }
+
+    radarCtx.fillStyle = side === 0 ? homeCol : awayCol;
+    radarCtx.beginPath();
+    radarCtx.arc(px, py, 3.6, 0, Math.PI * 2);
+    radarCtx.fill();
+  }
+
+  const bx = mapX(packed[9] / 1000);
+  const by = mapY(packed[10] / 1000);
+  radarCtx.fillStyle = "#ffffff";
+  radarCtx.beginPath();
+  radarCtx.arc(bx, by, 3.3, 0, Math.PI * 2);
+  radarCtx.fill();
+  radarCtx.strokeStyle = "#090f1c";
+  radarCtx.lineWidth = 1;
+  radarCtx.stroke();
+}
+
+// --- Main 60 Hz Game & Render Loop ---
+
+function formatHalfBadge(half, phase) {
+  if (phase === 12) return "FT";
+  if (half === 3) return "ET1";
+  if (half === 4) return "ET2";
+  return `${half}H`;
+}
+
+let lastLoopMs = performance.now();
+let simAccumMs = 0;
+const SIM_STEP_MS = 1000 / 60;
+
+function mainLoop(nowMs) {
+  const frameDelta = Math.min(100, Math.max(0, nowMs - lastLoopMs));
+  lastLoopMs = nowMs;
+
+  pollGamepadMenuActions(nowMs);
+  updateControllerVisualizer();
+
+  if (wasm && currentSnapshot) {
+    if (currentScreen === "match" && replayActive && replayBuffer.length > 0) {
+      const idx = Math.min(replayBuffer.length - 1, Math.floor(replayCursor));
+      const snapPacked = replayBuffer[idx];
+      const camMode = REPLAY_CAM_MODES[replayCamIdx];
+      engine3d.renderFrame(snapPacked, {
+        active: true,
+        camMode,
+        orbitAngle: replayCursor * 0.025 + 0.65,
+      });
+      replayCursor += (frameDelta / SIM_STEP_MS) * 0.5;
+      if (replayCursor >= replayBuffer.length) {
+        replayCursor = 0;
+      }
+      document.getElementById("replay-scrub").value = String(Math.floor(replayCursor));
+      requestAnimationFrame(mainLoop);
+      return;
+    }
+
+    simAccumMs += frameDelta;
+    const steps = Math.min(6, Math.floor(simAccumMs / SIM_STEP_MS));
+    simAccumMs -= steps * SIM_STEP_MS;
+
+    // Advance simulation ticks at deterministic 60.0 Hz wall-clock pace
+    if (isAttractMatch) {
+      for (let s = 0; s < Math.max(1, steps); s++) {
+        wasm.sim_tick(0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+      }
+      const p = readPackedState();
+      if (p && p[17] > 0) wasm.sim_drain_events_json();
+      if (p && p[3] === 12) {
+        startAttractBackgroundMatch();
+      }
+      engine3d.renderFrame(p, null);
+    } else {
+      if (!paused && currentScreen === "match" && steps > 0) {
+        const sideMode = SIDE_MODES[pmSideIdx].id;
+        let hIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
+        let aIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
+
+        if (sideMode === "local_2p") {
+          hIn = samplePrimaryHumanInput(false);
+          aIn = sampleSecondaryHumanInput();
+        } else if (sideMode === "away_vs_cpu") {
+          aIn = samplePrimaryHumanInput(true);
+        } else if (sideMode === "home_vs_cpu") {
+          hIn = samplePrimaryHumanInput(true);
+        }
+
+        for (let s = 0; s < steps; s++) {
+          wasm.sim_tick(hIn.mx, hIn.my, hIn.ax, hIn.ay, hIn.btns, aIn.mx, aIn.my, aIn.ax, aIn.ay, aIn.btns);
+          const subPacked = readPackedState();
+          if (subPacked && subPacked[3] !== 12) {
+            if (replayBuffer.length >= REPLAY_CAPACITY) replayBuffer.shift();
+            replayBuffer.push(new Int32Array(subPacked));
+            if (subPacked[15] === 0) homePossTicks++;
+            else if (subPacked[15] === 1) awayPossTicks++;
+          }
+          if (subPacked && subPacked[17] > 0) {
+            drainLiveMatchEvents(subPacked);
+          }
+        }
       }
 
       const packed = readPackedState();
       if (packed) {
-        const tick = packed[0];
         const clockTicks = packed[1];
         const half = packed[2];
         const phase = packed[3];
         const hScore = packed[4];
         const aScore = packed[5];
-        const ownerSide = packed[15];
 
-        if (!paused && phase !== 12) {
-          if (replayBuffer.length >= REPLAY_CAPACITY) {
-            replayBuffer.shift();
+        if (currentScreen === "match") {
+          const penSuffix = lastShootoutScore ? ` (${lastShootoutScore[0]}-${lastShootoutScore[1]}P)` : "";
+          document.getElementById("sb-score").textContent = `${hScore} - ${aScore}${penSuffix}`;
+          document.getElementById("sb-half").textContent = formatHalfBadge(half, phase);
+          const totalSec = Math.floor(clockTicks / 60);
+          const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
+          const ss = String(totalSec % 60).padStart(2, "0");
+          document.getElementById("sb-time").textContent = `${mm}:${ss}`;
+          document.getElementById("sb-phase").textContent =
+            phase === 0 ? "KICK OFF · PRESS PASS [SPACE / A]" : PHASE_LABELS[phase] || "OPEN PLAY";
+
+          updatePlayerCornerHuds(packed);
+          drawPitchRadar(packed);
+
+          if (phase === 12 && !fulltimeShown) {
+            openFullTimeSummaryModal();
           }
-          replayBuffer.push(new Int32Array(packed));
-
-          if (ownerSide === 0) homePossTicks++;
-          else if (ownerSide === 1) awayPossTicks++;
-
-          const bx = packed[9] / 1000;
-          const by = packed[10] / 1000;
-          const bz = packed[11] / 1000;
-          ballTrail.push({ x: bx, y: by, z: bz });
-          if (ballTrail.length > 10) ballTrail.shift();
+          if (goalBannerTicks > 0) {
+            goalBannerTicks--;
+            if (goalBannerTicks === 0) {
+              document.getElementById("goal-banner").hidden = true;
+            }
+          }
         }
 
-        const penSuffix = lastShootoutScore
-          ? ` (${lastShootoutScore[0]}-${lastShootoutScore[1]}p)`
+        engine3d.renderFrame(packed, null);
+      }
+    }
+  } else {
+    engine3d.renderFrame(null, null);
+  }
+
+  requestAnimationFrame(mainLoop);
+}
+
+// --- Team Management (Visual Pitch 11 → 5 Formation Board) ---
+
+function ensureClubDraft(roster) {
+  const cid = roster.club_id;
+  if (!draftLineups[cid] || !draftLineups[cid].dirty) {
+    draftLineups[cid] = {
+      starterIds: Array.from(roster.starter_ids_5v5 || []),
+      formation: roster.formation_5v5 || "1-2-1",
+      dirty: false,
+    };
+  }
+  return draftLineups[cid];
+}
+
+function roleBadgeMeta(role) {
+  if (role === "Goalkeeper") return { label: "GK", cls: "role-gk", order: 0 };
+  if (role === "Defender") return { label: "DEF", cls: "role-def", order: 1 };
+  if (role === "Midfielder") return { label: "MID", cls: "role-mid", order: 2 };
+  return { label: "FWD", cls: "role-fwd", order: 3 };
+}
+
+function renderSquadBuilder() {
+  if (!latestOverview || !latestOverview.rosters) return;
+  const roster = latestOverview.rosters[activeSquadClub];
+  if (!roster) return;
+
+  document.querySelectorAll(".sq-club-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.getAttribute("data-club") === activeSquadClub);
+  });
+
+  const draft = ensureClubDraft(roster);
+  document.querySelectorAll(".sq-fmt-pill").forEach((btn) => {
+    btn.classList.toggle("active", btn.getAttribute("data-fmt") === draft.formation);
+  });
+
+  const byId = new Map(roster.squad.map((p) => [p.footballer_id, p]));
+  const selectedMembers = draft.starterIds.map((id) => byId.get(id)).filter(Boolean);
+  const gk = selectedMembers.find((m) => m.role === "Goalkeeper");
+  const outfield = selectedMembers
+    .filter((m) => m.role !== "Goalkeeper")
+    .sort((a, b) => roleBadgeMeta(a.role).order - roleBadgeMeta(b.role).order);
+
+  const orderedStarters = [...(gk ? [gk] : []), ...outfield];
+  const validFive = Boolean(gk) && outfield.length === 4;
+
+  const pill = document.getElementById("squad-count-pill");
+  const saveBtn = document.getElementById("btn-save-lineup");
+  const playBtn = document.getElementById("btn-play-with-squad");
+  if (validFive) {
+    const tag = draft.dirty ? "UNSAVED" : roster.custom_lineup_active ? "SAVED" : "DEFAULT 5";
+    pill.textContent = `5 / 5 READY (${tag})`;
+    saveBtn.disabled = false;
+    playBtn.disabled = false;
+  } else {
+    pill.textContent = `${orderedStarters.length} / 5 SELECTED`;
+    saveBtn.disabled = true;
+    playBtn.disabled = true;
+  }
+
+  // Render 5 interactive tokens on the 2D Tactical Pitch Board!
+  const coords = FORMATION_COORDS_5V5[draft.formation] || FORMATION_COORDS_5V5["1-2-1"];
+  const tokensLayer = document.getElementById("tp-tokens-layer");
+  tokensLayer.innerHTML = "";
+  const kits = resolveMatchKits(roster.club_id, "chelsea", roster.primary_color, "#1d4ed8");
+
+  orderedStarters.slice(0, 5).forEach((m, idx) => {
+    const [xp, yp] = coords[idx] || [50, 50];
+    const isGk = m.role === "Goalkeeper";
+    const bg = isGk ? kits.homeGk.shirt : kits.homeOutfield.shirt;
+    const fg = isGk ? kits.homeGk.numberColor : kits.homeOutfield.numberColor;
+    const surname = m.name.trim().split(/\s+/).slice(-1)[0].toUpperCase();
+
+    const token = document.createElement("div");
+    token.className = `pitch-token${swapArmedStarterId === m.footballer_id ? " swap-armed" : ""}`;
+    token.style.left = `${xp}%`;
+    token.style.top = `${yp}%`;
+    token.innerHTML = `
+      <div class="pt-jersey" style="background:${bg};color:${fg}">${m.shirt_number}</div>
+      <div class="pt-tag">${surname} · ${m.overall}</div>
+    `;
+    token.addEventListener("click", () => {
+      if (isGk) {
+        swapArmedStarterId = null;
+      } else {
+        swapArmedStarterId = swapArmedStarterId === m.footballer_id ? null : m.footballer_id;
+      }
+      GameAudio.uiTick(540);
+      renderSquadBuilder();
+    });
+    tokensLayer.appendChild(token);
+  });
+
+  // Render full 11-player official squad list
+  const listEl = document.getElementById("squad-roster-list");
+  listEl.innerHTML = "";
+  const selectedSet = new Set(draft.starterIds);
+
+  for (const p of roster.squad) {
+    const isSelected = selectedSet.has(p.footballer_id);
+    const rb = roleBadgeMeta(p.role);
+    const a = p.attributes;
+    const attrs =
+      p.role === "Goalkeeper"
+        ? `GK ${a.goalkeeping} · POS ${a.positioning} · PAS ${a.passing}`
+        : `PAC ${a.pace} · SHO ${a.shooting} · PAS ${a.passing} · DRI ${a.dribbling} · DEF ${a.tackling}`;
+
+    const row = document.createElement("div");
+    row.className = `squad-player-row${isSelected ? " selected" : ""}`;
+    row.innerHTML = `
+      <div class="sp-left">
+        <span class="sp-shirt">#${p.shirt_number}</span>
+        <span class="role-tag ${rb.cls}">${rb.label}</span>
+        <span class="sp-name">${p.name}</span>
+      </div>
+      <div class="sp-right">
+        <span class="sp-attrs">${attrs}</span>
+        <span class="ovr-pill">${p.overall}</span>
+      </div>
+    `;
+
+    row.addEventListener("click", () => {
+      const msg = document.getElementById("squad-save-msg");
+      if (p.role === "Goalkeeper") {
+        draft.starterIds = [
+          p.footballer_id,
+          ...draft.starterIds.filter((id) => {
+            const m = byId.get(id);
+            return m && m.role !== "Goalkeeper";
+          }),
+        ];
+        msg.hidden = false;
+        msg.textContent = `${p.name} locked in at Goalkeeper (5v5 requires 1 GK + 4 Outfielders).`;
+        renderSquadBuilder();
+        return;
+      }
+
+      // Direct swap if a pitch token was armed and user clicked a bench outfielder!
+      if (!isSelected && swapArmedStarterId && selectedSet.has(swapArmedStarterId)) {
+        draft.starterIds = draft.starterIds.map((id) => (id === swapArmedStarterId ? p.footballer_id : id));
+        swapArmedStarterId = null;
+        draft.dirty = true;
+        msg.hidden = true;
+        GameAudio.uiConfirm();
+        renderSquadBuilder();
+        return;
+      }
+
+      if (isSelected) {
+        draft.starterIds = draft.starterIds.filter((id) => id !== p.footballer_id);
+        if (swapArmedStarterId === p.footballer_id) swapArmedStarterId = null;
+        draft.dirty = true;
+        msg.hidden = true;
+      } else {
+        const currentOut = draft.starterIds.filter((id) => {
+          const m = byId.get(id);
+          return m && m.role !== "Goalkeeper";
+        });
+        if (currentOut.length >= 4) {
+          // Swap out the last outfielder automatically or prompt
+          const droppedId = currentOut[currentOut.length - 1];
+          draft.starterIds = draft.starterIds.map((id) => (id === droppedId ? p.footballer_id : id));
+          const dropped = byId.get(droppedId);
+          msg.hidden = false;
+          msg.textContent = `Swapped in ${p.name} for ${dropped ? dropped.name : "starter"}.`;
+        } else {
+          draft.starterIds.push(p.footballer_id);
+          msg.hidden = true;
+        }
+        draft.dirty = true;
+      }
+      GameAudio.uiTick(560);
+      renderSquadBuilder();
+    });
+
+    listEl.appendChild(row);
+  }
+}
+
+async function saveActiveClubLineup() {
+  const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[activeSquadClub];
+  if (!roster) return false;
+  const draft = ensureClubDraft(roster);
+  const res = await fetch(
+    `/api/worlds/${encodeURIComponent(activeWorldId)}/clubs/${encodeURIComponent(activeSquadClub)}/lineup`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        starter_ids: draft.starterIds,
+        formation_5v5: draft.formation,
+        actor_id: "part-alex",
+      }),
+    }
+  );
+  const out = await res.json();
+  const msg = document.getElementById("squad-save-msg");
+  msg.hidden = false;
+  if (!res.ok) {
+    msg.textContent = out.detail || "Could not save lineup";
+    return false;
+  }
+  draft.dirty = false;
+  draft.starterIds = Array.from(out.roster.starter_ids_5v5);
+  draft.formation = out.roster.formation_5v5;
+  msg.textContent = `Saved ${out.roster.name} (${out.roster.formation_5v5}) to active Parallel Season world!`;
+  GameAudio.uiConfirm();
+  await refreshWorldOverview();
+  return true;
+}
+
+// --- Parallel Season World Hub Sync ---
+
+async function refreshWorldsDropdown() {
+  const res = await fetch("/api/worlds");
+  if (!res.ok) return;
+  const data = await res.json();
+  const sel = document.getElementById("world-select");
+  sel.innerHTML = "";
+  for (const w of data.worlds) {
+    const opt = document.createElement("option");
+    opt.value = w.id;
+    opt.textContent = `${w.season_label} · ${w.name} (${w.status})`;
+    if (w.id === activeWorldId) opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+function buildFixtureCardElement(fx) {
+  const isCup = fx.stage !== "league";
+  const srcClass =
+    fx.result_source === "played_vs_friend"
+      ? "src-friend"
+      : fx.result_source === "played_vs_cpu"
+        ? "src-cpu"
+        : fx.result_source === "generated"
+          ? "src-generated"
+          : "src-imported";
+
+  const isPlayable =
+    fx.state !== "accepted" &&
+    (fx.result_source === "played_vs_friend" || fx.result_source === "played_vs_cpu");
+  const isGeneratable = fx.state !== "accepted" && fx.result_source === "generated";
+  const isAdminPending = fx.state === "awaiting_admin";
+
+  let scoreText = "VS";
+  if (fx.state === "accepted") {
+    const pen =
+      fx.accepted_shootout_home !== null && fx.accepted_shootout_home !== undefined
+        ? ` (${fx.accepted_shootout_home}-${fx.accepted_shootout_away}P)`
+        : fx.accepted_aet
+          ? " (AET)"
           : "";
-        sbScore.textContent = `${hScore} - ${aScore}${penSuffix}`;
-        sbHalf.textContent = formatHalfBadge(half, phase);
-        const totalSec = Math.floor(clockTicks / 60);
-        const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
-        const ss = String(totalSec % 60).padStart(2, "0");
-        sbTime.textContent = `${mm}:${ss}`;
-        sbPhase.textContent = PHASE_LABELS[phase] || "PLAY";
-
-        if (tick % 12 === 0) {
-          wasm.sim_state_hash_hex();
-          hashPill.textContent = `State Hash: #${wasmReadText()}`;
-          const hPct = Math.round((homePossTicks / (homePossTicks + awayPossTicks)) * 100);
-          possessionBadge.textContent = `Possession ${hPct}% - ${100 - hPct}%`;
-        }
-
-        if (packed[17] > 0) {
-          drainAndRenderMatchEvents();
-        }
-
-        if (goalBannerTicks > 0) {
-          goalBannerTicks--;
-          if (goalBannerTicks === 0) goalBanner.hidden = true;
-        }
-
-        drawScene(packed, null);
-      }
-    }
-    requestAnimationFrame(frameLoop);
+    scoreText = `${fx.accepted_home_goals} - ${fx.accepted_away_goals}${pen}`;
+  } else if (fx.state === "in_session") {
+    scoreText = "LIVE";
+  } else if (isAdminPending) {
+    scoreText = "RULING";
   }
 
-  // --- Parallel Season World Host UI Sync ---
+  const stageBadge =
+    fx.stage === "cup_sf"
+      ? "FA CUP SEMI-FINAL"
+      : fx.stage === "cup_final"
+        ? "FA CUP FINAL"
+        : `PREMIER LEAGUE R${fx.round}`;
 
-  let latestOverview = null;
+  const realNote =
+    fx.real_home_goals !== null && fx.real_away_goals !== null
+      ? `Real Football: ${fx.real_home_goals}-${fx.real_away_goals}`
+      : isCup
+        ? "Parallel-Only Divergent Tie"
+        : "";
 
-  function renderWorldOverviewCardsHighlight() {
-    if (!latestOverview) return;
-    document.querySelectorAll(".fixture-card").forEach((el) => {
-      const fid = el.getAttribute("data-fixture-id");
-      el.classList.toggle(
-        "active-session",
-        Boolean(activeOfficialSession && activeOfficialSession.fixtureId === fid)
-      );
+  let actionHtml = `<span>${fx.accepted_source === "imported" ? "Inherited" : "Verified"}</span>`;
+  if (isPlayable) {
+    actionHtml = `<button class="console-btn console-btn-primary btn-play-fx" type="button" style="font-size:14px;padding:6px 14px">
+      ${fx.state === "in_session" ? "RESUME MATCH ▶" : "PLAY OFFICIAL ▶"}
+    </button>`;
+  } else if (isGeneratable) {
+    actionHtml = `<button class="console-btn console-btn-gold btn-gen-fx" type="button" style="font-size:14px;padding:6px 14px">SIM POISSON</button>`;
+  } else if (isAdminPending) {
+    actionHtml = `<button class="console-btn console-btn-secondary btn-admin-fx" type="button" style="font-size:14px;padding:6px 14px">AWARD 3-0</button>`;
+  }
+
+  const card = document.createElement("div");
+  card.className = `fixture-card${isCup ? " cup-card" : ""}`;
+  card.innerHTML = `
+    <div class="fx-top">
+      <span>${stageBadge} · ${fx.state.toUpperCase()}</span>
+      <span class="fx-source ${srcClass}">${fx.result_source.replace(/_/g, " ")}</span>
+    </div>
+    <div class="fx-mid">
+      <span>${fx.home_club.name}</span>
+      <span class="fx-score-box">${scoreText}</span>
+      <span>${fx.away_club.name}</span>
+    </div>
+    <div class="fx-bottom">
+      <span>${realNote}</span>
+      ${actionHtml}
+    </div>
+  `;
+
+  const playBtn = card.querySelector(".btn-play-fx");
+  if (playBtn) {
+    playBtn.addEventListener("click", () => {
+      pendingOfficialFixture = {
+        id: fx.id,
+        homeClubId: fx.home_club.club_id || fx.home_club_id,
+        awayClubId: fx.away_club.club_id || fx.away_club_id,
+        result_source: fx.result_source,
+        stageLabel: stageBadge,
+      };
+      pmSideIdx = fx.result_source === "played_vs_friend" ? 2 : 0;
+      GameAudio.uiConfirm();
+      navigateTo("prematch");
     });
   }
 
-  async function refreshWorldsDropdown() {
-    const res = await fetch("/api/worlds");
-    if (!res.ok) return;
-    const data = await res.json();
-    worldSelect.innerHTML = "";
-    for (const w of data.worlds) {
-      const opt = document.createElement("option");
-      opt.value = w.id;
-      opt.textContent = `${w.season_label} (${w.status})`;
-      if (w.id === activeWorldId) opt.selected = true;
-      worldSelect.appendChild(opt);
-    }
+  const genBtn = card.querySelector(".btn-gen-fx");
+  if (genBtn) {
+    genBtn.addEventListener("click", async () => {
+      await fetch(`/api/fixtures/${encodeURIComponent(fx.id)}/generate`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({}),
+      });
+      await refreshWorldOverview();
+    });
   }
 
-  async function refreshWorldOverview() {
-    await refreshWorldsDropdown();
-    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/overview`);
-    if (!res.ok) return;
-    const data = await res.json();
-    latestOverview = data;
-
-    document.getElementById("world-name").textContent = data.world.name;
-    const repLabel = data.assignments
-      .map((a) => `${a.club_id.toUpperCase()} (${a.participant_name.split(" ")[0]})`)
-      .join(", ");
-    document.getElementById("world-meta").textContent =
-      `${data.world.season_label} · ${data.world.status.toUpperCase()} · ${repLabel || "Unassigned"}`;
-
-    // Honours strip
-    const honStrip = document.getElementById("honours-strip");
-    if (data.honours && data.honours.length > 0) {
-      honStrip.hidden = false;
-      honStrip.innerHTML = data.honours
-        .map((h) => `<span>🏆 <strong>${h.category.replace("_", " ").toUpperCase()}:</strong> ${h.winner_name}</span>`)
-        .join("");
-    } else {
-      honStrip.hidden = true;
-    }
-
-    // 1. Render Fixtures (filtered by activeCompFilter)
-    const fxContainer = document.getElementById("fixture-list");
-    fxContainer.innerHTML = "";
-    const filteredFixtures = data.fixtures.filter((fx) => {
-      if (activeCompFilter === "league") return fx.stage === "league";
-      if (activeCompFilter === "knockout") return fx.stage !== "league";
-      return true;
-    });
-
-    for (const fx of filteredFixtures) {
-      const isCup = fx.stage !== "league";
-      const srcClass =
-        fx.result_source === "played_vs_friend"
-          ? "src-friend"
-          : fx.result_source === "played_vs_cpu"
-            ? "src-cpu"
-            : fx.result_source === "generated"
-              ? "src-generated"
-              : "src-imported";
-
-      const isPlayable =
-        fx.state !== "accepted" &&
-        (fx.result_source === "played_vs_friend" || fx.result_source === "played_vs_cpu");
-      const isGeneratable = fx.state !== "accepted" && fx.result_source === "generated";
-      const isAdminPending = fx.state === "awaiting_admin";
-
-      let scoreText = "vs";
-      if (fx.state === "accepted") {
-        const pen =
-          fx.accepted_shootout_home !== null && fx.accepted_shootout_home !== undefined
-            ? ` (${fx.accepted_shootout_home}-${fx.accepted_shootout_away}p)`
-            : fx.accepted_aet
-              ? " (AET)"
-              : "";
-        scoreText = `${fx.accepted_home_goals} - ${fx.accepted_away_goals}${pen}`;
-      } else if (fx.state === "in_session") {
-        scoreText = "IN SESSION";
-      } else if (isAdminPending) {
-        scoreText = "ADMIN RULING";
-      }
-
-      const stageBadge =
-        fx.stage === "cup_sf"
-          ? "FA CUP SEMI-FINAL"
-          : fx.stage === "cup_final"
-            ? "FA CUP FINAL"
-            : `League R${fx.round}`;
-
-      const realNote =
-        fx.real_home_goals !== null && fx.real_away_goals !== null
-          ? `Real Ref: ${fx.real_home_goals}-${fx.real_away_goals}`
-          : isCup
-            ? "Parallel-Only Divergent Tie!"
-            : "";
-
-      let actionHtml = `<span>${fx.accepted_source === "imported" ? "Inherited / Imported" : "Verified"}</span>`;
-      if (isPlayable) {
-        actionHtml = `<button class="btn btn-primary btn-play-fx" data-fx="${fx.id}" data-src="${fx.result_source}" data-stage="${stageBadge}">
-          ${fx.state === "in_session" ? "Resume 5v5" : "Play Official 5v5"}
-        </button>`;
-      } else if (isGeneratable) {
-        actionHtml = `<button class="btn btn-amber btn-gen-fx" data-fx="${fx.id}">Generate Poisson</button>`;
-      } else if (isAdminPending) {
-        actionHtml = `<button class="btn btn-secondary btn-admin-fx" data-fx="${fx.id}">Award 3-0 Ruling</button>`;
-      }
-
-      const card = document.createElement("div");
-      card.className = `fixture-card${isCup ? " cup-card" : ""}`;
-      card.setAttribute("data-fixture-id", fx.id);
-      if (activeOfficialSession && activeOfficialSession.fixtureId === fx.id) {
-        card.classList.add("active-session");
-      }
-
-      card.innerHTML = `
-        <div class="fx-top">
-          <span>${stageBadge} · ${fx.state.toUpperCase()}${fx.extra_time_enabled ? " · ET/Pens" : ""}</span>
-          <span class="fx-source ${srcClass}">${fx.result_source}</span>
-        </div>
-        <div class="fx-mid">
-          <span>${fx.home_club.name}</span>
-          <span class="fx-score-box">${scoreText}</span>
-          <span>${fx.away_club.name}</span>
-        </div>
-        <div class="fx-bottom">
-          <span>${realNote}${fx.accepted_hash_hex ? ` · #${fx.accepted_hash_hex.slice(0, 8)}` : ""}</span>
-          ${actionHtml}
-        </div>
-      `;
-      fxContainer.appendChild(card);
-    }
-
-    fxContainer.querySelectorAll(".btn-play-fx").forEach((btn) => {
-      btn.addEventListener("click", () => {
-        launchOfficialFixtureSession(
-          btn.getAttribute("data-fx"),
-          btn.getAttribute("data-src"),
-          btn.getAttribute("data-stage")
-        );
+  const adminBtn = card.querySelector(".btn-admin-fx");
+  if (adminBtn) {
+    adminBtn.addEventListener("click", async () => {
+      await fetch(`/api/admin/fixtures/${encodeURIComponent(fx.id)}/resolve`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ home_goals: 3, away_goals: 0, reason: "commissioner walkover" }),
       });
+      await refreshWorldOverview();
     });
+  }
 
-    fxContainer.querySelectorAll(".btn-gen-fx").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const fid = btn.getAttribute("data-fx");
-        await fetch(`/api/fixtures/${encodeURIComponent(fid)}/generate`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({}),
-        });
-        await refreshWorldOverview();
-      });
-    });
+  return card;
+}
 
-    fxContainer.querySelectorAll(".btn-admin-fx").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const fid = btn.getAttribute("data-fx");
-        await fetch(`/api/admin/fixtures/${encodeURIComponent(fid)}/resolve`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ home_goals: 3, away_goals: 0, reason: "commissioner walkover" }),
-        });
-        await refreshWorldOverview();
-      });
-    });
+async function refreshWorldOverview() {
+  await refreshWorldsDropdown();
+  const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/overview`);
+  if (!res.ok) return;
+  const data = await res.json();
+  latestOverview = data;
 
-    // 2. Render Standings
-    const stBody = document.getElementById("standings-tbody");
-    stBody.innerHTML = "";
-    for (const r of data.standings) {
-      const delta = r.delta_vs_real;
-      const deltaStr =
-        delta > 0 ? `<span class="pos-delta">+${delta}</span>` : delta < 0 ? `<span class="neg-delta">${delta}</span>` : "0";
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
+  document.getElementById("top-world-chip").textContent = `${data.world.season_label} · ${data.world.name}`;
+  document.getElementById("world-name").textContent = `${data.world.name} (${data.world.season_label})`;
+
+  const repLabel = data.assignments
+    .map((a) => `${a.club_id.toUpperCase()} (${a.participant_name.split(" ")[0]})`)
+    .join(", ");
+  document.getElementById("world-meta").textContent = `Represented: ${repLabel || "None"}`;
+
+  // Main Menu Spotlight Card (Next Playable Official Fixture + Mini Standings)
+  const nextPlayable = data.fixtures.find(
+    (fx) =>
+      fx.state !== "accepted" &&
+      (fx.result_source === "played_vs_friend" || fx.result_source === "played_vs_cpu")
+  );
+  const hubMatchup = document.getElementById("hub-next-matchup");
+  const hubMeta = document.getElementById("hub-next-meta");
+  const hubPlayBtn = document.getElementById("btn-hub-play-official");
+
+  if (nextPlayable) {
+    const stg =
+      nextPlayable.stage === "cup_sf"
+        ? "FA Parallel Cup Semi-Final"
+        : nextPlayable.stage === "cup_final"
+          ? "FA Parallel Cup Final"
+          : `Premier League · Round ${nextPlayable.round}`;
+    hubMatchup.textContent = `${nextPlayable.home_club.short_name} vs ${nextPlayable.away_club.short_name}`;
+    hubMeta.textContent = `${stg} · ${nextPlayable.result_source.replace(/_/g, " ").toUpperCase()}`;
+    hubPlayBtn.disabled = false;
+    hubPlayBtn.onclick = () => {
+      pendingOfficialFixture = {
+        id: nextPlayable.id,
+        homeClubId: nextPlayable.home_club.club_id || nextPlayable.home_club_id,
+        awayClubId: nextPlayable.away_club.club_id || nextPlayable.away_club_id,
+        result_source: nextPlayable.result_source,
+        stageLabel: stg.toUpperCase(),
+      };
+      pmSideIdx = nextPlayable.result_source === "played_vs_friend" ? 2 : 0;
+      GameAudio.uiConfirm();
+      navigateTo("prematch");
+    };
+  } else {
+    hubMatchup.textContent = "ALL MATCHDAYS PLAYED";
+    hubMeta.textContent = "Advance FA Parallel Cup or Roll Over Season in Hub";
+    hubPlayBtn.disabled = false;
+    hubPlayBtn.textContent = "OPEN PARALLEL SEASON HUB ▶";
+    hubPlayBtn.onclick = () => navigateTo("season");
+  }
+
+  const miniTbody = document.querySelector("#hub-mini-standings tbody");
+  miniTbody.innerHTML = data.standings
+    .map(
+      (r) => `
+      <tr>
         <td>${r.position}</td>
-        <td><strong>${r.short_name}</strong> ${r.represented ? "🎮" : ""}</td>
+        <td><strong>${r.short_name}</strong> ${r.represented ? "★" : ""}</td>
         <td>${r.played}</td>
-        <td>${r.won}-${r.drawn}-${r.lost}</td>
         <td>${r.gd > 0 ? `+${r.gd}` : r.gd}</td>
-        <td>${r.inherited_points}</td>
-        <td>${r.earned_points}</td>
         <td><strong>${r.points}</strong></td>
-        <td>${deltaStr}</td>
-      `;
-      stBody.appendChild(tr);
-    }
+      </tr>`
+    )
+    .join("");
 
-    // 3. Render Player Stats (Inherited / Earned / Combined + Skill Moves & Saves)
-    const plBody = document.getElementById("players-tbody");
-    plBody.innerHTML = "";
-    for (const p of data.players) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = `
+  // Honours banner
+  const honStrip = document.getElementById("honours-strip");
+  if (data.honours && data.honours.length > 0) {
+    honStrip.hidden = false;
+    honStrip.innerHTML = data.honours
+      .map((h) => `<span>🏆 <strong>${h.category.replace(/_/g, " ").toUpperCase()}:</strong> ${h.winner_name}</span>`)
+      .join("");
+  } else {
+    honStrip.hidden = true;
+  }
+
+  // Season Fixtures Grid
+  const fxGrid = document.getElementById("fixture-list");
+  fxGrid.innerHTML = "";
+  const filtered = data.fixtures.filter((fx) => {
+    if (activeCompFilter === "league") return fx.stage === "league";
+    if (activeCompFilter === "knockout") return fx.stage !== "league";
+    return true;
+  });
+  filtered.forEach((fx) => fxGrid.appendChild(buildFixtureCardElement(fx)));
+
+  // FA Parallel Cup Bracket Grid
+  const cupGrid = document.getElementById("cup-bracket-container");
+  cupGrid.innerHTML = "";
+  data.fixtures.filter((fx) => fx.stage !== "league").forEach((fx) => cupGrid.appendChild(buildFixtureCardElement(fx)));
+
+  // League Standings Table
+  const stBody = document.getElementById("standings-tbody");
+  stBody.innerHTML = data.standings
+    .map((r) => {
+      const d = r.delta_vs_real;
+      const dHtml = d > 0 ? `<span class="pos-delta">+${d}</span>` : d < 0 ? `<span class="neg-delta">${d}</span>` : "0";
+      return `
+        <tr>
+          <td>${r.position}</td>
+          <td><strong>${r.name}</strong> ${r.represented ? "🎮" : ""}</td>
+          <td>${r.played}</td>
+          <td>${r.won} - ${r.drawn} - ${r.lost}</td>
+          <td>${r.gd > 0 ? `+${r.gd}` : r.gd}</td>
+          <td>${r.inherited_points}</td>
+          <td>${r.earned_points}</td>
+          <td><strong>${r.points}</strong></td>
+          <td>${dHtml}</td>
+        </tr>`;
+    })
+    .join("");
+
+  // Top Scorers & Player Stats
+  document.getElementById("players-tbody").innerHTML = data.players
+    .map(
+      (p) => `
+      <tr>
         <td><strong>${p.name}</strong></td>
         <td>${p.club_short}</td>
-        <td>${p.inherited.goals}G / ${p.inherited.assists}A</td>
-        <td>${p.earned.goals}G / ${p.earned.assists}A</td>
-        <td><strong>${p.combined.goals}G / ${p.combined.assists}A</strong></td>
-        <td>${p.combined.skill_moves || 0}★ / ${p.combined.saves}Sv</td>
-      `;
-      plBody.appendChild(tr);
-    }
+        <td>${p.inherited.goals}G · ${p.inherited.assists}A</td>
+        <td>${p.earned.goals}G · ${p.earned.assists}A</td>
+        <td><strong>${p.combined.goals}G · ${p.combined.assists}A</strong></td>
+        <td>${p.combined.skill_moves || 0}★ · ${p.combined.saves} SV</td>
+      </tr>`
+    )
+    .join("");
 
-    // 4. Render Appointments
-    const apptList = document.getElementById("appointment-list");
-    apptList.innerHTML = "";
-    for (const ap of data.appointments || []) {
-      const li = document.createElement("li");
-      const canAccept = ap.state === "proposed";
-      li.innerHTML = `
-        <span><code>${ap.fixture_id}</code> · ${ap.proposed_at_utc} (${ap.state.toUpperCase()})</span>
-        ${canAccept ? `<button class="btn btn-primary btn-accept-appt" data-id="${ap.id}">Accept</button>` : ""}
-      `;
-      apptList.appendChild(li);
-    }
-    apptList.querySelectorAll(".btn-accept-appt").forEach((btn) => {
+  // Commissioner Appointments & Ledger
+  const apptList = document.getElementById("appointment-list");
+  apptList.innerHTML = "";
+  for (const ap of data.appointments || []) {
+    const li = document.createElement("li");
+    li.innerHTML = `
+      <span>${ap.fixture_id} · ${ap.proposed_at_utc} (${ap.state.toUpperCase()})</span>
+      ${ap.state === "proposed" ? `<button class="console-btn console-btn-primary btn-acc" type="button" style="font-size:12px;padding:4px 10px">ACCEPT</button>` : ""}
+    `;
+    const btn = li.querySelector(".btn-acc");
+    if (btn) {
       btn.addEventListener("click", async () => {
-        await fetch(`/api/appointments/${encodeURIComponent(btn.getAttribute("data-id"))}/respond`, {
+        await fetch(`/api/appointments/${encodeURIComponent(ap.id)}/respond`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ responder_id: "part-sam", accept: true }),
         });
         await refreshWorldOverview();
       });
-    });
-
-    // 5. Render Ledger Events
-    document.getElementById("event-count").textContent = String(data.total_events);
-    const ledList = document.getElementById("ledger-list");
-    ledList.innerHTML = "";
-    for (const ev of data.recent_events) {
-      const li = document.createElement("li");
-      if (ev.type === "import_parked" || ev.type === "identity_resolution_required") {
-        li.classList.add("ev-parked");
-      }
-      li.innerHTML = `<span><span class="ledger-seq">#${ev.seq}</span><strong>${ev.type}</strong> · <code>${ev.aggregate_id}</code></span>`;
-      ledList.appendChild(li);
     }
+    apptList.appendChild(li);
+  }
 
-    // 6. Sync & Render 5v5 Squad Builder (11 -> 5)
+  document.getElementById("event-count").textContent = String(data.total_events);
+  document.getElementById("ledger-list").innerHTML = data.recent_events
+    .map((ev) => `<li><span>#${ev.seq} <strong>${ev.type}</strong></span><span>${ev.aggregate_id}</span></li>`)
+    .join("");
+
+  if (currentScreen === "prematch") renderPreMatchScreen();
+  if (currentScreen === "squad") renderSquadBuilder();
+}
+
+// --- UI Event Wiring ---
+
+document.getElementById("btn-press-start").addEventListener("click", () => {
+  GameAudio.uiConfirm();
+  navigateTo("menu");
+});
+
+document.getElementById("btn-home-logo").addEventListener("click", () => {
+  GameAudio.uiTick(440);
+  navigateTo("menu");
+});
+
+document.getElementById("btn-audio-toggle").addEventListener("click", (ev) => {
+  const on = GameAudio.toggle();
+  ev.currentTarget.textContent = on ? "SFX: ON" : "SFX: MUTED";
+});
+
+document.querySelectorAll(".hub-blade").forEach((blade, idx) => {
+  blade.addEventListener("mouseenter", () => {
+    focusedBladeIdx = idx;
+    document.querySelectorAll(".hub-blade").forEach((b, i) => b.classList.toggle("focused", i === idx));
+  });
+  blade.addEventListener("click", () => triggerHubBlade(blade.getAttribute("data-nav")));
+});
+
+document.getElementById("btn-hub-full-table").addEventListener("click", () => {
+  GameAudio.uiConfirm();
+  navigateTo("season");
+  document.querySelector('[data-stab="standings"]').click();
+});
+
+// Pre-Match Steppers
+function stepClub(current, dir, avoid) {
+  let idx = CLUB_ORDER.indexOf(current);
+  for (let i = 0; i < CLUB_ORDER.length; i++) {
+    idx = (idx + dir + CLUB_ORDER.length) % CLUB_ORDER.length;
+    if (CLUB_ORDER[idx] !== avoid) return CLUB_ORDER[idx];
+  }
+  return current;
+}
+
+document.getElementById("pm-home-prev").addEventListener("click", () => {
+  pmHomeClub = stepClub(pmHomeClub, -1, pmAwayClub);
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-home-next").addEventListener("click", () => {
+  pmHomeClub = stepClub(pmHomeClub, 1, pmAwayClub);
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-away-prev").addEventListener("click", () => {
+  pmAwayClub = stepClub(pmAwayClub, -1, pmHomeClub);
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-away-next").addEventListener("click", () => {
+  pmAwayClub = stepClub(pmAwayClub, 1, pmHomeClub);
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+
+document.getElementById("pm-side-prev").addEventListener("click", () => {
+  pmSideIdx = (pmSideIdx - 1 + SIDE_MODES.length) % SIDE_MODES.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-side-next").addEventListener("click", () => {
+  pmSideIdx = (pmSideIdx + 1) % SIDE_MODES.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-fmt-prev").addEventListener("click", () => {
+  pmFmtIdx = (pmFmtIdx - 1 + FORMAT_OPTIONS.length) % FORMAT_OPTIONS.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-fmt-next").addEventListener("click", () => {
+  pmFmtIdx = (pmFmtIdx + 1) % FORMAT_OPTIONS.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-dur-prev").addEventListener("click", () => {
+  pmDurIdx = (pmDurIdx - 1 + DURATION_OPTIONS.length) % DURATION_OPTIONS.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-dur-next").addEventListener("click", () => {
+  pmDurIdx = (pmDurIdx + 1) % DURATION_OPTIONS.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-diff-prev").addEventListener("click", () => {
+  pmDiffIdx = (pmDiffIdx - 1 + DIFF_OPTIONS.length) % DIFF_OPTIONS.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-diff-next").addEventListener("click", () => {
+  pmDiffIdx = (pmDiffIdx + 1) % DIFF_OPTIONS.length;
+  GameAudio.uiTick();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-cam-prev").addEventListener("click", () => {
+  cycleMatchCamera();
+  renderPreMatchScreen();
+});
+document.getElementById("pm-cam-next").addEventListener("click", () => {
+  cycleMatchCamera();
+  renderPreMatchScreen();
+});
+
+document.getElementById("btn-pm-back").addEventListener("click", () => {
+  GameAudio.uiTick(380);
+  navigateTo(pendingOfficialFixture ? "season" : "menu");
+});
+document.getElementById("btn-pm-squads").addEventListener("click", () => {
+  activeSquadClub = pmHomeClub;
+  GameAudio.uiConfirm();
+  navigateTo("squad");
+});
+document.getElementById("btn-pm-kickoff").addEventListener("click", () => launchSelectedMatch());
+
+// Squad Screen Controls
+document.querySelectorAll(".sq-club-tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    activeSquadClub = btn.getAttribute("data-club");
+    swapArmedStarterId = null;
+    document.getElementById("squad-save-msg").hidden = true;
+    GameAudio.uiTick();
     renderSquadBuilder();
-  }
+  });
+});
 
-  function ensureClubDraft(roster) {
-    const cid = roster.club_id;
-    if (!draftLineups[cid] || !draftLineups[cid].dirty) {
-      draftLineups[cid] = {
-        starterIds: new Set(roster.starter_ids_5v5 || []),
-        formation: roster.formation_5v5 || "1-2-1",
-        dirty: false,
-      };
-    }
-    return draftLineups[cid];
-  }
-
-  function roleBadgeMeta(role) {
-    if (role === "Goalkeeper") return { label: "GK", cls: "role-gk" };
-    if (role === "Defender") return { label: "DEF", cls: "role-def" };
-    if (role === "Midfielder") return { label: "MID", cls: "role-mid" };
-    return { label: "FWD", cls: "role-fwd" };
-  }
-
-  function renderSquadBuilder() {
-    if (!squadRosterList || !latestOverview || !latestOverview.rosters) return;
-    const clubId = squadClubSelect.value;
-    const roster = latestOverview.rosters[clubId];
+document.querySelectorAll(".sq-fmt-pill").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[activeSquadClub];
     if (!roster) return;
-
     const draft = ensureClubDraft(roster);
-    squadFormationSelect.value = draft.formation;
-
-    let gkCount = 0;
-    let outCount = 0;
-    for (const p of roster.squad) {
-      if (draft.starterIds.has(p.footballer_id)) {
-        if (p.role === "Goalkeeper") gkCount++;
-        else outCount++;
-      }
-    }
-
-    const validFive = gkCount === 1 && outCount === 4;
-    if (validFive) {
-      const savedTag = draft.dirty ? "Unsaved" : roster.custom_lineup_active ? "Custom Saved" : "Default 5";
-      squadCountPill.textContent = `5 / 5 Ready (${savedTag})`;
-      squadCountPill.className = "pill pill-emerald";
-      btnSaveLineup.disabled = false;
-      btnPlayWithSquad.disabled = false;
-    } else {
-      const needed = 4 - outCount;
-      squadCountPill.textContent = `${gkCount + outCount} / 5 (Pick ${needed} more Outfield)`;
-      squadCountPill.className = "pill pill-amber";
-      btnSaveLineup.disabled = true;
-      btnPlayWithSquad.disabled = true;
-    }
-
-    squadRosterList.innerHTML = "";
-    for (const p of roster.squad) {
-      const isSelected = draft.starterIds.has(p.footballer_id);
-      const rb = roleBadgeMeta(p.role);
-      const a = p.attributes;
-      const attrSummary =
-        p.role === "Goalkeeper"
-          ? `REF ${a.goalkeeping} · POS ${a.positioning} · PAS ${a.passing}`
-          : `PAC ${a.pace} · DRI ${a.dribbling} · PAS ${a.passing} · SHO ${a.shooting} · DEF ${a.tackling}`;
-
-      const row = document.createElement("div");
-      row.className = `squad-player-row${isSelected ? " selected" : ""}`;
-      row.innerHTML = `
-        <div class="sp-left">
-          <span class="sp-check">✓</span>
-          <span class="sp-shirt">#${p.shirt_number}</span>
-          <span class="role-tag ${rb.cls}">${rb.label}</span>
-          <span class="sp-name">${p.name}${p.default_starter_5v5 ? '<span class="sp-default-star" title="Default 5v5 Starter">★</span>' : ""}</span>
-        </div>
-        <div class="sp-right">
-          <span class="sp-attrs">${attrSummary}</span>
-          <span class="ovr-pill">${p.overall}</span>
-        </div>
-      `;
-
-      row.addEventListener("click", () => {
-        if (p.role === "Goalkeeper") {
-          for (const other of roster.squad) {
-            if (other.role === "Goalkeeper") draft.starterIds.delete(other.footballer_id);
-          }
-          draft.starterIds.add(p.footballer_id);
-          squadSaveMsg.hidden = false;
-          squadSaveMsg.innerHTML = `Goalkeeper <strong>${p.name}</strong> locked in (every 5v5 lineup requires 1 GK + 4 Outfielders).`;
-          renderSquadBuilder();
-          return;
-        }
-
-        if (draft.starterIds.has(p.footballer_id)) {
-          draft.starterIds.delete(p.footballer_id);
-          draft.dirty = true;
-          squadSaveMsg.hidden = true;
-        } else {
-          let currentOut = 0;
-          for (const m of roster.squad) {
-            if (m.role !== "Goalkeeper" && draft.starterIds.has(m.footballer_id)) currentOut++;
-          }
-          if (currentOut >= 4) {
-            squadSaveMsg.hidden = false;
-            squadSaveMsg.innerHTML = `4 outfielders already selected — uncheck one starter first to swap in <strong>${p.name}</strong>.`;
-            return;
-          }
-          draft.starterIds.add(p.footballer_id);
-          draft.dirty = true;
-          squadSaveMsg.hidden = true;
-        }
-        renderSquadBuilder();
-      });
-
-      squadRosterList.appendChild(row);
-    }
-  }
-
-  async function persistSelectedClubLineup() {
-    const clubId = squadClubSelect.value;
-    const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[clubId];
-    if (!roster) return false;
-    const draft = ensureClubDraft(roster);
-
-    const res = await fetch(
-      `/api/worlds/${encodeURIComponent(activeWorldId)}/clubs/${encodeURIComponent(clubId)}/lineup`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          starter_ids: Array.from(draft.starterIds),
-          formation_5v5: draft.formation,
-          actor_id: "part-alex",
-        }),
-      }
-    );
-    const out = await res.json();
-    squadSaveMsg.hidden = false;
-    if (!res.ok) {
-      squadSaveMsg.innerHTML = `<strong>Lineup Error:</strong> ${out.detail || "Invalid 5v5 selection"}`;
-      return false;
-    }
-    draft.dirty = false;
-    draft.starterIds = new Set(out.roster.starter_ids_5v5);
-    draft.formation = out.roster.formation_5v5;
-    const pickedNames = out.roster.squad
-      .filter((m) => m.selected_5v5)
-      .map((m) => m.name.split(" ").slice(-1)[0])
-      .join(", ");
-    squadSaveMsg.innerHTML = `<strong>Saved ${out.roster.short_name} 5v5 (${out.roster.formation_5v5}):</strong> ${pickedNames}`;
-    await refreshWorldOverview();
-    return true;
-  }
-
-  // --- UI Event Wiring ---
-
-  document.querySelectorAll(".tab").forEach((tabBtn) => {
-    tabBtn.addEventListener("click", () => {
-      document.querySelectorAll(".tab").forEach((b) => b.classList.remove("active"));
-      document.querySelectorAll(".tab-pane").forEach((p) => (p.hidden = true));
-      tabBtn.classList.add("active");
-      const target = document.getElementById(`tab-${tabBtn.getAttribute("data-tab")}`);
-      if (target) target.hidden = false;
-    });
+    draft.formation = btn.getAttribute("data-fmt");
+    draft.dirty = true;
+    GameAudio.uiTick();
+    renderSquadBuilder();
   });
+});
 
-  document.querySelectorAll(".comp-pill").forEach((pill) => {
-    pill.addEventListener("click", () => {
-      document.querySelectorAll(".comp-pill").forEach((p) => p.classList.remove("active"));
-      pill.classList.add("active");
-      activeCompFilter = pill.getAttribute("data-comp");
-      refreshWorldOverview();
-    });
+document.getElementById("btn-reset-lineup-default").addEventListener("click", () => {
+  const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[activeSquadClub];
+  if (!roster) return;
+  draftLineups[activeSquadClub] = {
+    starterIds: roster.squad.filter((m) => m.default_starter_5v5).map((m) => m.footballer_id),
+    formation: "1-2-1",
+    dirty: true,
+  };
+  swapArmedStarterId = null;
+  GameAudio.uiTick();
+  renderSquadBuilder();
+});
+
+document.getElementById("btn-save-lineup").addEventListener("click", () => saveActiveClubLineup());
+
+document.getElementById("btn-play-with-squad").addEventListener("click", async () => {
+  const ok = await saveActiveClubLineup();
+  if (!ok) return;
+  pendingOfficialFixture = null;
+  pmHomeClub = activeSquadClub;
+  if (pmAwayClub === pmHomeClub) {
+    pmAwayClub = activeSquadClub === "arsenal" ? "man-utd" : "arsenal";
+  }
+  pmFmtIdx = 0;
+  navigateTo("prematch");
+});
+
+document.getElementById("btn-sq-back").addEventListener("click", () => {
+  GameAudio.uiTick(380);
+  navigateTo(previousScreen === "prematch" ? "prematch" : "menu");
+});
+
+// Parallel Season Hub Sub-Tabs & Actions
+document.querySelectorAll(".season-tab").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    document.querySelectorAll(".season-tab").forEach((b) => b.classList.remove("active"));
+    document.querySelectorAll(".season-pane").forEach((p) => (p.hidden = true));
+    btn.classList.add("active");
+    const target = document.getElementById(`spane-${btn.getAttribute("data-stab")}`);
+    if (target) target.hidden = false;
+    GameAudio.uiTick();
   });
+});
 
-  worldSelect.addEventListener("change", () => {
-    activeWorldId = worldSelect.value;
-    Object.keys(draftLineups).forEach((k) => delete draftLineups[k]);
+document.querySelectorAll(".comp-pill").forEach((pill) => {
+  pill.addEventListener("click", () => {
+    document.querySelectorAll(".comp-pill").forEach((p) => p.classList.remove("active"));
+    pill.classList.add("active");
+    activeCompFilter = pill.getAttribute("data-comp");
+    GameAudio.uiTick();
     refreshWorldOverview();
   });
+});
 
-  squadClubSelect.addEventListener("change", () => {
-    squadSaveMsg.hidden = true;
-    renderSquadBuilder();
+document.getElementById("world-select").addEventListener("change", (ev) => {
+  activeWorldId = ev.currentTarget.value;
+  Object.keys(draftLineups).forEach((k) => delete draftLineups[k]);
+  refreshWorldOverview();
+});
+
+document.getElementById("btn-advance-cup").addEventListener("click", async () => {
+  const msg = document.getElementById("cup-divergence-msg");
+  const comps = (latestOverview && latestOverview.competitions) || [];
+  const cup = comps.find((c) => c.kind === "knockout");
+  const cupId = cup ? cup.id : DEFAULT_CUP_ID;
+  const res = await fetch(
+    `/api/worlds/${encodeURIComponent(activeWorldId)}/competitions/${encodeURIComponent(cupId)}/advance`,
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }
+  );
+  const out = await res.json();
+  msg.hidden = false;
+  msg.textContent = res.ok
+    ? out.diverged_from_real_world
+      ? `Parallel Divergence! Created Parallel-Only Final: ${out.final_fixture.home_club_id.toUpperCase()} vs ${out.final_fixture.away_club_id.toUpperCase()}`
+      : `Created Final: ${out.final_fixture.home_club_id.toUpperCase()} vs ${out.final_fixture.away_club_id.toUpperCase()}`
+    : out.detail || "Complete both Semi-Finals first!";
+  await refreshWorldOverview();
+});
+
+document.getElementById("btn-rollover-season").addEventListener("click", async () => {
+  const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/rollover`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ next_season_label: "2027/28" }),
   });
+  const out = await res.json();
+  const box = document.getElementById("rollover-msg");
+  box.hidden = false;
+  box.textContent = res.ok
+    ? `Season Completed! Awarded ${out.honours.length} honours & created next season (${out.next_world.season_label}).`
+    : out.detail || "Rollover failed";
+  await refreshWorldOverview();
+});
 
-  squadFormationSelect.addEventListener("change", () => {
-    const clubId = squadClubSelect.value;
-    const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[clubId];
-    if (!roster) return;
-    const draft = ensureClubDraft(roster);
-    draft.formation = squadFormationSelect.value;
-    draft.dirty = true;
-    renderSquadBuilder();
+document.getElementById("btn-propose-appt").addEventListener("click", async () => {
+  await fetch("/api/fixtures/fix-r3-mun-ars/appointments", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ proposed_by: "part-alex", proposed_at_utc: "2026-08-30T20:00:00Z" }),
   });
+  await refreshWorldOverview();
+});
 
-  btnResetLineupDefault.addEventListener("click", () => {
-    const clubId = squadClubSelect.value;
-    const roster = latestOverview && latestOverview.rosters && latestOverview.rosters[clubId];
-    if (!roster) return;
-    const defaults = roster.squad.filter((m) => m.default_starter_5v5).map((m) => m.footballer_id);
-    draftLineups[clubId] = {
-      starterIds: new Set(defaults),
-      formation: "1-2-1",
-      dirty: true,
-    };
-    squadSaveMsg.hidden = false;
-    squadSaveMsg.textContent = "Reset selection to club's default 5v5 starters — click Save to persist.";
-    renderSquadBuilder();
+document.getElementById("btn-test-gate").addEventListener("click", async () => {
+  const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/ingest/result`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ fixture_id: "fix-r3-mun-ars", home_goals: 1, away_goals: 4, events: [] }),
   });
+  const out = await res.json();
+  const box = document.getElementById("gate-msg");
+  box.hidden = false;
+  box.textContent = `Proposal Gate Decision: ${String(out.decision).toUpperCase()} (${out.reason})`;
+  await refreshWorldOverview();
+});
 
-  btnSaveLineup.addEventListener("click", async () => {
-    const clubId = squadClubSelect.value;
-    const ok = await persistSelectedClubLineup();
-    if (ok && !activeOfficialSession && (homeClubSelect.value === clubId || awayClubSelect.value === clubId)) {
-      await startExhibitionMatch();
-    }
+document.getElementById("btn-reset-world").addEventListener("click", async () => {
+  const res = await fetch(`/api/worlds/${encodeURIComponent(DEFAULT_WORLD_ID)}/reset-demo`, { method: "POST" });
+  const box = document.getElementById("gate-msg");
+  box.hidden = false;
+  if (!res.ok) {
+    box.textContent = "Demo reset is disabled in production mode.";
+    return;
+  }
+  activeWorldId = DEFAULT_WORLD_ID;
+  box.textContent = "Demo world reset to Round 3.";
+  await refreshWorldOverview();
+});
+
+document.getElementById("btn-season-back").addEventListener("click", () => {
+  GameAudio.uiTick(380);
+  navigateTo("menu");
+});
+
+// Controllers & Cartridge Screen Actions
+document.getElementById("cart-device-select").addEventListener("change", (ev) => {
+  const isAlex = ev.currentTarget.value.includes("alex");
+  document.getElementById("cart-title-display").textContent = isAlex
+    ? "ALEX · MANCHESTER UNITED"
+    : "SAM · ARSENAL";
+});
+
+document.getElementById("btn-sync-cartridge").addEventListener("click", async () => {
+  const [participantId, deviceId] = document.getElementById("cart-device-select").value.split("|");
+  const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/cartridge/sync`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      participant_id: participantId,
+      device_id: deviceId,
+      camera_preset: engine3d.cameraMode,
+    }),
   });
+  const out = await res.json();
+  const box = document.getElementById("cartridge-msg");
+  box.hidden = false;
+  if (!res.ok) {
+    box.textContent = out.detail || "Cartridge sync failed";
+    return;
+  }
+  latestSyncedEnvelope = out.envelope;
+  document.getElementById("btn-verify-cartridge").disabled = false;
+  document.getElementById("btn-download-cartridge").disabled = false;
+  document.getElementById("cart-rev-display").textContent =
+    `REV #${out.envelope.manifest.revision} · SEQ #${out.envelope.manifest.world.last_event_seq}`;
+  box.textContent = `Synced ${deviceId} (Rev #${out.envelope.manifest.revision}) with Ed25519/HMAC signature.`;
+  GameAudio.uiConfirm();
+});
 
-  btnPlayWithSquad.addEventListener("click", async () => {
-    const clubId = squadClubSelect.value;
-    const ok = await persistSelectedClubLineup();
-    if (!ok) return;
-    homeClubSelect.value = clubId;
-    if (awayClubSelect.value === clubId) {
-      awayClubSelect.value = clubId === "arsenal" ? "man-utd" : "arsenal";
-    }
-    formatSelect.value = "5v5";
-    await startExhibitionMatch();
-    window.scrollTo({ top: 0, behavior: "smooth" });
+document.getElementById("btn-verify-cartridge").addEventListener("click", async () => {
+  if (!latestSyncedEnvelope) return;
+  const res = await fetch("/api/cartridge/verify", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ envelope: latestSyncedEnvelope }),
   });
+  const out = await res.json();
+  const box = document.getElementById("cartridge-msg");
+  box.hidden = false;
+  box.textContent = `Verification: ${out.valid ? "AUTHENTIC CARTRIDGE" : "TAMPERED"} · Rev #${out.revision}`;
+});
 
-  btnExhibition.addEventListener("click", () => startExhibitionMatch());
-  homeClubSelect.addEventListener("change", () => {
-    if (!activeOfficialSession) startExhibitionMatch();
-  });
-  awayClubSelect.addEventListener("change", () => {
-    if (!activeOfficialSession) startExhibitionMatch();
-  });
-  formatSelect.addEventListener("change", () => {
-    if (!activeOfficialSession) startExhibitionMatch();
-  });
-  modeSelect.addEventListener("change", () => {
-    if (!activeOfficialSession) startExhibitionMatch();
-  });
+document.getElementById("btn-download-cartridge").addEventListener("click", () => {
+  if (!latestSyncedEnvelope) return;
+  const blob = new Blob([JSON.stringify(latestSyncedEnvelope, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `${latestSyncedEnvelope.manifest.device_id}.psfc.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+});
 
-  btnPause.addEventListener("click", () => {
-    paused = !paused;
-    btnPause.textContent = paused ? "Resume" : "Pause";
-  });
+document.getElementById("btn-ctrl-back").addEventListener("click", () => {
+  GameAudio.uiTick(380);
+  navigateTo("menu");
+});
 
-  btnInstantReplay.addEventListener("click", toggleInstantReplay);
+// Match HUD, Pause & Replay Buttons
+document.getElementById("btn-hud-cam").addEventListener("click", cycleMatchCamera);
+document.getElementById("btn-hud-replay").addEventListener("click", toggleInstantReplay);
+document.getElementById("btn-hud-pause").addEventListener("click", togglePauseModal);
 
-  btnSimRest.addEventListener("click", async () => {
-    if (!wasm) return;
-    wasm.sim_auto_step(90000);
-    drainAndRenderMatchEvents();
-    if (activeOfficialSession && !activeOfficialSession.completed) {
-      await submitOfficialSessionResult();
-    }
-  });
+document.getElementById("btn-pause-resume").addEventListener("click", togglePauseModal);
+document.getElementById("btn-pause-replay").addEventListener("click", toggleInstantReplay);
+document.getElementById("btn-pause-cam").addEventListener("click", cycleMatchCamera);
+document.getElementById("btn-pause-sim").addEventListener("click", () => {
+  if (!wasm) return;
+  paused = false;
+  document.getElementById("pause-modal").hidden = true;
+  wasm.sim_auto_step(90000);
+  const p = readPackedState();
+  drainLiveMatchEvents(p);
+  openFullTimeSummaryModal();
+});
+document.getElementById("btn-pause-quit").addEventListener("click", () => {
+  paused = false;
+  document.getElementById("pause-modal").hidden = true;
+  navigateTo(activeOfficialSession ? "season" : "menu");
+});
 
-  btnSubmitSession.addEventListener("click", submitOfficialSessionResult);
+document.getElementById("replay-scrub").addEventListener("input", (ev) => {
+  replayCursor = parseFloat(ev.currentTarget.value) || 0;
+});
+document.getElementById("btn-replay-cam").addEventListener("click", (ev) => {
+  replayCamIdx = (replayCamIdx + 1) % REPLAY_CAM_MODES.length;
+  ev.currentTarget.textContent = REPLAY_CAM_LABELS[REPLAY_CAM_MODES[replayCamIdx]];
+  GameAudio.uiTick();
+});
+document.getElementById("btn-replay-exit").addEventListener("click", exitInstantReplay);
 
-  // Advance Knockout Cup (`comp-facup-2026`)
-  document.getElementById("btn-advance-cup").addEventListener("click", async () => {
-    const msgBox = document.getElementById("cup-divergence-msg");
-    const comps = (latestOverview && latestOverview.competitions) || [];
-    const cup = comps.find((c) => c.kind === "knockout");
-    const cupId = cup ? cup.id : DEFAULT_CUP_ID;
+document.getElementById("btn-submit-session").addEventListener("click", submitOfficialSessionResult);
+document.getElementById("btn-ft-rematch").addEventListener("click", () => launchSelectedMatch());
+document.getElementById("btn-ft-hub").addEventListener("click", () => {
+  navigateTo(activeOfficialSession ? "season" : "menu");
+});
 
-    const res = await fetch(
-      `/api/worlds/${encodeURIComponent(activeWorldId)}/competitions/${encodeURIComponent(cupId)}/advance`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({}),
-      }
-    );
-    const out = await res.json();
-    msgBox.hidden = false;
-    if (!res.ok) {
-      msgBox.innerHTML = `<strong>Cup Advance Blocked:</strong> ${out.detail || "Play both Cup Semi-Finals first!"}`;
-      return;
-    }
-    const fx = out.final_fixture;
-    msgBox.innerHTML = out.diverged_from_real_world
-      ? `<strong>Parallel Divergence Detected!</strong> Real Final was <code>LIV vs ARS</code>, so generated Parallel-Only Final <code>${fx.home_club_id.toUpperCase()} vs ${fx.away_club_id.toUpperCase()}</code> (source: <code>${fx.result_source}</code>)!`
-      : `<strong>Real-World Alignment:</strong> Finalists match real football — created Final <code>${fx.home_club_id.toUpperCase()} vs ${fx.away_club_id.toUpperCase()}</code>.`;
-    await refreshWorldOverview();
-  });
+// --- Boot Sequence ---
 
-  // Season Honours & Rollover
-  document.getElementById("btn-rollover-season").addEventListener("click", async () => {
-    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/rollover`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ next_season_label: "2027/28" }),
-    });
-    const out = await res.json();
-    const box = document.getElementById("rollover-msg");
-    box.hidden = false;
-    if (!res.ok) {
-      box.textContent = out.detail || "Rollover error";
-      return;
-    }
-    box.innerHTML = `<strong>Season Completed &amp; Rolled Over!</strong> Awarded ${out.honours.length} honours · Created <code>${out.next_world.id}</code> (${out.next_world.season_label}) preserving club ownership!`;
-    await refreshWorldOverview();
-  });
+async function bootGame() {
+  updateGamepadBadges();
+  await refreshWorldOverview();
 
-  // Cartridge Sync / Verify / Download
-  document.getElementById("btn-sync-cartridge").addEventListener("click", async () => {
-    const [participantId, deviceId] = document.getElementById("cart-device-select").value.split("|");
-    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/cartridge/sync`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        participant_id: participantId,
-        device_id: deviceId,
-        camera_preset: "broadcast_5v5",
-      }),
-    });
-    const out = await res.json();
-    const box = document.getElementById("cartridge-msg");
-    box.hidden = false;
-    if (!res.ok) {
-      box.textContent = out.detail || "Cartridge sync error";
-      return;
-    }
-    latestSyncedEnvelope = out.envelope;
-    document.getElementById("btn-verify-cartridge").disabled = false;
-    document.getElementById("btn-download-cartridge").disabled = false;
-    const m = latestSyncedEnvelope.manifest;
-    box.innerHTML = `Issued <code>PSFC-CART-V1</code> Rev #${m.revision} for <code>${m.device_id}</code> · Seq #${m.world.last_event_seq} · HMAC <code>${latestSyncedEnvelope.signature.slice(0, 14)}…</code>`;
-    await refreshWorldOverview();
-  });
-
-  document.getElementById("btn-verify-cartridge").addEventListener("click", async () => {
-    if (!latestSyncedEnvelope) return;
-    const res = await fetch("/api/cartridge/verify", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ envelope: latestSyncedEnvelope }),
-    });
-    const out = await res.json();
-    const box = document.getElementById("cartridge-msg");
-    box.hidden = false;
-    box.innerHTML = `Host Verification: <strong>${out.valid ? "VALID SIGNATURE" : "INVALID"}</strong> · Rev #${out.revision} · Stale Cache: <code>${out.stale_cache}</code>`;
-  });
-
-  document.getElementById("btn-download-cartridge").addEventListener("click", () => {
-    if (!latestSyncedEnvelope) return;
-    const blob = new Blob([JSON.stringify(latestSyncedEnvelope, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${latestSyncedEnvelope.manifest.device_id}.psfc.json`;
-    a.click();
-    URL.revokeObjectURL(url);
-  });
-
-  // Kickoff Appointments
-  document.getElementById("btn-propose-appt").addEventListener("click", async () => {
-    await fetch("/api/fixtures/fix-r3-mun-ars/appointments", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        proposed_by: "part-alex",
-        proposed_at_utc: "2026-08-30T20:00:00Z",
-      }),
-    });
-    await refreshWorldOverview();
-  });
-
-  // Proposal Gate & Identity Queue testers
-  document.getElementById("btn-test-gate").addEventListener("click", async () => {
-    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/ingest/result`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        fixture_id: "fix-r3-mun-ars",
-        home_goals: 1,
-        away_goals: 4,
-        events: [{ event_type: "Goal", footballer_id: "ars-fwd-1", minute: 12 }],
-        provider: "external_live_wire",
-      }),
-    });
-    const out = await res.json();
-    const box = document.getElementById("gate-result-msg");
-    box.hidden = false;
-    box.innerHTML = `Proposal <code>${out.proposal_id}</code> → Decision: <strong>${out.decision.toUpperCase()}</strong> (Reason: <code>${out.reason}</code>). Parallel World history preserved!`;
-    await refreshWorldOverview();
-  });
-
-  document.getElementById("btn-test-id-queue").addEventListener("click", async () => {
-    const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/ingest/provider-fixture`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        provider: "football_data_v4",
-        external_fixture_id: "ext-fx-991",
-        external_home_club_id: "ext-club-unknown-999",
-        external_away_club_id: "ext-club-57",
-        home_goals: 0,
-        away_goals: 2,
-      }),
-    });
-    const out = await res.json();
-    const box = document.getElementById("gate-result-msg");
-    box.hidden = false;
-    box.innerHTML = `Provider Feed Status: <strong>${out.status}</strong> → Queued <code>${out.queue_item.id}</code> (${out.queue_item.display_hint}) without corrupting world state!`;
-    await refreshWorldOverview();
-  });
-
-  document.getElementById("btn-reset-world").addEventListener("click", async () => {
-    activeWorldId = DEFAULT_WORLD_ID;
-    Object.keys(draftLineups).forEach((k) => delete draftLineups[k]);
-    await fetch(`/api/worlds/${DEFAULT_WORLD_ID}/reset-demo`, { method: "POST" });
-    activeOfficialSession = null;
-    document.getElementById("cup-divergence-msg").hidden = true;
-    document.getElementById("rollover-msg").hidden = true;
-    squadSaveMsg.hidden = true;
-    await refreshWorldOverview();
-    await startExhibitionMatch();
-  });
-
-  // --- Boot WASM & World Overview ---
-
-  async function boot() {
-    updateConnectedGamepadBadge();
-    await refreshWorldOverview();
-    try {
-      const resp = await fetch("/wasm/psfc_wasm.wasm");
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-      const bytes = await resp.arrayBuffer();
-      const { instance } = await WebAssembly.instantiate(bytes, {});
-      wasm = instance.exports;
-      wasmPill.textContent = "WASM Sim: 60Hz Fixed-Point Ready";
-      await startExhibitionMatch();
-      requestAnimationFrame(frameLoop);
-    } catch (err) {
-      wasmPill.textContent = `WASM Error: ${err.message}`;
-      console.error(err);
-    }
+  const titlePill = document.getElementById("title-engine-pill");
+  try {
+    const resp = await fetch("/wasm/psfc_wasm.wasm");
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const bytes = await resp.arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(bytes, {});
+    wasm = instance.exports;
+    titlePill.textContent = "3D FLOODLIT STADIUM · 60HZ ENGINE READY";
+    await startAttractBackgroundMatch();
+  } catch (err) {
+    titlePill.textContent = `ENGINE LOAD ERROR: ${err.message}`;
   }
 
-  boot();
-})();
+  requestAnimationFrame(mainLoop);
+}
+
+bootGame();

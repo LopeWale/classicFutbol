@@ -370,8 +370,21 @@ class ClubCatalogue:
             except KeyError:
                 break
         cat = ClubCatalogue()
-        for wid in reversed(lineage):
-            cat.replay_transfer_events(store.list_events(wid))
+        ordered = list(reversed(lineage))
+        for idx, wid in enumerate(ordered):
+            events = store.list_events(wid)
+            if idx + 1 < len(ordered):
+                child_wid = ordered[idx + 1]
+                bounded: list[dict[str, Any]] = []
+                for ev in events:
+                    bounded.append(ev)
+                    if (
+                        ev.get("type") == "season_rolled_over"
+                        and (ev.get("payload") or {}).get("next_world_id") == child_wid
+                    ):
+                        break
+                events = bounded
+            cat.replay_transfer_events(events)
         return cat
 
     def resolve_saved_5v5_selection(
