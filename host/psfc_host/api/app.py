@@ -494,36 +494,18 @@ def create_app(
         if req.away_club_id not in cat.clubs:
             raise HTTPException(status_code=404, detail=f"Unknown club '{req.away_club_id}'")
 
-        saved_home = (
-            store.get_club_lineup_5v5(req.world_id, req.home_club_id)
-            if req.world_id
-            else None
+        saved_home_ids, saved_home_fmt = cat.resolve_saved_5v5_selection(
+            req.home_club_id,
+            store.get_club_lineup_5v5(req.world_id, req.home_club_id) if req.world_id else None,
         )
-        saved_away = (
-            store.get_club_lineup_5v5(req.world_id, req.away_club_id)
-            if req.world_id
-            else None
+        saved_away_ids, saved_away_fmt = cat.resolve_saved_5v5_selection(
+            req.away_club_id,
+            store.get_club_lineup_5v5(req.world_id, req.away_club_id) if req.world_id else None,
         )
-        eff_home_starters = (
-            req.home_starters
-            if req.home_starters is not None
-            else (saved_home["starter_ids"] if saved_home else None)
-        )
-        eff_away_starters = (
-            req.away_starters
-            if req.away_starters is not None
-            else (saved_away["starter_ids"] if saved_away else None)
-        )
-        eff_home_fmt = (
-            req.home_formation
-            if req.home_formation is not None
-            else (saved_home["formation_5v5"] if saved_home else None)
-        )
-        eff_away_fmt = (
-            req.away_formation
-            if req.away_formation is not None
-            else (saved_away["formation_5v5"] if saved_away else None)
-        )
+        eff_home_starters = req.home_starters if req.home_starters is not None else saved_home_ids
+        eff_away_starters = req.away_starters if req.away_starters is not None else saved_away_ids
+        eff_home_fmt = req.home_formation if req.home_formation is not None else saved_home_fmt
+        eff_away_fmt = req.away_formation if req.away_formation is not None else saved_away_fmt
         chosen_seed = req.seed if req.seed is not None else 20_261_119
         try:
             snapshot = cat.build_fixture_snapshot(

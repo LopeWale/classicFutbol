@@ -146,31 +146,21 @@ class MatchSessionService:
                     else {"kind": "Cpu", "difficulty": "Normal"}
                 )
 
-        # Resolve saved per-world 5v5 lineups unless caller explicitly supplied per-match overrides
-        saved_home = self.store.get_club_lineup_5v5(world_id, fx["home_club_id"])
-        saved_away = self.store.get_club_lineup_5v5(world_id, fx["away_club_id"])
-        eff_home_starters = (
-            home_starters
-            if home_starters is not None
-            else (saved_home["starter_ids"] if saved_home else None)
-        )
-        eff_away_starters = (
-            away_starters
-            if away_starters is not None
-            else (saved_away["starter_ids"] if saved_away else None)
-        )
-        eff_home_fmt = (
-            home_formation
-            if home_formation is not None
-            else (saved_home["formation_5v5"] if saved_home else None)
-        )
-        eff_away_fmt = (
-            away_formation
-            if away_formation is not None
-            else (saved_away["formation_5v5"] if saved_away else None)
-        )
-
+        # Resolve saved per-world 5v5 lineups unless caller explicitly supplied per-match overrides.
+        # Saved lineups are re-checked against the *current* squad: if a saved starter has since
+        # transferred away we fall back to club defaults (as the squad endpoint displays) instead
+        # of blocking the match. Explicit overrides are still strictly validated downstream.
         world_cat = self.catalogue.for_world(self.store, world_id)
+        saved_home_ids, saved_home_fmt = world_cat.resolve_saved_5v5_selection(
+            fx["home_club_id"], self.store.get_club_lineup_5v5(world_id, fx["home_club_id"])
+        )
+        saved_away_ids, saved_away_fmt = world_cat.resolve_saved_5v5_selection(
+            fx["away_club_id"], self.store.get_club_lineup_5v5(world_id, fx["away_club_id"])
+        )
+        eff_home_starters = home_starters if home_starters is not None else saved_home_ids
+        eff_away_starters = away_starters if away_starters is not None else saved_away_ids
+        eff_home_fmt = home_formation if home_formation is not None else saved_home_fmt
+        eff_away_fmt = away_formation if away_formation is not None else saved_away_fmt
         chosen_seed = seed if seed is not None else _deterministic_seed_for_fixture(fixture_id)
         snapshot = (
             existing_snap["snapshot"]

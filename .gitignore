@@ -13,6 +13,8 @@
 
 # WebAssembly & generated web artifacts
 /host/psfc_host/web/static/wasm/*.wasm
+# Prebuilt browser client is committed so serverless deploys (Vercel) can serve it
+!/host/psfc_host/web/static/wasm/psfc_wasm.wasm
 
 # Python
 __pycache__/
