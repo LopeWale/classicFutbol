@@ -677,6 +677,12 @@ function decodeWebHidReport(vPad, bytes) {
     vPad._restBytes = new Uint8Array(bytes);
     vPad._axisBytes = new Set();
     vPad._pendingAxisBytes = new Set();
+    vPad._constCenterBytes = new Set();
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+        vPad._constCenterBytes.add(i);
+      }
+    }
     if (bytes.length >= 2) {
       for (let i = 0; i <= maxAxisIdx; i++) {
         if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
@@ -715,6 +721,11 @@ function decodeWebHidReport(vPad, bytes) {
       }
     }
   } else {
+    for (let i = 0; i < bytes.length; i++) {
+      if (!(bytes[i] >= 0x70 && bytes[i] <= 0x8f)) {
+        vPad._constCenterBytes.delete(i);
+      }
+    }
     if (vPad._isDragonRiseFormat) {
       for (let i = 5; i < bytes.length; i++) {
         vPad._axisBytes.delete(i);
@@ -841,10 +852,10 @@ function decodeWebHidReport(vPad, bytes) {
       setBtn(9, (b6 & 0x08) !== 0);
     }
   } else {
-    // Generic fallback: decode all non-axis bytes from byte 0 onward
+    // Generic fallback: decode all non-axis, non-constant-centered-padding bytes from byte 0 onward
     const activeBits = [];
     for (let bi = 0; bi < bytes.length; bi++) {
-      if (vPad._axisBytes.has(bi)) continue;
+      if (vPad._axisBytes.has(bi) || vPad._constCenterBytes.has(bi)) continue;
       if (bi < rest.length) {
         // Clear any bit that was held on packet 0 as soon as 0 is observed in that bit
         rest[bi] &= bytes[bi];
@@ -900,6 +911,7 @@ async function pairWebHidUsbReceiver() {
         existing._restBytes = null;
         existing._axisBytes = null;
         existing._pendingAxisBytes = null;
+        existing._constCenterBytes = null;
         continue;
       }
       if (!dev.opened) await dev.open();
@@ -918,6 +930,7 @@ async function pairWebHidUsbReceiver() {
         _restBytes: null,
         _axisBytes: null,
         _pendingAxisBytes: null,
+        _constCenterBytes: null,
         _isDragonRiseFormat: false,
         _uses10BtnMeta: false,
       };
