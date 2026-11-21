@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from psfc_host.catalogue.clubs import ClubCatalogue
@@ -458,6 +459,18 @@ def _fixture_id(rnd: int, home: str, away: str) -> str:
     return f"fix-mw{rnd}-{_CLUB_SLUG[home]}-{_CLUB_SLUG[away]}"
 
 
+def _playing_window_for_kickoff(kickoff_utc: str, *, grace_days: int = 14) -> tuple[str, str]:
+    """Derive `[window_open_utc, window_close_utc]` from scheduled `kickoff_utc` so future 2027 ties stay open through their matchweek."""
+    ko_dt = datetime.fromisoformat(kickoff_utc.replace("Z", "+00:00")).astimezone(timezone.utc)
+    season_anchor = datetime(2026, 11, 21, 0, 0, 0, tzinfo=timezone.utc)
+    open_dt = min(ko_dt - timedelta(days=7), season_anchor)
+    close_dt = (ko_dt + timedelta(days=grace_days)).replace(hour=23, minute=59, second=59)
+    return (
+        open_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        close_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+    )
+
+
 def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
     worlds = store.list_worlds()
     existing = next((w for w in worlds if w["id"] == DEFAULT_WORLD_ID), None)
@@ -505,6 +518,7 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
         # 1. Create & ingest all 107 completed 2026–27 Premier League matches (MW 1 through Sat 21 Nov 2026 MW 11)
         for rnd, home, away, ko, hg, ag in COMPLETED_2026_27_RESULTS:
             fid = _fixture_id(rnd, home, away)
+            win_open, win_close = _playing_window_for_kickoff(ko)
             store.create_fixture(
                 fixture_id=fid,
                 world_id=DEFAULT_WORLD_ID,
@@ -514,8 +528,8 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
                 home_club_id=home,
                 away_club_id=away,
                 kickoff_utc=ko,
-                window_open_utc="2026-08-21T00:00:00Z",
-                window_close_utc="2026-12-31T23:59:59Z",
+                window_open_utc=win_open,
+                window_close_utc=win_close,
                 result_source="imported",
                 state="open",
                 extra_time_enabled=False,
@@ -532,6 +546,7 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
 
         # 2. Create open upcoming Matchweek 11 (Sun/Mon 22–23 Nov), Matchweek 12 (27–29 Nov), & featured winter fixtures
         for fid, rnd, home, away, ko in UPCOMING_2026_27_FIXTURES:
+            win_open, win_close = _playing_window_for_kickoff(ko)
             store.create_fixture(
                 fixture_id=fid,
                 world_id=DEFAULT_WORLD_ID,
@@ -541,8 +556,8 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
                 home_club_id=home,
                 away_club_id=away,
                 kickoff_utc=ko,
-                window_open_utc="2026-11-21T00:00:00Z",
-                window_close_utc="2026-12-31T23:59:59Z",
+                window_open_utc=win_open,
+                window_close_utc=win_close,
                 result_source="imported",
                 state="open",
                 extra_time_enabled=False,
@@ -556,6 +571,7 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
             ("fix-cup-sf2-ars-che", 1, "arsenal", "chelsea", "2027-04-19T16:30:00Z", 2, 1),
         ]
         for fid, rnd, home, away, ko, rhg, rag in cup_semis_spec:
+            win_open, win_close = _playing_window_for_kickoff(ko)
             store.create_fixture(
                 fixture_id=fid,
                 world_id=DEFAULT_WORLD_ID,
@@ -565,8 +581,8 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
                 home_club_id=home,
                 away_club_id=away,
                 kickoff_utc=ko,
-                window_open_utc="2026-11-21T00:00:00Z",
-                window_close_utc="2026-12-31T23:59:59Z",
+                window_open_utc=win_open,
+                window_close_utc=win_close,
                 result_source="imported",
                 state="open",
                 extra_time_enabled=True,

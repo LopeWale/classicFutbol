@@ -259,14 +259,43 @@ def test_overdue_playing_window_transitions_to_awaiting_admin_never_real_score()
     app = create_app(db_path=":memory:", seed_demo=True)
     client = TestClient(app)
 
+    # 1. On 1 Jan 2027, overdue Nov 2026 ties expire, while Jan/Feb 2027 league ties & Apr 2027 Cup SFs stay open & playable!
+    r_jan = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
+        json={"as_of_utc": "2027-01-01T00:00:00Z"},
+    )
+    assert r_jan.status_code == 200
+    jan_transitioned = {f["id"] for f in r_jan.json()["transitioned"]}
+    assert "fix-mw11-liv-mun" in jan_transitioned
+    assert "fix-mw12-mun-bre" in jan_transitioned
+    for future_id in (
+        "fix-mw16-ars-mun",
+        "fix-mw23-mun-liv",
+        "fix-mw27-mun-ars",
+        "fix-cup-sf1-mun-liv",
+        "fix-cup-sf2-ars-che",
+    ):
+        assert future_id not in jan_transitioned
+
+    # Verify Jan 2027 & Apr 2027 fixtures remain open and accept official sessions in 2027
+    by_id_jan = {
+        f["id"]: f
+        for f in client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/fixtures").json()["fixtures"]
+    }
+    assert by_id_jan["fix-mw23-mun-liv"]["state"] == "open"
+    assert by_id_jan["fix-mw27-mun-ars"]["state"] == "open"
+    assert by_id_jan["fix-cup-sf1-mun-liv"]["state"] == "open"
+
+    # 2. After mid-March 2027 (`2027-03-20`), unplayed Jan & Feb 2027 league ties expire to `awaiting_admin` without substituting real scores, while Apr Cup SFs stay open!
     r_exp = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
-        json={"as_of_utc": "2027-02-01T00:00:00Z"},
+        json={"as_of_utc": "2027-03-20T00:00:00Z"},
     )
     assert r_exp.status_code == 200
     transitioned_ids = {f["id"] for f in r_exp.json()["transitioned"]}
     assert "fix-mw27-mun-ars" in transitioned_ids
     assert "fix-mw23-mun-liv" in transitioned_ids
+    assert "fix-cup-sf1-mun-liv" not in transitioned_ids
 
     fx_mw27 = next(
         f
@@ -823,13 +852,13 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
     assert r_unfin.status_code == 422
     assert "FullTime" in r_unfin.json()["detail"]
 
-    # Expiring overdue window transitions `fix-mw27-mun-ars` to `awaiting_admin` -> `open_session` MUST reject (`409`)!
+    # Expiring overdue window on 10 Jan 2027 transitions Dec 2026 `fix-mw16-ars-mun` to `awaiting_admin` -> `open_session` MUST reject (`409`)!
     cm.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
         json={"as_of_utc": "2027-01-10T00:00:00Z"},
     )
     r_blocked = cm.post(
-        "/api/fixtures/fix-mw27-mun-ars/sessions",
+        "/api/fixtures/fix-mw16-ars-mun/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5"},
     )
     assert r_blocked.status_code == 409

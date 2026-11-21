@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import hashlib
 import math
 import random
@@ -135,6 +136,12 @@ class CompetitionEngine:
             caused_by=actor_id,
         )
 
+        latest_sf_ko = max(str(sf["kickoff_utc"]) for sf in semis)
+        sf_dt = datetime.fromisoformat(latest_sf_ko.replace("Z", "+00:00")).astimezone(timezone.utc)
+        final_ko_dt = (sf_dt + timedelta(days=26)).replace(hour=16, minute=30, second=0)
+        final_close_dt = (final_ko_dt + timedelta(days=14)).replace(hour=23, minute=59, second=59)
+        final_open_utc = min(str(sf["window_open_utc"]) for sf in semis)
+
         final_fx = self.store.create_fixture(
             fixture_id=final_id,
             world_id=world_id,
@@ -143,9 +150,9 @@ class CompetitionEngine:
             round_no=max(int(sf["round"]) for sf in semis) + 1,
             home_club_id=home_finalist,
             away_club_id=away_finalist,
-            kickoff_utc="2026-10-18T16:30:00Z",
-            window_open_utc="2026-08-01T00:00:00Z",
-            window_close_utc="2026-12-31T23:59:59Z",
+            kickoff_utc=final_ko_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            window_open_utc=final_open_utc,
+            window_close_utc=final_close_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             result_source=result_source,
             state="open",
             extra_time_enabled=True,
