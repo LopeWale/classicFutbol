@@ -569,13 +569,18 @@ function doesBrowserPadMatchWebHid(browserPad, vPad) {
       return true;
     }
   }
-  return bpName === "standard gamepad" || bpName === "gamepad" || bpName === "unknown gamepad";
+  return false;
 }
 
 /**
  * Collect all connected browser Gamepads (safely skipping sparse `null` slots on macOS/Safari/Chrome)
- * and reconcile any WebHID direct USB receiver pads 1-for-1 so a receiver exposed by both APIs
- * is never counted twice.
+ * and reconcile WebHID direct USB receiver pads by model group so:
+ * - A single physical receiver exposed by both APIs (`M=1, K=1`) or full paired set (`K >= M`) replaces
+ *   the matching browser slots 1-for-1 without duplicating controllers.
+ * - Multiple WebHID-only receivers (`M=0, K>=1`) are all preserved.
+ * - When `navigator.getGamepads()` already exposes more identical controllers than were paired via
+ *   WebHID (`K < M`, e.g. 2 browser pads and 1 WebHID handle with indistinguishable VID:PID), we keep
+ *   the browser Gamepad entries intact rather than guessing which physical slot to replace.
  */
 function getConnectedPads() {
   const browserPads = [];
@@ -598,54 +603,104 @@ function getConnectedPads() {
   }
   if (activeWebHid.length === 0) return browserPads;
 
-  const out = browserPads.slice();
-  const browserCount = browserPads.length;
-  const replacedSlots = new Set();
+  const groups = new Map();
   for (let i = 0; i < activeWebHid.length; i++) {
     const vPad = activeWebHid[i];
-    let matchedIdx = -1;
+    const gKey =
+      vPad._vidPid && vPad._vidPid !== "0000:0000"
+        ? `vp:${vPad._vidPid}`
+        : vPad._prodName && vPad._prodName.length >= 3
+          ? `nm:${vPad._prodName}`
+          : `id:${vPad.index}`;
+    let list = groups.get(gKey);
+    if (!list) {
+      list = [];
+      groups.set(gKey, list);
+    }
+    list.push(vPad);
+  }
+
+  const out = browserPads.slice();
+  const browserCount = browserPads.length;
+  const claimedBrowserSlots = new Set();
+
+  for (const hidGroup of groups.values()) {
+    const rep = hidGroup[0];
+    const matchingSlots = [];
     for (let j = 0; j < browserCount; j++) {
-      if (!replacedSlots.has(j) && !out[j]._isWebHid && doesBrowserPadMatchWebHid(out[j], vPad)) {
-        matchedIdx = j;
-        break;
+      if (!claimedBrowserSlots.has(j) && !out[j]._isWebHid && doesBrowserPadMatchWebHid(out[j], rep)) {
+        matchingSlots.push(j);
       }
     }
-    if (matchedIdx >= 0) {
-      out[matchedIdx] = vPad;
-      replacedSlots.add(matchedIdx);
-    } else {
-      out.push(vPad);
+    for (let s = 0; s < matchingSlots.length; s++) {
+      claimedBrowserSlots.add(matchingSlots[s]);
     }
+    if (hidGroup.length >= matchingSlots.length) {
+      for (let m = 0; m < matchingSlots.length; m++) {
+        out[matchingSlots[m]] = hidGroup[m];
+      }
+      for (let m = matchingSlots.length; m < hidGroup.length; m++) {
+        out.push(hidGroup[m]);
+      }
+    }
+    // Otherwise (`hidGroup.length < matchingSlots.length`): keep all `matchingSlots` on the
+    // Gamepad API backend so we never replace the wrong physical controller or duplicate one.
   }
   return out;
 }
 
 function decodeWebHidReport(vPad, bytes) {
   if (!bytes || bytes.length === 0) return;
-  if (!vPad._restBytes) {
-    vPad._restBytes = new Uint8Array(bytes);
-    vPad._drAxisBytes = new Set();
-    vPad._constCenterBytes = new Set();
-    for (let i = 2; i < bytes.length - 1; i++) {
-      if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
-        vPad._constCenterBytes.add(i);
-      }
-    }
-  }
-  const rest = vPad._restBytes;
-  for (let i = 0; i < bytes.length; i++) {
-    if (i <= 4 && bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
-      vPad._drAxisBytes.add(i);
-    }
-    if (!(bytes[i] >= 0x70 && bytes[i] <= 0x8f)) {
-      vPad._constCenterBytes.delete(i);
-    }
-  }
-
   if (bytes.length >= 7 && (bytes[5] & 0x0f) === 0x0f) {
     vPad._isDragonRiseFormat = true;
   }
+
+  if (!vPad._restBytes) {
+    vPad._restBytes = new Uint8Array(bytes);
+    vPad._axisBytes = new Set();
+    const axisLimit = vPad._isDragonRiseFormat ? Math.min(5, bytes.length - 1) : bytes.length - 1;
+    for (let i = 0; i < axisLimit; i++) {
+      const bVal = bytes[i];
+      const isCenter = bVal >= 0x70 && bVal <= 0x8f;
+      const isPrimaryDeflected = i <= 1 && bytes.length >= 3 && (bVal === 0x00 || bVal === 0xff);
+      if (isCenter || isPrimaryDeflected) {
+        vPad._axisBytes.add(i);
+      }
+    }
+  } else if (vPad._isDragonRiseFormat) {
+    for (let i = 5; i < bytes.length; i++) {
+      vPad._axisBytes.delete(i);
+    }
+    for (let i = 0; i <= 4 && i < bytes.length; i++) {
+      if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+        vPad._axisBytes.add(i);
+      }
+    }
+  }
+
+  const rest = vPad._restBytes;
   const isDragonRise = bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f);
+
+  // Detect X/Y D-Pad byte pair across standard & alternate HID axis offsets (`[0,1]`, `[3,4]`, `[2,3]`, `[1,2]`)
+  let axX = 0;
+  let axY = 0;
+  const candidatePairs = [
+    [0, 1],
+    [3, 4],
+    [2, 3],
+    [1, 2],
+  ];
+  for (const [ix, iy] of candidatePairs) {
+    if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
+      const vx = (bytes[ix] - 127.5) / 127.5;
+      const vy = (bytes[iy] - 127.5) / 127.5;
+      if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
+        axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
+        axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
+        if (axX !== 0 || axY !== 0) break;
+      }
+    }
+  }
 
   // Clear button states
   for (let i = 0; i < vPad.buttons.length; i++) {
@@ -653,35 +708,8 @@ function decodeWebHidReport(vPad, bytes) {
     vPad.buttons[i].value = 0;
   }
 
-  let axX = 0;
-  let axY = 0;
-
   // Standard DragonRise / Microntek USB SNES (`byte[5]` upper nibble = buttons 0..3, lower nibble = hat; `byte[6]` = L, R, Select, Start)
   if (isDragonRise) {
-    const candidatePairs = [
-      [0, 1],
-      [3, 4],
-      [2, 3],
-      [1, 2],
-    ];
-    const isDrAxisByte = (idx) =>
-      idx <= 4 &&
-      (vPad._drAxisBytes.has(idx) ||
-        (bytes[idx] >= 0x70 && bytes[idx] <= 0x8f) ||
-        ((idx === 0 || idx === 1) && (bytes[idx] === 0x00 || bytes[idx] === 0xff)));
-
-    for (const [ix, iy] of candidatePairs) {
-      if (iy < bytes.length && isDrAxisByte(ix) && isDrAxisByte(iy)) {
-        const vx = (bytes[ix] - 127.5) / 127.5;
-        const vy = (bytes[iy] - 127.5) / 127.5;
-        if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
-          axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
-          axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
-          if (axX !== 0 || axY !== 0) break;
-        }
-      }
-    }
-
     const b5 = bytes[5];
     const b6 = bytes[6];
     for (let k = 0; k < 4; k++) {
@@ -726,18 +754,15 @@ function decodeWebHidReport(vPad, bytes) {
       setBtn(9, (b6 & 0x08) !== 0);
     }
   } else {
-    // Generic fallback: bytes 0,1 are X/Y axes (when >= 3 bytes); trailing non-padding bytes are buttons
-    const btnStartIdx = bytes.length >= 3 ? 2 : 0;
-    if (bytes.length >= 3) {
-      const vx = (bytes[0] - 127.5) / 127.5;
-      const vy = (bytes[1] - 127.5) / 127.5;
-      axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
-      axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
+    // Generic fallback: exclude identified axis bytes (and any leading report header byte before the first axis)
+    let minAxisIdx = Infinity;
+    for (const ai of vPad._axisBytes) {
+      if (ai < minAxisIdx) minAxisIdx = ai;
     }
-
+    const startIdx = minAxisIdx === Infinity ? 0 : minAxisIdx + 1;
     const activeBits = [];
-    for (let bi = btnStartIdx; bi < bytes.length; bi++) {
-      if (vPad._constCenterBytes.has(bi)) continue;
+    for (let bi = startIdx; bi < bytes.length; bi++) {
+      if (vPad._axisBytes.has(bi)) continue;
       if (bi < rest.length) {
         // Clear any bit that was held on packet 0 as soon as 0 is observed in that bit
         rest[bi] &= bytes[bi];
@@ -791,8 +816,7 @@ async function pairWebHidUsbReceiver() {
         if (!dev.opened) await dev.open();
         existing.connected = true;
         existing._restBytes = null;
-        existing._drAxisBytes = null;
-        existing._constCenterBytes = null;
+        existing._axisBytes = null;
         continue;
       }
       if (!dev.opened) await dev.open();
@@ -809,8 +833,7 @@ async function pairWebHidUsbReceiver() {
         _vidPid: vidPid,
         _prodName: String(dev.productName || "").trim().toLowerCase(),
         _restBytes: null,
-        _drAxisBytes: null,
-        _constCenterBytes: null,
+        _axisBytes: null,
         _isDragonRiseFormat: false,
         _uses10BtnMeta: false,
       };
