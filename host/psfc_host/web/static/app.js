@@ -544,27 +544,72 @@ function classifyGamepadVendor(idStr, btnCount = 16) {
   return "USB / BT GAMEPAD";
 }
 
+function extractGamepadVidPid(idStr) {
+  const s = String(idStr || "").toLowerCase();
+  let m = s.match(/vendor:\s*([0-9a-f]{1,4})\s+product:\s*([0-9a-f]{1,4})/);
+  if (m) return `${m[1].padStart(4, "0")}:${m[2].padStart(4, "0")}`;
+  m = s.match(/\b([0-9a-f]{4})[:\-]([0-9a-f]{4})\b/);
+  if (m) return `${m[1]}:${m[2]}`;
+  return null;
+}
+
+function doesBrowserPadMatchWebHid(browserPad, vPad) {
+  const bpVidPid = extractGamepadVidPid(browserPad.id);
+  if (bpVidPid && vPad._vidPid && vPad._vidPid !== "0000:0000") {
+    return bpVidPid === vPad._vidPid;
+  }
+  const bpName = String(browserPad.id || "").trim().toLowerCase();
+  if (vPad._prodName && vPad._prodName.length >= 3) {
+    if (bpName.includes(vPad._prodName) || (bpName.length >= 3 && vPad._prodName.includes(bpName))) {
+      return true;
+    }
+  }
+  return bpName === "standard gamepad" || bpName === "gamepad" || bpName === "unknown gamepad";
+}
+
 /**
  * Collect all connected browser Gamepads (safely skipping sparse `null` slots on macOS/Safari/Chrome)
- * plus any WebHID direct USB receiver pads.
+ * and reconcile any WebHID direct USB receiver pads 1-for-1 so a receiver exposed by both APIs
+ * is never counted twice.
  */
 function getConnectedPads() {
-  const out = [];
+  const browserPads = [];
   if (navigator.getGamepads) {
     try {
       const rawList = navigator.getGamepads();
       if (rawList) {
         for (let i = 0; i < rawList.length; i++) {
           const p = rawList[i];
-          if (p && p.connected) out.push(p);
+          if (p && p.connected) browserPads.push(p);
         }
       }
     } catch (_e) {
       // Ignore transient Gamepad API access error
     }
   }
+  const activeWebHid = [];
   for (let i = 0; i < webHidPads.length; i++) {
-    if (webHidPads[i].connected) out.push(webHidPads[i]);
+    if (webHidPads[i].connected) activeWebHid.push(webHidPads[i]);
+  }
+  if (activeWebHid.length === 0) return browserPads;
+
+  const out = browserPads.slice();
+  const replacedSlots = new Set();
+  for (let i = 0; i < activeWebHid.length; i++) {
+    const vPad = activeWebHid[i];
+    let matchedIdx = -1;
+    for (let j = 0; j < out.length; j++) {
+      if (!replacedSlots.has(j) && doesBrowserPadMatchWebHid(out[j], vPad)) {
+        matchedIdx = j;
+        break;
+      }
+    }
+    if (matchedIdx >= 0) {
+      out[matchedIdx] = vPad;
+      replacedSlots.add(matchedIdx);
+    } else {
+      out.push(vPad);
+    }
   }
   return out;
 }
@@ -716,8 +761,9 @@ async function pairWebHidUsbReceiver() {
     for (const dev of devices) {
       if (webHidPads.some((p) => p._dev === dev)) continue;
       if (!dev.opened) await dev.open();
+      const vidPid = `${hex4(dev.vendorId)}:${hex4(dev.productId)}`;
       const vPad = {
-        id: `${dev.productName || "USB SNES Receiver"} (${hex4(dev.vendorId)}:${hex4(dev.productId)})`,
+        id: `${dev.productName || "USB SNES Receiver"} (${vidPid})`,
         index: 100 + webHidPads.length,
         connected: true,
         mapping: "",
@@ -725,6 +771,8 @@ async function pairWebHidUsbReceiver() {
         buttons: Array.from({ length: 10 }, () => ({ pressed: false, value: 0 })),
         _dev: dev,
         _isWebHid: true,
+        _vidPid: vidPid,
+        _prodName: String(dev.productName || "").trim().toLowerCase(),
         _restBytes: null,
         _centeredBytes: null,
         _isDragonRiseFormat: false,
@@ -1060,7 +1108,7 @@ function sampleRawGamepad(logicalSlot) {
     profile === "snes_std" ||
     (profile === "auto" && snesDetected && pad.mapping === "standard");
   const isSnesMode = isSnesUsb || isSnesStd || (useCustom && snesDetected);
-  const isSwitchSwap = profile === "switch" || isSnesStd;
+  const isSwitchSwap = profile === "switch";
   const isDirectInput =
     profile === "dinput" ||
     (profile === "auto" &&
@@ -1181,18 +1229,30 @@ function sampleRawGamepad(logicalSlot) {
       r2 = btnCount >= 10 && b(7);
       selectBtn = b(8) || (btnCount <= 9 && b(6));
       startBtn = b(9) || (btnCount <= 9 && b(7));
-    } else if (isSwitchSwap) {
-      // Physical Nintendo/SNES label match: Bottom `B` = Pass (`b(0)`), Right `A` = Shoot (`b(1)`), Left `Y` = Lob (`b(2)`), Top `X` = Through (`b(3)`)
+    } else if (isSnesStd) {
+      // W3C Standard-Mapped Bluetooth SNES (`057e:2017` / SN30): Positional Bottom `B` = Pass (`b(0)`), Right `A` = Shoot (`b(1)`), Left `Y` = Lob (`b(2)`), Top `X` = Through (`b(3)`)
       south = b(0);
       east = b(1);
       west = b(2);
       north = b(3);
       l1 = b(4);
       r1 = b(5);
-      l2 = !isSnesMode && trig(6);
-      r2 = !isSnesMode && trig(7);
-      selectBtn = b(8) || (isSnesMode && btnCount <= 9 && b(6));
-      startBtn = b(9) || (isSnesMode && btnCount <= 9 && b(7));
+      l2 = false;
+      r2 = false;
+      selectBtn = b(8) || (btnCount <= 9 && b(6));
+      startBtn = b(9) || (btnCount <= 9 && b(7));
+    } else if (isSwitchSwap) {
+      // Explicit Nintendo Switch Pro ("Swap A-B / X-Y"): swap 0<->1 and 2<->3
+      south = b(1);
+      east = b(0);
+      west = b(3);
+      north = b(2);
+      l1 = b(4);
+      r1 = b(5);
+      l2 = trig(6);
+      r2 = trig(7);
+      selectBtn = b(8);
+      startBtn = b(9);
     } else if (isDirectInput) {
       south = b(1);
       east = b(2);
