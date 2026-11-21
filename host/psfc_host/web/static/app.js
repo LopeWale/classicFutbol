@@ -703,16 +703,16 @@ function decodeWebHidReport(vPad, bytes) {
     return false;
   };
 
-  // Confirm any candidate X/Y pair (including overlapping pairs such as [1,2] behind centered byte 0)
-  // once both bytes have been observed in the neutral center range (even across separate reports while
-  // rotating a held D-pad, or 0xff + center on packet 0), while preserving at least one button byte
-  // whenever an earlier pair is already confirmed.
+  // Confirm any candidate X/Y pair once both bytes have been observed in the neutral center range
+  // (including disjoint trailing pairs that consume the entire report such as [128,128,128,128] and
+  // packet-0 overlapping pairs such as [128,128,128,0]), while blocking post-packet-0 overlapping
+  // expansion (e.g. [1,2] after [0,1] when a button byte hits 0x80).
   for (const [ix, iy] of candidatePairs) {
     if (iy >= bytes.length) continue;
     if (vPad._isDragonRiseFormat && iy >= 5) continue;
     if (vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) continue;
-    const newBytesNeeded = (vPad._axisBytes.has(ix) ? 0 : 1) + (vPad._axisBytes.has(iy) ? 0 : 1);
-    if (hasAnyConfirmedPair() && vPad._axisBytes.size + newBytesNeeded >= bytes.length) continue;
+    const isOverlapping = vPad._axisBytes.has(ix) || vPad._axisBytes.has(iy);
+    if (!isFirstPacket && isOverlapping && hasAnyConfirmedPair()) continue;
 
     const bothSawCenter = vPad._sawCenterBytes.has(ix) && vPad._sawCenterBytes.has(iy);
     const pkt0HighDeflect =
