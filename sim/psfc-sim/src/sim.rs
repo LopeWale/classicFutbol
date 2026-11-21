@@ -224,8 +224,8 @@ impl MatchSimulation {
         match self.state.phase {
             MatchPhase::GoalScored {
                 scoring_team,
+                scorer_idx,
                 celebration_ticks,
-                ..
             } => {
                 if celebration_ticks <= 1 {
                     let restart_team = scoring_team.opponent();
@@ -233,10 +233,10 @@ impl MatchSimulation {
                 } else {
                     self.state.phase = MatchPhase::GoalScored {
                         scoring_team,
-                        scorer_idx: 0,
+                        scorer_idx,
                         celebration_ticks: celebration_ticks - 1,
                     };
-                    self.step_celebration_drift();
+                    self.step_celebration_drift(scoring_team, scorer_idx);
                 }
                 self.state.prev_buttons = [inputs[0].buttons, inputs[1].buttons];
                 return;
@@ -847,12 +847,123 @@ impl MatchSimulation {
         true
     }
 
-    fn step_celebration_drift(&mut self) {
+    fn step_celebration_drift(&mut self, scoring_team: TeamSide, scorer_idx: usize) {
         let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
+        let half_len = self.state.format.half_length();
+        let half_wid = self.state.format.half_width();
+        let goal_half_w = self.state.format.goal_half_width();
+        let goal_h = self.state.format.goal_height();
+
+        // 1. Active celebration run for scorer toward touchline + gentle teammate/opponent deceleration
         for side in [TeamSide::Home, TeamSide::Away] {
-            for p in &mut self.state.players[side.index()] {
-                p.vel = p.vel.scale(Fp::from_milli(920));
-                p.pos += p.vel.scale(dt);
+            let s_idx = side.index();
+            for (idx, p) in self.state.players[s_idx].iter_mut().enumerate() {
+                if p.z > Fp::ZERO || p.vz != Fp::ZERO {
+                    p.z += p.vz.mul(dt);
+                    p.vz -= Fp::from_milli(9_810).mul(dt);
+                    if p.z <= Fp::ZERO {
+                        p.z = Fp::ZERO;
+                        p.vz = Fp::ZERO;
+                    }
+                }
+                if side == scoring_team && idx == scorer_idx && idx > 0 && !p.sent_off {
+                    let corner_y = if p.pos.y >= Fp::ZERO {
+                        half_wid - Fp::from_milli(2_500)
+                    } else {
+                        -half_wid + Fp::from_milli(2_500)
+                    };
+                    let target = Vec2::new(p.pos.x.mul(Fp::from_milli(820)), corner_y);
+                    let to_corner = (target - p.pos).normalize_or_zero();
+                    let celeb_vel = to_corner.scale(Fp::from_milli(4_200));
+                    p.vel = p.vel.scale(Fp::from_milli(850)) + celeb_vel.scale(Fp::from_milli(150));
+                    if p.vel.len() > Fp::from_milli(200) {
+                        p.facing_bam = p.vel.to_bam();
+                    }
+                } else {
+                    p.vel = p.vel.scale(Fp::from_milli(915));
+                }
+                p.pos = (p.pos + p.vel.scale(dt)).clamp_box(half_len, half_wid);
+            }
+        }
+
+        // 2. Physical 3D Goal-Pocket Net Containment: ball hits back/side/top nylon net, drops under gravity, and rolls!
+        let goal_sign = if self.state.ball.pos.x >= Fp::ZERO {
+            Fp::ONE
+        } else {
+            Fp::NEG_ONE
+        };
+        let net_back_abs_x = half_len + Fp::from_milli(1_680);
+        let net_front_abs_x = half_len + Fp::from_milli(80);
+        let net_side_y = (goal_half_w - Fp::from_milli(120)).max(Fp::from_milli(600));
+        let net_top_z = (goal_h - Fp::from_milli(120)).max(Fp::from_milli(1_200));
+
+        if self.state.ball.pos.z > Fp::ZERO || self.state.ball.vel.z != Fp::ZERO {
+            self.state.ball.vel.z -= Fp::from_milli(9_810).mul(dt);
+        } else {
+            let roll_dec = Fp::from_milli(2_400).mul(dt);
+            let v_xy = self.state.ball.vel.xy();
+            let spd = v_xy.len();
+            if spd <= roll_dec {
+                self.state.ball.vel.x = Fp::ZERO;
+                self.state.ball.vel.y = Fp::ZERO;
+            } else {
+                let n_xy = (v_xy - v_xy.normalize_or_zero().scale(roll_dec)).scale(Fp::from_milli(985));
+                self.state.ball.vel.x = n_xy.x;
+                self.state.ball.vel.y = n_xy.y;
+            }
+        }
+
+        self.state.ball.pos = self.state.ball.pos + self.state.ball.vel.scale(dt);
+
+        // Back nylon net absorption (`restitution = 0.16`, mesh friction `0.62`)
+        if self.state.ball.pos.x.abs() > net_back_abs_x {
+            self.state.ball.pos.x = goal_sign.mul(net_back_abs_x);
+            if self.state.ball.vel.x.mul(goal_sign) > Fp::ZERO {
+                self.state.ball.vel.x = (-self.state.ball.vel.x).mul(Fp::from_milli(160));
+                self.state.ball.vel.y = self.state.ball.vel.y.mul(Fp::from_milli(620));
+                self.state.ball.vel.z = self.state.ball.vel.z.mul(Fp::from_milli(580));
+                self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(350));
+                self.state.ball.spin_side = self.state.ball.spin_side.mul(Fp::from_milli(350));
+            }
+        } else if self.state.ball.pos.x.abs() < net_front_abs_x {
+            self.state.ball.pos.x = goal_sign.mul(net_front_abs_x);
+            if self.state.ball.vel.x.mul(goal_sign) < Fp::ZERO {
+                self.state.ball.vel.x = Fp::ZERO;
+            }
+        }
+
+        // Side net walls
+        if self.state.ball.pos.y.abs() > net_side_y {
+            let y_sgn = if self.state.ball.pos.y >= Fp::ZERO {
+                Fp::ONE
+            } else {
+                Fp::NEG_ONE
+            };
+            self.state.ball.pos.y = y_sgn.mul(net_side_y);
+            if self.state.ball.vel.y.mul(y_sgn) > Fp::ZERO {
+                self.state.ball.vel.y = (-self.state.ball.vel.y).mul(Fp::from_milli(180));
+                self.state.ball.vel.x = self.state.ball.vel.x.mul(Fp::from_milli(680));
+            }
+        }
+
+        // Roof net ceiling
+        if self.state.ball.pos.z > net_top_z {
+            self.state.ball.pos.z = net_top_z;
+            if self.state.ball.vel.z > Fp::ZERO {
+                self.state.ball.vel.z = (-self.state.ball.vel.z).mul(Fp::from_milli(150));
+                self.state.ball.vel.x = self.state.ball.vel.x.mul(Fp::from_milli(700));
+            }
+        }
+
+        // Turf floor inside goal mouth
+        if self.state.ball.pos.z < Fp::ZERO {
+            self.state.ball.pos.z = Fp::ZERO;
+            if self.state.ball.vel.z < Fp::from_milli(-650) {
+                self.state.ball.vel.z = (-self.state.ball.vel.z).mul(Fp::from_milli(440));
+                self.state.ball.vel.x = self.state.ball.vel.x.mul(Fp::from_milli(820));
+                self.state.ball.vel.y = self.state.ball.vel.y.mul(Fp::from_milli(820));
+            } else {
+                self.state.ball.vel.z = Fp::ZERO;
             }
         }
     }
@@ -1449,23 +1560,42 @@ impl MatchSimulation {
                 base_speed_mm + charge_boost_mm
             });
 
-            // Vertical lift: low driven on quick tap, rising dipping strike on higher charge
-            let vz = Fp::from_milli(780) + charge_norm.mul(Fp::from_milli(4_200));
-            let finesse_curl = if is_5v5 { 5_400 } else { 4_500 };
-            let spin = if finesse {
+            // 4-Mode Physical Strike Trajectory:
+            // - Quick tap (`charge < 0.26`): Low Driven Grass-Cutter into bottom corner
+            // - Finesse (`BTN_JOCKEY`): Inside-of-boot curling whip around keeper
+            // - Driven Laces (`charge >= 0.26`): Rising instep thunderbolt with strong dipping topspin
+            let is_low_driven = !finesse && charge_norm < Fp::from_milli(260);
+            let vz = if is_low_driven {
+                Fp::from_milli(420) + charge_norm.mul(Fp::from_milli(1_650))
+            } else if finesse {
+                Fp::from_milli(920) + charge_norm.mul(Fp::from_milli(3_850))
+            } else {
+                Fp::from_milli(840) + charge_norm.mul(Fp::from_milli(4_350))
+            };
+            let finesse_curl = if is_5v5 { 5_650 } else { 4_750 };
+            let spin_side = if finesse {
                 if target_y >= Fp::ZERO {
                     Fp::from_milli(-finesse_curl)
                 } else {
                     Fp::from_milli(finesse_curl)
                 }
             } else {
-                self.state.rng.range_milli(-850, 850)
+                // Subtle outside/inside laces swerve
+                self.state.rng.range_milli(-950, 950)
+            };
+            let spin_top = if is_low_driven {
+                Fp::from_milli(950)
+            } else if finesse {
+                Fp::from_milli(1_250)
+            } else {
+                // Strong forward topspin (`+1.65 .. +2.85`) makes rising power drives dip viciously!
+                Fp::from_milli(1_650) + charge_norm.mul(Fp::from_milli(1_200))
             };
 
             self.state.ball.pos.z = self.state.ball.pos.z.max(Fp::from_milli(110));
             self.state.ball.vel = Vec3::new(dir_xy.x.mul(speed), dir_xy.y.mul(speed), vz);
-            self.state.ball.spin_side = spin;
-            self.state.ball.spin_top = Fp::from_milli(1_650);
+            self.state.ball.spin_side = spin_side;
+            self.state.ball.spin_top = spin_top;
 
             self.emit_event(
                 MatchEventType::Shot,
@@ -2102,26 +2232,50 @@ impl MatchSimulation {
         // Advance position
         self.state.ball.pos = self.state.ball.pos + self.state.ball.vel.scale(dt);
 
-        // Ground bounce with spin-to-turf friction coupling (backspin checks up; topspin skids forward)
+        // Rigid-body oblique spin-to-turf bounce (`v_slip = v_t - R * omega_top` + lateral English kick)
         if self.state.ball.pos.z < Fp::ZERO {
             self.state.ball.pos.z = Fp::ZERO;
-            if self.state.ball.vel.z < Fp::from_milli(-780) {
-                let restitution = if is_5v5 {
-                    Fp::from_milli(615)
+            if self.state.ball.vel.z < Fp::from_milli(-720) {
+                let base_rest = if is_5v5 {
+                    Fp::from_milli(610)
                 } else {
-                    Fp::from_milli(590)
+                    Fp::from_milli(585)
                 };
-                let horiz_keep = if self.state.ball.spin_top < Fp::from_milli(-300) {
-                    Fp::from_milli(800)
-                } else if self.state.ball.spin_top > Fp::from_milli(400) {
-                    Fp::from_milli(915)
-                } else {
-                    Fp::from_milli(880)
-                };
+                // Backspin (`spin_top < 0`) bites into turf -> higher vertical pop & strong horizontal check;
+                // Topspin (`spin_top > 0`) skids fast off turf -> lower vertical pop & forward skid impulse!
+                let spin_clamped = self
+                    .state
+                    .ball
+                    .spin_top
+                    .clamp(Fp::from_milli(-2_600), Fp::from_milli(2_800));
+                let rest_mod = Fp::ONE - spin_clamped.mul(Fp::from_milli(42));
+                let restitution = base_rest.mul(rest_mod).clamp(Fp::from_milli(480), Fp::from_milli(690));
                 self.state.ball.vel.z = (-self.state.ball.vel.z).mul(restitution);
-                self.state.ball.vel.x = self.state.ball.vel.x.mul(horiz_keep);
-                self.state.ball.vel.y = self.state.ball.vel.y.mul(horiz_keep);
-                self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(650));
+
+                let v_xy = self.state.ball.vel.xy();
+                let spd_xy = v_xy.len();
+                if spd_xy > Fp::from_milli(180) {
+                    let fwd = v_xy.normalize_or_zero();
+                    let perp = Vec2::new(-fwd.y, fwd.x);
+                    let horiz_keep = (Fp::from_milli(855) + spin_clamped.mul(Fp::from_milli(48)))
+                        .clamp(Fp::from_milli(715), Fp::from_milli(935));
+                    let skid_add = spin_clamped.mul(Fp::from_milli(280));
+                    let side_kick = self
+                        .state
+                        .ball
+                        .spin_side
+                        .clamp(Fp::from_milli(-5_500), Fp::from_milli(5_500))
+                        .mul(Fp::from_milli(165));
+                    let next_spd = (spd_xy.mul(horiz_keep) + skid_add).max(Fp::ZERO);
+                    let bounced_xy = fwd.scale(next_spd) + perp.scale(side_kick);
+                    self.state.ball.vel.x = bounced_xy.x;
+                    self.state.ball.vel.y = bounced_xy.y;
+                } else {
+                    self.state.ball.vel.x = self.state.ball.vel.x.mul(Fp::from_milli(820));
+                    self.state.ball.vel.y = self.state.ball.vel.y.mul(Fp::from_milli(820));
+                }
+                self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(620));
+                self.state.ball.spin_side = self.state.ball.spin_side.mul(Fp::from_milli(720));
             } else {
                 self.state.ball.vel.z = Fp::ZERO;
             }
@@ -2422,7 +2576,7 @@ impl MatchSimulation {
                 self.emit_event(
                     MatchEventType::Interception,
                     side,
-                    Some(player_id),
+                    Some(player_id.clone()),
                     None,
                     format!("{player_name} intercepts pass"),
                 );
@@ -2431,8 +2585,102 @@ impl MatchSimulation {
             self.state.ball.assist_candidate = None;
         }
 
+        // 4b. Contested Aerial Header Physics when a leaping player (`z > 140mm`) meets a high ball (`ball_z > 1.38m`)!
+        let player_jump_z = self.state.players[s_idx][idx].z;
+        if idx != 0
+            && player_jump_z > Fp::from_milli(140)
+            && ball_z > Fp::from_milli(1_380)
+            && self.state.input_buffer[s_idx].is_none()
+        {
+            let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
+            let dist_opp_goal = (self.state.players[s_idx][idx].pos.x - opp_goal_x).abs();
+            if dist_opp_goal <= Fp::from_milli(if self.state.format.players_per_side <= 6 { 11_500 } else { 15_500 }) {
+                // Attacking downward bullet header toward goal mouth!
+                let corner_y = if self.state.players[s_idx][idx].pos.y >= Fp::ZERO {
+                    -self.state.format.goal_half_width().mul(Fp::from_milli(520))
+                } else {
+                    self.state.format.goal_half_width().mul(Fp::from_milli(520))
+                };
+                let hdr_dir = (Vec2::new(opp_goal_x, corner_y) - self.state.players[s_idx][idx].pos)
+                    .normalize_or_zero();
+                let hdr_spd = Fp::from_milli(14_200 + (self.state.players[s_idx][idx].attributes.shooting as i64) * 45);
+                self.state.ball.owner = None;
+                self.state.ball.vel = Vec3::new(hdr_dir.x.mul(hdr_spd), hdr_dir.y.mul(hdr_spd), Fp::from_milli(-1_150));
+                self.state.ball.spin_top = Fp::from_milli(1_400);
+                self.set_last_touch(side, idx);
+                self.state.players[s_idx][idx].facing_bam = hdr_dir.to_bam();
+                self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
+                self.state.player_stats[s_idx][idx].shots += 1;
+                self.state.player_stats[s_idx][idx].shots_on_target += 1;
+                self.emit_event(
+                    MatchEventType::Shot,
+                    side,
+                    Some(player_id),
+                    None,
+                    format!("{player_name} powers a header toward goal!"),
+                );
+                return;
+            } else if (self.state.players[s_idx][idx].pos.x - own_goal_x).abs() <= Fp::from_milli(16_000) {
+                // Defensive clearing header away from danger!
+                let clr_dir = Vec2::new(
+                    Fp::from_int(attack_sign as i32),
+                    if self.state.players[s_idx][idx].pos.y >= Fp::ZERO {
+                        Fp::from_milli(340)
+                    } else {
+                        Fp::from_milli(-340)
+                    },
+                )
+                .normalize_or_zero();
+                self.state.ball.owner = None;
+                self.state.ball.vel = Vec3::new(
+                    clr_dir.x.mul(Fp::from_milli(13_400)),
+                    clr_dir.y.mul(Fp::from_milli(13_400)),
+                    Fp::from_milli(3_150),
+                );
+                self.state.ball.spin_top = Fp::from_milli(-700);
+                self.set_last_touch(side, idx);
+                self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
+                return;
+            }
+        }
+
         let incoming_xy = self.state.ball.vel.xy();
         let recv_vel = self.state.players[s_idx][idx].vel;
+        let rel_vel = incoming_xy - recv_vel;
+        let rel_speed = rel_vel.len();
+
+        // Visco-Elastic First-Touch Cushioning: bullet passes received on the back-turn or at full sprint
+        // pop slightly ahead into stride (`heavy touch`) instead of magnetically gluing in 0 ms!
+        let heading = Vec2::from_bam(self.state.players[s_idx][idx].facing_bam, Fp::ONE);
+        let pre_ball_xy = ball_xy - incoming_xy.scale(Fp::from_ratio(1, TICKS_PER_SECOND as i64));
+        let to_ball_dir = (pre_ball_xy - self.state.players[s_idx][idx].pos).normalize_or_zero();
+        let face_align = heading.dot(to_ball_dir); // +1 facing ball, -1 ball hitting back
+        let soft_trap_limit = Fp::from_milli(10_800 + drib_attr * 52)
+            + face_align.mul(Fp::from_milli(2_200));
+        if idx != 0
+            && self.state.input_buffer[s_idx].is_none()
+            && rel_speed > soft_trap_limit
+            && ball_z < Fp::from_milli(950)
+        {
+            let carry_dir = if recv_vel.len() > Fp::from_milli(450) {
+                recv_vel.normalize_or_zero()
+            } else {
+                heading
+            };
+            let pop_spd = ((rel_speed - soft_trap_limit).mul(Fp::from_milli(420)) + Fp::from_milli(2_650))
+                .clamp(Fp::from_milli(2_500), Fp::from_milli(5_600));
+            let pop_xy = carry_dir.scale(pop_spd) + recv_vel.scale(Fp::from_milli(680));
+            let nudged = self.state.players[s_idx][idx].pos + carry_dir.scale(Fp::from_milli(560));
+            self.state.ball.owner = None;
+            self.state.ball.pos = Vec3::new(nudged.x, nudged.y, ball_z.min(Fp::from_milli(220)));
+            self.state.ball.vel = Vec3::new(pop_xy.x, pop_xy.y, Fp::from_milli(320));
+            self.state.ball.spin_top = Fp::from_milli(380);
+            self.set_last_touch(side, idx);
+            self.state.controlled_idx[s_idx] = idx;
+            self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 4 };
+            return;
+        }
+
         let cushion_keep = Fp::from_milli((290 - drib_attr).clamp(150, 250));
         let cushioned_xy = if idx == 0 && in_own_box {
             Vec2::ZERO
@@ -2486,7 +2734,7 @@ impl MatchSimulation {
     }
 
     fn resolve_player_separation(&mut self) {
-        let min_sep = Fp::from_milli(760);
+        let min_sep = Fp::from_milli(780);
         // Flatten indices (side_idx, player_idx)
         let mut refs: Vec<(usize, usize)> = Vec::with_capacity(22);
         for (s, side_players) in self.state.players.iter().enumerate() {
@@ -2511,22 +2759,60 @@ impl MatchSimulation {
                         Vec2::new(Fp::ONE, Fp::ZERO)
                     };
                     let overlap = min_sep - dist;
-                    let str_a = (45 + self.state.players[sa][ia].attributes.strength as i64).max(50);
-                    let str_b = (45 + self.state.players[sb][ib].attributes.strength as i64).max(50);
-                    let total_str = str_a + str_b;
-                    // Stronger player yields less ground in shoulder-to-shoulder jostling!
-                    let share_a = Fp::from_ratio(str_b, total_str);
-                    let share_b = Fp::from_ratio(str_a, total_str);
+
+                    // Physical mass + low-center-of-gravity shielding brace (`BTN_JOCKEY`)
+                    let a_shield = (self.state.prev_buttons[sa] & BTN_JOCKEY) != 0;
+                    let b_shield = (self.state.prev_buttons[sb] & BTN_JOCKEY) != 0;
+                    let mass_a = (68 + (self.state.players[sa][ia].attributes.strength as i64) * 3 / 10)
+                        + if a_shield { 16 } else { 0 };
+                    let mass_b = (68 + (self.state.players[sb][ib].attributes.strength as i64) * 3 / 10)
+                        + if b_shield { 16 } else { 0 };
+                    let total_mass = (mass_a + mass_b).max(1);
+                    let share_a = Fp::from_ratio(mass_b, total_mass);
+                    let share_b = Fp::from_ratio(mass_a, total_mass);
+
                     self.state.players[sa][ia].pos -= push_dir.scale(overlap.mul(share_a));
                     self.state.players[sb][ib].pos += push_dir.scale(overlap.mul(share_b));
 
-                    // Damp inward closing normal velocity so bodies don't jitter through each other
+                    // Newtonian shoulder-to-shoulder momentum transfer (`e = 0.26`) & heavy-barge stumble!
                     let rel_v = self.state.players[sb][ib].vel - self.state.players[sa][ia].vel;
                     let closing = rel_v.dot(push_dir);
                     if closing < Fp::ZERO {
-                        let impulse = (-closing).mul(Fp::from_milli(750));
+                        let impulse = (-closing).mul(Fp::from_milli(1_260));
                         self.state.players[sa][ia].vel -= push_dir.scale(impulse.mul(share_a));
                         self.state.players[sb][ib].vel += push_dir.scale(impulse.mul(share_b));
+
+                        // High-energy opposing shoulder charge: drain burst stamina & unbalance lighter unbraced player
+                        if sa != sb && closing < Fp::from_milli(-5_100) {
+                            self.state.players[sa][ia].stamina_permille =
+                                (self.state.players[sa][ia].stamina_permille - 2).max(150);
+                            self.state.players[sb][ib].stamina_permille =
+                                (self.state.players[sb][ib].stamina_permille - 2).max(150);
+
+                            if mass_b - mass_a >= 14 && ia != 0 && !a_shield {
+                                self.state.players[sa][ia].action =
+                                    PlayerActionState::Stumbled { ticks_left: 9 };
+                                if self.state.ball.owner == Some((
+                                    if sa == 0 { TeamSide::Home } else { TeamSide::Away },
+                                    ia,
+                                )) {
+                                    self.state.ball.owner = None;
+                                    self.state.ball.vel.x -= push_dir.x.mul(Fp::from_milli(2_200));
+                                    self.state.ball.vel.y -= push_dir.y.mul(Fp::from_milli(2_200));
+                                }
+                            } else if mass_a - mass_b >= 14 && ib != 0 && !b_shield {
+                                self.state.players[sb][ib].action =
+                                    PlayerActionState::Stumbled { ticks_left: 9 };
+                                if self.state.ball.owner == Some((
+                                    if sb == 0 { TeamSide::Home } else { TeamSide::Away },
+                                    ib,
+                                )) {
+                                    self.state.ball.owner = None;
+                                    self.state.ball.vel.x += push_dir.x.mul(Fp::from_milli(2_200));
+                                    self.state.ball.vel.y += push_dir.y.mul(Fp::from_milli(2_200));
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -2624,7 +2910,8 @@ impl MatchSimulation {
         let s_idx = scoring_team.index();
         self.state.score[s_idx] += 1;
         self.state.ball.owner = None;
-        self.state.ball.vel = self.state.ball.vel.scale(Fp::from_milli(250));
+        // Preserve 82% entry momentum so the ball flies into the back of the 3D goal net before hitting the mesh!
+        self.state.ball.vel = self.state.ball.vel.scale(Fp::from_milli(820));
 
         // Credit scorer using substitution-safe `last_touch_meta`, then per-team `last_team_touch_meta`
         // (so shots deflected off an opponent GK/defender still credit an outgoing substituted shooter!)
@@ -3578,6 +3865,61 @@ mod tests {
         assert_eq!(
             defl_shooter_st.goals, 1,
             "outgoing shooter must still be credited when shot deflects off opponent GK into net"
+        );
+
+        // 5. 3D Goal-Pocket Net Containment during `GoalScored`: ball hits back net & settles inside goal mouth!
+        for _ in 0..45 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        }
+        let half_len = sim.state().format.half_length();
+        assert!(
+            sim.state().ball.pos.x >= half_len && sim.state().ball.pos.x <= half_len + Fp::from_milli(1_700),
+            "ball must stay contained inside the 3D goal-net pocket during celebration ({:?})",
+            sim.state().ball.pos.x
+        );
+        assert!(
+            sim.state().ball.pos.z <= Fp::from_milli(120),
+            "ball must drop under gravity onto the turf inside the goal mouth ({:?})",
+            sim.state().ball.pos.z
+        );
+
+        // 6. Oblique Spin-Turf Bounce: backspin checks forward speed while topspin skids forward faster!
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(0, 0, 50);
+        sim.state.ball.vel = Vec3::from_milli(14_000, 0, -5_000);
+        sim.state.ball.spin_top = Fp::from_milli(-2_400);
+        sim.state.ball.spin_side = Fp::ZERO;
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        let backspin_vx = sim.state().ball.vel.x;
+
+        sim.state.ball.pos = Vec3::from_milli(0, 0, 50);
+        sim.state.ball.vel = Vec3::from_milli(14_000, 0, -5_000);
+        sim.state.ball.spin_top = Fp::from_milli(2_400);
+        sim.state.ball.spin_side = Fp::ZERO;
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        let topspin_vx = sim.state().ball.vel.x;
+        assert!(
+            topspin_vx > backspin_vx + Fp::from_milli(1_500),
+            "topspin bounce ({:?}) must skid faster than checking backspin bounce ({:?})",
+            topspin_vx,
+            backspin_vx
+        );
+
+        // 7. Visco-Elastic Heavy First Touch: bullet pass hitting player from behind pops ahead (`owner = None`)!
+        sim.state.controlled_idx[0] = 1;
+        sim.state.players[0][1].pos = Vec2::from_milli(-4_000, 5_000);
+        sim.state.players[0][1].vel = Vec2::ZERO;
+        sim.state.players[0][1].facing_bam = 0; // facing +X while ball strikes from behind (-X -> +X)
+        sim.state.players[0][1].action = PlayerActionState::Normal;
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(-4_350, 5_000, 80);
+        sim.state.ball.vel = Vec3::from_milli(20_500, 0, 0);
+        sim.state.ball.last_touch_team = Some(TeamSide::Home);
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert!(
+            sim.state().ball.owner.is_none() && sim.state().ball.vel.x > Fp::from_milli(1_500),
+            "20.5 m/s bullet pass from behind must produce an elastic heavy first-touch pop-out instead of 0ms glue"
         );
     }
 }
