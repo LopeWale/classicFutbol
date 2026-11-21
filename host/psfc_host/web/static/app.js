@@ -573,8 +573,17 @@ function decodeWebHidReport(vPad, bytes) {
   if (!bytes || bytes.length === 0) return;
   if (!vPad._restBytes) {
     vPad._restBytes = new Uint8Array(bytes);
+    vPad._centeredBytes = new Set();
   }
   const rest = vPad._restBytes;
+  for (let i = 0; i < bytes.length; i++) {
+    if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+      vPad._centeredBytes.add(i);
+    } else if (i < rest.length && !(rest[i] >= 0x70 && rest[i] <= 0x8f)) {
+      // Clear any bit that was held on packet 0 as soon as we observe 0 in that bit
+      rest[i] &= bytes[i];
+    }
+  }
 
   // Detect X/Y D-Pad byte pair on standard 7/8-byte USB SNES / DragonRise / Microntek HID reports (`0x00=-1, 0x7f/0x80=0, 0xff=+1`)
   let axX = 0;
@@ -585,8 +594,13 @@ function decodeWebHidReport(vPad, bytes) {
     [2, 3],
     [1, 2],
   ];
+  const isAxisLikeByte = (idx) =>
+    vPad._centeredBytes.has(idx) ||
+    (bytes[idx] >= 0x70 && bytes[idx] <= 0x8f) ||
+    ((idx === 0 || idx === 1) && (bytes[idx] === 0x00 || bytes[idx] === 0xff));
+
   for (const [ix, iy] of candidatePairs) {
-    if (iy < bytes.length && rest[ix] >= 0x70 && rest[ix] <= 0x8f && rest[iy] >= 0x70 && rest[iy] <= 0x8f) {
+    if (iy < bytes.length && isAxisLikeByte(ix) && isAxisLikeByte(iy)) {
       const vx = (bytes[ix] - 127.5) / 127.5;
       const vy = (bytes[iy] - 127.5) / 127.5;
       if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
@@ -603,8 +617,12 @@ function decodeWebHidReport(vPad, bytes) {
     vPad.buttons[i].value = 0;
   }
 
+  if (bytes.length >= 7 && (bytes[5] & 0x0f) === 0x0f) {
+    vPad._isDragonRiseFormat = true;
+  }
+
   // Standard DragonRise / Microntek USB SNES (`byte[5]` upper nibble = buttons 0..3, lower nibble = hat; `byte[6]` = L, R, Select, Start)
-  if (bytes.length >= 7 && (rest[5] & 0x0f) === 0x0f) {
+  if (bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f)) {
     const b5 = bytes[5];
     const b6 = bytes[6];
     for (let k = 0; k < 4; k++) {
@@ -627,24 +645,57 @@ function decodeWebHidReport(vPad, bytes) {
       axX = dirs[hat][0];
       axY = dirs[hat][1];
     }
-    for (let k = 0; k < 6 && 4 + k < vPad.buttons.length; k++) {
-      const on = ((b6 >>> k) & 1) === 1;
-      vPad.buttons[4 + k].pressed = on;
-      vPad.buttons[4 + k].value = on ? 1 : 0;
+    const setBtn = (idx, on) => {
+      if (idx < vPad.buttons.length) {
+        vPad.buttons[idx].pressed = on;
+        vPad.buttons[idx].value = on ? 1 : 0;
+      }
+    };
+    // Shoulder L / R -> slots 4, 5
+    setBtn(4, (b6 & 0x01) !== 0);
+    setBtn(5, (b6 & 0x02) !== 0);
+    if ((b6 & 0x30) !== 0 || vPad._uses10BtnMeta) {
+      // 10-button DragonRise layout: bits 2,3 = L2,R2 (slots 6,7), bits 4,5 = Select,Start (slots 8,9)
+      if ((b6 & 0x30) !== 0) vPad._uses10BtnMeta = true;
+      setBtn(6, (b6 & 0x04) !== 0);
+      setBtn(7, (b6 & 0x08) !== 0);
+      setBtn(8, (b6 & 0x10) !== 0);
+      setBtn(9, (b6 & 0x20) !== 0);
+    } else {
+      // 8-button USB SNES layout: bits 2,3 = Select,Start -> aligned directly to slots 8,9 consumed by sampleRawGamepad!
+      setBtn(8, (b6 & 0x04) !== 0);
+      setBtn(9, (b6 & 0x08) !== 0);
     }
   } else {
     // Generic fallback: map changed non-axis bit positions against resting HID report
-    let btnSlot = 0;
-    for (let bi = 0; bi < bytes.length && btnSlot < vPad.buttons.length; bi++) {
-      if (rest[bi] >= 0x70 && rest[bi] <= 0x8f) continue; // skip centered analog/D-pad axis byte
+    const activeBits = [];
+    for (let bi = 0; bi < bytes.length; bi++) {
+      if (vPad._centeredBytes.has(bi) || (rest[bi] >= 0x70 && rest[bi] <= 0x8f)) continue;
       const diff = bytes[bi] & ~rest[bi];
-      for (let bit = 0; bit < 8 && btnSlot < vPad.buttons.length; bit++) {
+      for (let bit = 0; bit < 8; bit++) {
         if (((rest[bi] >>> bit) & 1) === 0) {
-          const on = ((diff >>> bit) & 1) === 1;
-          vPad.buttons[btnSlot].pressed = on;
-          vPad.buttons[btnSlot].value = on ? 1 : 0;
-          btnSlot++;
+          activeBits.push(((diff >>> bit) & 1) === 1);
         }
+      }
+    }
+    if (activeBits.length <= 8) {
+      // Single button byte (8-button USB SNES layout): 0..5 = Face + L/R, 6..7 = Select/Start -> slots 8,9
+      for (let i = 0; i < Math.min(6, activeBits.length); i++) {
+        vPad.buttons[i].pressed = activeBits[i];
+        vPad.buttons[i].value = activeBits[i] ? 1 : 0;
+      }
+      if (activeBits.length > 6) {
+        vPad.buttons[8].pressed = activeBits[6];
+        vPad.buttons[8].value = activeBits[6] ? 1 : 0;
+      }
+      if (activeBits.length > 7) {
+        vPad.buttons[9].pressed = activeBits[7];
+        vPad.buttons[9].value = activeBits[7] ? 1 : 0;
+      }
+    } else {
+      for (let i = 0; i < Math.min(vPad.buttons.length, activeBits.length); i++) {
+        vPad.buttons[i].pressed = activeBits[i];
+        vPad.buttons[i].value = activeBits[i] ? 1 : 0;
       }
     }
   }
@@ -671,10 +722,13 @@ async function pairWebHidUsbReceiver() {
         connected: true,
         mapping: "",
         axes: [0, 0, 0, 0],
-        buttons: Array.from({ length: 12 }, () => ({ pressed: false, value: 0 })),
+        buttons: Array.from({ length: 10 }, () => ({ pressed: false, value: 0 })),
         _dev: dev,
         _isWebHid: true,
         _restBytes: null,
+        _centeredBytes: null,
+        _isDragonRiseFormat: false,
+        _uses10BtnMeta: false,
       };
       dev.addEventListener("inputreport", (ev) => {
         const view = new Uint8Array(ev.data.buffer, ev.data.byteOffset, ev.data.byteLength);
@@ -768,20 +822,54 @@ function syncGamepadConnectionState() {
 window.addEventListener("gamepadconnected", updateGamepadBadges);
 window.addEventListener("gamepaddisconnected", updateGamepadBadges);
 
-function getPadAxisBaseline(pad) {
-  const key = `${pad.index}|${pad.id}`;
-  let base = padAxisBaselines.get(key);
-  if (!base && pad.axes && pad.axes.length > 0) {
-    const anyPressed = pad.buttons && Array.from(pad.buttons).some((bt) => bt && (bt.pressed || bt.value > 0.4));
-    if (!anyPressed) {
-      base = Array.from(pad.axes, (v) => Number(v || 0));
-      padAxisBaselines.set(key, base);
-    }
-  }
-  return base || null;
+function decodeHatDirection(hatVal) {
+  // Standard 8-way HID POV hat encodes active steps 0..7 in [-1.0, +1.0] (-1, -5/7, -3/7, -1/7, +1/7, +3/7, +5/7, +1);
+  // neutral/released is > 1.05 (e.g. +1.2857 / +3.2857), and an unused 0-centered axis sits near 0.0 (|v| <= 0.06).
+  if (hatVal < -1.05 || hatVal > 1.05 || Math.abs(hatVal) <= 0.06) return [0, 0];
+  const step = Math.max(0, Math.min(7, Math.round(((hatVal + 1.0) * 7.0) / 2.0)));
+  const dirs = [
+    [0, -1],
+    [1, -1],
+    [1, 0],
+    [1, 1],
+    [0, 1],
+    [-1, 1],
+    [-1, 0],
+    [-1, -1],
+  ];
+  return dirs[step] || [0, 0];
 }
 
-function evalCustomBinding(pad, spec, baseAxes) {
+function updatePadAxisTrackers(pad) {
+  if (!pad.axes || pad.axes.length === 0) return null;
+  const key = `${pad.index}|${pad.id}`;
+  let states = padAxisBaselines.get(key);
+  if (!states || states.length !== pad.axes.length) {
+    states = Array.from(pad.axes, (v) => {
+      const num = Number(v || 0);
+      return {
+        initial: num,
+        min: num,
+        max: num,
+        sawCenter: Math.abs(num) < 0.35,
+      };
+    });
+    padAxisBaselines.set(key, states);
+    return states;
+  }
+  for (let i = 0; i < pad.axes.length; i++) {
+    const raw = Number(pad.axes[i] || 0);
+    const st = states[i];
+    if (raw < st.min) st.min = raw;
+    if (raw > st.max) st.max = raw;
+    if (Math.abs(raw) < 0.35 || (st.min < -0.4 && st.max > 0.4)) {
+      st.sawCenter = true;
+    }
+  }
+  return states;
+}
+
+function evalCustomBinding(pad, spec, axisStates) {
   if (!spec) return false;
   if (spec.type === "btn") {
     const bt = pad.buttons[spec.index];
@@ -789,13 +877,20 @@ function evalCustomBinding(pad, spec, baseAxes) {
   }
   if (spec.type === "axis") {
     const v = Number(pad.axes[spec.index] || 0);
-    const rest = baseAxes && spec.index < baseAxes.length ? baseAxes[spec.index] : 0;
-    const cleanRest = Math.abs(rest) > 0.75 ? rest : 0;
-    return (v - cleanRest) * spec.sign > 0.45;
+    return v * spec.sign > 0.45;
   }
   if (spec.type === "hat") {
     const v = Number(pad.axes[spec.index] || 0);
-    return Math.abs(v - spec.value) < 0.12;
+    const [hx, hy] = decodeHatDirection(v);
+    if (spec.dx && spec.dy) return hx === spec.dx && hy === spec.dy;
+    if (spec.dx) return hx === spec.dx;
+    if (spec.dy) return hy === spec.dy;
+    // Backwards-compatibility if a legacy single-value hat binding was stored in localStorage
+    if (typeof spec.value === "number") {
+      const [shx, shy] = decodeHatDirection(spec.value);
+      return (shx !== 0 && hx === shx) || (shy !== 0 && hy === shy);
+    }
+    return false;
   }
   return false;
 }
@@ -805,45 +900,92 @@ function stepPadCalibrationWizard() {
   const pads = getConnectedPads();
   if (!pads.length) return;
 
-  let detectedSpec = null;
-  for (const pad of pads) {
-    if (!calibState.restAxes.has(pad.index)) {
-      calibState.restAxes.set(
-        pad.index,
-        Array.from(pad.axes || [], (v) => Number(v || 0))
-      );
-    }
-    const rest = calibState.restAxes.get(pad.index);
-    let activeSpec = null;
+  const step = CALIB_STEPS[calibState.stepIdx];
+  if (!step) return;
 
+  let anyHeldDuringRelease = false;
+  let detectedSpec = null;
+
+  for (const pad of pads) {
+    const axisStates = updatePadAxisTrackers(pad);
+
+    let btnPressedIdx = -1;
     for (let bi = 0; bi < pad.buttons.length; bi++) {
       const bt = pad.buttons[bi];
       if (bt && (bt.pressed || bt.value > 0.5)) {
-        activeSpec = { type: "btn", index: bi };
+        btnPressedIdx = bi;
         break;
       }
     }
-    if (!activeSpec && pad.axes) {
+
+    let hatDir = [0, 0];
+    if (pad.axes && pad.axes.length > 9) {
+      hatDir = decodeHatDirection(Number(pad.axes[9] || 0));
+    }
+
+    if (calibState.waitingRelease) {
+      const primaryActive =
+        pad.axes &&
+        ((pad.axes.length > 0 && Math.abs(Number(pad.axes[0] || 0)) > 0.4) ||
+          (pad.axes.length > 1 && Math.abs(Number(pad.axes[1] || 0)) > 0.4));
+      let secActive = false;
+      if (pad.axes && axisStates) {
+        for (let ai = 2; ai < pad.axes.length; ai++) {
+          if (ai === 9) continue;
+          const v = Number(pad.axes[ai] || 0);
+          const st = axisStates[ai];
+          if ((ai >= 6 || (st && st.sawCenter)) && Math.abs(v) > 0.45) {
+            secActive = true;
+            break;
+          }
+        }
+      }
+      if (btnPressedIdx >= 0 || hatDir[0] !== 0 || hatDir[1] !== 0 || primaryActive || secActive) {
+        anyHeldDuringRelease = true;
+      }
+      continue;
+    }
+
+    let activeSpec = null;
+    if (btnPressedIdx >= 0) {
+      activeSpec = { type: "btn", index: btnPressedIdx };
+    } else if (hatDir[0] !== 0 || hatDir[1] !== 0) {
+      const wantVert = step.key === "up" || step.key === "down";
+      const wantHoriz = step.key === "left" || step.key === "right";
+      if (wantVert && hatDir[1] !== 0) {
+        activeSpec = { type: "hat", index: 9, dx: 0, dy: hatDir[1] };
+      } else if (wantHoriz && hatDir[0] !== 0) {
+        activeSpec = { type: "hat", index: 9, dx: hatDir[0], dy: 0 };
+      } else {
+        activeSpec = {
+          type: "hat",
+          index: 9,
+          dx: hatDir[0] !== 0 && hatDir[1] === 0 ? hatDir[0] : 0,
+          dy: hatDir[1] !== 0 && hatDir[0] === 0 ? hatDir[1] : hatDir[1] || 0,
+        };
+      }
+    } else if (pad.axes) {
+      const rest = calibState.restAxes.get(pad.index) || [];
       for (let ai = 0; ai < pad.axes.length; ai++) {
+        if (ai === 9) continue;
         const v = Number(pad.axes[ai] || 0);
         const r = rest[ai] || 0;
-        if (ai === 9 && Math.abs(v) <= 1.05 && Math.abs(v - r) > 0.12) {
-          activeSpec = { type: "hat", index: ai, value: v };
-          break;
-        }
-        if (Math.abs(v - r) > 0.55 && Math.abs(v) > 0.45) {
-          activeSpec = { type: "axis", index: ai, sign: v > r ? 1 : -1 };
+        const st = axisStates && ai < axisStates.length ? axisStates[ai] : null;
+        const effectiveRest = ai >= 2 && ai <= 5 && st && !st.sawCenter && Math.abs(r) > 0.80 ? r : 0;
+        if (Math.abs(v - effectiveRest) > 0.55 && Math.abs(v) > 0.45) {
+          activeSpec = { type: "axis", index: ai, sign: v > effectiveRest ? 1 : -1 };
           break;
         }
       }
     }
+
     if (activeSpec && !detectedSpec) {
       detectedSpec = activeSpec;
     }
   }
 
   if (calibState.waitingRelease) {
-    if (!detectedSpec) {
+    if (!anyHeldDuringRelease) {
       calibState.waitingRelease = false;
       for (const pad of pads) {
         calibState.restAxes.set(
@@ -856,7 +998,6 @@ function stepPadCalibrationWizard() {
   }
 
   if (detectedSpec) {
-    const step = CALIB_STEPS[calibState.stepIdx];
     calibState.draft[step.key] = detectedSpec;
     calibState.stepIdx++;
     calibState.waitingRelease = true;
@@ -899,22 +1040,6 @@ function startPadCalibration() {
   advanceOrFinishCalibration();
 }
 
-function decodeHatDirection(hatVal) {
-  if (hatVal < -1.05 || hatVal > 1.05) return [0, 0];
-  const step = Math.round(((hatVal + 1.0) * 7.0) / 2.0);
-  const dirs = [
-    [0, -1],
-    [1, -1],
-    [1, 0],
-    [1, 1],
-    [0, 1],
-    [-1, 1],
-    [-1, 0],
-    [-1, -1],
-  ];
-  return dirs[step] || [0, 0];
-}
-
 function sampleRawGamepad(logicalSlot) {
   const pads = getConnectedPads();
   const pad = pads[logicalSlot];
@@ -924,7 +1049,7 @@ function sampleRawGamepad(logicalSlot) {
   const profile = profileSel ? profileSel.value : "auto";
   const idLc = String(pad.id || "").toLowerCase();
   const btnCount = pad.buttons ? pad.buttons.length : 0;
-  const baseAxes = getPadAxisBaseline(pad);
+  const axisStates = updatePadAxisTrackers(pad);
 
   const snesDetected = isSnesSignature(idLc, btnCount);
   const useCustom = profile === "custom" && customPadMap;
@@ -951,9 +1076,11 @@ function sampleRawGamepad(logicalSlot) {
   const cleanAxis = (idx, deadzone = 0.22) => {
     if (!pad.axes || idx >= pad.axes.length) return 0;
     const raw = Number(pad.axes[idx] || 0);
-    const rest = baseAxes && idx < baseAxes.length ? baseAxes[idx] : 0;
-    // Reject dummy DirectInput axes permanently stuck at ±1.0 from connection!
-    if (idx >= 2 && Math.abs(rest) > 0.80 && Math.abs(raw - rest) < 0.25) return 0;
+    const st = axisStates && idx < axisStates.length ? axisStates[idx] : null;
+    // Reject unpressed DirectInput Z/Rz trigger axes (2..5) stuck at ±1.0 until center (`|raw| < 0.35`) or full-swing is observed!
+    if (idx >= 2 && idx <= 5 && st && !st.sawCenter && Math.abs(st.initial) > 0.80 && Math.abs(raw - st.initial) < 0.25) {
+      return 0;
+    }
     return Math.abs(raw) < deadzone ? 0 : Math.max(-1, Math.min(1, raw));
   };
 
@@ -976,22 +1103,22 @@ function sampleRawGamepad(logicalSlot) {
   let startBtn = false;
 
   if (useCustom) {
-    if (evalCustomBinding(pad, customPadMap.left, baseAxes)) lx -= 1;
-    if (evalCustomBinding(pad, customPadMap.right, baseAxes)) lx += 1;
-    if (evalCustomBinding(pad, customPadMap.up, baseAxes)) ly -= 1;
-    if (evalCustomBinding(pad, customPadMap.down, baseAxes)) ly += 1;
+    if (evalCustomBinding(pad, customPadMap.left, axisStates)) lx -= 1;
+    if (evalCustomBinding(pad, customPadMap.right, axisStates)) lx += 1;
+    if (evalCustomBinding(pad, customPadMap.up, axisStates)) ly -= 1;
+    if (evalCustomBinding(pad, customPadMap.down, axisStates)) ly += 1;
     if (lx === 0 && ly === 0) {
       lx = cleanAxis(0, 0.25);
       ly = cleanAxis(1, 0.25);
     }
-    south = evalCustomBinding(pad, customPadMap.south, baseAxes);
-    east = evalCustomBinding(pad, customPadMap.east, baseAxes);
-    west = evalCustomBinding(pad, customPadMap.west, baseAxes);
-    north = evalCustomBinding(pad, customPadMap.north, baseAxes);
-    l1 = evalCustomBinding(pad, customPadMap.l1, baseAxes);
-    r1 = evalCustomBinding(pad, customPadMap.r1, baseAxes);
-    selectBtn = evalCustomBinding(pad, customPadMap.select, baseAxes);
-    startBtn = evalCustomBinding(pad, customPadMap.start, baseAxes);
+    south = evalCustomBinding(pad, customPadMap.south, axisStates);
+    east = evalCustomBinding(pad, customPadMap.east, axisStates);
+    west = evalCustomBinding(pad, customPadMap.west, axisStates);
+    north = evalCustomBinding(pad, customPadMap.north, axisStates);
+    l1 = evalCustomBinding(pad, customPadMap.l1, axisStates);
+    r1 = evalCustomBinding(pad, customPadMap.r1, axisStates);
+    selectBtn = evalCustomBinding(pad, customPadMap.select, axisStates);
+    startBtn = evalCustomBinding(pad, customPadMap.start, axisStates);
   } else {
     lx = cleanAxis(0, 0.24);
     ly = cleanAxis(1, 0.24);
@@ -1030,15 +1157,11 @@ function sampleRawGamepad(logicalSlot) {
       }
     }
 
-    // 8-way POV Hat switch (`axes[9]`) with resting-neutral check
+    // Stateless 8-way POV Hat switch (`axes[9]`): active in [-1.0, +1.0], neutral > +1.05 or 0.0
     if (dpadX === 0 && dpadY === 0 && lx === 0 && ly === 0 && pad.axes && pad.axes.length > 9) {
-      const hat = Number(pad.axes[9] || 0);
-      const hatRest = baseAxes && baseAxes.length > 9 ? baseAxes[9] : 1.2857;
-      if (Math.abs(hat - hatRest) > 0.08) {
-        const [hx, hy] = decodeHatDirection(hat);
-        dpadX = hx;
-        dpadY = hy;
-      }
+      const [hx, hy] = decodeHatDirection(Number(pad.axes[9] || 0));
+      dpadX = hx;
+      dpadY = hy;
     }
 
     if (lx === 0 && ly === 0 && (dpadX !== 0 || dpadY !== 0)) {
@@ -1286,11 +1409,15 @@ function updateControllerVisualizer() {
       for (let i = 0; i < p.buttons.length; i++) {
         if (p.buttons[i] && (p.buttons[i].pressed || p.buttons[i].value > 0.4)) pressedBtns.push(`B${i}`);
       }
+      const mvStr =
+        activeGp.mx !== 0 || activeGp.my !== 0 ? `MV(${activeGp.mx},${activeGp.my}) ` : "";
       const axStr =
         p.axes && p.axes.length >= 2
           ? `AX(${Number(p.axes[0] || 0).toFixed(1)},${Number(p.axes[1] || 0).toFixed(1)})`
           : "";
-      rawEl.textContent = pressedBtns.length ? `PRESSED: ${pressedBtns.join("+")} ${axStr}` : `READY · ${axStr || "IDLE"}`;
+      rawEl.textContent = pressedBtns.length
+        ? `PRESSED: ${pressedBtns.join("+")} ${mvStr}${axStr}`.trim()
+        : `READY · ${mvStr}${axStr || "IDLE"}`.trim();
     } else {
       rawEl.textContent = "RAW: IDLE";
     }
