@@ -661,109 +661,61 @@ function decodeWebHidReport(vPad, bytes) {
     [2, 3],
     [1, 2],
   ];
-  const threeByteFrontAxes =
-    bytes.length === 3 &&
-    bytes[0] >= 0x70 &&
-    bytes[0] <= 0x8f &&
-    bytes[1] >= 0x70 &&
-    bytes[1] <= 0x8f;
-  const maxAxisIdx = vPad._isDragonRiseFormat
-    ? Math.min(4, bytes.length - 1)
-    : threeByteFrontAxes
-      ? 1
-      : Math.min(4, bytes.length - 1);
+  const isCenterByte = (v) => v >= 0x70 && v <= 0x8f;
+  const isFirstPacket = !vPad._restBytes;
 
-  if (!vPad._restBytes) {
+  if (isFirstPacket) {
     vPad._restBytes = new Uint8Array(bytes);
     vPad._axisBytes = new Set();
-    vPad._pendingAxisBytes = new Set();
     vPad._constCenterBytes = new Set();
     for (let i = 0; i < bytes.length; i++) {
-      if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+      if (isCenterByte(bytes[i])) {
         vPad._constCenterBytes.add(i);
-      }
-    }
-    if (bytes.length >= 2) {
-      for (let i = 0; i <= maxAxisIdx; i++) {
-        if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
-          vPad._axisBytes.add(i);
-        }
-      }
-      const pairedSet = new Set();
-      for (const [ix, iy] of candidatePairs) {
-        if (iy <= maxAxisIdx && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
-          pairedSet.add(ix);
-          pairedSet.add(iy);
-        }
-      }
-      for (let i = 0; i <= maxAxisIdx; i++) {
-        if (vPad._axisBytes.has(i)) continue;
-        const bVal = bytes[i];
-        if (bVal !== 0x00 && bVal !== 0xff) continue;
-        let hasEligiblePartner = false;
-        let hasCenteredPartner = false;
-        for (const [ix, iy] of candidatePairs) {
-          if (iy > maxAxisIdx || (i !== ix && i !== iy)) continue;
-          const p = i === ix ? iy : ix;
-          if (pairedSet.has(p)) continue;
-          const pv = bytes[p];
-          if ((pv >= 0x70 && pv <= 0x8f) || pv === 0x00 || pv === 0xff) {
-            hasEligiblePartner = true;
-            if (vPad._axisBytes.has(p)) hasCenteredPartner = true;
-          }
-        }
-        if (!hasEligiblePartner) continue;
-        if (bVal === 0xff || (pairedSet.size === 0 && i <= 1 && hasCenteredPartner)) {
-          vPad._axisBytes.add(i);
-        } else {
-          vPad._pendingAxisBytes.add(i);
-        }
       }
     }
   } else {
     for (let i = 0; i < bytes.length; i++) {
-      if (!(bytes[i] >= 0x70 && bytes[i] <= 0x8f)) {
+      if (!isCenterByte(bytes[i])) {
         vPad._constCenterBytes.delete(i);
       }
     }
-    if (vPad._isDragonRiseFormat) {
-      for (let i = 5; i < bytes.length; i++) {
-        vPad._axisBytes.delete(i);
-        vPad._pendingAxisBytes.delete(i);
-      }
-      for (let i = 0; i <= 4 && i < bytes.length; i++) {
-        if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
-          vPad._axisBytes.add(i);
-          vPad._pendingAxisBytes.delete(i);
-        }
+  }
+
+  if (vPad._isDragonRiseFormat) {
+    for (let i = 5; i < bytes.length; i++) {
+      vPad._axisBytes.delete(i);
+    }
+    for (let i = 0; i <= 4 && i < bytes.length; i++) {
+      if (isCenterByte(bytes[i])) {
+        vPad._axisBytes.add(i);
       }
     }
-    if (vPad._pendingAxisBytes && vPad._pendingAxisBytes.size > 0) {
-      for (const pi of Array.from(vPad._pendingAxisBytes)) {
-        if (pi >= bytes.length) continue;
-        const bVal = bytes[pi];
-        if ((bVal >= 0x01 && bVal <= 0x6f) || (bVal >= 0x90 && bVal <= 0xfe)) {
-          vPad._pendingAxisBytes.delete(pi);
-        } else if (bVal === 0xff) {
-          vPad._axisBytes.add(pi);
-          vPad._pendingAxisBytes.delete(pi);
-        } else if (bVal >= 0x70 && bVal <= 0x8f) {
-          for (const [ix, iy] of candidatePairs) {
-            if (iy > maxAxisIdx) continue;
-            if (ix === 1 && iy === 2 && vPad._axisBytes.has(0)) continue;
-            if (pi === ix || pi === iy) {
-              const partner = pi === ix ? iy : ix;
-              const pCentered =
-                vPad._axisBytes.has(partner) || (bytes[partner] >= 0x70 && bytes[partner] <= 0x8f);
-              if (pCentered) {
-                vPad._axisBytes.add(pi);
-                vPad._pendingAxisBytes.delete(pi);
-                break;
-              }
-            }
-          }
-        }
-      }
+  }
+
+  const hasAnyConfirmedPair = () => {
+    for (const [px, py] of candidatePairs) {
+      if (py < bytes.length && vPad._axisBytes.has(px) && vPad._axisBytes.has(py)) return true;
+    }
+    return false;
+  };
+
+  // Confirm any non-overlapping candidate X/Y pair once both bytes are observed in the neutral center range
+  // (or 0xff + center on packet 0), whether on packet 0 or after releasing an initially deflected analog/digital stick.
+  for (const [ix, iy] of candidatePairs) {
+    if (iy >= bytes.length) continue;
+    if (vPad._isDragonRiseFormat && iy >= 5) continue;
+    if (vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) continue;
+    if (vPad._axisBytes.has(ix) || vPad._axisBytes.has(iy)) continue;
+    if (hasAnyConfirmedPair() && vPad._axisBytes.size + 2 >= bytes.length) continue;
+
+    const bothCenter = isCenterByte(bytes[ix]) && isCenterByte(bytes[iy]);
+    const pkt0HighDeflect =
+      isFirstPacket &&
+      ((bytes[ix] === 0xff && isCenterByte(bytes[iy])) ||
+        (isCenterByte(bytes[ix]) && bytes[iy] === 0xff));
+    if (bothCenter || pkt0HighDeflect) {
+      vPad._axisBytes.add(ix);
+      vPad._axisBytes.add(iy);
     }
   }
 
@@ -771,25 +723,21 @@ function decodeWebHidReport(vPad, bytes) {
   const isDragonRise = bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f);
 
   // Detect X/Y D-Pad byte pair across standard & alternate HID axis offsets (`[0,1]`, `[3,4]`, `[2,3]`, `[1,2]`)
-  let hasConfirmedPair = false;
-  for (const [ix, iy] of candidatePairs) {
-    if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
-      hasConfirmedPair = true;
-      break;
-    }
-  }
+  const confirmedReady = hasAnyConfirmedPair();
+  let usedPrimaryWake = false;
   let axX = 0;
   let axY = 0;
   for (const [ix, iy] of candidatePairs) {
-    const pairActive =
-      iy < bytes.length &&
-      ((vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) ||
-        (!hasConfirmedPair &&
-          ix === 0 &&
-          iy === 1 &&
-          (vPad._axisBytes.has(0) || vPad._pendingAxisBytes.has(0)) &&
-          (vPad._axisBytes.has(1) || vPad._pendingAxisBytes.has(1))));
-    if (pairActive) {
+    if (iy >= bytes.length) continue;
+    const confirmed = vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy);
+    const primaryWake =
+      !confirmedReady &&
+      ix === 0 &&
+      iy === 1 &&
+      (isCenterByte(bytes[0]) || bytes[0] === 0x00 || bytes[0] === 0xff) &&
+      (isCenterByte(bytes[1]) || bytes[1] === 0x00 || bytes[1] === 0xff);
+    if (confirmed || primaryWake) {
+      if (primaryWake) usedPrimaryWake = true;
       const vx = (bytes[ix] - 127.5) / 127.5;
       const vy = (bytes[iy] - 127.5) / 127.5;
       if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
@@ -856,6 +804,7 @@ function decodeWebHidReport(vPad, bytes) {
     const activeBits = [];
     for (let bi = 0; bi < bytes.length; bi++) {
       if (vPad._axisBytes.has(bi) || vPad._constCenterBytes.has(bi)) continue;
+      if (usedPrimaryWake && (bi === 0 || bi === 1)) continue;
       if (bi < rest.length) {
         // Clear any bit that was held on packet 0 as soon as 0 is observed in that bit
         rest[bi] &= bytes[bi];
@@ -910,7 +859,6 @@ async function pairWebHidUsbReceiver() {
         existing.connected = true;
         existing._restBytes = null;
         existing._axisBytes = null;
-        existing._pendingAxisBytes = null;
         existing._constCenterBytes = null;
         continue;
       }
@@ -929,7 +877,6 @@ async function pairWebHidUsbReceiver() {
         _prodName: String(dev.productName || "").trim().toLowerCase(),
         _restBytes: null,
         _axisBytes: null,
-        _pendingAxisBytes: null,
         _constCenterBytes: null,
         _isDragonRiseFormat: false,
         _uses10BtnMeta: false,
