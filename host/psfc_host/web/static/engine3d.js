@@ -250,15 +250,15 @@ const PLAYER_LIKENESS = {
   "liv-def-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "lean" }, // Robertson
   "liv-mid-1": { skin: 1, hair: 1, style: "swept", beard: true, build: "athletic" }, // Mac Allister
   "liv-mid-2": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // Gravenberch
-  "liv-mid-3": { skin: 0, hair: 1, style: "swept", beard: true, build: "athletic" }, // Szoboszlai
+  "liv-mid-3": { skin: 0, hair: 1, style: "headband", beard: true, build: "athletic" }, // Szoboszlai
   "liv-fwd-1": { skin: 2, hair: 0, style: "curls", beard: true, build: "lean" }, // Salah
   "liv-fwd-2": { skin: 2, hair: 0, style: "fade", beard: false, build: "lean" }, // Diaz
   "liv-fwd-3": { skin: 1, hair: 1, style: "bun", beard: true, build: "power" }, // Nunez
 
-  "che-gk-1": { skin: 2, hair: 0, style: "fade", beard: true, build: "power" },
+  "che-gk-1": { skin: 1, hair: 1, style: "headgear", beard: false, build: "power" }, // Iconic Cech-style GK headgear (`IMG_0364`, `IMG_0366`)
   "che-def-1": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" },
   "che-def-2": { skin: 4, hair: 0, style: "curls", beard: true, build: "power" },
-  "che-def-3": { skin: 1, hair: 1, style: "curls", beard: true, build: "athletic" },
+  "che-def-3": { skin: 1, hair: 1, style: "headband", beard: true, build: "athletic" },
   "che-def-4": { skin: 5, hair: 0, style: "fade", beard: false, build: "power" },
   "che-mid-1": { skin: 0, hair: 3, style: "crop", beard: false, build: "lean" }, // Palmer
   "che-mid-2": { skin: 4, hair: 0, style: "fade", beard: false, build: "power" }, // Caicedo
@@ -572,11 +572,11 @@ function dampBoneEuler(bone, rx, ry, rz, smoothTime, dt) {
  */
 function createSkinnedTorsoGeometry() {
   const rings = [
-    [0.854, 0.132, 0.088, -0.001], // Subtle inner underside lip so untucked jersey hem has real thickness!
-    [0.858, 0.149, 0.100, -0.001], // Untucked jersey hem overhanging shorts waist (`IMG_0347`, `IMG_0354`)
-    [0.905, 0.146, 0.096, 0.0],
-    [0.960, 0.141, 0.092, 0.001], // Lean athletic waist taper
-    [1.035, 0.147, 0.097, 0.003],
+    [0.902, 0.134, 0.088, -0.001], // Subtle inner underside lip so untucked jersey hem has real thickness!
+    [0.906, 0.148, 0.098, -0.001], // Untucked jersey hem overhanging shorts waist (`IMG_0347`, `IMG_0354`)
+    [0.938, 0.145, 0.095, 0.0],
+    [0.975, 0.141, 0.092, 0.001], // Lean athletic waist taper
+    [1.038, 0.147, 0.097, 0.003],
     [1.115, 0.158, 0.104, 0.006], // Oblique taper
     [1.195, 0.173, 0.111, 0.009], // Lower latissimus flare
     [1.275, 0.186, 0.117, 0.011], // Pectoral fullness
@@ -596,7 +596,7 @@ function createSkinnedTorsoGeometry() {
 
   for (let r = 0; r < rings.length; r++) {
     const [y, rx, rz, zShift] = rings[r];
-    const vCoord = Math.min(1, Math.max(0, (y - 0.858) / (1.482 - 0.858)));
+    const vCoord = Math.min(1, Math.max(0, (y - 0.904) / (1.482 - 0.904)));
 
     // Smooth 3-bone spinal weighting (Hips -> Spine -> Chest)
     let wHips = 0;
@@ -672,17 +672,34 @@ function createSkinnedTorsoGeometry() {
 /**
  * Helper to append a closed bottom-to-top skinned cylindrical limb loft with material groups.
  */
-function appendSkinnedTube(acc, rings, radialSegs, weightFn) {
+function appendSkinnedTube(acc, rings, radialSegs, weightFn, uvMode = "wrap") {
   const baseVertex = acc.positions.length / 3;
   for (let r = 0; r < rings.length; r++) {
     const { cx, y, cz, rx, rz } = rings[r];
     const [bi0, bw0, bi1, bw1] = weightFn(y);
+    const isShortsUv =
+      uvMode === "shortsLeft" || uvMode === "shortsRight" || uvMode === "pelvis";
+    const vCoord = isShortsUv
+      ? Math.max(0, Math.min(1, (y - 0.556) / (0.926 - 0.556)))
+      : r / Math.max(1, rings.length - 1);
     for (let s = 0; s <= radialSegs; s++) {
-      const theta = (s / radialSegs) * Math.PI * 2;
+      const f = s / radialSegs;
+      const theta = f * Math.PI * 2;
       const x = cx + Math.cos(theta) * rx;
       const z = cz + Math.sin(theta) * rz;
+      let u = f;
+      if (uvMode === "shortsLeft") {
+        // u = 0 strictly on outer +X hip seam; u = 1 on inner -X groin inseam (continuous, zero winding flip!)
+        u = 1.0 - Math.abs(f * 2.0 - 1.0);
+      } else if (uvMode === "shortsRight") {
+        // u = 0 strictly on outer -X hip seam; u = 1 on inner +X groin inseam!
+        u = Math.abs(f * 2.0 - 1.0);
+      } else if (uvMode === "pelvis") {
+        // Pure clean shorts fabric across the entire pelvis & crotch bridge (zero stripe bleed!)
+        u = 0.36 + 0.54 * (1.0 - Math.abs(f * 2.0 - 1.0));
+      }
       acc.positions.push(x, y, z);
-      acc.uvs.push(s / radialSegs, r / Math.max(1, rings.length - 1));
+      acc.uvs.push(u, vCoord);
       acc.skinIndices.push(bi0, bi1, 0, 0);
       acc.skinWeights.push(bw0, bw1, 0, 0);
     }
@@ -795,19 +812,25 @@ function createSkinnedLowerBodyGeometry() {
     groupIndices: [[], [], [], []],
   };
 
-  // 1. Tailored Pelvis & Crotch Inseam Block (`y = 0.770 -> 0.925`) tucked cleanly beneath untucked jersey hem!
+  // 1. Tailored Pelvis & Crotch Inseam Block (`y = 0.812 -> 0.926`) tucked cleanly under waist hem!
   const pelvisRings = [
-    { cx: 0, y: 0.768, cz: -0.002, rx: 0.002, rz: 0.002, mat: 0 },
-    { cx: 0, y: 0.775, cz: -0.002, rx: 0.124, rz: 0.088, mat: 0 }, // Seamless crotch inseam bridging both thighs!
-    { cx: 0, y: 0.825, cz: -0.003, rx: 0.138, rz: 0.093, mat: 0 },
-    { cx: 0, y: 0.875, cz: -0.004, rx: 0.139, rz: 0.093, mat: 0 },
-    { cx: 0, y: 0.916, cz: -0.002, rx: 0.132, rz: 0.087, mat: 0 },
+    { cx: 0, y: 0.810, cz: -0.003, rx: 0.002, rz: 0.002, mat: 0 },
+    { cx: 0, y: 0.816, cz: -0.003, rx: 0.114, rz: 0.078, mat: 0 },
+    { cx: 0, y: 0.860, cz: -0.003, rx: 0.128, rz: 0.086, mat: 0 },
+    { cx: 0, y: 0.902, cz: -0.002, rx: 0.132, rz: 0.089, mat: 0 },
+    { cx: 0, y: 0.920, cz: -0.002, rx: 0.128, rz: 0.086, mat: 0 },
     { cx: 0, y: 0.926, cz: 0, rx: 0.002, rz: 0.002, mat: 0 },
   ];
-  appendSkinnedTube(acc, pelvisRings, 20, (y) => {
-    const t = smoothstep(0.89, 0.926, y) * 0.22;
-    return [B_HIPS, 1.0 - t, B_SPINE, t];
-  });
+  appendSkinnedTube(
+    acc,
+    pelvisRings,
+    20,
+    (y) => {
+      const t = smoothstep(0.89, 0.926, y) * 0.22;
+      return [B_HIPS, 1.0 - t, B_SPINE, t];
+    },
+    "pelvis"
+  );
 
   // 2. Left & Right Continuous Skinned Legs (Ankle y = 0.062 -> Hip y = 0.922)
   for (const sideSign of [1, -1]) {
@@ -853,14 +876,20 @@ function createSkinnedLowerBodyGeometry() {
       { cx, y: 0.922, cz: 0, rx: 0.002, rz: 0.002, mat: 0 },
     ];
 
-    appendSkinnedTube(acc, shortLegRings, 16, (y) => {
-      if (y < 0.605) {
-        const kneeFollow = (1.0 - smoothstep(0.556, 0.605, y)) * 0.16;
-        return [bHip, 1.0 - kneeFollow, bKnee, kneeFollow];
-      }
-      const pelvisBlend = smoothstep(0.83, 0.922, y) * 0.42;
-      return [bHip, 1.0 - pelvisBlend, B_HIPS, pelvisBlend];
-    });
+    appendSkinnedTube(
+      acc,
+      shortLegRings,
+      16,
+      (y) => {
+        if (y < 0.605) {
+          const kneeFollow = (1.0 - smoothstep(0.556, 0.605, y)) * 0.16;
+          return [bHip, 1.0 - kneeFollow, bKnee, kneeFollow];
+        }
+        const pelvisBlend = smoothstep(0.83, 0.922, y) * 0.42;
+        return [bHip, 1.0 - pelvisBlend, B_HIPS, pelvisBlend];
+      },
+      sideSign > 0 ? "shortsLeft" : "shortsRight"
+    );
   }
 
   return finalizeGroupedSkinnedGeometry(acc);
@@ -967,7 +996,7 @@ function createSculptedCleatGeometry() {
  * Uses phiStart = -PI/2 so u = 0.5 maps directly to +Z (front face) and UV seam hides at -Z!
  */
 function createSculptedHeadGeometry() {
-  const g = new THREE.SphereGeometry(0.103, 28, 22, -Math.PI * 0.5, Math.PI * 2);
+  const g = new THREE.SphereGeometry(0.103, 30, 24, -Math.PI * 0.5, Math.PI * 2);
   const pos = g.attributes.position;
   for (let i = 0; i < pos.count; i++) {
     let x = pos.getX(i);
@@ -979,9 +1008,9 @@ function createSculptedHeadGeometry() {
 
     if (y < 0) {
       const t = Math.min(1, -y / 0.118);
-      x *= 1.0 - t * 0.31; // Defined athletic jawline taper
+      x *= 1.0 - t * 0.30; // Defined athletic jawline taper
       if (z > 0) {
-        z *= 1.0 - t * 0.13;
+        z *= 1.0 - t * 0.12;
         if (t > 0.65 && Math.abs(x) < 0.034) {
           z += 0.009 * (t - 0.65); // Chin projection
         }
@@ -990,11 +1019,13 @@ function createSculptedHeadGeometry() {
       }
     }
 
-    // Subtle anatomical brow ridge + recessed orbital eye sockets (eliminates smooth balloon-head!)
-    if (z > 0.042 && y > 0.010 && y < 0.044) {
-      z += 0.008 * Math.cos(((y - 0.027) / 0.017) * Math.PI * 0.5);
-    } else if (z > 0.048 && y > -0.012 && y <= 0.010 && Math.abs(x) > 0.014 && Math.abs(x) < 0.052) {
-      z -= 0.0045;
+    // Smooth supraorbital brow ridge + zygomatic cheekbone fullness (zero faceted eye-socket dents!)
+    if (z > 0.042 && y > 0.014 && y < 0.044) {
+      z += 0.0062 * Math.cos(((y - 0.029) / 0.015) * Math.PI * 0.5);
+    }
+    if (z > 0.022 && y > -0.024 && y < 0.012 && Math.abs(x) > 0.032) {
+      x *= 1.028;
+      z += 0.0025;
     }
 
     pos.setXYZ(i, x, y, z);
@@ -1003,9 +1034,9 @@ function createSculptedHeadGeometry() {
   return g;
 }
 
-function createFaceSkinTexture(skinHex, hairHex, hasBeard) {
-  const W = 256;
-  const H = 256;
+function createFaceSkinTexture(skinHex, hairHex, hasBeard, faceSeed = 0, maxAnisotropy = 4) {
+  const W = 512;
+  const H = 512;
   const c = document.createElement("canvas");
   c.width = W;
   c.height = H;
@@ -1014,126 +1045,217 @@ function createFaceSkinTexture(skinHex, hairHex, hasBeard) {
   ctx.fillStyle = skinHex;
   ctx.fillRect(0, 0, W, H);
 
-  // Subtle subsurface warmth across cheeks & nose bridge + jawline contour shadow
-  const cheek = ctx.createRadialGradient(128, 134, 6, 128, 134, 64);
-  cheek.addColorStop(0, "rgba(195, 78, 60, 0.10)");
-  cheek.addColorStop(1, "rgba(195, 78, 60, 0)");
-  ctx.fillStyle = cheek;
-  ctx.fillRect(60, 72, 136, 120);
+  // Subsurface cheek/nose warmth + forehead highlight + jawline ambient contour (`IMG_0363`, `IMG_0365`)
+  const foreheadHi = ctx.createRadialGradient(256, 198, 8, 256, 198, 72);
+  foreheadHi.addColorStop(0, "rgba(255, 245, 235, 0.14)");
+  foreheadHi.addColorStop(1, "rgba(255, 245, 235, 0)");
+  ctx.fillStyle = foreheadHi;
+  ctx.fillRect(160, 130, 192, 110);
 
-  const jawShade = ctx.createLinearGradient(0, 168, 0, 256);
-  jawShade.addColorStop(0, "rgba(20, 12, 8, 0)");
-  jawShade.addColorStop(1, "rgba(20, 12, 8, 0.24)");
+  for (const cx of [214, 298]) {
+    const cheek = ctx.createRadialGradient(cx, 272, 4, cx, 272, 44);
+    cheek.addColorStop(0, "rgba(195, 72, 56, 0.12)");
+    cheek.addColorStop(1, "rgba(195, 72, 56, 0)");
+    ctx.fillStyle = cheek;
+    ctx.beginPath();
+    ctx.arc(cx, 272, 44, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const jawShade = ctx.createLinearGradient(0, 332, 0, 512);
+  jawShade.addColorStop(0, "rgba(18, 10, 6, 0)");
+  jawShade.addColorStop(1, "rgba(18, 10, 6, 0.25)");
   ctx.fillStyle = jawShade;
-  ctx.fillRect(0, 168, W, 88);
+  ctx.fillRect(0, 332, W, 180);
 
-  // Baked hairline / temple / nape fade so 3D hair blends organically into skin (zero helmet seam!)
+  // Baked hairline / temple / nape fade so 3D hair blends organically into skin
   ctx.fillStyle = hairHex;
   ctx.globalAlpha = 0.30;
-  ctx.fillRect(0, 0, W, 76);
-  // Nape & sideburn fade (`u < 0.30` and `u > 0.70`)
-  ctx.fillRect(0, 76, 72, 92);
-  ctx.fillRect(184, 76, 72, 92);
+  ctx.fillRect(0, 0, W, 152);
+  ctx.fillRect(0, 152, 146, 188);
+  ctx.fillRect(366, 152, 146, 188);
   ctx.globalAlpha = 1.0;
 
-  if (hasBeard) {
-    const beardGrad = ctx.createRadialGradient(128, 176, 10, 128, 172, 42);
-    beardGrad.addColorStop(0, hairHex);
-    beardGrad.addColorStop(0.78, hairHex);
-    beardGrad.addColorStop(1, "rgba(0,0,0,0)");
+  // 4 Distinct Adult Pro Facial-Hair Styles (`IMG_0363`, `IMG_0365`)
+  const beardVariant = hasBeard ? 1 + (faceSeed % 3) : faceSeed % 4 === 0 ? 1 : 0; // 0=clean, 1=stubble, 2=goatee, 3=fullBeard
+  if (beardVariant > 0) {
     ctx.save();
-    ctx.globalAlpha = 0.42;
+    const beardAlpha = beardVariant === 1 ? 0.22 : beardVariant === 2 ? 0.44 : 0.56;
+    const beardRx = beardVariant === 2 ? 42 : 76;
+    const beardGrad = ctx.createRadialGradient(256, 346, 16, 256, 338, 90);
+    beardGrad.addColorStop(0, hairHex);
+    beardGrad.addColorStop(0.76, hairHex);
+    beardGrad.addColorStop(1, "rgba(0,0,0,0)");
+    ctx.globalAlpha = beardAlpha;
     ctx.fillStyle = beardGrad;
     ctx.beginPath();
-    ctx.ellipse(128, 174, 35, 29, 0, 0.06, Math.PI - 0.06);
+    ctx.ellipse(256, 340, beardRx, 64, 0, 0.04, Math.PI - 0.04);
     ctx.fill();
-    ctx.globalAlpha = 0.48;
-    ctx.fillStyle = hairHex;
+
+    // Mustache arch above upper lip
+    ctx.globalAlpha = beardVariant === 1 ? 0.26 : 0.58;
+    ctx.strokeStyle = hairHex;
+    ctx.lineWidth = beardVariant === 1 ? 6 : 9;
+    ctx.lineCap = "round";
     ctx.beginPath();
-    ctx.roundRect(114, 150, 28, 4.5, 2);
-    ctx.fill();
+    ctx.moveTo(226, 299);
+    ctx.quadraticCurveTo(256, 291, 286, 299);
+    ctx.stroke();
+
+    // Chin soul-patch connector
+    if (beardVariant >= 2) {
+      ctx.fillStyle = hairHex;
+      ctx.beginPath();
+      ctx.roundRect(249, 318, 14, 18, 4);
+      ctx.fill();
+    }
     ctx.restore();
   }
 
-  // Orbital socket ambient shadow under brow ridge (replaces flat cartoon sticker eyes!)
-  for (const ex of [113, 143]) {
-    const sock = ctx.createRadialGradient(ex, 118, 1, ex, 118, 11);
-    sock.addColorStop(0, "rgba(28, 15, 10, 0.28)");
-    sock.addColorStop(1, "rgba(28, 15, 10, 0)");
-    ctx.fillStyle = sock;
+  // Crisp 512x512 Anatomical Eyes (`IMG_0363`, `IMG_0365`): Sclera + Colored Iris + Pupil + Catchlight + Lashes!
+  const irisColors = ["#2c1d11", "#3f2a18", "#233645", "#4c3822"];
+  const irisHex = irisColors[faceSeed % irisColors.length];
+  for (const [idx, ex] of [
+    [0, 225],
+    [1, 287],
+  ]) {
+    const sgn = idx === 0 ? -1 : 1; // -1 = viewer left, +1 = viewer right
+    // Subtle upper-orbital crease shadow (strictly ABOVE eye so sclera stays crisp!)
+    const browShadow = ctx.createRadialGradient(ex, 226, 2, ex, 228, 22);
+    browShadow.addColorStop(0, "rgba(26, 14, 10, 0.24)");
+    browShadow.addColorStop(1, "rgba(26, 14, 10, 0)");
+    ctx.fillStyle = browShadow;
     ctx.beginPath();
-    ctx.arc(ex, 118, 11, 0, Math.PI * 2);
+    ctx.arc(ex, 228, 22, Math.PI, Math.PI * 2);
     ctx.fill();
 
-    // Natural muted sclera (never glowing #ffffff!)
-    ctx.fillStyle = "#d6dde6";
+    // Almond sclera (`#eef2f6` with subtle corner shading)
+    ctx.fillStyle = "#eef2f6";
     ctx.beginPath();
-    ctx.ellipse(ex, 120, 4.8, 2.5, 0, 0, Math.PI * 2);
+    ctx.moveTo(ex - 13.5, 238);
+    ctx.quadraticCurveTo(ex, 229.2, ex + 13.5, 238);
+    ctx.quadraticCurveTo(ex, 245.4, ex - 13.5, 238);
+    ctx.closePath();
     ctx.fill();
 
-    // Rich dark iris + pupil
-    ctx.fillStyle = "#261a10";
+    // Colored iris + limbal ring
+    ctx.fillStyle = irisHex;
     ctx.beginPath();
-    ctx.arc(ex, 120, 2.5, 0, Math.PI * 2);
+    ctx.arc(ex, 237.4, 5.9, 0, Math.PI * 2);
     ctx.fill();
-
-    ctx.fillStyle = "#090d16";
-    ctx.beginPath();
-    ctx.arc(ex, 120, 1.3, 0, Math.PI * 2);
-    ctx.fill();
-
-    // Upper eyelid lash crease
-    ctx.strokeStyle = "rgba(18, 12, 10, 0.72)";
-    ctx.lineWidth = 1.6;
-    ctx.beginPath();
-    ctx.moveTo(ex - 5.2, 119.5);
-    ctx.quadraticCurveTo(ex, 116.6, ex + 5.2, 119.5);
+    ctx.strokeStyle = "rgba(10, 12, 18, 0.65)";
+    ctx.lineWidth = 1.2;
     ctx.stroke();
+
+    // Deep pupil
+    ctx.fillStyle = "#060911";
+    ctx.beginPath();
+    ctx.arc(ex, 237.4, 3.1, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Specular stadium floodlight catchlight dot
+    ctx.fillStyle = "rgba(255, 255, 255, 0.85)";
+    ctx.beginPath();
+    ctx.arc(ex - 1.8, 235.6, 1.45, 0, Math.PI * 2);
+    ctx.fill();
+
+    // Crisp upper eyelid lash arch + subtle lower tear-line
+    ctx.strokeStyle = "rgba(14, 10, 9, 0.88)";
+    ctx.lineWidth = 3.0;
+    ctx.lineCap = "round";
+    ctx.beginPath();
+    ctx.moveTo(ex - 14.2, 238.4);
+    ctx.quadraticCurveTo(ex, 228.4, ex + 14.2, 238.4);
+    ctx.stroke();
+
+    ctx.strokeStyle = "rgba(56, 30, 22, 0.36)";
+    ctx.lineWidth = 1.4;
+    ctx.beginPath();
+    ctx.moveTo(ex - 11.5, 240.0);
+    ctx.quadraticCurveTo(ex, 245.5, ex + 11.5, 240.0);
+    ctx.stroke();
+
+    // Expressive competitive arched eyebrows (`IMG_0363`, `IMG_0365`)
+    ctx.fillStyle = hairHex;
+    ctx.globalAlpha = 0.90;
+    ctx.beginPath();
+    ctx.moveTo(ex - sgn * 16, 219);
+    ctx.quadraticCurveTo(ex + sgn * 2, 211, ex + sgn * 18, 217);
+    ctx.lineTo(ex + sgn * 17, 222);
+    ctx.quadraticCurveTo(ex + sgn * 2, 217, ex - sgn * 15, 224);
+    ctx.closePath();
+    ctx.fill();
+    ctx.globalAlpha = 1.0;
   }
 
-  // Natural tapered eyebrows
-  ctx.fillStyle = hairHex;
-  ctx.globalAlpha = 0.86;
+  // Defined nasal bridge side-contours + nostril wings (`cy = 278`)
+  ctx.strokeStyle = "rgba(38, 18, 12, 0.18)";
+  ctx.lineWidth = 2.6;
   ctx.beginPath();
-  ctx.roundRect(105, 109, 15, 3.2, 1.5);
-  ctx.roundRect(136, 109, 15, 3.2, 1.5);
-  ctx.fill();
-  ctx.globalAlpha = 1.0;
+  ctx.moveTo(246, 236);
+  ctx.quadraticCurveTo(243, 260, 241, 276);
+  ctx.moveTo(266, 236);
+  ctx.quadraticCurveTo(269, 260, 271, 276);
+  ctx.stroke();
 
-  // Nose bridge & nostril shadow
-  ctx.fillStyle = "rgba(28, 14, 10, 0.18)";
+  ctx.fillStyle = "rgba(26, 12, 9, 0.34)";
   ctx.beginPath();
-  ctx.ellipse(128, 141, 4.4, 2.0, 0, 0, Math.PI * 2);
+  ctx.ellipse(247, 279, 4.6, 2.5, -0.25, 0, Math.PI * 2);
+  ctx.ellipse(265, 279, 4.6, 2.5, 0.25, 0, Math.PI * 2);
   ctx.fill();
 
-  // Subtle neutral athletic mouth / philtrum shadow
-  ctx.fillStyle = "rgba(120, 52, 46, 0.34)";
+  // Nasolabial athletic creases + two-tone sculpted lips (`cy = 308`)
+  ctx.strokeStyle = "rgba(42, 20, 14, 0.14)";
+  ctx.lineWidth = 2.0;
   ctx.beginPath();
-  ctx.ellipse(128, 158.5, 9.5, 2.6, 0, 0, Math.PI * 2);
+  ctx.moveTo(236, 278);
+  ctx.quadraticCurveTo(226, 296, 230, 313);
+  ctx.moveTo(276, 278);
+  ctx.quadraticCurveTo(286, 296, 282, 313);
+  ctx.stroke();
+
+  // Upper lip (richer shadow vermilion) & lower lip (subtle sheen)
+  ctx.fillStyle = "rgba(126, 54, 48, 0.52)";
+  ctx.beginPath();
+  ctx.moveTo(234, 308);
+  ctx.quadraticCurveTo(248, 301, 256, 303.5);
+  ctx.quadraticCurveTo(264, 301, 278, 308);
+  ctx.quadraticCurveTo(256, 310, 234, 308);
   ctx.fill();
-  ctx.strokeStyle = "rgba(52, 20, 16, 0.52)";
-  ctx.lineWidth = 1.8;
+
+  ctx.fillStyle = "rgba(154, 72, 64, 0.40)";
   ctx.beginPath();
-  ctx.moveTo(119, 158.5);
-  ctx.quadraticCurveTo(128, 160.2, 137, 158.5);
+  ctx.moveTo(236, 309);
+  ctx.quadraticCurveTo(256, 318.5, 276, 309);
+  ctx.closePath();
+  ctx.fill();
+
+  ctx.strokeStyle = "rgba(44, 16, 14, 0.68)";
+  ctx.lineWidth = 2.4;
+  ctx.beginPath();
+  ctx.moveTo(234, 308.5);
+  ctx.quadraticCurveTo(256, 311.2, 278, 308.5);
   ctx.stroke();
 
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = maxAnisotropy;
   return tex;
 }
 
 /**
- * Procedural 3-blade tapered 3D grass tuft geometry for GPU InstancedMesh turf detail (`IMG_0364`, `IMG_0366`).
+ * Procedural 5-blade manicured 3D stadium grass micro-tuft geometry (`2.4cm` height, `IMG_0351`, `IMG_0364`).
  */
 function createGrassTuftGeometry() {
   const positions = [];
   const normals = [];
   const uvs = [];
   const blades = [
-    { ox: 0.0, oz: 0.0, yaw: 0.0, lean: 0.015, h: 0.046, w: 0.0075 },
-    { ox: -0.014, oz: 0.011, yaw: 1.95, lean: 0.019, h: 0.04, w: 0.0068 },
-    { ox: 0.013, oz: -0.012, yaw: -2.05, lean: 0.017, h: 0.043, w: 0.007 },
+    { ox: 0.0, oz: 0.0, yaw: 0.1, lean: 0.009, h: 0.026, w: 0.0046 },
+    { ox: -0.016, oz: 0.012, yaw: 1.45, lean: 0.011, h: 0.023, w: 0.0042 },
+    { ox: 0.015, oz: -0.013, yaw: -1.75, lean: 0.010, h: 0.025, w: 0.0044 },
+    { ox: 0.018, oz: 0.014, yaw: 2.65, lean: 0.011, h: 0.021, w: 0.0040 },
+    { ox: -0.014, oz: -0.017, yaw: -0.65, lean: 0.009, h: 0.024, w: 0.0042 },
   ];
   const pushTriBothSides = (ax, ay, az, bx, by, bz, cx, cy, cz, nx, ny, nz) => {
     positions.push(ax, ay, az, bx, by, bz, cx, cy, cz);
@@ -1226,16 +1348,17 @@ const SHARED_GEO = (() => {
   const skinnedLowerBody = retainGpu(createSkinnedLowerBodyGeometry());
 
   const cleat = retainGpu(createSculptedCleatGeometry());
+  const solePlate = retainGpu(new THREE.BoxGeometry(0.068, 0.008, 0.222));
   const bootStripe = retainGpu(new THREE.BoxGeometry(0.088, 0.020, 0.080));
-  const stud = retainGpu(new THREE.CylinderGeometry(0.0065, 0.0045, 0.013, 6));
+  const stud = retainGpu(new THREE.CylinderGeometry(0.0065, 0.0045, 0.014, 6));
 
   const handL = retainGpu(createSculptedHandGeometry(1));
   const handR = retainGpu(createSculptedHandGeometry(-1));
   const wristTape = retainGpu(new THREE.CylinderGeometry(0.032, 0.031, 0.030, 12));
-  const gkGlove = retainGpu(new THREE.SphereGeometry(0.048, 12, 10));
-  gkGlove.scale(0.92, 1.12, 0.50);
-  const gkFinger = retainGpu(new THREE.CapsuleGeometry(0.0095, 0.036, 4, 6));
-  const gkCuff = retainGpu(new THREE.CylinderGeometry(0.040, 0.038, 0.038, 12));
+  const gkGlove = retainGpu(new THREE.SphereGeometry(0.052, 12, 10));
+  gkGlove.scale(0.98, 1.18, 0.48);
+  const gkFinger = retainGpu(new THREE.CapsuleGeometry(0.0105, 0.042, 4, 6));
+  const gkCuff = retainGpu(new THREE.CylinderGeometry(0.044, 0.041, 0.044, 12));
 
   const neck = retainGpu(new THREE.CylinderGeometry(0.050, 0.061, 0.095, 12));
   const collar = retainGpu(new THREE.TorusGeometry(0.069, 0.0135, 8, 18));
@@ -1245,6 +1368,16 @@ const SHARED_GEO = (() => {
   nose.scale(0.74, 1.08, 1.12);
   const ear = retainGpu(new THREE.SphereGeometry(0.019, 8, 6));
   ear.scale(0.42, 1.04, 0.66);
+
+  const hairTopPad = retainGpu(new THREE.SphereGeometry(0.068, 12, 8));
+  const hairCurl = retainGpu(new THREE.SphereGeometry(0.021, 7, 6));
+  const hairWave = retainGpu(new THREE.SphereGeometry(0.056, 12, 10));
+  const hairBun = retainGpu(new THREE.SphereGeometry(0.034, 10, 10));
+  const headband = retainGpu(new THREE.TorusGeometry(0.096, 0.0095, 8, 24));
+  headband.rotateX(Math.PI * 0.46);
+  headband.scale(0.92, 1.03, 1.0);
+  const gkHeadgear = retainGpu(createTailoredHairCapGeometry(-0.068, 0.012));
+  const sNumPlane = retainGpu(new THREE.PlaneGeometry(0.054, 0.050));
 
   // Sleek FIFA 10–12 Proportioned Pitch Indicators (`IMG_0350.webp`)
   const ring = retainGpu(new THREE.RingGeometry(0.35, 0.45, 36));
@@ -1265,6 +1398,7 @@ const SHARED_GEO = (() => {
     skinnedArmsGk,
     skinnedLowerBody,
     cleat,
+    solePlate,
     bootStripe,
     stud,
     handL,
@@ -1278,6 +1412,13 @@ const SHARED_GEO = (() => {
     head,
     nose,
     ear,
+    hairTopPad,
+    hairCurl,
+    hairWave,
+    hairBun,
+    headband,
+    gkHeadgear,
+    sNumPlane,
     ring,
     chargeArc,
     aimArrow,
@@ -1578,34 +1719,49 @@ function createPitchPbrMaps(pitchLen, pitchWid, fmt, maxAnisotropy) {
   return { tex, normalMap, roughnessMap, totalW, totalH };
 }
 
-function createGoalNetTexture() {
+function createGoalNetTexture(maxAnisotropy = 4) {
+  const S = 256;
   const c = document.createElement("canvas");
-  c.width = 128;
-  c.height = 128;
+  c.width = S;
+  c.height = S;
   const ctx = c.getContext("2d");
-  ctx.clearRect(0, 0, 128, 128);
-  ctx.strokeStyle = "rgba(248, 250, 252, 0.86)";
-  ctx.lineWidth = 2.2;
-  for (let i = -128; i <= 256; i += 14) {
+  ctx.clearRect(0, 0, S, S);
+
+  // Crisp braided white diamond/square FIFA stadium goal net (`IMG_0350.webp`, `IMG_0351.jpeg`, `IMG_0356.jpeg`)
+  ctx.strokeStyle = "rgba(255, 255, 255, 0.95)";
+  ctx.lineWidth = 3.4;
+  const step = 28;
+  for (let i = -S; i <= S * 2; i += step) {
     ctx.beginPath();
     ctx.moveTo(i, 0);
-    ctx.lineTo(i + 128, 128);
+    ctx.lineTo(i + S, S);
     ctx.stroke();
     ctx.beginPath();
-    ctx.moveTo(i + 128, 0);
-    ctx.lineTo(i, 128);
+    ctx.moveTo(i + S, 0);
+    ctx.lineTo(i, S);
     ctx.stroke();
   }
+  // Subtle knot highlight at diamond intersections
+  ctx.fillStyle = "rgba(226, 232, 240, 0.9)";
+  for (let y = 0; y <= S; y += step * 0.5) {
+    for (let x = 0; x <= S; x += step) {
+      const ox = (Math.round(y / (step * 0.5)) % 2) * (step * 0.5);
+      ctx.fillRect(x + ox - 1.5, y - 1.5, 3, 3);
+    }
+  }
+
   const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
   tex.wrapS = THREE.RepeatWrapping;
   tex.wrapT = THREE.RepeatWrapping;
-  tex.repeat.set(9, 4.5);
+  tex.repeat.set(12, 5.5);
+  tex.anisotropy = maxAnisotropy;
   return tex;
 }
 
 /**
- * 2010–2012 Era Thermally-Bonded FIFA Size 5 Match Ball Texture (Adidas Tango 12 / Finale inspired).
- * Crisp white leather base with high-contrast black & crimson-gold curved triad panels so spin reads at 23cm!
+ * Clean Thermally-Bonded Pro Size 5 Match Ball Texture (`IMG_0345`, `IMG_0358`, `IMG_0363`, `IMG_0366`).
+ * Crisp pearl-white leather with non-overlapping geometric Obsidian/Gold/Crimson star-pentagon panels!
  */
 function createMatchBallTexture() {
   const W = 512;
@@ -1615,82 +1771,89 @@ function createMatchBallTexture() {
   c.height = H;
   const ctx = c.getContext("2d");
 
+  // Pearl-white micro-textured polyurethane match ball leather
   ctx.fillStyle = "#f8fafc";
   ctx.fillRect(0, 0, W, H);
 
-  // Subtle thermally-bonded panel seam grid
-  ctx.strokeStyle = "rgba(100, 116, 139, 0.28)";
-  ctx.lineWidth = 2.2;
-  for (let u = 0; u <= W; u += 64) {
-    ctx.beginPath();
-    ctx.moveTo(u, 0);
-    ctx.lineTo(u, H);
-    ctx.stroke();
-  }
-
-  const triads = [
-    [0.125, 0.27],
-    [0.375, 0.23],
-    [0.625, 0.27],
-    [0.875, 0.23],
-    [0.25, 0.52],
-    [0.5, 0.5],
-    [0.75, 0.52],
+  // Clean icosahedral thermal-bond panel seam lines (subtle, never messy!)
+  const centers = [
+    [0.125, 0.26],
+    [0.375, 0.26],
+    [0.625, 0.26],
+    [0.875, 0.26],
     [0.0, 0.5],
-    [0.125, 0.77],
-    [0.375, 0.75],
-    [0.625, 0.77],
-    [0.875, 0.75],
+    [0.25, 0.5],
+    [0.5, 0.5],
+    [0.75, 0.5],
+    [1.0, 0.5],
+    [0.125, 0.74],
+    [0.375, 0.74],
+    [0.625, 0.74],
+    [0.875, 0.74],
   ];
 
-  // Tango 12 crimson/gold outer speed rings
-  ctx.strokeStyle = "#dc2626";
-  ctx.lineWidth = 7.5;
-  for (let i = 0; i < triads.length; i += 2) {
-    ctx.beginPath();
-    ctx.arc(triads[i][0] * W, triads[i][1] * H, 38, 0, Math.PI * 2);
-    ctx.stroke();
-  }
-
-  // Bold dark-navy Tango curved triad ribbons
-  ctx.strokeStyle = "#0f172a";
-  ctx.lineWidth = 9.5;
-  for (let i = 0; i < triads.length; i++) {
-    for (let j = i + 1; j < triads.length; j++) {
-      const dx = (triads[i][0] - triads[j][0]) * W;
-      const dy = (triads[i][1] - triads[j][1]) * H;
-      if (Math.hypot(dx, dy) < 142) {
+  ctx.strokeStyle = "rgba(100, 116, 139, 0.30)";
+  ctx.lineWidth = 2.0;
+  for (let i = 0; i < centers.length; i++) {
+    for (let j = i + 1; j < centers.length; j++) {
+      const dx = (centers[i][0] - centers[j][0]) * W;
+      const dy = (centers[i][1] - centers[j][1]) * H;
+      const d = Math.hypot(dx, dy);
+      if (d > 40 && d < 136) {
         ctx.beginPath();
-        ctx.moveTo(triads[i][0] * W, triads[i][1] * H);
-        ctx.quadraticCurveTo(
-          ((triads[i][0] + triads[j][0]) * 0.5) * W,
-          ((triads[i][1] + triads[j][1]) * 0.5) * H - 11,
-          triads[j][0] * W,
-          triads[j][1] * H
-        );
+        ctx.moveTo(centers[i][0] * W, centers[i][1] * H);
+        ctx.lineTo(centers[j][0] * W, centers[j][1] * H);
         ctx.stroke();
       }
     }
   }
 
-  for (const [u, v] of triads) {
+  // Crisp non-overlapping geometric 5-point Pro Star / Pentagon panels (`IMG_0363`, `IMG_0366`)
+  for (let idx = 0; idx < centers.length; idx++) {
+    const [u, v] = centers[idx];
     const cx = u * W;
     const cy = v * H;
+    const latStretch = 1.0 / Math.max(0.55, Math.sin(v * Math.PI));
+
+    // Outer crimson/gold aero ring
+    ctx.strokeStyle = idx % 2 === 0 ? "#dc2626" : "#eab308";
+    ctx.lineWidth = 4.2;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, 27 * Math.min(1.25, latStretch), 25, 0, 0, Math.PI * 2);
+    ctx.stroke();
+
+    // Crisp Obsidian 5-point star-pentagon core
     ctx.fillStyle = "#0f172a";
     ctx.beginPath();
-    for (let k = 0; k < 5; k++) {
-      const ang = -Math.PI * 0.5 + (k * Math.PI * 2) / 5;
-      const px = cx + Math.cos(ang) * 24;
-      const py = cy + Math.sin(ang) * 22;
+    for (let k = 0; k < 10; k++) {
+      const ang = -Math.PI * 0.5 + (k * Math.PI) / 5;
+      const rad = k % 2 === 0 ? 22 : 12.5;
+      const px = cx + Math.cos(ang) * rad * Math.min(1.22, latStretch);
+      const py = cy + Math.sin(ang) * rad * 0.94;
       if (k === 0) ctx.moveTo(px, py);
       else ctx.lineTo(px, py);
     }
     ctx.closePath();
     ctx.fill();
+
+    // Crisp silver-gold inner pentagon badge
+    ctx.strokeStyle = "#facc15";
+    ctx.lineWidth = 1.8;
+    ctx.beginPath();
+    for (let k = 0; k < 5; k++) {
+      const ang = -Math.PI * 0.5 + (k * Math.PI * 2) / 5;
+      const px = cx + Math.cos(ang) * 9.5 * Math.min(1.2, latStretch);
+      const py = cy + Math.sin(ang) * 9.0;
+      if (k === 0) ctx.moveTo(px, py);
+      else ctx.lineTo(px, py);
+    }
+    ctx.closePath();
+    ctx.stroke();
   }
 
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
+  tex.anisotropy = 4;
   return retainGpu(tex);
 }
 
@@ -1825,18 +1988,22 @@ function createShortsTexture(kit) {
   ctx.fillStyle = kit.shorts || "#ffffff";
   ctx.fillRect(0, 0, 128, 128);
 
-  // Lateral contrast piping stripes strictly on outer hip seams (`IMG_0347`, `IMG_0348`)
+  // Lateral contrast piping strictly at u = 0 (`shortsLeft` / `shortsRight` maps u = 0 to outer lateral hip ONLY; u = 1 is clean inner groin!)
   ctx.fillStyle = kit.shortsStripe || kit.trim || "#ef4444";
-  ctx.fillRect(0, 0, 7, 128);
-  ctx.fillRect(61, 0, 7, 128);
+  ctx.fillRect(0, 0, 6, 128);
+  ctx.fillRect(9, 0, 4, 128);
 
   // Subtle ambient-occlusion drop shadow at the top of the shorts (`v -> 1`, canvas y = 0..24) cast by untucked jersey hem!
   const hemAo = ctx.createLinearGradient(0, 0, 0, 26);
-  hemAo.addColorStop(0, "rgba(8, 12, 22, 0.32)");
-  hemAo.addColorStop(0.55, "rgba(8, 12, 22, 0.12)");
+  hemAo.addColorStop(0, "rgba(8, 12, 22, 0.30)");
+  hemAo.addColorStop(0.55, "rgba(8, 12, 22, 0.11)");
   hemAo.addColorStop(1, "rgba(8, 12, 22, 0)");
   ctx.fillStyle = hemAo;
   ctx.fillRect(0, 0, 128, 26);
+
+  // Subtle bottom shorts hem stitch (`v -> 0`, canvas y = 122..128)
+  ctx.fillStyle = "rgba(15, 23, 42, 0.12)";
+  ctx.fillRect(0, 123, 128, 5);
 
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
@@ -1865,18 +2032,31 @@ function createShortsNumberTexture(kit, shirtNumber) {
   return tex;
 }
 
-function createGkGloveTexture(accentHex) {
+function createGkGloveTexture(accentHex, side = 0) {
   const c = document.createElement("canvas");
-  c.width = 128;
-  c.height = 128;
+  c.width = 256;
+  c.height = 256;
   const ctx = c.getContext("2d");
-  ctx.fillStyle = "#111827";
-  ctx.fillRect(0, 0, 128, 128);
-  ctx.fillStyle = accentHex || "#facc15";
-  ctx.fillRect(0, 18, 128, 26);
-  ctx.fillRect(14, 56, 100, 18);
-  ctx.fillStyle = "#f8fafc";
-  ctx.fillRect(18, 84, 92, 32);
+  // High-visibility Neon-Volt/Obsidian (`IMG_0364`, `IMG_0366`) & Crisp White/Obsidian (`IMG_0358`, `IMG_0365`) pro latex GK gloves!
+  const hiVis = side === 0 ? "#d9f99d" : "#f8fafc";
+  const punchAccent = side === 0 ? "#eab308" : accentHex || "#38bdf8";
+
+  ctx.fillStyle = hiVis;
+  ctx.fillRect(0, 0, 256, 256);
+
+  // Obsidian segmented backhand punch-zone ribs & wrist strap (`IMG_0358`, `IMG_0364`)
+  ctx.fillStyle = "#0f172a";
+  ctx.fillRect(0, 0, 256, 44); // Wrap-around neoprene wrist strap
+  ctx.fillRect(18, 64, 220, 24);
+  ctx.fillRect(24, 102, 208, 20);
+  ctx.fillStyle = punchAccent;
+  ctx.fillRect(0, 44, 256, 12);
+  ctx.fillRect(28, 130, 200, 14);
+
+  // Bright grip-latex palm zone
+  ctx.fillStyle = "#ffffff";
+  ctx.fillRect(22, 156, 212, 86);
+
   const tex = new THREE.CanvasTexture(c);
   tex.colorSpace = THREE.SRGBColorSpace;
   return tex;
@@ -2081,7 +2261,7 @@ function createTailoredHairCapGeometry(napeDrop = -0.078, crownBoost = 0.008) {
 const HAIR_CAP_FULL = retainGpu(createTailoredHairCapGeometry(-0.078, 0.009));
 const HAIR_CAP_FADE = retainGpu(createTailoredHairCapGeometry(-0.044, 0.005));
 
-function buildHairMesh(style, hairColorHex) {
+function buildHairMesh(style, hairColorHex, accentHex = "#f8fafc") {
   const mat = new THREE.MeshStandardMaterial({
     color: hairColorHex,
     roughness: 0.84,
@@ -2089,18 +2269,33 @@ function buildHairMesh(style, hairColorHex) {
   });
   const group = new THREE.Group();
 
+  if (style === "headgear") {
+    // Iconic Petr Cech padded GK scrum-cap headgear (`IMG_0364.jpeg`, `IMG_0366.webp`)
+    const gearMat = new THREE.MeshStandardMaterial({
+      color: "#111827",
+      roughness: 0.52,
+      metalness: 0.08,
+    });
+    const shell = new THREE.Mesh(SHARED_GEO.gkHeadgear, gearMat);
+    shell.scale.set(1.035, 1.025, 1.035);
+    group.add(shell);
+    const browPad = new THREE.Mesh(SHARED_GEO.headband, gearMat);
+    browPad.position.set(0, 0.044, 0.004);
+    browPad.scale.set(1.04, 1.04, 1.35);
+    group.add(browPad);
+    return group;
+  }
+
   if (style === "buzz" || style === "fade") {
     group.add(new THREE.Mesh(HAIR_CAP_FADE, mat));
     if (style === "fade") {
-      const topPad = new THREE.Mesh(new THREE.SphereGeometry(0.068, 12, 8), mat);
+      const topPad = new THREE.Mesh(SHARED_GEO.hairTopPad, mat);
       topPad.scale.set(0.95, 0.44, 1.08);
       topPad.position.set(0, 0.106, 0.006);
       group.add(topPad);
     }
   } else if (style === "curls") {
     group.add(new THREE.Mesh(HAIR_CAP_FULL, mat));
-    // Textured multi-row footballer curls across crown, temples, and occipital back (zero crown-ring buns!)
-    const curlGeo = new THREE.SphereGeometry(0.021, 7, 6);
     const rings = [
       { r: 0.032, y: 0.116, n: 6, zOff: 0.006 },
       { r: 0.064, y: 0.096, n: 10, zOff: -0.004 },
@@ -2111,7 +2306,7 @@ function buildHairMesh(style, hairColorHex) {
         const ang = (i / row.n) * Math.PI * 2 + row.y * 7.0;
         const cz = Math.sin(ang) * row.r + row.zOff;
         if (row.backOnly && cz > 0.028) continue;
-        const puff = new THREE.Mesh(curlGeo, mat);
+        const puff = new THREE.Mesh(SHARED_GEO.hairCurl, mat);
         puff.position.set(
           Math.cos(ang) * row.r * 0.92,
           row.y + ((i % 2) - 0.5) * 0.006,
@@ -2120,21 +2315,30 @@ function buildHairMesh(style, hairColorHex) {
         group.add(puff);
       }
     }
-  } else if (style === "swept") {
+  } else if (style === "swept" || style === "headband") {
     group.add(new THREE.Mesh(HAIR_CAP_FULL, mat));
-    const wave = new THREE.Mesh(new THREE.SphereGeometry(0.056, 12, 10), mat);
+    const wave = new THREE.Mesh(SHARED_GEO.hairWave, mat);
     wave.scale.set(1.18, 0.46, 1.02);
     wave.position.set(0.008, 0.108, 0.020);
     wave.rotation.x = -0.14;
     wave.rotation.z = -0.08;
     group.add(wave);
+    if (style === "headband") {
+      // Athletic footballer hairband (`IMG_0365.jpeg` #3)
+      const bandMat = new THREE.MeshStandardMaterial({
+        color: accentHex || "#f8fafc",
+        roughness: 0.48,
+      });
+      const band = new THREE.Mesh(SHARED_GEO.headband, bandMat);
+      band.position.set(0, 0.052, 0.003);
+      group.add(band);
+    }
   } else if (style === "bun") {
     group.add(new THREE.Mesh(HAIR_CAP_FULL, mat));
-    const bun = new THREE.Mesh(new THREE.SphereGeometry(0.034, 10, 10), mat);
+    const bun = new THREE.Mesh(SHARED_GEO.hairBun, mat);
     bun.position.set(0, 0.054, -0.106);
     group.add(bun);
   } else {
-    // Classic modern textured crop
     group.add(new THREE.Mesh(HAIR_CAP_FULL, mat));
   }
   return group;
@@ -2152,7 +2356,7 @@ function resolveLikeness(footballerId, fallbackSeed, isGk) {
     };
   }
   const h = hashStr(footballerId || String(fallbackSeed));
-  const styles = ["crop", "fade", "curls", "swept", "buzz"];
+  const styles = ["crop", "fade", "curls", "swept", "buzz", "headband"];
   const builds = ["lean", "athletic", "power"];
   return {
     skinHex: SKIN_TONES[h % SKIN_TONES.length],
@@ -2179,15 +2383,16 @@ function createFootballerActor(spec) {
     side,
     scale = 1.06,
   } = spec;
+  const faceSeed = hashStr(footballerId || String((shirtNumber || 9) + side * 31));
   const likeness = resolveLikeness(footballerId, (shirtNumber || 9) + side * 31, isGk);
   const soma = isReferee
     ? SOMATOTYPE_SCALES.athletic
     : SOMATOTYPE_SCALES[likeness.build] || SOMATOTYPE_SCALES.athletic;
 
   const clothNormScale = new THREE.Vector2(0.46, 0.46);
-  const skinMat = new THREE.MeshStandardMaterial({ color: likeness.skinHex, roughness: 0.62 });
-  const faceTex = createFaceSkinTexture(likeness.skinHex, likeness.hairHex, likeness.beard);
-  const headFaceMat = new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.64 });
+  const skinMat = new THREE.MeshStandardMaterial({ color: likeness.skinHex, roughness: 0.60 });
+  const faceTex = createFaceSkinTexture(likeness.skinHex, likeness.hairHex, likeness.beard, faceSeed, 4);
+  const headFaceMat = new THREE.MeshStandardMaterial({ map: faceTex, roughness: 0.62 });
 
   const sleeveMat = new THREE.MeshStandardMaterial({
     color: kit.sleeves,
@@ -2216,7 +2421,7 @@ function createFootballerActor(spec) {
         { upper: "#1d4ed8", accent: "#f8fafc" }, // Royal Vapor Blue / Silver (`IMG_0363`)
         { upper: "#111827", accent: "#facc15" }, // Predator Black / Gold
         { upper: "#dc2626", accent: "#f8fafc" }, // Crimson / White
-      ][hashStr(footballerId || String(shirtNumber || 9)) % 5];
+      ][faceSeed % 5];
 
   const bootCanvas = document.createElement("canvas");
   bootCanvas.width = 128;
@@ -2226,12 +2431,12 @@ function createFootballerActor(spec) {
   bCtx.fillRect(0, 0, 128, 128);
   // Dark carbon outsole rim & heel counter
   bCtx.fillStyle = "#0f172a";
-  bCtx.fillRect(0, 0, 128, 26);
+  bCtx.fillRect(0, 0, 128, 28);
   bCtx.fillStyle = bootPalette.accent;
-  bCtx.fillRect(0, 26, 128, 10);
+  bCtx.fillRect(0, 28, 128, 11);
   // Central tongue & speed-lace panel
   bCtx.fillStyle = "#0f172a";
-  bCtx.fillRect(48, 38, 32, 54);
+  bCtx.fillRect(48, 40, 32, 52);
   bCtx.strokeStyle = bootPalette.accent;
   bCtx.lineWidth = 3.5;
   for (let ly = 46; ly <= 84; ly += 9) {
@@ -2243,9 +2448,10 @@ function createFootballerActor(spec) {
   const bootTex = new THREE.CanvasTexture(bootCanvas);
   bootTex.colorSpace = THREE.SRGBColorSpace;
 
-  const bootMat = new THREE.MeshStandardMaterial({ map: bootTex, roughness: 0.28, metalness: 0.12 });
+  const bootMat = new THREE.MeshStandardMaterial({ map: bootTex, roughness: 0.26, metalness: 0.14 });
   const bootAccentMat = new THREE.MeshStandardMaterial({ color: bootPalette.accent, roughness: 0.30 });
-  const studMat = new THREE.MeshStandardMaterial({ color: "#e2e8f0", metalness: 0.58, roughness: 0.25 });
+  const soleMat = new THREE.MeshStandardMaterial({ color: "#090d16", roughness: 0.24, metalness: 0.36 });
+  const studMat = new THREE.MeshStandardMaterial({ color: "#e2e8f0", metalness: 0.64, roughness: 0.22 });
 
   const jerseyTex = createJerseyTextures(
     kit,
@@ -2346,7 +2552,7 @@ function createFootballerActor(spec) {
   if (!isReferee && shirtNumber) {
     const sNumTex = createShortsNumberTexture(kit, shirtNumber);
     const sNumPatch = new THREE.Mesh(
-      new THREE.PlaneGeometry(0.054, 0.050),
+      SHARED_GEO.sNumPlane,
       new THREE.MeshStandardMaterial({
         map: sNumTex,
         transparent: true,
@@ -2388,13 +2594,13 @@ function createFootballerActor(spec) {
     bones[B_HEAD].add(ear);
   }
 
-  const hair = buildHairMesh(likeness.style, likeness.hairHex);
+  const hair = buildHairMesh(likeness.style, likeness.hairHex, kit.trim);
   hair.position.set(0, 0.086, 0);
   bones[B_HEAD].add(hair);
 
-  // Sculpted Anatomical Hands / Articulated 5-Finger GK Gloves / Wrist Tape (`IMG_0354`, `IMG_0364`)
-  const gloveTex = isGk ? createGkGloveTexture(kit.bootAccent || "#facc15") : null;
-  const gloveMat = isGk ? new THREE.MeshStandardMaterial({ map: gloveTex, roughness: 0.36 }) : null;
+  // Sculpted Anatomical Hands / Articulated Spread-Finger GK Latex Gloves (`IMG_0358`, `IMG_0364`, `IMG_0366`)
+  const gloveTex = isGk ? createGkGloveTexture(kit.bootAccent || "#facc15", side) : null;
+  const gloveMat = isGk ? new THREE.MeshStandardMaterial({ map: gloveTex, roughness: 0.34 }) : null;
   const tapeMat =
     !isGk && !isReferee && (shirtNumber === 7 || shirtNumber === 10 || shirtNumber === 5 || shirtNumber % 3 === 1)
       ? new THREE.MeshStandardMaterial({ color: "#f8fafc", roughness: 0.58 })
@@ -2407,24 +2613,25 @@ function createFootballerActor(spec) {
     if (isGk) {
       const gloveGroup = new THREE.Group();
       gloveGroup.position.set(0, -0.236, 0.006);
+      gloveGroup.scale.setScalar(1.14);
       const cuff = new THREE.Mesh(SHARED_GEO.gkCuff, gloveMat);
-      cuff.position.set(0, 0.034, 0);
+      cuff.position.set(0, 0.036, 0);
       gloveGroup.add(cuff);
       const palm = new THREE.Mesh(SHARED_GEO.gkGlove, gloveMat);
       palm.castShadow = true;
       gloveGroup.add(palm);
       for (let f = 0; f < 4; f++) {
-        const fx = (f - 1.5) * 0.019;
+        const fx = (f - 1.5) * 0.021;
         const finger = new THREE.Mesh(SHARED_GEO.gkFinger, gloveMat);
-        finger.position.set(fx, -0.052, 0.006);
-        finger.rotation.z = (f - 1.5) * -0.09;
-        finger.rotation.x = 0.14;
+        finger.position.set(fx, -0.058, 0.006);
+        finger.rotation.z = (f - 1.5) * -0.15; // Spread-finger shot-stopper ready hand (`IMG_0358`, `IMG_0364`)!
+        finger.rotation.x = 0.10;
         gloveGroup.add(finger);
       }
       const thumb = new THREE.Mesh(SHARED_GEO.gkFinger, gloveMat);
-      thumb.position.set(armIdx * -0.041, -0.022, 0.020);
-      thumb.rotation.z = armIdx * 0.62;
-      thumb.rotation.x = 0.25;
+      thumb.position.set(armIdx * -0.046, -0.024, 0.022);
+      thumb.rotation.z = armIdx * 0.68;
+      thumb.rotation.x = 0.22;
       gloveGroup.add(thumb);
       elBone.add(gloveGroup);
     } else {
@@ -2440,22 +2647,28 @@ function createFootballerActor(spec) {
     }
   }
 
-  // Flush-Sole 3D Cleats attached to Ankle Bones (sole & studs land cleanly at y = 0.000!)
+  // Flush-Sole 3D Cleats with Carbon Soleplate & 6 Metallic Studs (`IMG_0345`, `IMG_0354`, `IMG_0363`)
   for (const ankleBone of [bones[B_ANKLE_L], bones[B_ANKLE_R]]) {
     const cleat = new THREE.Mesh(SHARED_GEO.cleat, bootMat);
     cleat.position.set(0, 0, 0.018);
     cleat.castShadow = true;
     ankleBone.add(cleat);
 
+    const sole = new THREE.Mesh(SHARED_GEO.solePlate, soleMat);
+    sole.position.set(0, -0.050, 0.036);
+    ankleBone.add(sole);
+
     const stripe = new THREE.Mesh(SHARED_GEO.bootStripe, bootAccentMat);
     stripe.position.set(0, -0.025, 0.03);
     ankleBone.add(stripe);
 
     for (const [sx, sz] of [
-      [-0.022, -0.044],
-      [0.022, -0.044],
-      [-0.024, 0.080],
-      [0.024, 0.080],
+      [-0.022, -0.048],
+      [0.022, -0.048],
+      [-0.024, 0.042],
+      [0.024, 0.042],
+      [-0.020, 0.106],
+      [0.020, 0.106],
     ]) {
       const st = new THREE.Mesh(SHARED_GEO.stud, studMat);
       st.position.set(sx, -0.055, sz);
@@ -2596,23 +2809,26 @@ function evaluateContinuousFootTarget(phase, sideSign, speed, speedNorm, isGk, o
   if (p < Math.PI) {
     const u = p / Math.PI;
     gz = halfSpan * (1.0 - 2.0 * u);
-    const heelPitch = -0.24 * (0.45 + 0.55 * runBlend);
-    const toeOffPitch = (0.34 + 0.24 * runBlend) * locoWeight;
+    const heelPitch = -0.25 * (0.45 + 0.55 * runBlend);
+    const toeOffPitch = (0.36 + 0.28 * runBlend) * locoWeight;
     pitch =
       u < 0.22
         ? heelPitch * (1 - u / 0.22)
-        : u > 0.64
-          ? ((u - 0.64) / 0.36) * toeOffPitch
+        : u > 0.62
+          ? ((u - 0.62) / 0.38) * toeOffPitch
           : 0.0;
-    const toeLiftY = u > 0.72 ? ((u - 0.72) / 0.28) * 0.042 * locoWeight : 0.0;
+    const toeLiftY = u > 0.70 ? ((u - 0.70) / 0.30) * 0.048 * locoWeight : 0.0;
     gy = SOLE_HEIGHT + toeLiftY;
   } else {
     const w = (p - Math.PI) / Math.PI;
     gz = -halfSpan + 2.0 * halfSpan * (w - Math.sin(w * Math.PI * 2) * 0.055);
-    const peakLift = (0.055 + speedNorm * 0.27 * (0.35 + 0.65 * runBlend)) * locoWeight;
+    // High hamstring back-swing fold so carbon soleplate & studs flash behind sprinters (`IMG_0345`, `IMG_0354`)!
+    const peakLift = (0.062 + speedNorm * 0.34 * (0.35 + 0.65 * runBlend)) * locoWeight;
     gy = SOLE_HEIGHT + Math.sin(w * Math.PI) * peakLift;
-    const heelFold = Math.sin(Math.min(1, w * 1.32) * Math.PI);
-    pitch = (0.28 + 0.34 * runBlend) * heelFold * locoWeight - (w > 0.76 ? ((w - 0.76) / 0.24) * 0.24 * locoWeight : 0);
+    const heelFold = Math.sin(Math.min(1, w * 1.38) * Math.PI);
+    pitch =
+      (0.34 + 0.64 * runBlend) * heelFold * locoWeight -
+      (w > 0.76 ? ((w - 0.76) / 0.24) * 0.26 * locoWeight : 0);
   }
 
   outVec.set(gx, gy, idleZ * (1 - locoWeight) + gz);
@@ -2697,7 +2913,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   if (!actor.isReferee) {
     if (speed > 3.2 && actor.sweatLevel < 1.0) {
       actor.sweatLevel = Math.min(1.0, actor.sweatLevel + dt * 0.015);
-      actor.skinMat.roughness = 0.62 - actor.sweatLevel * 0.16;
+      actor.skinMat.roughness = 0.60 - actor.sweatLevel * 0.16;
     }
     if ((action === 3 || action === 5 || action === 4) && actor.dirtLevel < 0.36) {
       actor.dirtLevel = Math.min(0.36, actor.dirtLevel + dt * 0.28);
@@ -2706,13 +2922,24 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     }
   }
 
-  // Cleat turf divot / wet spray on sharp cuts, slide tackles, or collision falls
+  // Cleat turf divot / wet spray on sharp cuts, standing lunge tackles, slide tackles, low GK dives, or falls (`IMG_0365`, `IMG_0366`)
   if (
     particleSystem &&
-    (Math.hypot(axTick, ayTick) > 17.0 || action === 3 || action === 5) &&
-    Math.random() < dt * 20
+    (Math.hypot(axTick, ayTick) > 16.5 ||
+      action === 2 ||
+      action === 3 ||
+      action === 5 ||
+      (action === 4 && jumpZ < 0.24)) &&
+    Math.random() < dt * (action === 3 || action === 4 ? 28 : 18)
   ) {
-    particleSystem.spawnBurst(wx, 0.04, wy, -vx * 0.22, -vy * 0.22, action === 3 ? 5 : 2);
+    particleSystem.spawnBurst(
+      wx,
+      0.04,
+      wy,
+      -vx * 0.25,
+      -vy * 0.25,
+      action === 3 || action === 4 ? 6 : 3
+    );
   }
 
   // Trigger continuous proximal-to-distal kick whip follow-through on release from Charge (1)
@@ -2813,52 +3040,77 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   }
 
   if (action === 4) {
+    // Dynamic-height GK Save Biomechanics:
+    // - Airborne full-stretch horizontal layout dive (`jumpZ > 0.25m`, `IMG_0356.jpeg`, `IMG_0364.jpeg`)
+    // - Low turf reaction lunge / wet-grass smother block (`jumpZ <= 0.25m`, `IMG_0358.webp`, `IMG_0366.webp`)
     const lateral = vx * Math.sin(facingRad) - vy * Math.cos(facingRad);
     const diveSign = lateral >= 0 ? -1 : 1;
-    damp(actor, "smoothJumpY", 0.28, 0.05, dt);
+    const targetDiveLift = 0.10 + jumpZ * 0.96;
+    const highDive = smoothstep(0.16, 0.55, targetDiveLift);
+    damp(actor, "smoothJumpY", targetDiveLift, 0.042, dt);
     actor.bodyScaleGroup.position.y = actor.smoothJumpY;
-    damp(actor, "smoothHipY", 0.58, 0.05, dt);
+    damp(actor, "smoothHipY", 0.44 + highDive * 0.18, 0.045, dt);
     bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
-    dampBoneEuler(bones[B_HIPS], 0, 0, diveSign * 1.32, 0.05, dt);
-    dampBoneEuler(bones[B_SPINE], 0.04, 0, diveSign * 0.14, 0.05, dt);
-    dampBoneEuler(bones[B_CHEST], 0.04, 0, diveSign * 0.14, 0.05, dt);
-    dampBoneEuler(bones[B_SH_L], -2.68, 0, 0.18, 0.05, dt);
-    dampBoneEuler(bones[B_SH_R], -2.68, 0, -0.18, 0.05, dt);
-    dampBoneEuler(bones[B_EL_L], -0.12, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_EL_R], -0.12, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_HIP_L], -0.16, 0, 0.18, 0.05, dt);
-    dampBoneEuler(bones[B_HIP_R], -0.08, 0, -0.18, 0.05, dt);
-    dampBoneEuler(bones[B_KNEE_L], diveSign > 0 ? 0.65 : 0.22, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_KNEE_R], diveSign < 0 ? 0.65 : 0.22, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_ANKLE_L], 0.26, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_ANKLE_R], 0.26, 0, 0, 0.05, dt);
-    actor.contactShadow.scale.set(1.65, 1.15, 1);
+    dampBoneEuler(bones[B_HIPS], 0.04 * (1 - highDive), 0, diveSign * (1.28 + highDive * 0.18), 0.045, dt);
+    dampBoneEuler(bones[B_SPINE], 0.03, 0, diveSign * 0.16, 0.045, dt);
+    dampBoneEuler(bones[B_CHEST], 0.02, 0, diveSign * 0.16, 0.045, dt);
+    // Asymmetrical full-extension lead-glove fingertip reach (`IMG_0356`, `IMG_0364`)!
+    const lIsLead = diveSign < 0;
+    dampBoneEuler(bones[B_SH_L], lIsLead ? -2.96 : -2.48, 0, 0.22, 0.045, dt);
+    dampBoneEuler(bones[B_SH_R], !lIsLead ? -2.96 : -2.48, 0, -0.22, 0.045, dt);
+    dampBoneEuler(bones[B_EL_L], lIsLead ? -0.06 : -0.24, 0, 0, 0.045, dt);
+    dampBoneEuler(bones[B_EL_R], !lIsLead ? -0.06 : -0.24, 0, 0, 0.045, dt);
+    dampBoneEuler(bones[B_HIP_L], -0.18, 0, 0.16, 0.05, dt);
+    dampBoneEuler(bones[B_HIP_R], -0.10, 0, -0.16, 0.05, dt);
+    dampBoneEuler(bones[B_KNEE_L], diveSign > 0 ? 0.68 - highDive * 0.22 : 0.18, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_KNEE_R], diveSign < 0 ? 0.68 - highDive * 0.22 : 0.18, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_ANKLE_L], 0.28, 0, 0, 0.05, dt);
+    dampBoneEuler(bones[B_ANKLE_R], 0.28, 0, 0, 0.05, dt);
+    const dShadow = Math.max(0.65, 1.55 - targetDiveLift * 0.65);
+    actor.contactShadow.scale.set(dShadow * 1.15, dShadow * 0.82, 1);
     return;
   }
 
-  // Smooth vertical jump elevation for Aerial Headers & Volleys (`IMG_0348.jpeg`!)
+  // Smooth vertical jump elevation for GK High-Cross Plucks/Punches (`IMG_0365`) & Outfield Headers (`IMG_0348`)!
   damp(actor, "smoothJumpY", jumpZ, 0.042, dt);
   actor.bodyScaleGroup.position.y = actor.smoothJumpY;
-  const airborneBlend = smoothstep(0.05, 0.36, actor.smoothJumpY);
-  const shadowScale = Math.max(0.52, 1.0 - actor.smoothJumpY * 0.55);
+  const airborneBlend = smoothstep(0.05, 0.34, actor.smoothJumpY);
+  const shadowScale = Math.max(0.48, 1.0 - actor.smoothJumpY * 0.55);
   actor.contactShadow.scale.set(shadowScale, shadowScale, 1);
 
-  if (airborneBlend > 0.35) {
+  if (airborneBlend > 0.28) {
     damp(actor, "smoothHipY", HIPS_BIND_Y - 0.02, 0.045, dt);
     bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
-    dampBoneEuler(bones[B_HIPS], -0.14 * airborneBlend, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_SPINE], -0.12 * airborneBlend, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_CHEST], -0.10 * airborneBlend, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_HIP_L], 0.18 * airborneBlend, 0, 0.08, 0.05, dt);
-    dampBoneEuler(bones[B_KNEE_L], 0.96 * airborneBlend, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_ANKLE_L], 0.34, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_HIP_R], 0.28 * airborneBlend, 0, -0.08, 0.05, dt);
-    dampBoneEuler(bones[B_KNEE_R], 1.12 * airborneBlend, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_ANKLE_R], 0.36, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_SH_L], -1.52 * airborneBlend, 0, 0.34, 0.05, dt);
-    dampBoneEuler(bones[B_SH_R], -1.42 * airborneBlend, 0, -0.34, 0.05, dt);
-    dampBoneEuler(bones[B_EL_L], -0.48, 0, 0, 0.05, dt);
-    dampBoneEuler(bones[B_EL_R], -0.52, 0, 0, 0.05, dt);
+    if (actor.isGk) {
+      // Towering Goalkeeper High-Cross Leap (`IMG_0365.jpeg` Oblak: twin gloves skyward + protective raised knee!)
+      dampBoneEuler(bones[B_HIPS], -0.08 * airborneBlend, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_SPINE], -0.10 * airborneBlend, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_CHEST], -0.10 * airborneBlend, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_HIP_L], 0.14 * airborneBlend, 0, 0.06, 0.045, dt);
+      dampBoneEuler(bones[B_KNEE_L], 0.22 * airborneBlend, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_ANKLE_L], 0.34, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_HIP_R], -0.94 * airborneBlend, 0, -0.08, 0.045, dt);
+      dampBoneEuler(bones[B_KNEE_R], 1.62 * airborneBlend, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_ANKLE_R], 0.28, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_SH_L], -2.84 * airborneBlend, 0, 0.20, 0.045, dt);
+      dampBoneEuler(bones[B_SH_R], -2.80 * airborneBlend, 0, -0.20, 0.045, dt);
+      dampBoneEuler(bones[B_EL_L], -0.16, 0, 0, 0.045, dt);
+      dampBoneEuler(bones[B_EL_R], -0.18, 0, 0, 0.045, dt);
+    } else {
+      dampBoneEuler(bones[B_HIPS], -0.14 * airborneBlend, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_SPINE], -0.12 * airborneBlend, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_CHEST], -0.10 * airborneBlend, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_HIP_L], 0.18 * airborneBlend, 0, 0.08, 0.05, dt);
+      dampBoneEuler(bones[B_KNEE_L], 0.96 * airborneBlend, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_ANKLE_L], 0.34, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_HIP_R], 0.28 * airborneBlend, 0, -0.08, 0.05, dt);
+      dampBoneEuler(bones[B_KNEE_R], 1.12 * airborneBlend, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_ANKLE_R], 0.36, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_SH_L], -1.52 * airborneBlend, 0, 0.34, 0.05, dt);
+      dampBoneEuler(bones[B_SH_R], -1.42 * airborneBlend, 0, -0.34, 0.05, dt);
+      dampBoneEuler(bones[B_EL_L], -0.48, 0, 0, 0.05, dt);
+      dampBoneEuler(bones[B_EL_R], -0.52, 0, 0, 0.05, dt);
+    }
     return;
   }
 
@@ -2875,15 +3127,22 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const leanRoll = Math.max(-0.22, Math.min(0.22, -actor.smoothAccelLat * 0.011 - yawRate * 0.024));
 
   let baseHipY = actor.isGk && speed < 0.4 ? 0.84 : inWall ? 0.895 : HIPS_BIND_Y - 0.028 - speedNorm * 0.032;
-  if (action === 2) baseHipY = 0.80;
+  if (action === 2) baseHipY = 0.65; // Deep split-leg standing tackle lunge (`IMG_0363.jpeg`)!
   const idleBreathe = seededNoise2D(actor.phaseSeed, nowSec * 0.9) * 0.007 * (1 - locoWeight);
   const runBounce = -Math.cos(actor.stridePhase * 2) * 0.035 * locoWeight * Math.min(1, speedNorm + 0.18);
-  damp(actor, "smoothHipY", baseHipY + runBounce + idleBreathe, 0.045, dt);
+  damp(actor, "smoothHipY", baseHipY + (action === 2 ? 0 : runBounce) + idleBreathe, 0.045, dt);
   bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
 
-  const pelvisYaw = -s * 0.135 * locoWeight * Math.min(1, speedNorm + 0.22);
+  const pelvisYaw = action === 2 ? 0.24 : -s * 0.135 * locoWeight * Math.min(1, speedNorm + 0.22);
   const pelvisHipDrop = s * 0.050 * locoWeight * Math.min(1, speedNorm + 0.2);
-  dampBoneEuler(bones[B_HIPS], leanPitch * 0.40, pelvisYaw, leanRoll * 0.65 + pelvisHipDrop, 0.05, dt);
+  dampBoneEuler(
+    bones[B_HIPS],
+    action === 2 ? 0.22 : leanPitch * 0.40,
+    pelvisYaw,
+    leanRoll * 0.65 + pelvisHipDrop,
+    0.05,
+    dt
+  );
 
   const stationaryFactor = 1.0 - smoothstep(0.3, 2.2, speed);
   const chargeCockBlend =
@@ -2897,7 +3156,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   let spineYaw = s * 0.125 * locoWeight * Math.min(1, speedNorm + 0.25);
   let spineRoll = -pelvisHipDrop * 0.45;
 
-  if (chargeCockBlend > 0.01) {
+  if (action === 2) {
+    spinePitch += 0.22;
+    spineYaw = -0.22;
+    spineRoll = -0.10;
+  } else if (chargeCockBlend > 0.01) {
     spineYaw -= 0.20 * chargeCockBlend;
     spineRoll += 0.08 * chargeCockBlend;
   } else if (whipArc > 0.01) {
@@ -2940,11 +3203,12 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     pitchL = 0;
     pitchR = 0;
   } else if (action === 2) {
-    _tmpFootR.set(-0.095, SOLE_HEIGHT, 0.54);
-    pitchR = -0.18;
-    yawR = 0.28;
-    _tmpFootL.set(0.10, SOLE_HEIGHT + 0.02, -0.36);
-    pitchL = 0.42;
+    // Deep split-leg standing tackle lunge (`IMG_0363.jpeg` Valencia defender!)
+    _tmpFootR.set(-0.065, SOLE_HEIGHT + 0.015, 0.68);
+    pitchR = -0.26;
+    yawR = 0.34;
+    _tmpFootL.set(0.12, SOLE_HEIGHT + 0.03, -0.50);
+    pitchL = 0.58;
   } else if (chargeCockBlend > 0.01) {
     const cockR = _vEffTarget.set(-0.10, SOLE_HEIGHT + 0.34 * chargeCockBlend, -0.36 * chargeCockBlend);
     _tmpFootR.lerp(cockR, chargeCockBlend);
@@ -3026,6 +3290,12 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     dampBoneEuler(bones[B_SH_R], -0.34, -0.36, 0.22, 0.06, dt);
     dampBoneEuler(bones[B_EL_L], -0.46, 0, -0.28, 0.06, dt);
     dampBoneEuler(bones[B_EL_R], -0.46, 0, 0.28, 0.06, dt);
+  } else if (action === 2) {
+    // Wide counter-balance lunge arms (`IMG_0363.jpeg`)
+    dampBoneEuler(bones[B_SH_L], -0.38, 0.22, 0.82, 0.045, dt);
+    dampBoneEuler(bones[B_EL_L], -0.48, 0, 0, 0.045, dt);
+    dampBoneEuler(bones[B_SH_R], 0.28, -0.18, -0.78, 0.045, dt);
+    dampBoneEuler(bones[B_EL_R], -0.56, 0, 0, 0.045, dt);
   } else if (refSignal > 0.05) {
     // Match Referee Advantage / Free-Kick / Whistle Arm Signal (`IMG_0354`, `IMG_0359`)
     dampBoneEuler(bones[B_SH_L], 0.08, 0, 0.14, 0.06, dt);
@@ -3296,8 +3566,8 @@ class GrassBladeField {
 
     this.detailOffsets = new Float32Array(this.detailCount * 4);
     const dummy = new THREE.Object3D();
-    const cLight = new THREE.Color("#56a23d");
-    const cDark = new THREE.Color("#3b8028");
+    const cLight = new THREE.Color("#43822c");
+    const cDark = new THREE.Color("#2d631d");
     const cTmp = new THREE.Color();
 
     let gSeed = 0x51a72010;
@@ -3309,9 +3579,9 @@ class GrassBladeField {
     for (let i = 0; i < this.staticCount; i++) {
       const x = (rand() * 2 - 1) * (halfL - 0.3);
       const z = (rand() * 2 - 1) * (halfW - 0.3);
-      dummy.position.set(x, 0.002, z);
+      dummy.position.set(x, 0.001, z);
       dummy.rotation.set(0, rand() * Math.PI * 2, 0);
-      const sc = 0.85 + rand() * 0.55;
+      const sc = 0.85 + rand() * 0.45;
       dummy.scale.set(sc, sc, sc);
       dummy.updateMatrix();
       this.mesh.setMatrixAt(i, dummy.matrix);
@@ -3320,14 +3590,14 @@ class GrassBladeField {
     }
 
     for (let j = 0; j < this.detailCount; j++) {
-      const r = Math.sqrt(rand()) * 7.8;
+      const r = Math.sqrt(rand()) * 7.6;
       const ang = rand() * Math.PI * 2;
       this.detailOffsets[j * 4 + 0] = Math.cos(ang) * r;
       this.detailOffsets[j * 4 + 1] = Math.sin(ang) * r;
       this.detailOffsets[j * 4 + 2] = rand() * Math.PI * 2;
-      this.detailOffsets[j * 4 + 3] = 0.8 + rand() * 0.5;
+      this.detailOffsets[j * 4 + 3] = 0.82 + rand() * 0.42;
       const idx = this.staticCount + j;
-      dummy.position.set(this.detailOffsets[j * 4], 0.002, this.detailOffsets[j * 4 + 1]);
+      dummy.position.set(this.detailOffsets[j * 4], 0.001, this.detailOffsets[j * 4 + 1]);
       dummy.rotation.set(0, this.detailOffsets[j * 4 + 2], 0);
       dummy.scale.setScalar(this.detailOffsets[j * 4 + 3]);
       dummy.updateMatrix();
@@ -3346,13 +3616,13 @@ class GrassBladeField {
     // Snap rolling detail patch on a coarse 1.5m grid + gentle wind sway so blades never crawl across grass!
     const snapX = Math.round(focusX / 1.5) * 1.5;
     const snapZ = Math.round(focusZ / 1.5) * 1.5;
-    const sway = Math.sin(nowSec * 2.4) * 0.08;
+    const sway = Math.sin(nowSec * 2.4) * 0.06;
     const dummy = this.dummy;
     for (let j = 0; j < this.detailCount; j++) {
       const b = j * 4;
       const wx = Math.max(-this.halfL, Math.min(this.halfL, snapX + this.detailOffsets[b + 0]));
       const wz = Math.max(-this.halfW, Math.min(this.halfW, snapZ + this.detailOffsets[b + 1]));
-      dummy.position.set(wx, 0.002, wz);
+      dummy.position.set(wx, 0.001, wz);
       dummy.rotation.set(sway, this.detailOffsets[b + 2], sway * 0.5);
       dummy.scale.setScalar(this.detailOffsets[b + 3]);
       dummy.updateMatrix();
@@ -3363,14 +3633,77 @@ class GrassBladeField {
 }
 
 /**
- * Builds an authentic box-stanchion Goal Assembly (`IMG_0350`, `IMG_0351`, `IMG_0352`)
- * with subdivided 3D nylon net panels supporting localized vertex impact pocket deformation!
+ * Procedural Multi-Row Stadium Crowd Tapestry Texture (`IMG_0354`, `IMG_0358`, `IMG_0359`).
+ * Eliminates dark empty concrete gaps between 3D instanced supporters so stands read as a packed stadium bowl!
+ */
+function createCrowdTierTexture(homeHex, awayHex) {
+  const W = 512;
+  const H = 128;
+  const c = document.createElement("canvas");
+  c.width = W;
+  c.height = H;
+  const ctx = c.getContext("2d");
+
+  ctx.fillStyle = "#111827";
+  ctx.fillRect(0, 0, W, H);
+
+  // Subtle concrete terrace riser lip at top & bottom
+  ctx.fillStyle = "#263346";
+  ctx.fillRect(0, 0, W, 7);
+  ctx.fillStyle = "#0b1120";
+  ctx.fillRect(0, H - 10, W, 10);
+
+  const jacketColors = [
+    "#1e293b",
+    "#0f172a",
+    "#273549",
+    "#334155",
+    homeHex || "#991b1b",
+    awayHex || "#1e3a8a",
+    "#1f2937",
+  ];
+  let s = 0x44c19021;
+  const rnd = () => {
+    s = (Math.imul(s, 1664525) + 1013904223) >>> 0;
+    return s / 4294967296;
+  };
+
+  for (const rowY of [44, 86, 118]) {
+    for (let x = 6; x < W; x += 13) {
+      const jx = x + (rnd() - 0.5) * 4;
+      const col = jacketColors[Math.floor(rnd() * jacketColors.length)];
+      ctx.fillStyle = col;
+      ctx.globalAlpha = 0.44;
+      ctx.beginPath();
+      ctx.ellipse(jx, rowY, 7.2, 12.5, 0, Math.PI, Math.PI * 2);
+      ctx.fill();
+
+      ctx.fillStyle = SKIN_TONES[Math.floor(rnd() * SKIN_TONES.length)];
+      ctx.globalAlpha = 0.48;
+      ctx.beginPath();
+      ctx.arc(jx, rowY - 13.5, 3.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+  ctx.globalAlpha = 1.0;
+
+  const tex = new THREE.CanvasTexture(c);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.wrapS = THREE.RepeatWrapping;
+  tex.wrapT = THREE.RepeatWrapping;
+  tex.repeat.set(10, 1);
+  return tex;
+}
+
+/**
+ * Builds an authentic box-stanchion Goal Assembly (`IMG_0350`, `IMG_0351`, `IMG_0356`)
+ * with crisp white braided nylon net panels, diagonal tension cables & localized vertex impact pocket deformation!
  */
 function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
   const group = new THREE.Group();
   const postMat = new THREE.MeshStandardMaterial({
     color: "#ffffff",
-    roughness: 0.18,
+    roughness: 0.16,
     metalness: 0.28,
   });
   const stanchionMat = new THREE.MeshStandardMaterial({
@@ -3378,9 +3711,14 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
     roughness: 0.42,
     metalness: 0.38,
   });
+  const cableMat = new THREE.MeshStandardMaterial({
+    color: "#cbd5e1",
+    roughness: 0.35,
+    metalness: 0.5,
+  });
 
   const postR = 0.068;
-  const depth = 1.85;
+  const depth = 1.90;
   const backX = goalX + sign * depth;
 
   const postGeo = new THREE.CylinderGeometry(postR, postR, goalH, 14);
@@ -3390,16 +3728,36 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
     post.castShadow = true;
     group.add(post);
 
-    // Classic FIFA rear stanchion poles & tension wires (`IMG_0350`, `IMG_0351`)
-    const rearPost = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.036, goalH * 1.02, 8), stanchionMat);
-    rearPost.position.set(backX + sign * 0.22, goalH * 0.51, zSign * (goalHW + 0.12));
+    // Classic FIFA rear stanchion poles, ground frame & diagonal tension wires (`IMG_0350`, `IMG_0351`)
+    const rearX = backX + sign * 0.28;
+    const rearZ = zSign * (goalHW + 0.16);
+    const rearPost = new THREE.Mesh(new THREE.CylinderGeometry(0.036, 0.036, goalH * 1.04, 8), stanchionMat);
+    rearPost.position.set(rearX, goalH * 0.52, rearZ);
     group.add(rearPost);
 
-    const topBar = new THREE.Mesh(new THREE.CylinderGeometry(0.028, 0.028, depth * 0.96, 8), stanchionMat);
+    const topBar = new THREE.Mesh(new THREE.CylinderGeometry(0.026, 0.026, depth * 0.96, 8), postMat);
     topBar.rotation.z = Math.PI * 0.5;
-    topBar.position.set(goalX + sign * depth * 0.48, goalH * 0.98, zSign * goalHW);
+    topBar.position.set(goalX + sign * depth * 0.48, goalH * 0.99, zSign * goalHW);
     group.add(topBar);
+
+    const groundSide = new THREE.Mesh(new THREE.CylinderGeometry(0.030, 0.030, depth, 8), postMat);
+    groundSide.rotation.z = Math.PI * 0.5;
+    groundSide.position.set(goalX + sign * depth * 0.5, 0.03, zSign * goalHW);
+    group.add(groundSide);
+
+    // Diagonal tension cable from top net corner to top of rear stanchion pole (`IMG_0350`, `IMG_0351`)
+    const cableLen = Math.hypot(0.36, 0.16);
+    const cable = new THREE.Mesh(new THREE.CylinderGeometry(0.012, 0.012, cableLen, 6), cableMat);
+    cable.rotation.z = Math.PI * 0.5;
+    cable.rotation.y = -sign * zSign * 0.42;
+    cable.position.set(backX + sign * 0.10, goalH * 1.01, zSign * (goalHW + 0.08));
+    group.add(cable);
   }
+
+  const groundBack = new THREE.Mesh(new THREE.CylinderGeometry(0.032, 0.032, goalHW * 2, 8), postMat);
+  groundBack.rotation.x = Math.PI * 0.5;
+  groundBack.position.set(backX, 0.03, 0);
+  group.add(groundBack);
 
   const crossbar = new THREE.Mesh(new THREE.CylinderGeometry(postR, postR, goalHW * 2 + postR * 2, 14), postMat);
   crossbar.rotation.x = Math.PI * 0.5;
@@ -3410,9 +3768,12 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
   const netMat = new THREE.MeshStandardMaterial({
     map: netTex,
     transparent: true,
-    opacity: 0.88,
+    alphaTest: 0.08,
+    opacity: 0.94,
+    emissive: "#e2e8f0",
+    emissiveIntensity: 0.10,
     side: THREE.DoubleSide,
-    roughness: 0.82,
+    roughness: 0.72,
     depthWrite: false,
   });
 
@@ -3420,19 +3781,19 @@ function buildGoalAssembly(goalX, sign, goalHW, goalH, netTex, accentHex) {
   netHolder.position.set(goalX, 0, 0);
   group.add(netHolder);
 
-  const roofGeo = new THREE.PlaneGeometry(depth * 0.88, goalHW * 2, 10, 14);
+  const roofGeo = new THREE.PlaneGeometry(depth * 0.90, goalHW * 2, 10, 14);
   const roofNet = new THREE.Mesh(roofGeo, netMat);
   roofNet.rotation.x = -Math.PI * 0.5;
-  roofNet.position.set(sign * depth * 0.44, goalH - 0.02, 0);
+  roofNet.position.set(sign * depth * 0.45, goalH - 0.02, 0);
   netHolder.add(roofNet);
 
-  const backSlopeLen = Math.hypot(depth * 0.16, goalH);
+  const backSlopeLen = Math.hypot(depth * 0.14, goalH);
   const backGeo = new THREE.PlaneGeometry(goalHW * 2, backSlopeLen, 18, 12);
   const backBase = new Float32Array(backGeo.attributes.position.array);
   const backNet = new THREE.Mesh(backGeo, netMat);
   backNet.rotation.y = sign > 0 ? -Math.PI * 0.5 : Math.PI * 0.5;
-  backNet.rotation.x = sign * 0.14;
-  backNet.position.set(sign * depth * 0.92, goalH * 0.5, 0);
+  backNet.rotation.x = sign * 0.12;
+  backNet.position.set(sign * depth * 0.93, goalH * 0.5, 0);
   netHolder.add(backNet);
 
   for (const zSign of [-1, 1]) {
@@ -3490,7 +3851,7 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   );
 
   const trackFloor = new THREE.Mesh(
-    new THREE.PlaneGeometry(pitchLen + 76, pitchWid + 76),
+    new THREE.PlaneGeometry(pitchLen + 92, pitchWid + 92),
     new THREE.MeshStandardMaterial({ color: "#141c27", roughness: 0.92 })
   );
   trackFloor.rotation.x = -Math.PI * 0.5;
@@ -3522,11 +3883,11 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   pitchMesh.receiveShadow = true;
   stadium.add(pitchMesh);
 
-  // 3D Instanced Shaded Grass Blade Tufts (`IMG_0364`, `IMG_0366`)
+  // 3D Instanced Manicured Grass Micro-Blades (`IMG_0351`, `IMG_0364`, `IMG_0366`)
   const grassField = new GrassBladeField(halfL, halfW);
   stadium.add(grassField.mesh);
 
-  const netTex = createGoalNetTexture();
+  const netTex = createGoalNetTexture(maxAnisotropy || 4);
   const leftGoal = buildGoalAssembly(-halfL, -1, goalHW, goalH, netTex, kits.homeOutfield.shirt);
   const rightGoal = buildGoalAssembly(halfL, 1, goalHW, goalH, netTex, kits.awayOutfield.shirt);
   stadium.add(leftGoal.group);
@@ -3659,8 +4020,8 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   northAd.castShadow = true;
   stadium.add(northAd);
 
-  const southAd = new THREE.Mesh(new THREE.BoxGeometry(adDistX * 2, adH * 0.65, 0.18), adMat);
-  southAd.position.set(0, adH * 0.32, adDistZ + 1.8);
+  const southAd = new THREE.Mesh(new THREE.BoxGeometry(adDistX * 2, adH * 0.78, 0.18), adMat);
+  southAd.position.set(0, adH * 0.39, adDistZ + 0.85);
   stadium.add(southAd);
 
   for (const xSign of [-1, 1]) {
@@ -3670,14 +4031,18 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     stadium.add(endAd);
   }
 
-  const concreteMat = new THREE.MeshStandardMaterial({ color: "#1e293b", roughness: 0.88 });
-  const riserDarkMat = new THREE.MeshStandardMaterial({ color: "#0f172a", roughness: 0.92 });
-  const stairMat = new THREE.MeshStandardMaterial({ color: "#334155", roughness: 0.86 });
-  // Translucent Sky-Blue Glass & White Steel Truss Cantilevered Roof Canopy (`IMG_0348.jpeg`!)
+  const crowdTierTex = createCrowdTierTexture(kits.homeOutfield.shirt, kits.awayOutfield.shirt);
+  const tierCrowdMat = new THREE.MeshStandardMaterial({
+    map: crowdTierTex,
+    roughness: 0.84,
+  });
+  const riserDarkMat = new THREE.MeshStandardMaterial({ color: "#0f172a", roughness: 0.90 });
+  const stairMat = new THREE.MeshStandardMaterial({ color: "#64748b", roughness: 0.82 });
+  // Translucent Sky-Blue Glass & White Steel Truss Cantilevered Roof Canopy (`IMG_0348.jpeg`, `IMG_0364.jpeg`!)
   const roofGlassMat = new THREE.MeshStandardMaterial({
     color: "#64748b",
     transparent: true,
-    opacity: 0.58,
+    opacity: 0.62,
     roughness: 0.22,
     metalness: 0.28,
   });
@@ -3685,29 +4050,59 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   const fasciaMatHome = new THREE.MeshStandardMaterial({
     color: kits.homeOutfield.shirt,
     emissive: kits.homeOutfield.shirt,
-    emissiveIntensity: 0.14,
-    roughness: 0.55,
+    emissiveIntensity: 0.18,
+    roughness: 0.50,
   });
   const fasciaMatAway = new THREE.MeshStandardMaterial({
     color: kits.awayOutfield.shirt,
     emissive: kits.awayOutfield.shirt,
-    emissiveIntensity: 0.14,
-    roughness: 0.55,
+    emissiveIntensity: 0.18,
+    roughness: 0.50,
   });
+  // Illuminated Mid-Tier LED Stadium Ribbon (`IMG_0359.jpeg`!)
+  const midRibbonMat = new THREE.MeshStandardMaterial({
+    color: "#f59e0b",
+    emissive: "#d97706",
+    emissiveIntensity: 0.42,
+    roughness: 0.40,
+  });
+
+  // Upper South Stand & South-Corner group: visible in 360° field/replay/pro/set-piece cameras,
+  // automatically hidden ONLY when high exterior gantry cameras (`TELE`, `CO-OP`, `DYNAMIC`) sit behind the +Z stand!
+  const southStandUpper = new THREE.Group();
+  stadium.add(southStandUpper);
 
   const crowdPositions = [];
   const crowdColors = [];
-  // Muted broadcast-authentic supporter jackets & club shirts (`IMG_0354`, `IMG_0363` — zero bright toy Lego pills!)
-  const homeSupporterCol = new THREE.Color(kits.homeOutfield.shirt).multiplyScalar(0.62);
-  const awaySupporterCol = new THREE.Color(kits.awayOutfield.shirt).multiplyScalar(0.62);
+  const crowdHeadColors = [];
+  const southCrowdPositions = [];
+  const southCrowdColors = [];
+  const southCrowdHeadColors = [];
+
+  // Muted broadcast-authentic supporter jackets & club shirts (`IMG_0354`, `IMG_0358`, `IMG_0359` — zero yellow clash-kit Lego blocks!)
+  const homeSupporterCol = new THREE.Color(
+    snapshot.home.primary_color || kits.homeOutfield.shirt
+  ).multiplyScalar(0.50);
+  const awaySupporterCol = new THREE.Color(
+    snapshot.away.primary_color || kits.awayOutfield.shirt
+  ).multiplyScalar(0.50);
   const palette = [
     homeSupporterCol,
     new THREE.Color("#1e293b"),
     awaySupporterCol,
     new THREE.Color("#0f172a"),
+    new THREE.Color("#273549"),
     new THREE.Color("#334155"),
     new THREE.Color("#475569"),
-    new THREE.Color("#cbd5e1").multiplyScalar(0.58),
+    new THREE.Color("#64748b").multiplyScalar(0.75),
+  ];
+  const headPalette = [
+    new THREE.Color("#cfa07a"),
+    new THREE.Color("#b5835d"),
+    new THREE.Color("#855737"),
+    new THREE.Color("#4a3121"),
+    new THREE.Color("#241b16"),
+    new THREE.Color("#dca982"),
   ];
 
   let cSeed = 0x99fa2026;
@@ -3715,69 +4110,102 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     cSeed = (Math.imul(cSeed, 1664525) + 1013904223) >>> 0;
     return cSeed / 4294967296;
   };
+  const _yAxis = new THREE.Vector3(0, 1, 0);
 
-  function buildStand(length, startDist, rotY, tiers, addRoof, isHomeBias) {
-    const stand = new THREE.Group();
-    stand.rotation.y = rotY;
+  function buildStand(length, startDist, rotY, tiers, addRoof, isHomeBias, isSouth = false, originXZ = null) {
+    const ox = originXZ ? originXZ[0] : 0;
+    const oz = originXZ ? originXZ[1] : 0;
 
-    const stepDepth = 1.05;
+    const standLower = new THREE.Group();
+    standLower.position.set(ox, 0, oz);
+    standLower.rotation.y = rotY;
+    stadium.add(standLower);
+
+    let standUpper = standLower;
+    if (isSouth) {
+      standUpper = new THREE.Group();
+      standUpper.position.set(ox, 0, oz);
+      standUpper.rotation.y = rotY;
+      southStandUpper.add(standUpper);
+    }
+
+    const stepDepth = 1.04;
     const stepRise = 0.62;
 
     const wall = new THREE.Mesh(new THREE.BoxGeometry(length, 1.55, 0.6), riserDarkMat);
     wall.position.set(0, 0.775, -startDist);
-    stand.add(wall);
+    standLower.add(wall);
 
     const ribbon = new THREE.Mesh(
-      new THREE.BoxGeometry(length, 0.24, 0.66),
+      new THREE.BoxGeometry(length, 0.26, 0.66),
       isHomeBias ? fasciaMatHome : fasciaMatAway
     );
     ribbon.position.set(0, 1.44, -startDist);
-    stand.add(ribbon);
+    standLower.add(ribbon);
 
     for (let t = 0; t < tiers; t++) {
+      const targetGrp = isSouth && t >= 2 ? standUpper : standLower;
+      const targetPosArr = isSouth && t >= 2 ? southCrowdPositions : crowdPositions;
+      const targetColArr = isSouth && t >= 2 ? southCrowdColors : crowdColors;
+      const targetHeadArr = isSouth && t >= 2 ? southCrowdHeadColors : crowdHeadColors;
+
       const y = 1.55 + t * stepRise;
       const z = -startDist - 0.58 - t * stepDepth;
-      const tierMesh = new THREE.Mesh(new THREE.BoxGeometry(length, stepRise + 0.15, stepDepth + 0.1), concreteMat);
+      const tierMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(length, stepRise + 0.16, stepDepth + 0.12),
+        tierCrowdMat
+      );
       tierMesh.position.set(0, y, z);
       tierMesh.receiveShadow = true;
-      stand.add(tierMesh);
+      targetGrp.add(tierMesh);
 
-      // Deep under-roof stadium bowl shadow gradient toward upper rows (`IMG_0354.jpeg`, `IMG_0366.webp`!)
-      const rowShadowShade = Math.max(0.30, 0.88 - (t / Math.max(1, tiers)) * 0.56);
-      const spacing = 0.44;
-      const count = Math.floor((length - 2.0) / spacing);
+      if (t === 5) {
+        // Mid-Bowl Illuminated Fascia Ribbon (`IMG_0359.jpeg`!)
+        const midRib = new THREE.Mesh(new THREE.BoxGeometry(length + 0.2, 0.26, 0.22), midRibbonMat);
+        midRib.position.set(0, y + 0.24, z + stepDepth * 0.54);
+        targetGrp.add(midRib);
+      }
+
+      const rowShadowShade = Math.max(0.32, 0.90 - (t / Math.max(1, tiers)) * 0.54);
+      const spacing = 0.41;
+      const count = Math.floor((length - 1.4) / spacing);
       for (let i = 0; i < count; i++) {
         const lx = -((count - 1) * spacing) * 0.5 + i * spacing;
-        if (i % 28 === 14 || i % 28 === 15) {
+        if (length > 22 && (i % 28 === 14 || i % 28 === 15)) {
           if (i % 28 === 14) {
             const stair = new THREE.Mesh(
-              new THREE.BoxGeometry(0.86, stepRise + 0.16, stepDepth + 0.12),
+              new THREE.BoxGeometry(0.84, stepRise + 0.18, stepDepth + 0.14),
               stairMat
             );
-            stair.position.set(lx + spacing * 0.5, y + 0.02, z + 0.02);
-            stand.add(stair);
+            stair.position.set(lx + spacing * 0.5, y + 0.02, z + 0.03);
+            targetGrp.add(stair);
           }
           continue;
         }
-        const jitterX = lx + (cRand() - 0.5) * 0.14;
+        const jitterX = lx + (cRand() - 0.5) * 0.12;
         const ly = y + stepRise * 0.56;
         const lz = z + 0.06;
 
-        const v = new THREE.Vector3(jitterX, ly, lz).applyAxisAngle(new THREE.Vector3(0, 1, 0), rotY);
-        crowdPositions.push({ x: v.x, y: v.y, z: v.z, rotY, phase: cRand() * Math.PI * 2 });
+        const v = new THREE.Vector3(jitterX, ly, lz).applyAxisAngle(_yAxis, rotY);
+        v.x += ox;
+        v.z += oz;
+        targetPosArr.push({ x: v.x, y: v.y, z: v.z, rotY, phase: cRand() * Math.PI * 2 });
 
         const r = cRand();
         const baseCol =
-          r < 0.34
+          r < 0.28
             ? isHomeBias
               ? palette[0]
               : palette[2]
-            : r < 0.44
+            : r < 0.36
               ? isHomeBias
                 ? palette[2]
                 : palette[0]
-              : palette[1 + Math.floor(cRand() * 6)];
-        crowdColors.push(baseCol.clone().multiplyScalar(rowShadowShade * (0.82 + cRand() * 0.32)));
+              : palette[1 + Math.floor(cRand() * 7)];
+        targetColArr.push(baseCol.clone().multiplyScalar(rowShadowShade * (0.82 + cRand() * 0.26)));
+
+        const hCol = headPalette[Math.floor(cRand() * headPalette.length)];
+        targetHeadArr.push(hCol.clone().multiplyScalar(rowShadowShade * (0.78 + cRand() * 0.22)));
       }
     }
 
@@ -3785,7 +4213,7 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     const topY = 1.55 + tiers * stepRise;
     const backWall = new THREE.Mesh(new THREE.BoxGeometry(length + 3.0, topY + 4.2, 1.0), riserDarkMat);
     backWall.position.set(0, (topY + 4.2) * 0.5, backZ - 0.5);
-    stand.add(backWall);
+    standUpper.add(backWall);
 
     if (addRoof) {
       const roofDepth = tiers * stepDepth + 3.8;
@@ -3793,31 +4221,36 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
       const canopy = new THREE.Mesh(new THREE.BoxGeometry(length + 3.2, 0.22, roofDepth), roofGlassMat);
       canopy.position.set(0, topY + 4.15, canopyZ);
       canopy.rotation.x = 0.06;
-      stand.add(canopy);
+      standUpper.add(canopy);
 
-      const ribCount = Math.max(6, Math.floor(length / 9));
+      const ribCount = Math.max(3, Math.floor(length / 8.5));
       for (let rb = 0; rb <= ribCount; rb++) {
         const rx = -length * 0.5 + (rb / ribCount) * length;
         const rib = new THREE.Mesh(new THREE.BoxGeometry(0.28, 0.36, roofDepth + 0.2), trussMat);
         rib.position.set(rx, topY + 4.15, canopyZ);
         rib.rotation.x = 0.06;
-        stand.add(rib);
+        standUpper.add(rib);
       }
 
       const fascia = new THREE.Mesh(new THREE.BoxGeometry(length + 3.2, 0.52, 0.3), trussMat);
       fascia.position.set(0, topY + 3.88, backZ + roofDepth - 0.65);
-      stand.add(fascia);
+      standUpper.add(fascia);
     }
-
-    stadium.add(stand);
   }
 
-  const standSpanX = (adDistX + 8.5) * 2;
-  const standSpanZ = (adDistZ + 7.5) * 2;
-  buildStand(standSpanX, adDistZ + 2.4, 0, 11, true, true);
-  buildStand(standSpanZ, adDistX + 2.8, Math.PI * 0.5, 10, true, true);
-  buildStand(standSpanZ, adDistX + 2.8, -Math.PI * 0.5, 10, true, false);
-  buildStand(standSpanX, adDistZ + 28.0, Math.PI, 4, false, false);
+  // 4 Main Touchline & Goal-End Stands + 4 Angled 45° Corner Wedges -> 100% Enclosed 360° Bowl (`IMG_0345`, `IMG_0354`, `IMG_0359`)!
+  const standSpanX = (adDistX + 4.0) * 2;
+  const standSpanZ = (adDistZ + 3.6) * 2;
+  buildStand(standSpanX, adDistZ + 2.4, 0, 11, true, true, false); // North Stand
+  buildStand(standSpanZ, adDistX + 2.8, Math.PI * 0.5, 11, true, true, false); // West Home End
+  buildStand(standSpanZ, adDistX + 2.8, -Math.PI * 0.5, 11, true, false, false); // East Away End
+  buildStand(standSpanX, adDistZ + 2.8, Math.PI, 11, true, false, true); // Full Roofed South Stand!
+
+  const cornerSpan = 18.5;
+  buildStand(cornerSpan, 0, Math.PI * 0.25, 11, true, true, false, [-(adDistX + 2.8), -(adDistZ + 2.5)]); // NW
+  buildStand(cornerSpan, 0, -Math.PI * 0.25, 11, true, false, false, [adDistX + 2.8, -(adDistZ + 2.5)]); // NE
+  buildStand(cornerSpan, 0, Math.PI * 0.75, 11, true, true, true, [-(adDistX + 2.8), adDistZ + 2.7]); // SW
+  buildStand(cornerSpan, 0, -Math.PI * 0.75, 11, true, false, true, [adDistX + 2.8, adDistZ + 2.7]); // SE
 
   // Live 3D Stadium Jumbotron Scoreboards mounted on North & Goal-End Roof Fascias (`IMG_0359.jpeg`!)
   const jumbotron = createJumbotronScoreboard(
@@ -3836,8 +4269,8 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
   const jumboFrameMat = new THREE.MeshStandardMaterial({ color: "#090f1c", roughness: 0.5, metalness: 0.4 });
   for (const [jx, jy, jz, jYaw] of [
     [0, 9.8, -(adDistZ + 11.4), 0],
-    [-(adDistX + 10.6), 7.75, 0, Math.PI * 0.5],
-    [adDistX + 10.6, 7.75, 0, -Math.PI * 0.5],
+    [-(adDistX + 10.6), 8.25, 0, Math.PI * 0.5],
+    [adDistX + 10.6, 8.25, 0, -Math.PI * 0.5],
   ]) {
     const jGroup = new THREE.Group();
     jGroup.position.set(jx, jy, jz);
@@ -3850,14 +4283,16 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     stadium.add(jGroup);
   }
 
-  // Sculpted Human Supporter Silhouette Geometry (shoulders + torso + head, replacing giant Lego capsule pills!)
-  const supTorso = new THREE.BoxGeometry(0.30, 0.38, 0.18);
-  supTorso.translate(0, 0.16, 0);
-  const supHead = new THREE.SphereGeometry(0.085, 6, 5);
-  supHead.translate(0, 0.44, 0);
-  const personGeo = mergeStaticGeometries([supTorso, supHead]);
+  // Two-Part Human Supporter Silhouettes: Muted Jacket Torsos + Natural Skin/Hair Heads (zero single-color Lego pegs!)
+  const supTorsoGeo = new THREE.BoxGeometry(0.38, 0.42, 0.20);
+  supTorsoGeo.translate(0, 0.18, 0);
+  const supHeadGeo = new THREE.SphereGeometry(0.088, 6, 5);
+  supHeadGeo.translate(0, 0.47, 0);
+
   const crowdMat = new THREE.MeshLambertMaterial({ color: "#ffffff" });
-  const crowdMesh = new THREE.InstancedMesh(personGeo, crowdMat, crowdPositions.length);
+  const crowdHeadMat = new THREE.MeshLambertMaterial({ color: "#ffffff" });
+  const crowdMesh = new THREE.InstancedMesh(supTorsoGeo, crowdMat, crowdPositions.length);
+  const crowdHeadMesh = new THREE.InstancedMesh(supHeadGeo, crowdHeadMat, crowdPositions.length);
   const dummy = new THREE.Object3D();
   for (let i = 0; i < crowdPositions.length; i++) {
     const p = crowdPositions[i];
@@ -3866,10 +4301,44 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     dummy.updateMatrix();
     crowdMesh.setMatrixAt(i, dummy.matrix);
     crowdMesh.setColorAt(i, crowdColors[i]);
+    crowdHeadMesh.setMatrixAt(i, dummy.matrix);
+    crowdHeadMesh.setColorAt(i, crowdHeadColors[i]);
   }
   crowdMesh.instanceMatrix.needsUpdate = true;
   if (crowdMesh.instanceColor) crowdMesh.instanceColor.needsUpdate = true;
+  crowdHeadMesh.instanceMatrix.needsUpdate = true;
+  if (crowdHeadMesh.instanceColor) crowdHeadMesh.instanceColor.needsUpdate = true;
   stadium.add(crowdMesh);
+  stadium.add(crowdHeadMesh);
+
+  if (southCrowdPositions.length > 0) {
+    const southCrowdMesh = new THREE.InstancedMesh(
+      supTorsoGeo.clone(),
+      new THREE.MeshLambertMaterial({ color: "#ffffff" }),
+      southCrowdPositions.length
+    );
+    const southCrowdHeadMesh = new THREE.InstancedMesh(
+      supHeadGeo.clone(),
+      new THREE.MeshLambertMaterial({ color: "#ffffff" }),
+      southCrowdPositions.length
+    );
+    for (let i = 0; i < southCrowdPositions.length; i++) {
+      const p = southCrowdPositions[i];
+      dummy.position.set(p.x, p.y, p.z);
+      dummy.rotation.set(0, p.rotY || 0, 0);
+      dummy.updateMatrix();
+      southCrowdMesh.setMatrixAt(i, dummy.matrix);
+      southCrowdMesh.setColorAt(i, southCrowdColors[i]);
+      southCrowdHeadMesh.setMatrixAt(i, dummy.matrix);
+      southCrowdHeadMesh.setColorAt(i, southCrowdHeadColors[i]);
+    }
+    southCrowdMesh.instanceMatrix.needsUpdate = true;
+    if (southCrowdMesh.instanceColor) southCrowdMesh.instanceColor.needsUpdate = true;
+    southCrowdHeadMesh.instanceMatrix.needsUpdate = true;
+    if (southCrowdHeadMesh.instanceColor) southCrowdHeadMesh.instanceColor.needsUpdate = true;
+    southStandUpper.add(southCrowdMesh);
+    southStandUpper.add(southCrowdHeadMesh);
+  }
 
   // Emissive Floodlight Towers (dynamically toggled between Night/Rain vs Sunny Day!)
   const pylonMat = new THREE.MeshStandardMaterial({ color: "#475569", metalness: 0.6, roughness: 0.4 });
@@ -3921,6 +4390,7 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
 
   return {
     stadium,
+    southStandUpper,
     kits,
     halfL,
     halfW,
@@ -3935,6 +4405,7 @@ function buildStadiumWorld(snapshot, maxAnisotropy, glowTex) {
     rightGoal,
     cornerFlags,
     crowdMesh,
+    crowdHeadMesh,
     crowdPositions,
   };
 }
@@ -4526,12 +4997,14 @@ export class ClassicFifa3DEngine {
       halfL,
       halfW,
       pitchLen,
+      southStandUpper,
       grassField,
       jumbotron,
       leftGoal,
       rightGoal,
       cornerFlags,
       crowdMesh,
+      crowdHeadMesh,
       crowdPositions,
     } = this.stadiumData;
 
@@ -4542,6 +5015,7 @@ export class ClassicFifa3DEngine {
 
     // --- Pre-Match Showcase View ---
     if (this.viewMode === "showcase") {
+      if (southStandUpper) southStandUpper.visible = true;
       this.rain.step(dt, 0, 0);
       this.ballMesh.position.set(0, this.ballRadius, 0.85);
       this.ballMesh.rotation.y += dt * 0.8;
@@ -4914,8 +5388,10 @@ export class ClassicFifa3DEngine {
         dummy.rotation.set(0, p.rotY || 0, 0);
         dummy.updateMatrix();
         crowdMesh.setMatrixAt(i, dummy.matrix);
+        if (crowdHeadMesh) crowdHeadMesh.setMatrixAt(i, dummy.matrix);
       }
       crowdMesh.instanceMatrix.needsUpdate = true;
+      if (crowdHeadMesh) crowdHeadMesh.instanceMatrix.needsUpdate = true;
     }
 
     // --- EA FIFA 10–12 Broadcast Gantry & Dynamic Set-Piece Camera Controller (`IMG_0350.webp`!) ---
@@ -4941,6 +5417,10 @@ export class ClassicFifa3DEngine {
     let camSmoothTime = 0.22;
     let setPieceCamKey = 0;
 
+    const maxBowlX = halfL + 6.0;
+    const maxBowlZNorth = halfW + 5.4;
+    const maxBowlZSouth = halfW + 5.6;
+
     if (replayOpts && replayOpts.active) {
       setPieceCamKey =
         replayOpts.camMode === "closeup" ? 101 : replayOpts.camMode === "orbit" ? 102 : 100;
@@ -4956,7 +5436,11 @@ export class ClassicFifa3DEngine {
       } else {
         const r = (pitchLen > 80 ? 19.5 : 13.5) * zScale;
         const ang = replayOpts.orbitAngle;
-        targetPos = [ballX + Math.sin(ang) * r, 5.6 * zScale, ballY + Math.cos(ang) * r];
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX + Math.sin(ang) * r)),
+          Math.min(9.6, 5.6 * zScale),
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY + Math.cos(ang) * r)),
+        ];
         targetLook = [ballX, 0.85, ballY];
       }
     } else if (this.viewMode === "attract" || this.viewMode === "squad") {
@@ -4985,7 +5469,11 @@ export class ClassicFifa3DEngine {
         const uz = dz * inv;
         desiredFov = 34;
         camSmoothTime = 0.14;
-        targetPos = [ballX - ux * 6.2 * zScale, 3.35 * zScale, ballY - uz * 6.2 * zScale];
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * 6.2 * zScale)),
+          3.35 * zScale,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 6.2 * zScale)),
+        ];
         targetLook = [ballX + ux * 11.5, 1.05, ballY + uz * 11.5];
       } else if (phase === 6 || (phase === 5 && distToAttGoal < halfL * 0.92)) {
         // Authentic Behind-the-Free-Kick / Penalty-Taker Camera (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
@@ -4999,11 +5487,15 @@ export class ClassicFifa3DEngine {
         const camH = (phase === 6 ? 2.25 : 2.55) * zScale;
         desiredFov = 33.5;
         camSmoothTime = 0.14;
-        targetPos = [ballX - ux * backDist, camH, ballY - uz * backDist];
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * backDist)),
+          camH,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * backDist)),
+        ];
         targetLook = [targetGoalX, 1.38, 0];
       } else {
-        const clampX = halfL * (is11 ? 0.56 : 0.42);
-        const leadX = Math.max(-clampX, Math.min(clampX, fx * (is11 ? 0.66 : 0.52)));
+        const clampX = halfL * (is11 ? 0.72 : 0.66);
+        const leadX = Math.max(-clampX, Math.min(clampX, fx * (is11 ? 0.80 : 0.78)));
 
         if (this.cameraMode === "dynamic") {
           desiredFov = 29;
@@ -5012,9 +5504,21 @@ export class ClassicFifa3DEngine {
           targetPos = [leadX, heightY, fz * 0.35 + distZ];
           targetLook = [fx * 0.76, 0.55, fz * 0.35 + 0.45];
         } else if (this.cameraMode === "pro") {
-          desiredFov = 34;
-          targetPos = [fx - (is11 ? 24.0 : 18.2) * zScale, (is11 ? 13.2 : 10.4) * zScale, fz * 0.58];
-          targetLook = [fx + 9.5, 0.72, fz * 0.4];
+          // Authentic EA FIFA 10–12 "Be A Pro" Behind-the-Runner Horizon Camera (`IMG_0345.jpeg`!),
+          // clamped pitch-side clear of the West Stand wall (`-(halfL + 7.15)`) with smooth end-line elevation!
+          desiredFov = 36;
+          const rawProX = fx - (is11 ? 15.2 : 11.8) * zScale;
+          const minProX = -maxBowlX;
+          const proX = Math.max(minProX, Math.min(maxBowlX, rawProX));
+          const westWallBlend = Math.min(1, Math.max(0, (minProX - rawProX) / 10.0));
+          const proY = Math.min(9.6, (is11 ? 4.85 : 3.95) * zScale + westWallBlend * 2.15);
+          const proZ = Math.max(-(halfW + 4.8), Math.min(halfW + 4.8, fz * 0.68));
+          targetPos = [proX, proY, proZ];
+          targetLook = [
+            Math.max(proX + 5.5, fx + (is11 ? 16.0 : 12.0)),
+            1.32 - westWallBlend * 0.28,
+            fz * 0.42,
+          ];
         } else if (this.cameraMode === "wide") {
           // Classic FIFA Co-Op Tactical (full goal-to-goal tactical overview!)
           desiredFov = 30;
@@ -5023,12 +5527,12 @@ export class ClassicFifa3DEngine {
           targetPos = [leadX * 0.40, heightY, distZ];
           targetLook = [leadX * 0.44, 0.40, 0.55];
         } else {
-          // Authentic EA FIFA 10–12 Tele Broadcast Gantry (`IMG_0350.webp` — pitch fills 92% of screen, crisp diagonal shadows!)
+          // Authentic EA FIFA 10–12 Tele Broadcast Gantry (`IMG_0350.webp` — pitch fills 92% of screen, crisp diagonal shadows, full box + 3D net in frame!)
           desiredFov = 28.5;
           const heightY = (is11 ? 29.5 : 23.2) * zScale;
           const distZ = (is11 ? 39.5 : 31.2) * zScale;
-          targetPos = [leadX * 0.88, heightY, fz * 0.24 + distZ];
-          targetLook = [leadX * 0.92, 0.42, fz * 0.26 + 0.85];
+          targetPos = [leadX * 0.90, heightY, fz * 0.24 + distZ];
+          targetLook = [leadX * 0.95, 0.42, fz * 0.26 + 0.85];
         }
       }
     }
@@ -5050,6 +5554,19 @@ export class ClassicFifa3DEngine {
 
     this.camera.position.copy(this.camPos);
     this.camera.lookAt(this.camLook);
+
+    if (southStandUpper) {
+      const isSouthGantryCam =
+        this.viewMode === "attract" ||
+        this.viewMode === "squad" ||
+        (replayOpts && replayOpts.active && replayOpts.camMode === "broadcast") ||
+        (this.viewMode === "match" &&
+          !(replayOpts && replayOpts.active) &&
+          setPieceCamKey === 0 &&
+          this.cameraMode !== "pro") ||
+        this.camPos.z > halfW + 4.2;
+      southStandUpper.visible = !isSouthGantryCam;
+    }
 
     this._presentScene();
   }
