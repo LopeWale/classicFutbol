@@ -329,9 +329,16 @@ pub extern "C" fn sim_pack_render_state() -> usize {
             MatchPhase::HalfTime { .. } => 11,
             MatchPhase::FullTime => 12,
         };
-        let (owner_side, owner_idx) = match st.ball.owner {
-            Some((s, idx)) => (s.index() as i32, idx as i32),
-            None => (-1, -1),
+        let (owner_side, owner_idx) = match st.phase {
+            MatchPhase::GoalScored {
+                scoring_team,
+                scorer_idx,
+                ..
+            } => (scoring_team.index() as i32, scorer_idx as i32),
+            _ => match st.ball.owner {
+                Some((s, idx)) => (s.index() as i32, idx as i32),
+                None => (-1, -1),
+            },
         };
 
         PACKED_STATE.with(|buf| {
