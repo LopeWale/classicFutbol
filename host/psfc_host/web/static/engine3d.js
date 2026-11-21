@@ -5417,6 +5417,10 @@ export class ClassicFifa3DEngine {
     let camSmoothTime = 0.22;
     let setPieceCamKey = 0;
 
+    const maxBowlX = halfL + 6.0;
+    const maxBowlZNorth = halfW + 5.4;
+    const maxBowlZSouth = halfW + 5.6;
+
     if (replayOpts && replayOpts.active) {
       setPieceCamKey =
         replayOpts.camMode === "closeup" ? 101 : replayOpts.camMode === "orbit" ? 102 : 100;
@@ -5432,7 +5436,11 @@ export class ClassicFifa3DEngine {
       } else {
         const r = (pitchLen > 80 ? 19.5 : 13.5) * zScale;
         const ang = replayOpts.orbitAngle;
-        targetPos = [ballX + Math.sin(ang) * r, 5.6 * zScale, ballY + Math.cos(ang) * r];
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX + Math.sin(ang) * r)),
+          Math.min(9.6, 5.6 * zScale),
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY + Math.cos(ang) * r)),
+        ];
         targetLook = [ballX, 0.85, ballY];
       }
     } else if (this.viewMode === "attract" || this.viewMode === "squad") {
@@ -5461,7 +5469,11 @@ export class ClassicFifa3DEngine {
         const uz = dz * inv;
         desiredFov = 34;
         camSmoothTime = 0.14;
-        targetPos = [ballX - ux * 6.2 * zScale, 3.35 * zScale, ballY - uz * 6.2 * zScale];
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * 6.2 * zScale)),
+          3.35 * zScale,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 6.2 * zScale)),
+        ];
         targetLook = [ballX + ux * 11.5, 1.05, ballY + uz * 11.5];
       } else if (phase === 6 || (phase === 5 && distToAttGoal < halfL * 0.92)) {
         // Authentic Behind-the-Free-Kick / Penalty-Taker Camera (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
@@ -5475,7 +5487,11 @@ export class ClassicFifa3DEngine {
         const camH = (phase === 6 ? 2.25 : 2.55) * zScale;
         desiredFov = 33.5;
         camSmoothTime = 0.14;
-        targetPos = [ballX - ux * backDist, camH, ballY - uz * backDist];
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * backDist)),
+          camH,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * backDist)),
+        ];
         targetLook = [targetGoalX, 1.38, 0];
       } else {
         const clampX = halfL * (is11 ? 0.72 : 0.66);
@@ -5488,10 +5504,21 @@ export class ClassicFifa3DEngine {
           targetPos = [leadX, heightY, fz * 0.35 + distZ];
           targetLook = [fx * 0.76, 0.55, fz * 0.35 + 0.45];
         } else if (this.cameraMode === "pro") {
-          // Authentic EA FIFA 10–12 "Be A Pro" Behind-the-Runner Horizon Camera (`IMG_0345.jpeg`!)
+          // Authentic EA FIFA 10–12 "Be A Pro" Behind-the-Runner Horizon Camera (`IMG_0345.jpeg`!),
+          // clamped pitch-side clear of the West Stand wall (`-(halfL + 7.15)`) with smooth end-line elevation!
           desiredFov = 36;
-          targetPos = [fx - (is11 ? 15.2 : 11.8) * zScale, (is11 ? 4.85 : 3.95) * zScale, fz * 0.68];
-          targetLook = [fx + (is11 ? 16.0 : 12.0), 1.32, fz * 0.42];
+          const rawProX = fx - (is11 ? 15.2 : 11.8) * zScale;
+          const minProX = -maxBowlX;
+          const proX = Math.max(minProX, Math.min(maxBowlX, rawProX));
+          const westWallBlend = Math.min(1, Math.max(0, (minProX - rawProX) / 10.0));
+          const proY = Math.min(9.6, (is11 ? 4.85 : 3.95) * zScale + westWallBlend * 2.15);
+          const proZ = Math.max(-(halfW + 4.8), Math.min(halfW + 4.8, fz * 0.68));
+          targetPos = [proX, proY, proZ];
+          targetLook = [
+            Math.max(proX + 5.5, fx + (is11 ? 16.0 : 12.0)),
+            1.32 - westWallBlend * 0.28,
+            fz * 0.42,
+          ];
         } else if (this.cameraMode === "wide") {
           // Classic FIFA Co-Op Tactical (full goal-to-goal tactical overview!)
           desiredFov = 30;
