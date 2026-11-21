@@ -1444,12 +1444,16 @@ impl MatchSimulation {
                             dir.scale(skill_burst)
                         }
                         PlayerActionState::Charging { .. } => {
-                            if p.vel.len() > Fp::from_milli(1_400) {
-                                p.vel.scale(Fp::from_milli(840))
-                                    + move_dir.scale(top_speed.mul(Fp::from_milli(240)))
+                            let charge_cap = top_speed.mul(Fp::from_milli(900));
+                            let raw_charge_vel = if p.vel.len() > Fp::from_milli(1_400) {
+                                p.vel
+                                    .clamp_len(charge_cap)
+                                    .scale(Fp::from_milli(740))
+                                    + move_dir.scale(top_speed.mul(Fp::from_milli(160)))
                             } else {
                                 move_dir.scale(top_speed.mul(Fp::from_milli(420)))
-                            }
+                            };
+                            raw_charge_vel.clamp_len(charge_cap)
                         }
                         PlayerActionState::Stumbled { .. } => p.vel.scale(Fp::from_milli(820)),
                         _ => move_dir.scale(top_speed),
@@ -1703,8 +1707,9 @@ impl MatchSimulation {
             };
 
             // Predict vertical height at goal plane to accurately classify `on_target`
+            let launch_z = self.state.ball.pos.z.max(Fp::from_milli(110));
             let flight_t = dx_goal.div(speed.max(Fp::from_int(8)));
-            let est_goal_z = Fp::from_milli(115)
+            let est_goal_z = launch_z
                 + vz.mul(flight_t)
                 - Fp::from_milli(4_905).mul(flight_t.mul(flight_t));
             let on_target = target_y.abs() <= goal_half_w && est_goal_z <= self.state.format.goal_height();
@@ -1712,7 +1717,7 @@ impl MatchSimulation {
                 self.state.player_stats[s_idx][kicker_idx].shots_on_target += 1;
             }
 
-            self.state.ball.pos.z = self.state.ball.pos.z.max(Fp::from_milli(110));
+            self.state.ball.pos.z = launch_z;
             self.state.ball.vel = Vec3::new(dir_xy.x.mul(speed), dir_xy.y.mul(speed), vz);
             self.state.ball.spin_side = spin_side;
             self.state.ball.spin_top = spin_top;
@@ -2058,16 +2063,18 @@ impl MatchSimulation {
         let carrier_shielding = (self.state.prev_buttons[c_s_idx] & BTN_JOCKEY) != 0;
         let carrier_drib = self.state.players[c_s_idx][carrier_idx].attributes.dribbling as i64;
         let ball_xy = self.state.ball.pos.xy();
+        let ball_z = self.state.ball.pos.z;
 
         let def_count = self.state.players[d_s_idx].len();
 
         // Layer 1: Passive Jockey / Step-In Foot Interception when a defender positions cleanly on the exposed ball
-        // between the carrier and the ball (without needing a wild lunging tackle!).
+        // between the carrier and the ball (gated by shin/knee vertical reach `<= 520mm + def_p.z`!).
         let def_jockey_held = (self.state.prev_buttons[d_s_idx] & BTN_JOCKEY) != 0;
         for d_idx in 0..def_count {
             let def_p = &self.state.players[d_s_idx][d_idx];
             if !def_p.can_control_ball()
                 || !matches!(def_p.action, PlayerActionState::Normal)
+                || ball_z > def_p.z + Fp::from_milli(520)
             {
                 continue;
             }
@@ -2107,6 +2114,7 @@ impl MatchSimulation {
             self.state.ball.dribble_touch_cd = 6;
             self.state.ball.pos.x = carry_step.x;
             self.state.ball.pos.y = carry_step.y;
+            self.state.ball.pos.z = Fp::ZERO;
             self.state.ball.vel = Vec3::new(
                 def_vel.x.mul(Fp::from_milli(780)) + def_fwd.x.mul(Fp::from_milli(1_450)),
                 def_vel.y.mul(Fp::from_milli(780)) + def_fwd.y.mul(Fp::from_milli(1_450)),
@@ -2132,6 +2140,7 @@ impl MatchSimulation {
         for d_idx in 0..def_count {
             let def_action = self.state.players[d_s_idx][d_idx].action;
             let def_pos = self.state.players[d_s_idx][d_idx].pos;
+            let def_z = self.state.players[d_s_idx][d_idx].z;
             let def_vel = self.state.players[d_s_idx][d_idx].vel;
             let def_facing = self.state.players[d_s_idx][d_idx].facing_bam;
             let def_fwd = Vec2::from_bam(def_facing, Fp::ONE);
@@ -2139,37 +2148,57 @@ impl MatchSimulation {
             let (is_slide, contact_dist_ball, hit_man_before_ball, clipped_man) = match def_action {
                 PlayerActionState::Tackling { ticks_left } if ticks_left >= 5 => {
                     // Directional Standing Tackle: extended tackling boot `540mm` ahead along `def_fwd`
-                    // within a strict forward `±68°` cone (eliminating 1.25m 360° behind-the-back vacuum steals!)
+                    // within a strict forward `±68°` cone & hip/thigh vertical boot reach (`<= 680mm + def_z`)
                     let to_ball_vec = ball_xy - def_pos;
                     let raw_dist_ball = to_ball_vec.len();
-                    if raw_dist_ball > Fp::from_milli(1_120) {
-                        continue;
-                    }
-                    let cone_align = if raw_dist_ball > Fp::from_milli(180) {
-                        def_fwd.dot(to_ball_vec.normalize_or_zero())
-                    } else {
-                        Fp::ONE
-                    };
-                    if cone_align < Fp::from_milli(350) {
-                        continue;
-                    }
-                    let boot_pos = def_pos + def_fwd.scale(Fp::from_milli(540));
-                    let boot_to_ball = boot_pos.dist(ball_xy).min(raw_dist_ball);
-                    if boot_to_ball > Fp::from_milli(550) {
-                        continue;
-                    }
                     let dist_carrier = def_pos.dist(carrier_pos);
+                    if raw_dist_ball > Fp::from_milli(1_120) && dist_carrier > Fp::from_milli(640) {
+                        continue;
+                    }
+                    let ball_in_vert_reach = ball_z <= def_z + Fp::from_milli(680);
+                    let boot_to_ball = if ball_in_vert_reach {
+                        let cone_align = if raw_dist_ball > Fp::from_milli(180) {
+                            def_fwd.dot(to_ball_vec.normalize_or_zero())
+                        } else {
+                            Fp::ONE
+                        };
+                        if cone_align >= Fp::from_milli(350) {
+                            let boot_pos = def_pos + def_fwd.scale(Fp::from_milli(540));
+                            boot_pos.dist(ball_xy).min(raw_dist_ball)
+                        } else {
+                            Fp::from_int(99)
+                        }
+                    } else {
+                        Fp::from_int(99)
+                    };
+                    if boot_to_ball > Fp::from_milli(550) && dist_carrier > Fp::from_milli(620) {
+                        continue;
+                    }
                     let def_to_c = (carrier_pos - def_pos).normalize_or_zero();
                     let def_to_b = to_ball_vec.normalize_or_zero();
-                    let body_blocking = dist_carrier + Fp::from_milli(130) < raw_dist_ball
-                        && def_to_c.dot(def_to_b) > Fp::from_milli(680);
+                    let body_blocking = if !ball_in_vert_reach || boot_to_ball > Fp::from_milli(550) {
+                        dist_carrier <= Fp::from_milli(620)
+                            && def_fwd.dot(def_to_c) >= Fp::from_milli(350)
+                    } else {
+                        dist_carrier + Fp::from_milli(130) < raw_dist_ball
+                            && def_to_c.dot(def_to_b) > Fp::from_milli(680)
+                    };
+                    if boot_to_ball > Fp::from_milli(550) && !body_blocking {
+                        continue;
+                    }
                     (false, boot_to_ball, body_blocking, dist_carrier <= Fp::from_milli(720))
                 }
                 PlayerActionState::Sliding { ticks_left, dir } if ticks_left >= 6 => {
                     // Sweeping Slide Segment from `-120mm` (hip) to `+1060mm` (lead studs) along `dir`
+                    // gated by low turf-slide stud height (`ball_z <= 420mm`)!
                     let seg_a = def_pos - dir.scale(Fp::from_milli(120));
                     let seg_b = def_pos + dir.scale(Fp::from_milli(1_060));
-                    let (d_ball, t_ball) = point_to_segment_dist_and_t(ball_xy, seg_a, seg_b);
+                    let (d_ball_xy, t_ball) = point_to_segment_dist_and_t(ball_xy, seg_a, seg_b);
+                    let d_ball = if ball_z <= Fp::from_milli(420) {
+                        d_ball_xy
+                    } else {
+                        Fp::from_int(99)
+                    };
                     let (d_man, t_man) = point_to_segment_dist_and_t(carrier_pos, seg_a, seg_b);
                     if d_ball > Fp::from_milli(500) && d_man > Fp::from_milli(520) {
                         continue;
@@ -2268,6 +2297,7 @@ impl MatchSimulation {
                 self.state.ball.dribble_touch_cd = 6;
                 self.state.ball.pos.x = hook_xy.x;
                 self.state.ball.pos.y = hook_xy.y;
+                self.state.ball.pos.z = Fp::ZERO;
                 self.state.ball.vel = Vec3::new(hook_vel.x, hook_vel.y, Fp::ZERO);
                 if d_idx != 0 {
                     self.state.controlled_idx[d_s_idx] = d_idx;
@@ -2298,6 +2328,7 @@ impl MatchSimulation {
                 self.state.ball.owner = None;
                 self.state.ball.pos.x = nudged.x;
                 self.state.ball.pos.y = nudged.y;
+                self.state.ball.pos.z = ball_z.min(Fp::from_milli(420));
                 self.state.ball.vel = Vec3::new(
                     poke_dir.x.mul(poke_spd),
                     poke_dir.y.mul(poke_spd),
@@ -4791,6 +4822,117 @@ mod tests {
             sim.state().ball.spin_side.abs() > Fp::from_milli(4_500),
             "finesse shot (`BTN_JOCKEY + BTN_SHOOT`) must impart strong Magnus side-spin ({:?})",
             sim.state().ball.spin_side
+        );
+
+        // 4A. Charging Movement Speed Cap (Codex PR #10 Finding #1):
+        // Holding kick + full stick + sprint must NEVER accelerate the carrier above ordinary sprint `top_speed`!
+        setup_shooter(&mut sim);
+        sim.state.players[0][1].pos = Vec2::from_milli(-15_000, 0);
+        sim.state.ball.pos = Vec3::from_milli(-14_650, 0, 0);
+        for _ in 0..35 {
+            sim.tick(&[
+                InputFrame {
+                    move_x: 127,
+                    buttons: BTN_SPRINT,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        let normal_sprint_speed = sim.state().players[0][1].vel.len();
+
+        setup_shooter(&mut sim);
+        sim.state.players[0][1].pos = Vec2::from_milli(-15_000, 0);
+        sim.state.ball.pos = Vec3::from_milli(-14_650, 0, 0);
+        sim.state.players[0][1].vel = Vec2::new(normal_sprint_speed, Fp::ZERO);
+        let mut peak_charging_speed = Fp::ZERO;
+        for _ in 0..27 {
+            sim.tick(&[
+                InputFrame {
+                    move_x: 127,
+                    aim_x: 127,
+                    buttons: BTN_SPRINT | BTN_PASS,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+            peak_charging_speed = peak_charging_speed.max(sim.state().players[0][1].vel.len());
+        }
+        assert!(
+            peak_charging_speed <= normal_sprint_speed + Fp::from_milli(5),
+            "charging a kick while sprinting ({:?}) must NEVER boost carrier speed beyond top_speed ({:?})",
+            peak_charging_speed,
+            normal_sprint_speed
+        );
+
+        // 4B. Vertical Reach Gating on Aerial Chest-Cushioned Possession (Codex PR #10 Finding #2):
+        // Grounded passive step-in, standing tackle, and low turf slide must NOT steal a chest-high (`z = 1.25m`) ball!
+        let setup_chest_trap = |sim: &mut MatchSimulation, def_x_mm: i64| {
+            sim.state.phase = MatchPhase::OpenPlay;
+            sim.state.controlled_idx = [1, 1];
+            sim.state.players[0][1].pos = Vec2::from_milli(0, 0);
+            sim.state.players[0][1].vel = Vec2::ZERO;
+            sim.state.players[0][1].z = Fp::ZERO;
+            sim.state.players[0][1].facing_bam = 0;
+            sim.state.players[0][1].action = PlayerActionState::Normal;
+            sim.state.ball.owner = Some((TeamSide::Home, 1));
+            sim.state.ball.pos = Vec3::from_milli(340, 0, 1_250); // 1.25m chest-cushioned aerial trap
+            sim.state.ball.vel = Vec3::ZERO;
+
+            sim.state.players[1][1].pos = Vec2::from_milli(def_x_mm, 0);
+            sim.state.players[1][1].vel = Vec2::ZERO;
+            sim.state.players[1][1].z = Fp::ZERO;
+            sim.state.players[1][1].facing_bam = 32_768; // facing -X directly at ball
+            sim.state.players[1][1].action = PlayerActionState::Normal;
+            sim.state.prev_buttons = [0, 0];
+        };
+
+        // Grounded passive jockey step-in (`def_x = 0.62m`, `dist_ball = 0.28m < 0.475m`, but `ball_z = 1.25m > 0.52m`)
+        setup_chest_trap(&mut sim, 620);
+        sim.state.prev_buttons = [0, BTN_JOCKEY];
+        sim.tick(&[
+            InputFrame::IDLE,
+            InputFrame {
+                buttons: BTN_JOCKEY,
+                ..InputFrame::IDLE
+            },
+        ]);
+        assert_eq!(
+            sim.state().ball.owner,
+            Some((TeamSide::Home, 1)),
+            "grounded passive step-in must NOT pluck a 1.25m chest-cushioned ball with a foot"
+        );
+
+        // Grounded standing tackle (`def_x = 0.96m`, `ball_z = 1.25m > 0.68m`)
+        setup_chest_trap(&mut sim, 960);
+        sim.tick(&[
+            InputFrame::IDLE,
+            InputFrame {
+                move_x: -127,
+                buttons: BTN_TACKLE,
+                ..InputFrame::IDLE
+            },
+        ]);
+        assert_eq!(
+            sim.state().ball.owner,
+            Some((TeamSide::Home, 1)),
+            "grounded standing tackle must NOT steal a 1.25m chest-cushioned ball above boot reach"
+        );
+
+        // Grounded turf slide (`def_x = 0.96m`, `ball_z = 1.25m > 0.42m`)
+        setup_chest_trap(&mut sim, 960);
+        sim.tick(&[
+            InputFrame::IDLE,
+            InputFrame {
+                move_x: -127,
+                buttons: BTN_SLIDE,
+                ..InputFrame::IDLE
+            },
+        ]);
+        assert_eq!(
+            sim.state().ball.owner,
+            Some((TeamSide::Home, 1)),
+            "grounded slide tackle must NOT sweep a 1.25m chest-cushioned ball from below"
         );
     }
 }
