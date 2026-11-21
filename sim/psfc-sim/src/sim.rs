@@ -112,8 +112,11 @@ impl MatchSimulation {
                     spin_top: Fp::ZERO,
                     owner: None,
                     gk_hold_ticks: 0,
+                    dribble_touch_cd: 0,
                     last_touch_team: None,
                     last_touch_player: None,
+                    last_touch_meta: None,
+                    last_team_touch_meta: [None, None],
                     pass_in_flight: None,
                     assist_candidate: None,
                 },
@@ -133,6 +136,17 @@ impl MatchSimulation {
             "First half ready for kick-off".to_string(),
         );
         Ok(sim)
+    }
+
+    #[inline]
+    fn set_last_touch(&mut self, side: TeamSide, idx: usize) {
+        let p = &self.state.players[side.index()][idx];
+        let fid = p.footballer_id.clone();
+        let pname = p.name.clone();
+        self.state.ball.last_team_touch_meta[side.index()] = Some((fid.clone(), pname.clone()));
+        self.state.ball.last_touch_team = Some(side);
+        self.state.ball.last_touch_player = Some((side, idx));
+        self.state.ball.last_touch_meta = Some((side, fid, pname));
     }
 
     #[inline]
@@ -481,8 +495,11 @@ impl MatchSimulation {
             spin_top: Fp::ZERO,
             owner: None,
             gk_hold_ticks: 0,
+            dribble_touch_cd: 0,
             last_touch_team: Some(kicking_team),
             last_touch_player: None,
+            last_touch_meta: None,
+            last_team_touch_meta: [None, None],
             pass_in_flight: None,
             assist_candidate: None,
         };
@@ -529,6 +546,7 @@ impl MatchSimulation {
         self.state.players[kicking_team.index()][k_idx].pos =
             Vec2::from_milli(-k_sign * 380, 180);
         self.state.ball.owner = Some((kicking_team, k_idx));
+        self.set_last_touch(kicking_team, k_idx);
         self.state.phase = MatchPhase::KickOff {
             team: kicking_team,
             wait_ticks: 0,
@@ -564,6 +582,13 @@ impl MatchSimulation {
             }
         };
 
+        let taker_fid = self.state.players[team.index()][taker_idx]
+            .footballer_id
+            .clone();
+        let taker_fname = self.state.players[team.index()][taker_idx].name.clone();
+        let mut set_piece_team_meta: [Option<(String, String)>; 2] = [None, None];
+        set_piece_team_meta[team.index()] = Some((taker_fid.clone(), taker_fname.clone()));
+        let taker_meta = (team, taker_fid, taker_fname);
         self.state.ball = BallState {
             pos: Vec3::new(spot.x, spot.y, Fp::ZERO),
             vel: Vec3::ZERO,
@@ -571,8 +596,11 @@ impl MatchSimulation {
             spin_top: Fp::ZERO,
             owner: Some((team, taker_idx)),
             gk_hold_ticks: 0,
+            dribble_touch_cd: 0,
             last_touch_team: Some(team),
             last_touch_player: Some((team, taker_idx)),
+            last_touch_meta: Some(taker_meta),
+            last_team_touch_meta: set_piece_team_meta,
             pass_in_flight: None,
             assist_candidate: None,
         };
@@ -1376,8 +1404,8 @@ impl MatchSimulation {
 
         self.state.ball.owner = None;
         self.state.ball.gk_hold_ticks = 0;
-        self.state.ball.last_touch_team = Some(side);
-        self.state.ball.last_touch_player = Some((side, kicker_idx));
+        self.state.ball.dribble_touch_cd = 0;
+        self.set_last_touch(side, kicker_idx);
         self.state.players[s_idx][kicker_idx].action = PlayerActionState::Cooldown {
             ticks_left: if is_5v5 { 7 } else { 10 },
         };
@@ -1413,17 +1441,17 @@ impl MatchSimulation {
             let target_xy = Vec2::new(opp_goal_x, target_y);
             let dir_xy = (target_xy - kicker_pos).normalize_or_zero();
 
-            let base_speed_mm = 15_800 + (kicker_attrs.shooting as i64) * 66;
-            let charge_boost_mm = charge_norm.mul(Fp::from_milli(9_500)).to_milli();
+            let base_speed_mm = 16_200 + (kicker_attrs.shooting as i64) * 68;
+            let charge_boost_mm = charge_norm.mul(Fp::from_milli(9_800)).to_milli();
             let speed = Fp::from_milli(if finesse {
-                ((base_speed_mm + charge_boost_mm) * 89) / 100
+                ((base_speed_mm + charge_boost_mm) * 88) / 100
             } else {
                 base_speed_mm + charge_boost_mm
             });
 
-            // Vertical lift: low driven on quick tap, rising strike on higher charge
-            let vz = Fp::from_milli(850) + charge_norm.mul(Fp::from_milli(4_300));
-            let finesse_curl = if is_5v5 { 5_100 } else { 4_200 };
+            // Vertical lift: low driven on quick tap, rising dipping strike on higher charge
+            let vz = Fp::from_milli(780) + charge_norm.mul(Fp::from_milli(4_200));
+            let finesse_curl = if is_5v5 { 5_400 } else { 4_500 };
             let spin = if finesse {
                 if target_y >= Fp::ZERO {
                     Fp::from_milli(-finesse_curl)
@@ -1434,10 +1462,10 @@ impl MatchSimulation {
                 self.state.rng.range_milli(-850, 850)
             };
 
-            self.state.ball.pos.z = self.state.ball.pos.z.max(Fp::from_milli(120));
+            self.state.ball.pos.z = self.state.ball.pos.z.max(Fp::from_milli(110));
             self.state.ball.vel = Vec3::new(dir_xy.x.mul(speed), dir_xy.y.mul(speed), vz);
             self.state.ball.spin_side = spin;
-            self.state.ball.spin_top = Fp::from_milli(1_500);
+            self.state.ball.spin_top = Fp::from_milli(1_650);
 
             self.emit_event(
                 MatchEventType::Shot,
@@ -1539,33 +1567,40 @@ impl MatchSimulation {
         let dir = (delta + Vec2::new(-delta.y, delta.x).normalize_or_zero().scale(lateral_err))
             .normalize_or_zero();
 
+        // Distance-weighted pass kinematics: silky short layoffs (~8.5 m/s) up to crisp driven cross-field balls (~22.5 m/s)
         let (horiz_speed, vz) = if is_lob {
-            let spd = (Fp::from_milli(10_500)
-                + dist.mul(Fp::from_milli(360))
-                + charge_norm.mul(Fp::from_milli(5_500)))
-            .clamp(Fp::from_milli(10_500), Fp::from_milli(21_000));
-            let lift = (Fp::from_milli(5_200) + charge_norm.mul(Fp::from_milli(4_000)))
-                .clamp(Fp::from_milli(5_000), Fp::from_milli(9_200));
+            let spd = (Fp::from_milli(9_600)
+                + dist.mul(Fp::from_milli(390))
+                + charge_norm.mul(Fp::from_milli(5_600)))
+            .clamp(Fp::from_milli(9_600), Fp::from_milli(21_200));
+            let lift = (Fp::from_milli(5_100) + charge_norm.mul(Fp::from_milli(4_100)))
+                .clamp(Fp::from_milli(4_900), Fp::from_milli(9_200));
             (spd, lift)
         } else {
-            let spd = (Fp::from_milli(13_100)
-                + dist.mul(Fp::from_milli(445))
-                + charge_norm.mul(Fp::from_milli(6_200)))
-            .clamp(Fp::from_milli(12_800), Fp::from_milli(23_400));
-            let skim_vz = Fp::from_milli(320) + charge_norm.mul(Fp::from_milli(520));
+            let spd = (Fp::from_milli(6_800)
+                + dist.mul(Fp::from_milli(490))
+                + charge_norm.mul(Fp::from_milli(5_200)))
+            .clamp(Fp::from_milli(7_500), Fp::from_milli(22_800));
+            let skim_vz = if dist > Fp::from_milli(9_500) || charge_norm > Fp::from_milli(480) {
+                Fp::from_milli(180) + charge_norm.mul(Fp::from_milli(360))
+            } else {
+                Fp::ZERO
+            };
             (spd, skim_vz)
         };
 
         self.state.ball.vel = Vec3::new(dir.x.mul(horiz_speed), dir.y.mul(horiz_speed), vz);
         self.state.ball.spin_side = Fp::ZERO;
         self.state.ball.spin_top = if is_lob {
-            Fp::from_milli(-1_350)
+            Fp::from_milli(-1_450)
         } else {
-            Fp::from_milli(-780)
+            Fp::from_milli(-620)
         };
         self.state.ball.pass_in_flight = Some(PassInFlight {
             team: side,
             passer_idx: kicker_idx,
+            passer_id: kicker_id.clone(),
+            passer_name: kicker_name.clone(),
             intended_receiver_idx: receiver_idx,
             target_pos,
             launched_tick: self.state.tick,
@@ -1718,13 +1753,13 @@ impl MatchSimulation {
                 self.state.ball.vel = Vec3::new(poke_dir.x, poke_dir.y, Fp::from_milli(400));
             } else {
                 self.state.ball.owner = Some((def_side, d_idx));
+                self.state.ball.dribble_touch_cd = 6;
                 self.state.ball.vel = Vec3::ZERO;
                 if d_idx != 0 {
                     self.state.controlled_idx[def_side.index()] = d_idx;
                 }
             }
-            self.state.ball.last_touch_team = Some(def_side);
-            self.state.ball.last_touch_player = Some((def_side, d_idx));
+            self.set_last_touch(def_side, d_idx);
             self.state.ball.pass_in_flight = None;
             self.state.ball.assist_candidate = None;
 
@@ -1850,10 +1885,10 @@ impl MatchSimulation {
                 self.state.players[victim_side.index()][victim_idx].action =
                     PlayerActionState::Stumbled { ticks_left: 10 };
                 self.state.ball.owner = Some((victim_side, mate_idx));
+                self.state.ball.dribble_touch_cd = 6;
                 self.state.ball.pos = Vec3::new(mate_pos.x, mate_pos.y, Fp::ZERO);
                 self.state.ball.vel = Vec3::ZERO;
-                self.state.ball.last_touch_team = Some(victim_side);
-                self.state.ball.last_touch_player = Some((victim_side, mate_idx));
+                self.set_last_touch(victim_side, mate_idx);
                 self.state.controlled_idx[victim_side.index()] = mate_idx;
                 self.emit_event(
                     MatchEventType::Advantage,
@@ -1901,52 +1936,111 @@ impl MatchSimulation {
                 return;
             }
 
-            // FIFA 10–12 360° & Precision Dribbling: continuous rhythmic stride touches + true rolling ball velocity
+            // 1. Vertical aerial trap settle: if trapped above grass (chest/thigh), settle under gravity + cushioned bounce!
+            let mut next_z = self.state.ball.pos.z;
+            let mut next_vz = self.state.ball.vel.z;
+            if next_z > Fp::ZERO || next_vz != Fp::ZERO {
+                next_vz -= Fp::from_milli(9_810).mul(dt);
+                next_z += next_vz.mul(dt);
+                if next_z <= Fp::ZERO {
+                    next_z = Fp::ZERO;
+                    if next_vz < Fp::from_milli(-720) {
+                        next_vz = (-next_vz).mul(Fp::from_milli(360));
+                    } else {
+                        next_vz = Fp::ZERO;
+                    }
+                }
+            }
+
+            // 2. Impulse-Based 360° Dribbling: free rolling ball between discrete rhythmic boot touches!
             let inp = inputs[side.index()];
             let drib_skill = p.attributes.dribbling as i64;
             let p_speed = p.vel.len();
             let facing_dir = Vec2::from_bam(p.facing_bam, Fp::ONE);
-            let carry_dir = if p_speed > Fp::from_milli(450) {
+            let carry_dir = if p_speed > Fp::from_milli(380) {
                 facing_dir
-                    .lerp(p.vel.normalize_or_zero(), Fp::from_milli(420))
+                    .lerp(p.vel.normalize_or_zero(), Fp::from_milli(480))
                     .normalize_or_zero()
             } else {
                 facing_dir
             };
 
-            // Continuous triangle wave in [0, 1000] synced to stride cadence (zero square-wave snap!)
-            let (period_ticks, min_lead_mm, touch_amp_mm, follow_lerp) = if inp.pressed(BTN_JOCKEY) {
-                // FIFA 12 Precision Dribbling: rapid close touches right on the laces
-                (12_u32, 305_i64, 55_i64, Fp::from_milli(340))
-            } else if inp.pressed(BTN_SPRINT) && p_speed > Fp::from_milli(4_000) {
-                // Open-field Sprint Knock-On: rhythmic longer touches ahead into space
-                (20_u32, 620_i64, 240_i64, Fp::from_milli(240))
+            let (touch_cd_ticks, lead_mm, max_reach_mm, touch_gain) = if inp.pressed(BTN_JOCKEY) {
+                // Close sole/laces control: frequent soft touches right at the boot
+                (6_u8, 305_i64, 435_i64, Fp::from_milli(6_200))
+            } else if inp.pressed(BTN_SPRINT) && p_speed > Fp::from_milli(3_600) {
+                // Open-field sprint knock-on: stride push ahead into space, ball rolls freely between strides!
+                (12_u8, 720_i64, 910_i64, Fp::from_milli(5_600))
             } else {
-                // Balanced 360° Stride Carry (Personality+ dribbling tightness)
-                let tight_base = (485 - (drib_skill - 75) * 2).clamp(400, 525);
-                (16_u32, tight_base, 115_i64, Fp::from_milli(285))
-            };
-
-            let half_p = period_ticks / 2;
-            let phase_t = (self.state.tick + (idx as u32) * 5) % period_ticks;
-            let tri_permille = if phase_t <= half_p {
-                ((phase_t as i64) * 1_000) / (half_p as i64)
-            } else {
-                (((period_ticks - phase_t) as i64) * 1_000) / (half_p as i64)
-            };
-            let dynamic_lead_mm = if p_speed > Fp::from_milli(350) {
-                min_lead_mm + (touch_amp_mm * tri_permille) / 1_000
-            } else {
-                min_lead_mm
+                // Balanced 360° stride carry (Personality+ dribbling tightness)
+                let tight_lead = (445 - (drib_skill - 75) * 2).clamp(385, 480);
+                (9_u8, tight_lead, 620_i64, Fp::from_milli(5_800))
             };
 
             let prev_ball_xy = self.state.ball.pos.xy();
-            let target_xy = p.pos + carry_dir.scale(Fp::from_milli(dynamic_lead_mm));
-            let free_step_xy = prev_ball_xy + p.vel.scale(dt.mul(Fp::from_milli(650)));
-            let next_xy = free_step_xy.lerp(target_xy, follow_lerp);
-            let actual_vel_xy = (next_xy - prev_ball_xy).scale(Fp::from_int(TICKS_PER_SECOND as i32));
-            self.state.ball.vel = Vec3::new(actual_vel_xy.x, actual_vel_xy.y, Fp::ZERO);
-            self.state.ball.pos = Vec3::new(next_xy.x, next_xy.y, Fp::ZERO);
+            let mut vel_xy = self.state.ball.vel.xy();
+
+            // Natural turf deceleration while ball rolls between stride touches
+            let roll_decel = Fp::from_milli(1_850).mul(dt);
+            let cur_spd = vel_xy.len();
+            if cur_spd <= roll_decel {
+                vel_xy = Vec2::ZERO;
+            } else {
+                vel_xy = (vel_xy - vel_xy.normalize_or_zero().scale(roll_decel)).scale(Fp::from_milli(996));
+            }
+
+            if self.state.ball.dribble_touch_cd > 0 {
+                self.state.ball.dribble_touch_cd -= 1;
+            }
+
+            let rel_to_ball = prev_ball_xy - p.pos;
+            let rel_dist = rel_to_ball.len();
+            let align_with_carry = if rel_dist > Fp::from_milli(60) {
+                rel_to_ball.normalize_or_zero().dot(carry_dir)
+            } else {
+                Fp::NEG_ONE
+            };
+            // Trigger discrete boot touch when stride cadence fires, or when cutting/turning or ball crowds the feet
+            let cut_trigger = p_speed > Fp::from_milli(320) && align_with_carry < Fp::from_milli(700);
+            let crowd_trigger = rel_dist < Fp::from_milli(235);
+            let did_touch = self.state.ball.dribble_touch_cd == 0 || cut_trigger || crowd_trigger;
+            if did_touch {
+                let ideal_xy = p.pos + carry_dir.scale(Fp::from_milli(lead_mm));
+                if p_speed <= Fp::from_milli(220) && rel_dist <= Fp::from_milli(440) {
+                    // Standing shield / sole trap: settle ball gently in front of laces
+                    vel_xy = (ideal_xy - prev_ball_xy).scale(Fp::from_milli(4_200));
+                } else {
+                    // Rhythmic stride tap: impart forward rolling velocity ahead of carrier!
+                    let tap_impulse = (ideal_xy - prev_ball_xy).scale(touch_gain);
+                    vel_xy = p.vel.scale(Fp::from_milli(1_040)) + tap_impulse;
+                    let max_tap_spd = (p_speed + Fp::from_milli(3_400)).max(Fp::from_milli(2_800));
+                    vel_xy = vel_xy.clamp_len(max_tap_spd);
+                }
+                self.state.ball.dribble_touch_cd = touch_cd_ticks;
+                self.state.ball.spin_side = Fp::ZERO;
+                self.state.ball.spin_top = Fp::from_milli(520);
+            }
+
+            let mut next_xy = prev_ball_xy + vel_xy.scale(dt);
+
+            // Soft outer biomechanical leg-reach bound so ball never separates unnaturally or overlaps torso
+            let offset = next_xy - p.pos;
+            let off_len = offset.len();
+            let max_reach = Fp::from_milli(max_reach_mm);
+            let min_clear = Fp::from_milli(210);
+            if off_len > max_reach {
+                next_xy = p.pos + offset.normalize_or_zero().scale(max_reach);
+                vel_xy = (next_xy - prev_ball_xy).scale(Fp::from_int(TICKS_PER_SECOND as i32));
+            } else if off_len < min_clear {
+                next_xy = p.pos + carry_dir.scale(min_clear);
+                vel_xy = (next_xy - prev_ball_xy).scale(Fp::from_int(TICKS_PER_SECOND as i32));
+            }
+
+            self.state.ball.vel = Vec3::new(vel_xy.x, vel_xy.y, next_vz);
+            self.state.ball.pos = Vec3::new(next_xy.x, next_xy.y, next_z);
+            if did_touch {
+                self.set_last_touch(side, idx);
+            }
             return;
         }
 
@@ -1956,29 +2050,36 @@ impl MatchSimulation {
 
         // Horizontal Magnus curve from side spin when moving through air
         let speed_xy = self.state.ball.vel.xy().len();
-        if speed_xy > Fp::from_milli(2_000) && self.state.ball.spin_side.abs() > Fp::from_milli(50) {
+        if speed_xy > Fp::from_milli(1_800) && self.state.ball.spin_side.abs() > Fp::from_milli(45) {
             let perp = Vec2::new(-self.state.ball.vel.y, self.state.ball.vel.x).normalize_or_zero();
-            let magnus_accel = self.state.ball.spin_side.mul(Fp::from_milli(980));
+            let magnus_accel = self.state.ball.spin_side.mul(Fp::from_milli(1_050));
             self.state.ball.vel.x += perp.x.mul(magnus_accel).mul(dt);
             self.state.ball.vel.y += perp.y.mul(magnus_accel).mul(dt);
-            self.state.ball.spin_side = self.state.ball.spin_side.mul(Fp::from_milli(990));
+            self.state.ball.spin_side = self.state.ball.spin_side.mul(Fp::from_milli(991));
         }
 
-        // Air drag, vertical Magnus lift/dip (backspin floats lobs, topspin dips shots), vs grass rolling friction
-        if self.state.ball.pos.z > Fp::from_milli(60) {
-            let drag = Fp::from_milli(994);
-            self.state.ball.vel.x = self.state.ball.vel.x.mul(drag);
-            self.state.ball.vel.y = self.state.ball.vel.y.mul(drag);
-            // Vertical Magnus force: negative spin_top (backspin) lifts upward; positive spin_top (topspin) dips downward
-            if speed_xy > Fp::from_milli(2_500) && self.state.ball.spin_top.abs() > Fp::from_milli(40) {
-                let vert_magnus = (-self.state.ball.spin_top).mul(Fp::from_milli(680));
+        // Quadratic aerodynamic drag + vertical Magnus lift/dip in air vs natural grass rolling friction
+        if self.state.ball.pos.z > Fp::from_milli(45) {
+            let speed_3d = (self.state.ball.vel.xy().len_sq()
+                + self.state.ball.vel.z.mul(self.state.ball.vel.z))
+            .sqrt();
+            // Quadratic drag: a_drag = -k_d * |v| * v (k_d = 0.0135 m^-1)
+            let drag_loss = speed_3d.mul(Fp::from_milli(14)).mul(dt);
+            let air_keep = (Fp::ONE - drag_loss).clamp(Fp::from_milli(978), Fp::from_milli(999));
+            self.state.ball.vel.x = self.state.ball.vel.x.mul(air_keep);
+            self.state.ball.vel.y = self.state.ball.vel.y.mul(air_keep);
+            self.state.ball.vel.z = self.state.ball.vel.z.mul(air_keep);
+
+            // Vertical Magnus force: negative spin_top (backspin) lifts lobs; positive spin_top (topspin) dips shots
+            if speed_xy > Fp::from_milli(2_200) && self.state.ball.spin_top.abs() > Fp::from_milli(40) {
+                let vert_magnus = (-self.state.ball.spin_top).mul(Fp::from_milli(720));
                 self.state.ball.vel.z += vert_magnus.mul(dt);
                 self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(992));
             }
             self.state.ball.vel.z -= Fp::from_milli(9_810).mul(dt);
         } else {
-            // FIFA 10–12 non-linear turf glide: viscous grass-blade drag at high speed + smooth weighted settle
-            let decel = Fp::from_milli(if is_5v5 { 2_250 } else { 2_450 }).mul(dt);
+            // Natural football turf rolling resistance: steady rolling decel + subtle grass-blade drag
+            let decel = Fp::from_milli(if is_5v5 { 1_750 } else { 1_880 }).mul(dt);
             let v_xy = self.state.ball.vel.xy();
             let len = v_xy.len();
             if len <= decel {
@@ -1986,15 +2087,12 @@ impl MatchSimulation {
                 self.state.ball.vel.y = Fp::ZERO;
             } else {
                 let next_xy = v_xy - v_xy.normalize_or_zero().scale(decel);
-                let grass_viscous = if len > Fp::from_milli(11_000) {
-                    Fp::from_milli(991)
-                } else {
-                    Fp::from_milli(995)
-                };
+                let grass_viscous = Fp::from_milli(997);
                 self.state.ball.vel.x = next_xy.x.mul(grass_viscous);
                 self.state.ball.vel.y = next_xy.y.mul(grass_viscous);
             }
-            self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(920));
+            self.state.ball.spin_top = self.state.ball.spin_top.mul(Fp::from_milli(930));
+            self.state.ball.spin_side = self.state.ball.spin_side.mul(Fp::from_milli(940));
             if self.state.ball.vel.z < Fp::ZERO {
                 self.state.ball.vel.z = Fp::ZERO;
             }
@@ -2007,18 +2105,18 @@ impl MatchSimulation {
         // Ground bounce with spin-to-turf friction coupling (backspin checks up; topspin skids forward)
         if self.state.ball.pos.z < Fp::ZERO {
             self.state.ball.pos.z = Fp::ZERO;
-            if self.state.ball.vel.z < Fp::from_milli(-850) {
+            if self.state.ball.vel.z < Fp::from_milli(-780) {
                 let restitution = if is_5v5 {
-                    Fp::from_milli(630)
+                    Fp::from_milli(615)
                 } else {
-                    Fp::from_milli(600)
+                    Fp::from_milli(590)
                 };
                 let horiz_keep = if self.state.ball.spin_top < Fp::from_milli(-300) {
-                    Fp::from_milli(805)
+                    Fp::from_milli(800)
                 } else if self.state.ball.spin_top > Fp::from_milli(400) {
                     Fp::from_milli(915)
                 } else {
-                    Fp::from_milli(885)
+                    Fp::from_milli(880)
                 };
                 self.state.ball.vel.z = (-self.state.ball.vel.z).mul(restitution);
                 self.state.ball.vel.x = self.state.ball.vel.x.mul(horiz_keep);
@@ -2125,6 +2223,13 @@ impl MatchSimulation {
                     <= self.state.format.penalty_box_depth()
                     && p.pos.y.abs() <= self.state.format.penalty_box_half_width();
 
+                let is_intended_recv = self
+                    .state
+                    .ball
+                    .pass_in_flight
+                    .as_ref()
+                    .is_some_and(|pf| pf.team == side && pf.intended_receiver_idx == idx);
+
                 let (horiz_r, max_z) = if idx == 0 && in_own_box {
                     let gk_bonus = (p.attributes.goalkeeping as i64) * 5;
                     let dive_bonus = if matches!(p.action, PlayerActionState::Diving { .. }) {
@@ -2137,7 +2242,9 @@ impl MatchSimulation {
                         Fp::from_milli(2_250),
                     )
                 } else {
-                    (Fp::from_milli(720), Fp::from_milli(1_550) + p.z)
+                    // Regulation 110mm ball + anatomical leg/chest reach (~520mm, +65mm anticipation for intended receiver)
+                    let reach_mm = if is_intended_recv { 585 } else { 520 };
+                    (Fp::from_milli(reach_mm), Fp::from_milli(1_480) + p.z)
                 };
 
                 let dist = p.pos.dist(ball_xy);
@@ -2194,11 +2301,11 @@ impl MatchSimulation {
                 // Clean catch!
                 self.state.ball.owner = Some((side, 0));
                 self.state.ball.gk_hold_ticks = 105;
+                self.state.ball.dribble_touch_cd = 0;
                 self.state.ball.vel = Vec3::ZERO;
                 self.state.ball.pass_in_flight = None;
                 self.state.ball.assist_candidate = None;
-                self.state.ball.last_touch_team = Some(side);
-                self.state.ball.last_touch_player = Some((side, 0));
+                self.set_last_touch(side, 0);
                 if was_shot_threat {
                     self.state.player_stats[s_idx][0].saves += 1;
                     self.emit_event(
@@ -2230,8 +2337,7 @@ impl MatchSimulation {
                     )
                 };
                 self.state.ball.vel = Vec3::new(rebound_x, rebound_y, Fp::from_milli(1_800));
-                self.state.ball.last_touch_team = Some(side);
-                self.state.ball.last_touch_player = Some((side, 0));
+                self.set_last_touch(side, 0);
                 self.state.ball.pass_in_flight = None;
                 self.state.players[s_idx][0].action = PlayerActionState::Cooldown { ticks_left: 14 };
                 if was_shot_threat {
@@ -2248,31 +2354,66 @@ impl MatchSimulation {
             }
         }
 
-        // 3. Outfield block/deflection if thunderbolt shot hits defender at close range
-        let control_threshold = Fp::from_milli(
-            15_500 + (self.state.players[s_idx][idx].attributes.dribbling as i64) * 75,
-        );
-        if ball_speed > control_threshold && self.state.ball.last_touch_team != Some(side) {
-            let away_from_player = (ball_xy - self.state.players[s_idx][idx].pos)
-                .normalize_or_zero()
-                .scale(Fp::from_milli(6_500));
-            self.state.ball.vel =
-                Vec3::new(away_from_player.x, away_from_player.y, Fp::from_milli(900));
-            self.state.ball.last_touch_team = Some(side);
-            self.state.ball.last_touch_player = Some((side, idx));
+        // 3. Physical body block / ricochet deflection when a driven strike hits an opponent outfielder!
+        let drib_attr = self.state.players[s_idx][idx].attributes.dribbling as i64;
+        let opp_control_threshold = Fp::from_milli(10_200 + drib_attr * 52);
+        if ball_speed > opp_control_threshold && self.state.ball.last_touch_team != Some(side) {
+            let p_pos = self.state.players[s_idx][idx].pos;
+            let p_vel = self.state.players[s_idx][idx].vel;
+            let v_in = self.state.ball.vel.xy();
+            let pre_ball_xy = ball_xy - v_in.scale(Fp::from_ratio(1, TICKS_PER_SECOND as i64));
+            let normal = {
+                let d = pre_ball_xy - p_pos;
+                if d.len() > Fp::from_milli(25) {
+                    d.normalize_or_zero()
+                } else {
+                    (-v_in).normalize_or_zero()
+                }
+            };
+            let vn = v_in.dot(normal);
+            let reflected = if vn < Fp::ZERO {
+                v_in - normal.scale(vn.mul(Fp::from_int(2)))
+            } else {
+                normal.scale(ball_speed.mul(Fp::from_milli(700)))
+            };
+            let defl_xy = reflected
+                .scale(Fp::from_milli(510))
+                + p_vel.scale(Fp::from_milli(350));
+            let defl_vz = self.state.ball.vel.z.mul(Fp::from_milli(420)) + Fp::from_milli(1_150);
+            let pushed_xy = p_pos + normal.scale(Fp::from_milli(550));
+            self.state.ball.pos.x = pushed_xy.x;
+            self.state.ball.pos.y = pushed_xy.y;
+            self.state.ball.vel = Vec3::new(defl_xy.x, defl_xy.y, defl_vz);
+            self.state.ball.spin_top = Fp::from_milli(-450);
+            self.set_last_touch(side, idx);
             self.state.ball.pass_in_flight = None;
-            self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 10 };
+            self.state.ball.assist_candidate = None;
+            self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 11 };
             return;
         }
 
-        // 4. Clean trap & possession!
+        // 4. Clean trap & possession (with substitution-safe pass & assist attribution)!
         if let Some(pass) = self.state.ball.pass_in_flight.take() {
-            if pass.team == side && pass.passer_idx != idx {
-                self.state.player_stats[s_idx][pass.passer_idx].passes_completed += 1;
+            let same_athlete = if !pass.passer_id.is_empty() {
+                pass.passer_id == player_id
+            } else {
+                pass.passer_idx == idx
+            };
+            if pass.team == side && !same_athlete {
+                if !pass.passer_id.is_empty() {
+                    if let Some(st) = self.state.player_stats_mut_by_id(side, &pass.passer_id) {
+                        st.passes_completed += 1;
+                    }
+                } else if pass.passer_idx < self.state.player_stats[s_idx].len() {
+                    self.state.player_stats[s_idx][pass.passer_idx].passes_completed += 1;
+                }
                 self.state.ball.assist_candidate = Some(AssistCandidate {
                     team: side,
                     passer_idx: pass.passer_idx,
+                    passer_id: pass.passer_id,
+                    passer_name: pass.passer_name,
                     receiver_idx: idx,
+                    receiver_id: player_id.clone(),
                     completed_tick: self.state.tick,
                 });
             } else if pass.team != side {
@@ -2292,20 +2433,36 @@ impl MatchSimulation {
 
         let incoming_xy = self.state.ball.vel.xy();
         let recv_vel = self.state.players[s_idx][idx].vel;
-        let drib_attr = self.state.players[s_idx][idx].attributes.dribbling as i64;
-        let cushion_keep = Fp::from_milli((290 - drib_attr).clamp(155, 255));
+        let cushion_keep = Fp::from_milli((290 - drib_attr).clamp(150, 250));
         let cushioned_xy = if idx == 0 && in_own_box {
             Vec2::ZERO
         } else {
-            incoming_xy.scale(cushion_keep) + recv_vel.scale(Fp::from_milli(720))
+            incoming_xy.scale(cushion_keep) + recv_vel.scale(Fp::from_milli(760))
+        };
+
+        // Aerial chest/thigh cushioning: preserve elevated `ball_z` above 180mm so it drops smoothly under gravity!
+        let (trapped_z, trapped_vz) = if idx == 0 && in_own_box {
+            (Fp::from_milli(1_150), Fp::ZERO)
+        } else if ball_z > Fp::from_milli(180) {
+            let damped_vz = self
+                .state
+                .ball
+                .vel
+                .z
+                .min(Fp::ZERO)
+                .mul(Fp::from_milli(320))
+                - Fp::from_milli(480);
+            (ball_z, damped_vz)
+        } else {
+            (Fp::ZERO, Fp::ZERO)
         };
 
         self.state.ball.owner = Some((side, idx));
         self.state.ball.gk_hold_ticks = if idx == 0 && in_own_box { 75 } else { 0 };
-        self.state.ball.pos.z = Fp::ZERO;
-        self.state.ball.vel = Vec3::new(cushioned_xy.x, cushioned_xy.y, Fp::ZERO);
-        self.state.ball.last_touch_team = Some(side);
-        self.state.ball.last_touch_player = Some((side, idx));
+        self.state.ball.dribble_touch_cd = 6;
+        self.state.ball.pos.z = trapped_z;
+        self.state.ball.vel = Vec3::new(cushioned_xy.x, cushioned_xy.y, trapped_vz);
+        self.set_last_touch(side, idx);
 
         if idx != 0 {
             self.state.controlled_idx[s_idx] = idx;
@@ -2469,44 +2626,105 @@ impl MatchSimulation {
         self.state.ball.owner = None;
         self.state.ball.vel = self.state.ball.vel.scale(Fp::from_milli(250));
 
-        // Credit scorer (last touch on scoring team, or nearest forward on scoring team)
-        let scorer_idx = match self.state.ball.last_touch_player {
-            Some((touch_side, idx)) if touch_side == scoring_team => idx,
+        // Credit scorer using substitution-safe `last_touch_meta`, then per-team `last_team_touch_meta`
+        // (so shots deflected off an opponent GK/defender still credit an outgoing substituted shooter!)
+        let (scorer_id, scorer_name, scorer_idx) = match self.state.ball.last_touch_meta.clone() {
+            Some((touch_side, fid, fname)) if touch_side == scoring_team && !fid.is_empty() => {
+                let cur_slot = self.state.players[s_idx]
+                    .iter()
+                    .position(|p| p.footballer_id == fid)
+                    .or_else(|| {
+                        self.state
+                            .ball
+                            .last_touch_player
+                            .and_then(|(ts, idx)| (ts == scoring_team).then_some(idx))
+                    })
+                    .unwrap_or((self.state.players[s_idx].len() - 1).max(1));
+                (fid, fname, cur_slot)
+            }
             _ => {
-                let ball_xy = self.state.ball.pos.xy();
-                let mut best = (self.state.players[s_idx].len() - 1).max(1);
-                let mut best_d = Fp::from_int(9999);
-                for (i, p) in self.state.players[s_idx].iter().enumerate().skip(1) {
-                    let d = p.pos.dist(ball_xy);
-                    if d < best_d {
-                        best_d = d;
-                        best = i;
+                if let Some((fid, fname)) = self.state.ball.last_team_touch_meta[s_idx].clone() {
+                    if !fid.is_empty() {
+                        let cur_slot = self.state.players[s_idx]
+                            .iter()
+                            .position(|p| p.footballer_id == fid)
+                            .unwrap_or((self.state.players[s_idx].len() - 1).max(1));
+                        (fid, fname, cur_slot)
+                    } else {
+                        let slot = (self.state.players[s_idx].len() - 1).max(1);
+                        (
+                            self.state.players[s_idx][slot].footballer_id.clone(),
+                            self.state.players[s_idx][slot].name.clone(),
+                            slot,
+                        )
                     }
+                } else {
+                    let slot = match self.state.ball.last_touch_player {
+                        Some((touch_side, idx)) if touch_side == scoring_team => idx,
+                        _ => {
+                            let ball_xy = self.state.ball.pos.xy();
+                            let mut best = (self.state.players[s_idx].len() - 1).max(1);
+                            let mut best_d = Fp::from_int(9999);
+                            for (i, p) in self.state.players[s_idx].iter().enumerate().skip(1) {
+                                let d = p.pos.dist(ball_xy);
+                                if d < best_d {
+                                    best_d = d;
+                                    best = i;
+                                }
+                            }
+                            best
+                        }
+                    };
+                    (
+                        self.state.players[s_idx][slot].footballer_id.clone(),
+                        self.state.players[s_idx][slot].name.clone(),
+                        slot,
+                    )
                 }
-                best
             }
         };
 
-        self.state.player_stats[s_idx][scorer_idx].goals += 1;
-        let scorer_id = self.state.players[s_idx][scorer_idx].footballer_id.clone();
-        let scorer_name = self.state.players[s_idx][scorer_idx].name.clone();
+        if let Some(st) = self.state.player_stats_mut_by_id(scoring_team, &scorer_id) {
+            st.goals += 1;
+        } else if scorer_idx < self.state.player_stats[s_idx].len() {
+            self.state.player_stats[s_idx][scorer_idx].goals += 1;
+        }
 
-        // Check assist within 420 ticks (7 seconds)
+        // Check assist within 420 ticks (7 seconds) using substitution-safe identity
         let mut assist_id: Option<String> = None;
         let mut detail = format!("GOAL! {scorer_name}");
-        if let Some(ref cand) = self.state.ball.assist_candidate {
+        if let Some(cand) = self.state.ball.assist_candidate.clone() {
+            let recv_matches = if !cand.receiver_id.is_empty() {
+                cand.receiver_id == scorer_id
+            } else {
+                cand.receiver_idx == scorer_idx
+            };
+            let distinct_passer = if !cand.passer_id.is_empty() {
+                cand.passer_id != scorer_id
+            } else {
+                cand.passer_idx != scorer_idx
+            };
             if cand.team == scoring_team
-                && cand.receiver_idx == scorer_idx
-                && cand.passer_idx != scorer_idx
+                && recv_matches
+                && distinct_passer
                 && self.state.tick.saturating_sub(cand.completed_tick) <= 420
             {
-                self.state.player_stats[s_idx][cand.passer_idx].assists += 1;
-                let a_name = self.state.players[s_idx][cand.passer_idx].name.clone();
-                assist_id = Some(
-                    self.state.players[s_idx][cand.passer_idx]
-                        .footballer_id
-                        .clone(),
-                );
+                let (a_id, a_name) = if !cand.passer_id.is_empty() {
+                    (cand.passer_id.clone(), cand.passer_name.clone())
+                } else {
+                    (
+                        self.state.players[s_idx][cand.passer_idx]
+                            .footballer_id
+                            .clone(),
+                        self.state.players[s_idx][cand.passer_idx].name.clone(),
+                    )
+                };
+                if let Some(ast) = self.state.player_stats_mut_by_id(scoring_team, &a_id) {
+                    ast.assists += 1;
+                } else if cand.passer_idx < self.state.player_stats[s_idx].len() {
+                    self.state.player_stats[s_idx][cand.passer_idx].assists += 1;
+                }
+                assist_id = Some(a_id);
                 detail = format!("GOAL! {scorer_name} (assist: {a_name})");
             }
         }
@@ -3185,6 +3403,181 @@ mod tests {
         assert!(
             sim_a.state().player_stats[0][4].shots >= 1,
             "buffered pre-contact BTN_SHOOT must execute a crisp first-time shot upon contact!"
+        );
+    }
+
+    #[test]
+    fn in_flight_substitution_attribution_and_authentic_ball_physics_work() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2026_77);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).expect("valid 5v5 snapshot");
+
+        sim.state.phase = MatchPhase::OpenPlay;
+        // Clear defenders out of the lane
+        for p in sim.state.players[1].iter_mut() {
+            p.pos = Vec2::from_milli(-18_000, -14_000);
+        }
+
+        // 1. Aerial chest trap cushioning: ball at z = 1.05m should NOT snap to z = 0 in 1 tick!
+        sim.state.players[0][2].pos = Vec2::from_milli(0, 0);
+        sim.state.players[0][2].vel = Vec2::ZERO;
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(180, 0, 1_050);
+        sim.state.ball.vel = Vec3::from_milli(2_000, 0, -1_200);
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert_eq!(sim.state().ball.owner, Some((TeamSide::Home, 2)));
+        assert!(
+            sim.state().ball.pos.z > Fp::from_milli(700),
+            "chest-high aerial trap must cushion downward under gravity instead of snapping to z=0 ({:?})",
+            sim.state().ball.pos.z
+        );
+
+        // 2. Driven shot deflection off opponent defender (`21 m/s` > opponent trap limit -> ricochets free!)
+        sim.state.ball.owner = None;
+        sim.state.ball.last_touch_team = Some(TeamSide::Home);
+        sim.state.players[1][2].pos = Vec2::from_milli(8_000, 0);
+        sim.state.players[1][2].vel = Vec2::ZERO;
+        sim.state.players[1][2].action = PlayerActionState::Normal;
+        sim.state.ball.pos = Vec3::from_milli(7_650, 0, 150);
+        sim.state.ball.vel = Vec3::from_milli(21_000, 0, 400);
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert!(
+            sim.state().ball.owner.is_none(),
+            "21 m/s thunderbolt hitting defender must deflect off body rather than magnetically trapping"
+        );
+        assert!(sim.state().ball.vel.x < Fp::ZERO, "frontal block should ricochet backward");
+        sim.state.players[1][2].pos = Vec2::from_milli(-18_000, -14_000);
+
+        // 3. Codex PR #8 edge case: Passer (slot 3) passes to Striker (slot 4), Passer is subbed off mid-flight,
+        // Striker traps & shoots toward open net, Striker is ALSO subbed off while shot is in flight -> Goal!
+        // Both outgoing Passer and outgoing Striker MUST be credited in `combined_player_stats`!
+        let passer_orig_id = sim.state().players[0][3].footballer_id.clone();
+        let scorer_orig_id = sim.state().players[0][4].footballer_id.clone();
+        let sub_passer_id = sim.state().teams[0].substitutes[2].footballer_id.clone();
+        let sub_scorer_id = sim.state().teams[0].substitutes[3].footballer_id.clone();
+
+        sim.state.players[0][3].pos = Vec2::from_milli(12_000, 0);
+        sim.state.players[0][3].vel = Vec2::ZERO;
+        sim.state.players[0][3].action = PlayerActionState::Normal;
+        sim.state.players[0][4].pos = Vec2::from_milli(21_000, 0);
+        sim.state.players[0][4].vel = Vec2::ZERO;
+        sim.state.players[0][4].action = PlayerActionState::Normal;
+        sim.state.controlled_idx[0] = 3;
+        sim.state.ball.owner = Some((TeamSide::Home, 3));
+        sim.state.ball.pos = Vec3::from_milli(12_350, 0, 0);
+        sim.state.ball.vel = Vec3::ZERO;
+        sim.state.prev_buttons = [0, 0];
+
+        // Launch ground pass from slot 3 -> slot 4 (charge 4 ticks then release)
+        for _ in 0..4 {
+            sim.tick(&[
+                InputFrame {
+                    move_x: 127,
+                    aim_x: 127,
+                    buttons: BTN_PASS,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        sim.tick(&[
+            InputFrame {
+                move_x: 127,
+                aim_x: 127,
+                buttons: 0,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert!(sim.state().ball.pass_in_flight.is_some());
+
+        // Substitute slot 3 OFF while pass is still in flight!
+        assert!(sim.apply_substitution(TeamSide::Home, 3, 2));
+        assert_eq!(sim.state().players[0][3].footballer_id, sub_passer_id);
+
+        // Step until slot 4 traps the pass
+        for _ in 0..90 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().ball.owner == Some((TeamSide::Home, 4)) {
+                break;
+            }
+        }
+        assert_eq!(sim.state().ball.owner, Some((TeamSide::Home, 4)));
+
+        // Slot 4 shoots at open Away goal (`+28m`) — charge 5 ticks then release!
+        for _ in 0..5 {
+            sim.tick(&[
+                InputFrame {
+                    move_x: 127,
+                    aim_x: 127,
+                    buttons: BTN_SHOOT,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert!(sim.state().ball.owner.is_none());
+
+        // Substitute slot 4 OFF while shot is flying toward the net!
+        assert!(sim.apply_substitution(TeamSide::Home, 4, 3));
+        assert_eq!(sim.state().players[0][4].footballer_id, sub_scorer_id);
+
+        // Step until ball crosses goal line!
+        for _ in 0..60 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().score[0] >= 1 {
+                break;
+            }
+        }
+        assert_eq!(sim.state().score[0], 1, "expected in-flight shot to score");
+
+        let combined = sim.state().combined_player_stats(TeamSide::Home);
+        let orig_passer_st = combined
+            .iter()
+            .find(|s| s.footballer_id == passer_orig_id)
+            .expect("archived passer stats present");
+        let orig_scorer_st = combined
+            .iter()
+            .find(|s| s.footballer_id == scorer_orig_id)
+            .expect("archived scorer stats present");
+        let sub_scorer_st = combined
+            .iter()
+            .find(|s| s.footballer_id == sub_scorer_id)
+            .expect("incoming sub scorer stats present");
+
+        assert_eq!(orig_passer_st.passes_completed, 1, "outgoing passer must get completed pass");
+        assert_eq!(orig_passer_st.assists, 1, "outgoing passer must get assist");
+        assert_eq!(orig_scorer_st.goals, 1, "outgoing shooter must get goal");
+        assert_eq!(sub_scorer_st.goals, 0, "incoming substitute must NOT steal in-flight goal");
+
+        // 4. Deflected-shot edge case: Shooter (`slot 2`) shoots, is subbed off, Away GK touches/deflects
+        // on the way into the net -> outgoing Shooter (`slot 2`) STILL gets the goal rather than incoming sub!
+        sim.state.phase = MatchPhase::OpenPlay;
+        let defl_shooter_id = sim.state().players[0][2].footballer_id.clone();
+        sim.set_last_touch(TeamSide::Home, 2);
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(27_600, 0, 200);
+        sim.state.ball.vel = Vec3::from_milli(19_000, 0, 0);
+        assert!(sim.apply_substitution(TeamSide::Home, 2, 1));
+        // Simulate Away GK grazing the shot (`last_touch_meta` becomes Away, while `last_team_touch_meta[0]` stays `defl_shooter_id`)
+        sim.set_last_touch(TeamSide::Away, 0);
+        for _ in 0..10 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().score[0] >= 2 {
+                break;
+            }
+        }
+        assert_eq!(sim.state().score[0], 2);
+        let combined2 = sim.state().combined_player_stats(TeamSide::Home);
+        let defl_shooter_st = combined2
+            .iter()
+            .find(|s| s.footballer_id == defl_shooter_id)
+            .expect("archived deflected-shot shooter stats present");
+        assert_eq!(
+            defl_shooter_st.goals, 1,
+            "outgoing shooter must still be credited when shot deflects off opponent GK into net"
         );
     }
 }
