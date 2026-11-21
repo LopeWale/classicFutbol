@@ -428,6 +428,11 @@ const SCREEN_TITLES = {
 };
 
 function navigateTo(screen) {
+  if (screen !== "controllers" && calibState) {
+    calibState = null;
+    const banner = document.getElementById("pad-calib-banner");
+    if (banner) banner.hidden = true;
+  }
   if (currentScreen !== screen && currentScreen !== "match" && currentScreen !== "title") {
     previousScreen = currentScreen;
   }
@@ -780,7 +785,15 @@ async function pairWebHidUsbReceiver() {
       ],
     });
     for (const dev of devices) {
-      if (webHidPads.some((p) => p._dev === dev)) continue;
+      const existing = webHidPads.find((p) => p._dev === dev);
+      if (existing) {
+        if (!dev.opened) await dev.open();
+        existing.connected = true;
+        existing._restBytes = null;
+        existing._drAxisBytes = null;
+        existing._constCenterBytes = null;
+        continue;
+      }
       if (!dev.opened) await dev.open();
       const vidPid = `${hex4(dev.vendorId)}:${hex4(dev.productId)}`;
       const vPad = {
@@ -816,7 +829,15 @@ async function pairWebHidUsbReceiver() {
 if (navigator.hid && typeof navigator.hid.addEventListener === "function") {
   navigator.hid.addEventListener("disconnect", (ev) => {
     for (const p of webHidPads) {
-      if (p._dev === ev.device) p.connected = false;
+      if (p._dev === ev.device) {
+        p.connected = false;
+        p.axes[0] = 0;
+        p.axes[1] = 0;
+        for (let bi = 0; bi < p.buttons.length; bi++) {
+          p.buttons[bi].pressed = false;
+          p.buttons[bi].value = 0;
+        }
+      }
     }
     updateGamepadBadges();
   });
@@ -1703,7 +1724,7 @@ function sampleAnyMenuGamepad() {
 }
 
 function pollGamepadMenuActions(nowMs) {
-  if (calibState) return; // Don't navigate screens while calibrating buttons!
+  if (calibState && currentScreen === "controllers") return; // Don't navigate screens while calibrating buttons!
   const gp = sampleAnyMenuGamepad();
   if (!gp) {
     prevStartBtn = false;
