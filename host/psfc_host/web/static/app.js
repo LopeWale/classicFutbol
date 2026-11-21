@@ -594,17 +594,30 @@ function getConnectedPads() {
     }
   }
   const out = browserPads.slice();
+  const consumedBrowserSlots = new Set();
   for (let i = 0; i < webHidPads.length; i++) {
     const vPad = webHidPads[i];
     if (!vPad.connected) continue;
-    let alreadyInGamepadApi = false;
-    for (let j = 0; j < browserPads.length; j++) {
-      if (doesBrowserPadMatchWebHid(browserPads[j], vPad)) {
-        alreadyInGamepadApi = true;
-        break;
+    let matchedSlot = -1;
+    if (vPad._vidPid && vPad._vidPid !== "0000:0000") {
+      for (let j = 0; j < browserPads.length; j++) {
+        if (!consumedBrowserSlots.has(j) && extractGamepadVidPid(browserPads[j].id) === vPad._vidPid) {
+          matchedSlot = j;
+          break;
+        }
       }
     }
-    if (!alreadyInGamepadApi) {
+    if (matchedSlot < 0) {
+      for (let j = 0; j < browserPads.length; j++) {
+        if (!consumedBrowserSlots.has(j) && doesBrowserPadMatchWebHid(browserPads[j], vPad)) {
+          matchedSlot = j;
+          break;
+        }
+      }
+    }
+    if (matchedSlot >= 0) {
+      consumedBrowserSlots.add(matchedSlot);
+    } else {
       out.push(vPad);
     }
   }
@@ -667,21 +680,24 @@ function decodeWebHidReport(vPad, bytes) {
 
   // Confirm any candidate X/Y pair once both bytes have been observed in the neutral center range
   // (including disjoint trailing pairs that consume the entire report such as [128,128,128,128] and
-  // packet-0 overlapping pairs such as [128,128,128,0]), while blocking post-packet-0 overlapping
-  // expansion (e.g. [1,2] after [0,1] when a button byte hits 0x80).
+  // overlapping pairs such as [1,2] behind centered byte 0), while only blocking post-packet-0
+  // overlapping expansion when it would consume the final remaining button byte (e.g. [128,128,0] -> 0x80).
   for (const [ix, iy] of candidatePairs) {
     if (iy >= bytes.length) continue;
     if (vPad._isDragonRiseFormat && iy >= 5) continue;
     if (vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) continue;
     const isOverlapping = vPad._axisBytes.has(ix) || vPad._axisBytes.has(iy);
-    if (!isFirstPacket && isOverlapping && hasAnyConfirmedPair()) continue;
+    const newBytesNeeded = (vPad._axisBytes.has(ix) ? 0 : 1) + (vPad._axisBytes.has(iy) ? 0 : 1);
+    if (
+      !isFirstPacket &&
+      isOverlapping &&
+      hasAnyConfirmedPair() &&
+      vPad._axisBytes.size + newBytesNeeded >= bytes.length
+    ) {
+      continue;
+    }
 
-    const bothSawCenter = vPad._sawCenterBytes.has(ix) && vPad._sawCenterBytes.has(iy);
-    const pkt0HighDeflect =
-      isFirstPacket &&
-      ((bytes[ix] === 0xff && isCenterByte(bytes[iy])) ||
-        (isCenterByte(bytes[ix]) && bytes[iy] === 0xff));
-    if (bothSawCenter || pkt0HighDeflect) {
+    if (vPad._sawCenterBytes.has(ix) && vPad._sawCenterBytes.has(iy)) {
       vPad._axisBytes.add(ix);
       vPad._axisBytes.add(iy);
     }
@@ -691,9 +707,15 @@ function decodeWebHidReport(vPad, bytes) {
   const isDragonRise = bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f);
 
   // Detect X/Y D-Pad byte pair across standard & alternate HID axis offsets (`[0,1]`, `[3,4]`, `[2,3]`, `[1,2]`)
+  const isPrimaryWakeByte = (idx) =>
+    vPad._sawCenterBytes.has(idx) ||
+    isCenterByte(bytes[idx]) ||
+    bytes[idx] === 0x00 ||
+    bytes[idx] === 0xff;
   let usedPrimaryWake = false;
   let axX = 0;
   let axY = 0;
+  let confirmedUsedConstPad = false;
   for (const [ix, iy] of candidatePairs) {
     if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
       const vx = (bytes[ix] - 127.5) / 127.5;
@@ -701,23 +723,29 @@ function decodeWebHidReport(vPad, bytes) {
       if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
         axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
         axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
-        if (axX !== 0 || axY !== 0) break;
+        if (axX !== 0 || axY !== 0) {
+          confirmedUsedConstPad = ix === 1 && iy === 2 && vPad._constCenterBytes.has(2);
+          break;
+        }
       }
     }
   }
   if (
-    axX === 0 &&
-    axY === 0 &&
+    ((axX === 0 && axY === 0) || confirmedUsedConstPad) &&
     bytes.length >= 2 &&
     !(vPad._axisBytes.has(0) && vPad._axisBytes.has(1)) &&
-    (isCenterByte(bytes[0]) || bytes[0] === 0x00 || bytes[0] === 0xff) &&
-    (isCenterByte(bytes[1]) || bytes[1] === 0x00 || bytes[1] === 0xff)
+    isPrimaryWakeByte(0) &&
+    isPrimaryWakeByte(1)
   ) {
     const vx = (bytes[0] - 127.5) / 127.5;
     const vy = (bytes[1] - 127.5) / 127.5;
-    axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
-    axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
-    if (axX !== 0 || axY !== 0) usedPrimaryWake = true;
+    const wx = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
+    const wy = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
+    if (wx !== 0 || wy !== 0) {
+      axX = wx;
+      axY = wy;
+      usedPrimaryWake = true;
+    }
   }
 
   // Clear button states
