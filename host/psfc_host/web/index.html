@@ -469,55 +469,104 @@
       <div class="ctrl-card">
         <div class="ctrl-card-hdr">
           <h2>USB / BLUETOOTH CONTROLLER LIVE TESTER</h2>
-          <select id="pad-profile-select" class="console-select">
-            <option value="auto" selected>Layout: Auto (Xbox / PlayStation / 8BitDo)</option>
-            <option value="switch">Layout: Switch Pro (Swap A-B / X-Y)</option>
-            <option value="dinput">Layout: Generic USB DirectInput</option>
-          </select>
+          <div class="ctrl-hdr-actions">
+            <select id="pad-profile-select" class="console-select">
+              <option value="auto" selected>Layout: Auto (SNES / Xbox / PS / Switch)</option>
+              <option value="snes_usb">Layout: SNES 2.4G / USB D-Input (B=Pass, A=Shoot, R=Sprint)</option>
+              <option value="snes_std">Layout: SNES XInput / Switch (Swap A-B / X-Y + R=Sprint)</option>
+              <option value="switch">Layout: Switch Pro (Swap A-B / X-Y)</option>
+              <option value="dinput">Layout: Generic USB DirectInput</option>
+              <option value="custom">Layout: Custom Calibrated Mapping</option>
+            </select>
+            <button class="console-btn console-btn-secondary btn-compact" id="btn-calibrate-pad" type="button">
+              CALIBRATE PAD
+            </button>
+            <button class="console-btn console-btn-secondary btn-compact" id="btn-pair-webhid" type="button" hidden>
+              USB DONGLE (WebHID)
+            </button>
+          </div>
+        </div>
+
+        <!-- Dual-Controller Live Slot Readout & macOS / 2.4GHz Wireless Mode Helper -->
+        <div class="pad-slots-strip" id="pad-slots-strip">
+          <div class="pad-slot-pill" id="pad-slot-0">
+            <span class="psp-tag">P1</span>
+            <span class="psp-name" id="pad-slot-0-text">Waiting — Press START or B on Controller 1</span>
+          </div>
+          <div class="pad-slot-pill" id="pad-slot-1">
+            <span class="psp-tag">P2</span>
+            <span class="psp-name" id="pad-slot-1-text">Waiting — Press START or B on Controller 2</span>
+          </div>
+        </div>
+
+        <div class="pad-connect-guide" id="pad-connect-guide">
+          <strong>Using 2.4GHz USB / Bluetooth SNES Controllers?</strong>
+          <span>
+            1) Click this page &amp; press <kbd>START</kbd> or <kbd>B</kbd> on each controller to wake browser detection.
+            2) On <strong>macOS Safari</strong>, hold <kbd>SELECT + START</kbd> for 3–5 sec on each SNES pad until the LED blinks to switch its 2.4G USB receiver into <strong>XInput / Switch mode</strong> (or open in <strong>Chrome / Firefox</strong> for direct raw USB HID support).
+          </span>
+        </div>
+
+        <div class="pad-calib-banner" id="pad-calib-banner" hidden>
+          <span id="pad-calib-prompt">Press D-PAD UP on your controller...</span>
+          <div class="comm-btn-row">
+            <button class="console-btn console-btn-ghost btn-compact" id="btn-calib-skip" type="button">SKIP</button>
+            <button class="console-btn console-btn-ghost btn-compact" id="btn-calib-cancel" type="button">CANCEL</button>
+          </div>
         </div>
 
         <div class="pad-visualizer">
           <div class="pad-stick-box">
+            <div class="vis-shoulder-row">
+              <span class="vis-btn vis-bumper" id="vis-btn-l1">L · SWITCH / FINESSE</span>
+            </div>
             <div class="stick-well"><div class="stick-dot" id="vis-lstick"></div></div>
-            <span>LEFT STICK / MOVE</span>
+            <span>D-PAD / LEFT STICK</span>
           </div>
           <div class="pad-buttons-cluster">
-            <span class="vis-btn" id="vis-btn-north">Y / △</span>
+            <span class="vis-btn vis-snes-x" id="vis-btn-north">X (TOP) / △</span>
             <div class="vis-mid-row">
-              <span class="vis-btn" id="vis-btn-west">X / □</span>
-              <span class="vis-btn" id="vis-btn-east">B / ○</span>
+              <span class="vis-btn vis-snes-y" id="vis-btn-west">Y (LEFT) / □</span>
+              <span class="vis-btn vis-snes-a" id="vis-btn-east">A (RIGHT) / ○</span>
             </div>
-            <span class="vis-btn" id="vis-btn-south">A / ✕</span>
+            <span class="vis-btn vis-snes-b" id="vis-btn-south">B (BOTTOM) / ✕</span>
+            <div class="vis-meta-row">
+              <span class="vis-btn vis-mini" id="vis-btn-select">SELECT</span>
+              <span class="vis-btn vis-mini" id="vis-btn-start">START</span>
+            </div>
           </div>
           <div class="pad-stick-box">
+            <div class="vis-shoulder-row">
+              <span class="vis-btn vis-bumper" id="vis-btn-r1">R · SPRINT</span>
+            </div>
             <div class="stick-well"><div class="stick-dot" id="vis-rstick"></div></div>
-            <span>RIGHT STICK / SKILL</span>
+            <span id="vis-raw-readout">RAW: IDLE</span>
           </div>
         </div>
 
         <div class="controls-two-col">
           <div class="ctrl-map-box">
-            <h3>ON THE BALL (ATTACKING)</h3>
+            <h3>ON THE BALL (SNES / MODERN PAD)</h3>
             <ul>
-              <li><span>Move &amp; Pass/Shot Aim</span> <strong>L-Stick / D-Pad / WASD</strong></li>
-              <li><span>Ground Pass (Hold Force)</span> <strong>A / Cross / Space / J</strong></li>
-              <li><span>Through Ball (Hold Lead)</span> <strong>Y / Triangle / K</strong></li>
-              <li><span>Lob Switch / Wing Cross</span> <strong>X / Square / U</strong></li>
-              <li><span>Shoot (Tap Low / Hold Power)</span> <strong>B / Circle / L / Enter</strong></li>
-              <li><span>Finesse / Driven / Shield</span> <strong>LT / L2 / F</strong></li>
-              <li><span>Chip Shot / Call Run</span> <strong>RB+Shoot / R+L / R</strong></li>
-              <li><span>Sprint Knock-On / Skill</span> <strong>RT / Shift · R-Stick / Z</strong></li>
+              <li><span>Move &amp; Pass/Shot Aim</span> <strong>D-Pad / L-Stick / WASD</strong></li>
+              <li><span>Ground Pass (Hold Force)</span> <strong>SNES B (Bottom) / Cross / Space</strong></li>
+              <li><span>Shoot (Tap Low / Hold Power)</span> <strong>SNES A (Right) / Circle / L</strong></li>
+              <li><span>Lob Switch / Wing Cross</span> <strong>SNES Y (Left) / Square / U</strong></li>
+              <li><span>Through Ball (Hold Lead)</span> <strong>SNES X (Top) / Triangle / K</strong></li>
+              <li><span>Sprint / Knock-On</span> <strong>SNES R / RT / Shift</strong></li>
+              <li><span>Finesse / Driven / Shield</span> <strong>SNES L / LT / L2 / F</strong></li>
+              <li><span>Skill Move / Chip Shot</span> <strong>SELECT / R-Stick · L+R+Shoot</strong></li>
             </ul>
           </div>
           <div class="ctrl-map-box">
-            <h3>OFF THE BALL (DEFENDING)</h3>
+            <h3>OFF THE BALL (DEFENDING &amp; MENUS)</h3>
             <ul>
-              <li><span>Switch Defender</span> <strong>LB / L1 / Q</strong></li>
-              <li><span>Aimed Standing Tackle</span> <strong>A / Cross / E / Space</strong></li>
-              <li><span>Aimed Sweeping Slide</span> <strong>X / Square / C / U</strong></li>
-              <li><span>Jockey Step-In Interception</span> <strong>LT / L2 / F</strong></li>
-              <li><span>Team Press / GK Rush</span> <strong>RB / R1 / R</strong></li>
-              <li><span>Pause / Replay</span> <strong>Start / Esc / Tab</strong></li>
+              <li><span>Switch Defender + Jockey</span> <strong>SNES L / LB / L1 / Q / F</strong></li>
+              <li><span>Aimed Standing Tackle</span> <strong>SNES B (Bottom) / Cross / E</strong></li>
+              <li><span>Aimed Sweeping Slide</span> <strong>SNES Y (Left) / Square / C</strong></li>
+              <li><span>Team Press / GK Rush</span> <strong>SNES X (Top) / RB / R1 / R</strong></li>
+              <li><span>Sprint Track-Back</span> <strong>SNES R / RT / Shift</strong></li>
+              <li><span>Start / Pause / Replay</span> <strong>START / SELECT / Esc / Tab</strong></li>
             </ul>
           </div>
         </div>
@@ -540,8 +589,8 @@
 
         <div class="cart-controls-stack">
           <select id="cart-device-select" class="console-select">
-            <option value="part-alex|cart-alex-01">Alex's Cartridge (cart-alex-01 · MUN)</option>
-            <option value="part-sam|cart-sam-01">Sam's Cartridge (cart-sam-01 · ARS)</option>
+            <option value="part-alex|dev-alex-01">Alex's Cartridge (dev-alex-01 · MUN)</option>
+            <option value="part-sam|dev-sam-02">Sam's Cartridge (dev-sam-02 · ARS)</option>
           </select>
           <div class="comm-btn-row">
             <button class="console-btn console-btn-primary" id="btn-sync-cartridge" type="button">SYNC CARTRIDGE</button>
