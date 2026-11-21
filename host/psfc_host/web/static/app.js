@@ -618,43 +618,28 @@ function decodeWebHidReport(vPad, bytes) {
   if (!bytes || bytes.length === 0) return;
   if (!vPad._restBytes) {
     vPad._restBytes = new Uint8Array(bytes);
-    vPad._centeredBytes = new Set();
-  }
-  const rest = vPad._restBytes;
-  for (let i = 0; i < bytes.length; i++) {
-    if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
-      vPad._centeredBytes.add(i);
-    } else if (i < rest.length && !(rest[i] >= 0x70 && rest[i] <= 0x8f)) {
-      // Clear any bit that was held on packet 0 as soon as we observe 0 in that bit
-      rest[i] &= bytes[i];
-    }
-  }
-
-  // Detect X/Y D-Pad byte pair on standard 7/8-byte USB SNES / DragonRise / Microntek HID reports (`0x00=-1, 0x7f/0x80=0, 0xff=+1`)
-  let axX = 0;
-  let axY = 0;
-  const candidatePairs = [
-    [0, 1],
-    [3, 4],
-    [2, 3],
-    [1, 2],
-  ];
-  const isAxisLikeByte = (idx) =>
-    vPad._centeredBytes.has(idx) ||
-    (bytes[idx] >= 0x70 && bytes[idx] <= 0x8f) ||
-    ((idx === 0 || idx === 1) && (bytes[idx] === 0x00 || bytes[idx] === 0xff));
-
-  for (const [ix, iy] of candidatePairs) {
-    if (iy < bytes.length && isAxisLikeByte(ix) && isAxisLikeByte(iy)) {
-      const vx = (bytes[ix] - 127.5) / 127.5;
-      const vy = (bytes[iy] - 127.5) / 127.5;
-      if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
-        axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
-        axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
-        if (axX !== 0 || axY !== 0) break;
+    vPad._drAxisBytes = new Set();
+    vPad._constCenterBytes = new Set();
+    for (let i = 2; i < bytes.length - 1; i++) {
+      if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+        vPad._constCenterBytes.add(i);
       }
     }
   }
+  const rest = vPad._restBytes;
+  for (let i = 0; i < bytes.length; i++) {
+    if (i <= 4 && bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+      vPad._drAxisBytes.add(i);
+    }
+    if (!(bytes[i] >= 0x70 && bytes[i] <= 0x8f)) {
+      vPad._constCenterBytes.delete(i);
+    }
+  }
+
+  if (bytes.length >= 7 && (bytes[5] & 0x0f) === 0x0f) {
+    vPad._isDragonRiseFormat = true;
+  }
+  const isDragonRise = bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f);
 
   // Clear button states
   for (let i = 0; i < vPad.buttons.length; i++) {
@@ -662,12 +647,35 @@ function decodeWebHidReport(vPad, bytes) {
     vPad.buttons[i].value = 0;
   }
 
-  if (bytes.length >= 7 && (bytes[5] & 0x0f) === 0x0f) {
-    vPad._isDragonRiseFormat = true;
-  }
+  let axX = 0;
+  let axY = 0;
 
   // Standard DragonRise / Microntek USB SNES (`byte[5]` upper nibble = buttons 0..3, lower nibble = hat; `byte[6]` = L, R, Select, Start)
-  if (bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f)) {
+  if (isDragonRise) {
+    const candidatePairs = [
+      [0, 1],
+      [3, 4],
+      [2, 3],
+      [1, 2],
+    ];
+    const isDrAxisByte = (idx) =>
+      idx <= 4 &&
+      (vPad._drAxisBytes.has(idx) ||
+        (bytes[idx] >= 0x70 && bytes[idx] <= 0x8f) ||
+        ((idx === 0 || idx === 1) && (bytes[idx] === 0x00 || bytes[idx] === 0xff)));
+
+    for (const [ix, iy] of candidatePairs) {
+      if (iy < bytes.length && isDrAxisByte(ix) && isDrAxisByte(iy)) {
+        const vx = (bytes[ix] - 127.5) / 127.5;
+        const vy = (bytes[iy] - 127.5) / 127.5;
+        if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
+          axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
+          axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
+          if (axX !== 0 || axY !== 0) break;
+        }
+      }
+    }
+
     const b5 = bytes[5];
     const b6 = bytes[6];
     for (let k = 0; k < 4; k++) {
@@ -712,13 +720,26 @@ function decodeWebHidReport(vPad, bytes) {
       setBtn(9, (b6 & 0x08) !== 0);
     }
   } else {
-    // Generic fallback: map changed non-axis bit positions against resting HID report
+    // Generic fallback: bytes 0,1 are X/Y axes (when >= 3 bytes); trailing non-padding bytes are buttons
+    const btnStartIdx = bytes.length >= 3 ? 2 : 0;
+    if (bytes.length >= 3) {
+      const vx = (bytes[0] - 127.5) / 127.5;
+      const vy = (bytes[1] - 127.5) / 127.5;
+      axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
+      axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
+    }
+
     const activeBits = [];
-    for (let bi = 0; bi < bytes.length; bi++) {
-      if (vPad._centeredBytes.has(bi) || (rest[bi] >= 0x70 && rest[bi] <= 0x8f)) continue;
-      const diff = bytes[bi] & ~rest[bi];
+    for (let bi = btnStartIdx; bi < bytes.length; bi++) {
+      if (vPad._constCenterBytes.has(bi)) continue;
+      if (bi < rest.length) {
+        // Clear any bit that was held on packet 0 as soon as 0 is observed in that bit
+        rest[bi] &= bytes[bi];
+      }
+      const baseByte = bi < rest.length ? rest[bi] : 0;
+      const diff = bytes[bi] & ~baseByte;
       for (let bit = 0; bit < 8; bit++) {
-        if (((rest[bi] >>> bit) & 1) === 0) {
+        if (((baseByte >>> bit) & 1) === 0) {
           activeBits.push(((diff >>> bit) & 1) === 1);
         }
       }
@@ -774,7 +795,8 @@ async function pairWebHidUsbReceiver() {
         _vidPid: vidPid,
         _prodName: String(dev.productName || "").trim().toLowerCase(),
         _restBytes: null,
-        _centeredBytes: null,
+        _drAxisBytes: null,
+        _constCenterBytes: null,
         _isDragonRiseFormat: false,
         _uses10BtnMeta: false,
       };
