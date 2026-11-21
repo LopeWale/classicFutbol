@@ -265,16 +265,16 @@ def test_overdue_playing_window_transitions_to_awaiting_admin_never_real_score()
     )
     assert r_exp.status_code == 200
     transitioned_ids = {f["id"] for f in r_exp.json()["transitioned"]}
-    assert "fix-r3-mun-ars" in transitioned_ids
-    assert "fix-r4-mun-liv" in transitioned_ids
+    assert "fix-mw27-mun-ars" in transitioned_ids
+    assert "fix-mw23-mun-liv" in transitioned_ids
 
-    fx_r3 = next(
+    fx_mw27 = next(
         f
         for f in client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/fixtures").json()["fixtures"]
-        if f["id"] == "fix-r3-mun-ars"
+        if f["id"] == "fix-mw27-mun-ars"
     )
-    assert fx_r3["state"] == "awaiting_admin"
-    assert fx_r3["accepted_home_goals"] is None  # Real score was NOT substituted!
+    assert fx_mw27["state"] == "awaiting_admin"
+    assert fx_mw27["accepted_home_goals"] is None  # Real score was NOT substituted!
 
 
 def test_provider_feed_adapter_and_identity_resolution_queue() -> None:
@@ -315,11 +315,11 @@ def test_provider_feed_adapter_and_identity_resolution_queue() -> None:
             "external_away_club_id": "ext-club-mystery-88",
             "home_goals": 3,
             "away_goals": 0,
-            "target_fixture_id": "fix-r3-liv-che",
+            "target_fixture_id": "fix-mw15-liv-che",
         },
     )
     assert r_retry.status_code == 200
-    assert r_retry.json()["proposal"]["target_id"] == "fix-r3-liv-che"
+    assert r_retry.json()["proposal"]["target_id"] == "fix-mw15-liv-che"
 
 
 def test_kickoff_appointments_propose_and_accept() -> None:
@@ -327,8 +327,8 @@ def test_kickoff_appointments_propose_and_accept() -> None:
     client = TestClient(app)
 
     r_prop = client.post(
-        "/api/fixtures/fix-r3-mun-ars/appointments",
-        json={"proposed_by": "part-alex", "proposed_at_utc": "2026-08-30T19:30:00Z"},
+        "/api/fixtures/fix-mw27-mun-ars/appointments",
+        json={"proposed_by": "part-alex", "proposed_at_utc": "2027-02-27T19:30:00Z"},
     )
     assert r_prop.status_code == 200
     appt_id = r_prop.json()["appointment"]["id"]
@@ -425,7 +425,7 @@ def test_online_lobby_ready_pause_budget_disconnect_abandonment_and_relay_input_
 
     # 1. Lobby ready-check, 3-pause budget exhaustion, disconnect, and abandonment -> `awaiting_admin`
     r_open = client.post(
-        "/api/fixtures/fix-r3-mun-ars/sessions",
+        "/api/fixtures/fix-mw27-mun-ars/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 120},
     )
     sess_id = r_open.json()["session_id"]
@@ -451,13 +451,13 @@ def test_online_lobby_ready_pause_budget_disconnect_abandonment_and_relay_input_
     fx = next(
         f
         for f in client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/fixtures").json()["fixtures"]
-        if f["id"] == "fix-r3-mun-ars"
+        if f["id"] == "fix-mw27-mun-ars"
     )
     assert fx["state"] == "awaiting_admin"
 
     # 2. Relay input batch recording reconstructs full `frames_hex` for `complete_session`!
     r_open2 = client.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={
             "actor_id": "part-alex",
             "format_name": "5v5",
@@ -590,7 +590,7 @@ def test_custom_5v5_lineup_selection_from_11_man_squad_and_replay_verification()
 
     # 5. Official session freezes custom 5v5 starters + formation and passes WASM -> psfc-replay verification!
     r_open = client.post(
-        "/api/fixtures/fix-r3-mun-ars/sessions",
+        "/api/fixtures/fix-mw27-mun-ars/sessions",
         json={
             "actor_id": "part-alex",
             "format_name": "5v5",
@@ -731,7 +731,7 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
             for r in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/standings").json()["standings"]
             if r["club_id"] == "liverpool"
         )
-        salah_before = next(
+        isak_before = next(
             p["inherited"]["goals"]
             for p in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
             if p["footballer_id"] == "liv-fwd-1"
@@ -755,13 +755,13 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
             for r in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/standings").json()["standings"]
             if r["club_id"] == "liverpool"
         )
-        salah_after = next(
+        isak_after = next(
             p["inherited"]["goals"]
             for p in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
             if p["footballer_id"] == "liv-fwd-1"
         )
         assert liv_pts_after == liv_pts_before
-        assert salah_after == salah_before + 1
+        assert isak_after == isak_before + 1
 
         # Subsequent duplicate enrichment is parked
         r_dup_enrich = c2.post(
@@ -809,7 +809,7 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
     cm = TestClient(app_mem)
 
     r_open = cm.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 180},
     )
     assert r_open.status_code == 200
@@ -823,13 +823,13 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
     assert r_unfin.status_code == 422
     assert "FullTime" in r_unfin.json()["detail"]
 
-    # Expiring overdue window transitions `fix-r3-mun-ars` to `awaiting_admin` -> `open_session` MUST reject (`409`)!
+    # Expiring overdue window transitions `fix-mw27-mun-ars` to `awaiting_admin` -> `open_session` MUST reject (`409`)!
     cm.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
         json={"as_of_utc": "2027-01-10T00:00:00Z"},
     )
     r_blocked = cm.post(
-        "/api/fixtures/fix-r3-mun-ars/sessions",
+        "/api/fixtures/fix-mw27-mun-ars/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5"},
     )
     assert r_blocked.status_code == 409
@@ -859,7 +859,7 @@ def test_codex_pr3_stale_saved_lineup_fallback_and_rollover_transfer_inheritance
 
     # ... and the official session still opens using the same fallback instead of erroring.
     r_open = client.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 180},
     )
     assert r_open.status_code == 200, r_open.text

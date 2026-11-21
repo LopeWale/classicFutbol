@@ -251,7 +251,7 @@ class ProposalGate:
             "UPDATE fixture SET state = 'accepted' WHERE id = ?",
             (fixture_id,),
         )
-        self.store.conn.commit()
+        self.store.commit()
         return prop
 
     def submit_transfer_import(

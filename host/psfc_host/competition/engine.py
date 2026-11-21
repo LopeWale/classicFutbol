@@ -504,26 +504,28 @@ class CompetitionEngine:
                 baseline_summary={"rolled_over_from_world": world_id},
             )
 
-        # Seed opening Round 1 fixtures in the rolled-over season
+        # Seed opening Matchweek 1 fixtures across all clubs in the rolled-over 2027/28 season
         club_ids = list(clubs.keys())
-        if len(club_ids) >= 4:
-            for idx, (hc, ac) in enumerate([(club_ids[0], club_ids[1]), (club_ids[2], club_ids[3])], start=1):
-                src = self.store.compute_advance_result_source(next_world_id, hc, ac, has_real_equivalent=True)
-                self.store.create_fixture(
-                    fixture_id=f"fix-{next_world_id}-r1-{idx}",
-                    world_id=next_world_id,
-                    competition_id=next_league_id,
-                    stage="league",
-                    round_no=1,
-                    home_club_id=hc,
-                    away_club_id=ac,
-                    kickoff_utc="2027-08-15T15:00:00Z",
-                    window_open_utc=ts,
-                    window_close_utc="2027-12-31T23:59:59Z",
-                    result_source=src,
-                    state="open",
-                    caused_by=actor_id,
-                )
+        pairings = [
+            (club_ids[i], club_ids[i + 1]) for i in range(0, len(club_ids) - 1, 2)
+        ]
+        for idx, (hc, ac) in enumerate(pairings, start=1):
+            src = self.store.compute_advance_result_source(next_world_id, hc, ac, has_real_equivalent=True)
+            self.store.create_fixture(
+                fixture_id=f"fix-{next_world_id}-r1-{idx}",
+                world_id=next_world_id,
+                competition_id=next_league_id,
+                stage="league",
+                round_no=1,
+                home_club_id=hc,
+                away_club_id=ac,
+                kickoff_utc="2027-08-13T19:00:00Z",
+                window_open_utc=ts,
+                window_close_utc="2027-12-31T23:59:59Z",
+                result_source=src,
+                state="open",
+                caused_by=actor_id,
+            )
 
         self.store.append_event(
             world_id=world_id,

@@ -19,17 +19,49 @@ class FootballDataSource(Protocol):
 
 
 DEFAULT_EXTERNAL_CLUB_MAPPINGS: list[tuple[str, str, str]] = [
-    ("football_data_v4", "club", "ext-club-66"),   # man-utd
-    ("football_data_v4", "club", "ext-club-57"),   # arsenal
-    ("football_data_v4", "club", "ext-club-64"),   # liverpool
-    ("football_data_v4", "club", "ext-club-61"),   # chelsea
+    ("football_data_v4", "club", "ext-club-57"),    # arsenal
+    ("football_data_v4", "club", "ext-club-397"),   # brighton
+    ("football_data_v4", "club", "ext-club-65"),    # man-city
+    ("football_data_v4", "club", "ext-club-1044"),  # bournemouth
+    ("football_data_v4", "club", "ext-club-64"),    # liverpool
+    ("football_data_v4", "club", "ext-club-341"),   # leeds
+    ("football_data_v4", "club", "ext-club-62"),    # everton
+    ("football_data_v4", "club", "ext-club-61"),    # chelsea
+    ("football_data_v4", "club", "ext-club-73"),    # tottenham
+    ("football_data_v4", "club", "ext-club-402"),   # brentford
+    ("football_data_v4", "club", "ext-club-58"),    # aston-villa
+    ("football_data_v4", "club", "ext-club-67"),    # newcastle
+    ("football_data_v4", "club", "ext-club-1076"),  # coventry
+    ("football_data_v4", "club", "ext-club-322"),   # hull
+    ("football_data_v4", "club", "ext-club-63"),    # fulham
+    ("football_data_v4", "club", "ext-club-349"),   # ipswich
+    ("football_data_v4", "club", "ext-club-351"),   # nottm-forest
+    ("football_data_v4", "club", "ext-club-71"),    # sunderland
+    ("football_data_v4", "club", "ext-club-66"),    # man-utd
+    ("football_data_v4", "club", "ext-club-354"),   # crystal-palace
 ]
 
 _DEFAULT_INTERNAL_MAP = {
-    "ext-club-66": "man-utd",
     "ext-club-57": "arsenal",
+    "ext-club-397": "brighton",
+    "ext-club-65": "man-city",
+    "ext-club-1044": "bournemouth",
     "ext-club-64": "liverpool",
+    "ext-club-341": "leeds",
+    "ext-club-62": "everton",
     "ext-club-61": "chelsea",
+    "ext-club-73": "tottenham",
+    "ext-club-402": "brentford",
+    "ext-club-58": "aston-villa",
+    "ext-club-67": "newcastle",
+    "ext-club-1076": "coventry",
+    "ext-club-322": "hull",
+    "ext-club-63": "fulham",
+    "ext-club-349": "ipswich",
+    "ext-club-351": "nottm-forest",
+    "ext-club-71": "sunderland",
+    "ext-club-66": "man-utd",
+    "ext-club-354": "crystal-palace",
 }
 
 

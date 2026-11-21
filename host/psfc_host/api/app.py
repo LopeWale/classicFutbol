@@ -42,7 +42,7 @@ class ClubTakeoverRequest(BaseModel):
     participant_id: str = Field(..., min_length=2)
     display_name: str = Field(..., min_length=1)
     club_id: str = Field(..., min_length=2)
-    effective_from_round: int = Field(default=3, ge=1)
+    effective_from_round: int = Field(default=11, ge=1)
 
 
 class OpenSessionRequest(BaseModel):
@@ -411,7 +411,7 @@ def create_app(
             "rosters": rosters,
             "assignments": assignments,
             "standings": standings_proj["standings"],
-            "players": player_stats[:16],
+            "players": player_stats[:25],
             "fixtures": fixtures,
             "appointments": appointments.list_appointments(world_id)[:12],
             "honours": store.list_honours(world_id),
