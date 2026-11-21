@@ -724,21 +724,11 @@ function decodeWebHidReport(vPad, bytes) {
   const isDragonRise = bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f);
 
   // Detect X/Y D-Pad byte pair across standard & alternate HID axis offsets (`[0,1]`, `[3,4]`, `[2,3]`, `[1,2]`)
-  const confirmedReady = hasAnyConfirmedPair();
   let usedPrimaryWake = false;
   let axX = 0;
   let axY = 0;
   for (const [ix, iy] of candidatePairs) {
-    if (iy >= bytes.length) continue;
-    const confirmed = vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy);
-    const primaryWake =
-      !confirmedReady &&
-      ix === 0 &&
-      iy === 1 &&
-      (isCenterByte(bytes[0]) || bytes[0] === 0x00 || bytes[0] === 0xff) &&
-      (isCenterByte(bytes[1]) || bytes[1] === 0x00 || bytes[1] === 0xff);
-    if (confirmed || primaryWake) {
-      if (primaryWake) usedPrimaryWake = true;
+    if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
       const vx = (bytes[ix] - 127.5) / 127.5;
       const vy = (bytes[iy] - 127.5) / 127.5;
       if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
@@ -747,6 +737,20 @@ function decodeWebHidReport(vPad, bytes) {
         if (axX !== 0 || axY !== 0) break;
       }
     }
+  }
+  if (
+    axX === 0 &&
+    axY === 0 &&
+    bytes.length >= 2 &&
+    !(vPad._axisBytes.has(0) && vPad._axisBytes.has(1)) &&
+    (isCenterByte(bytes[0]) || bytes[0] === 0x00 || bytes[0] === 0xff) &&
+    (isCenterByte(bytes[1]) || bytes[1] === 0x00 || bytes[1] === 0xff)
+  ) {
+    const vx = (bytes[0] - 127.5) / 127.5;
+    const vy = (bytes[1] - 127.5) / 127.5;
+    axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
+    axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
+    if (axX !== 0 || axY !== 0) usedPrimaryWake = true;
   }
 
   // Clear button states
