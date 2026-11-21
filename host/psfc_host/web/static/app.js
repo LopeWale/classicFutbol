@@ -574,13 +574,9 @@ function doesBrowserPadMatchWebHid(browserPad, vPad) {
 
 /**
  * Collect all connected browser Gamepads (safely skipping sparse `null` slots on macOS/Safari/Chrome)
- * and reconcile WebHID direct USB receiver pads by model group so:
- * - A single physical receiver exposed by both APIs (`M=1, K=1`) or full paired set (`K >= M`) replaces
- *   the matching browser slots 1-for-1 without duplicating controllers.
- * - Multiple WebHID-only receivers (`M=0, K>=1`) are all preserved.
- * - When `navigator.getGamepads()` already exposes more identical controllers than were paired via
- *   WebHID (`K < M`, e.g. 2 browser pads and 1 WebHID handle with indistinguishable VID:PID), we keep
- *   the browser Gamepad entries intact rather than guessing which physical slot to replace.
+ * and append WebHID fallback pads ONLY for receivers not already exposed by `navigator.getGamepads()`.
+ * Preserving the browser Gamepad backend whenever present prevents counting one receiver twice, avoids
+ * ambiguous slot replacement across identical controllers, and retains full dual-stick / 16-button input.
  */
 function getConnectedPads() {
   const browserPads = [];
@@ -597,54 +593,20 @@ function getConnectedPads() {
       // Ignore transient Gamepad API access error
     }
   }
-  const activeWebHid = [];
-  for (let i = 0; i < webHidPads.length; i++) {
-    if (webHidPads[i].connected) activeWebHid.push(webHidPads[i]);
-  }
-  if (activeWebHid.length === 0) return browserPads;
-
-  const groups = new Map();
-  for (let i = 0; i < activeWebHid.length; i++) {
-    const vPad = activeWebHid[i];
-    const gKey =
-      vPad._vidPid && vPad._vidPid !== "0000:0000"
-        ? `vp:${vPad._vidPid}`
-        : vPad._prodName && vPad._prodName.length >= 3
-          ? `nm:${vPad._prodName}`
-          : `id:${vPad.index}`;
-    let list = groups.get(gKey);
-    if (!list) {
-      list = [];
-      groups.set(gKey, list);
-    }
-    list.push(vPad);
-  }
-
   const out = browserPads.slice();
-  const browserCount = browserPads.length;
-  const claimedBrowserSlots = new Set();
-
-  for (const hidGroup of groups.values()) {
-    const rep = hidGroup[0];
-    const matchingSlots = [];
-    for (let j = 0; j < browserCount; j++) {
-      if (!claimedBrowserSlots.has(j) && !out[j]._isWebHid && doesBrowserPadMatchWebHid(out[j], rep)) {
-        matchingSlots.push(j);
+  for (let i = 0; i < webHidPads.length; i++) {
+    const vPad = webHidPads[i];
+    if (!vPad.connected) continue;
+    let alreadyInGamepadApi = false;
+    for (let j = 0; j < browserPads.length; j++) {
+      if (doesBrowserPadMatchWebHid(browserPads[j], vPad)) {
+        alreadyInGamepadApi = true;
+        break;
       }
     }
-    for (let s = 0; s < matchingSlots.length; s++) {
-      claimedBrowserSlots.add(matchingSlots[s]);
+    if (!alreadyInGamepadApi) {
+      out.push(vPad);
     }
-    if (hidGroup.length >= matchingSlots.length) {
-      for (let m = 0; m < matchingSlots.length; m++) {
-        out[matchingSlots[m]] = hidGroup[m];
-      }
-      for (let m = matchingSlots.length; m < hidGroup.length; m++) {
-        out.push(hidGroup[m]);
-      }
-    }
-    // Otherwise (`hidGroup.length < matchingSlots.length`): keep all `matchingSlots` on the
-    // Gamepad API backend so we never replace the wrong physical controller or duplicate one.
   }
   return out;
 }
