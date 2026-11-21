@@ -602,11 +602,17 @@ function sampleRawGamepad(padIndex) {
   if (b(5)) buttons |= BTN_CALL_RUN | BTN_TACKLE;
   if (b(11) || b(10)) buttons |= BTN_SKILL;
 
+  const mx = Math.max(-127, Math.min(127, Math.round(lx * 127)));
+  const my = Math.max(-127, Math.min(127, Math.round(ly * 127)));
+  const rStickX = Math.max(-127, Math.min(127, Math.round(rx * 127)));
+  const rStickY = Math.max(-127, Math.min(127, Math.round(ry * 127)));
+  const aimingKick = (buttons & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
+
   return {
-    mx: Math.max(-127, Math.min(127, Math.round(lx * 127))),
-    my: Math.max(-127, Math.min(127, Math.round(ly * 127))),
-    ax: Math.max(-127, Math.min(127, Math.round(rx * 127))),
-    ay: Math.max(-127, Math.min(127, Math.round(ry * 127))),
+    mx,
+    my,
+    ax: aimingKick ? mx : rStickX,
+    ay: aimingKick ? my : rStickY,
     btns: buttons,
     south,
     east,
