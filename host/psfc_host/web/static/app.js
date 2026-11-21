@@ -599,12 +599,13 @@ function getConnectedPads() {
   if (activeWebHid.length === 0) return browserPads;
 
   const out = browserPads.slice();
+  const browserCount = browserPads.length;
   const replacedSlots = new Set();
   for (let i = 0; i < activeWebHid.length; i++) {
     const vPad = activeWebHid[i];
     let matchedIdx = -1;
-    for (let j = 0; j < out.length; j++) {
-      if (!replacedSlots.has(j) && doesBrowserPadMatchWebHid(out[j], vPad)) {
+    for (let j = 0; j < browserCount; j++) {
+      if (!replacedSlots.has(j) && !out[j]._isWebHid && doesBrowserPadMatchWebHid(out[j], vPad)) {
         matchedIdx = j;
         break;
       }
