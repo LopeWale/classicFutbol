@@ -5,7 +5,7 @@
 
 use psfc_sim::ai::generate_cpu_input;
 use psfc_sim::{
-    CpuDifficulty, FixtureSnapshot, InputFrame, MatchPhase, MatchSimulation, PlayerActionState,
+    CpuDifficulty, FixtureSnapshot, Fp, InputFrame, MatchPhase, MatchSimulation, PlayerActionState,
     SideController, TeamSide,
 };
 use serde::Serialize;
@@ -403,10 +403,24 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                     ]);
                 }
             }
-            // Trailing spin words `[spin_side_milli, spin_top_milli]` preserve all header & player offsets
+            let aim_bam_for = |side_idx: usize| -> i32 {
+                let c_idx = st.controlled_idx[side_idx];
+                if let Some(cp) = st.players[side_idx].get(c_idx) {
+                    if let PlayerActionState::Charging { aim, .. } = cp.action {
+                        if aim.len() > Fp::from_milli(100) {
+                            return aim.to_bam() as i32;
+                        }
+                        return cp.facing_bam as i32;
+                    }
+                }
+                -1
+            };
+            // Trailing words `[spin_side_milli, spin_top_milli, home_aim_bam, away_aim_bam]` preserve all header & player offsets
             out.extend_from_slice(&[
                 st.ball.spin_side.to_milli() as i32,
                 st.ball.spin_top.to_milli() as i32,
+                aim_bam_for(0),
+                aim_bam_for(1),
             ]);
             out.len()
         })

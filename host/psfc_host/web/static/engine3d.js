@@ -2631,6 +2631,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     axTick,
     ayTick,
     facingRad,
+    aimRad = null,
     action,
     charge,
     jumpZ = 0,
@@ -2733,6 +2734,16 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   if (isControlled) {
     actor.overheadCursor.position.y = 2.02 + actor.smoothJumpY + Math.sin(nowSec * 7.0) * 0.035;
     actor.overheadCursor.rotation.y = nowSec * 3.0;
+    const relAimYaw =
+      aimRad !== null && charge > 0.02
+        ? wrapAngleRad(Math.PI * 0.5 - aimRad - actor.root.rotation.y)
+        : 0;
+    const rAim = 0.53 + (charge > 0.02 ? charge * 0.18 : 0);
+    actor.aimWedge.position.set(Math.sin(relAimYaw) * rAim, 0.025, Math.cos(relAimYaw) * rAim);
+    actor.aimWedge.rotation.y = relAimYaw;
+    const wScale = charge > 0.02 ? 1.0 + charge * 0.32 : 1.0;
+    const lScale = charge > 0.02 ? 1.0 + charge * 0.55 : 1.0;
+    actor.aimWedge.scale.set(wScale, 1.0, lScale);
   }
   actor.nameplate.visible = false;
 
@@ -4673,6 +4684,9 @@ export class ClassicFifa3DEngine {
       const hasSpinWords = currPacked.length >= spinBase + 2;
       const spinSide = hasSpinWords ? currPacked[spinBase] / 1000 : 0;
       const spinTop = hasSpinWords ? currPacked[spinBase + 1] / 1000 : 0;
+      const hasAimWords = currPacked.length >= spinBase + 4;
+      const homeAimBam = hasAimWords ? currPacked[spinBase + 2] : -1;
+      const awayAimBam = hasAimWords ? currPacked[spinBase + 3] : -1;
 
       this.ballMesh.position.set(ballX, this.ballRadius + Math.max(0, ballZ), ballY);
       const bSpeed = Math.hypot(ballVx, ballVy);
@@ -4767,6 +4781,8 @@ export class ClassicFifa3DEngine {
         }
 
         const isControlled = showHudIndicators && (side === 0 ? idx === homeCtrl : idx === awayCtrl);
+        const rawAimBam = side === 0 ? homeAimBam : awayAimBam;
+        const aimRad = isControlled && rawAimBam >= 0 ? (rawAimBam * Math.PI * 2) / 65536 : null;
         const isBallCarrier = showHudIndicators && ownerSide === side && ownerIdx === idx;
         const celebrating = phase === 10 && ownerSide === side;
         const inWall =
@@ -4786,6 +4802,7 @@ export class ClassicFifa3DEngine {
             axTick,
             ayTick,
             facingRad,
+            aimRad,
             action,
             charge,
             jumpZ,
