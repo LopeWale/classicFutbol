@@ -667,15 +667,19 @@ function decodeWebHidReport(vPad, bytes) {
   if (isFirstPacket) {
     vPad._restBytes = new Uint8Array(bytes);
     vPad._axisBytes = new Set();
+    vPad._sawCenterBytes = new Set();
     vPad._constCenterBytes = new Set();
     for (let i = 0; i < bytes.length; i++) {
       if (isCenterByte(bytes[i])) {
         vPad._constCenterBytes.add(i);
+        if (i <= 4) vPad._sawCenterBytes.add(i);
       }
     }
   } else {
     for (let i = 0; i < bytes.length; i++) {
-      if (!isCenterByte(bytes[i])) {
+      if (isCenterByte(bytes[i])) {
+        if (i <= 4) vPad._sawCenterBytes.add(i);
+      } else {
         vPad._constCenterBytes.delete(i);
       }
     }
@@ -700,8 +704,9 @@ function decodeWebHidReport(vPad, bytes) {
   };
 
   // Confirm any candidate X/Y pair (including overlapping pairs such as [1,2] behind centered byte 0)
-  // once both bytes are observed in the neutral center range (or 0xff + center on packet 0), while
-  // preserving at least one button byte whenever an earlier pair is already confirmed.
+  // once both bytes have been observed in the neutral center range (even across separate reports while
+  // rotating a held D-pad, or 0xff + center on packet 0), while preserving at least one button byte
+  // whenever an earlier pair is already confirmed.
   for (const [ix, iy] of candidatePairs) {
     if (iy >= bytes.length) continue;
     if (vPad._isDragonRiseFormat && iy >= 5) continue;
@@ -709,12 +714,12 @@ function decodeWebHidReport(vPad, bytes) {
     const newBytesNeeded = (vPad._axisBytes.has(ix) ? 0 : 1) + (vPad._axisBytes.has(iy) ? 0 : 1);
     if (hasAnyConfirmedPair() && vPad._axisBytes.size + newBytesNeeded >= bytes.length) continue;
 
-    const bothCenter = isCenterByte(bytes[ix]) && isCenterByte(bytes[iy]);
+    const bothSawCenter = vPad._sawCenterBytes.has(ix) && vPad._sawCenterBytes.has(iy);
     const pkt0HighDeflect =
       isFirstPacket &&
       ((bytes[ix] === 0xff && isCenterByte(bytes[iy])) ||
         (isCenterByte(bytes[ix]) && bytes[iy] === 0xff));
-    if (bothCenter || pkt0HighDeflect) {
+    if (bothSawCenter || pkt0HighDeflect) {
       vPad._axisBytes.add(ix);
       vPad._axisBytes.add(iy);
     }
@@ -864,6 +869,7 @@ async function pairWebHidUsbReceiver() {
         existing.connected = true;
         existing._restBytes = null;
         existing._axisBytes = null;
+        existing._sawCenterBytes = null;
         existing._constCenterBytes = null;
         continue;
       }
@@ -882,6 +888,7 @@ async function pairWebHidUsbReceiver() {
         _prodName: String(dev.productName || "").trim().toLowerCase(),
         _restBytes: null,
         _axisBytes: null,
+        _sawCenterBytes: null,
         _constCenterBytes: null,
         _isDragonRiseFormat: false,
         _uses10BtnMeta: false,
