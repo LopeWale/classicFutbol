@@ -760,10 +760,25 @@ function decodeWebHidReport(vPad, bytes) {
   const isDragonRise = bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f);
 
   // Detect X/Y D-Pad byte pair across standard & alternate HID axis offsets (`[0,1]`, `[3,4]`, `[2,3]`, `[1,2]`)
+  let hasConfirmedPair = false;
+  for (const [ix, iy] of candidatePairs) {
+    if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
+      hasConfirmedPair = true;
+      break;
+    }
+  }
   let axX = 0;
   let axY = 0;
   for (const [ix, iy] of candidatePairs) {
-    if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
+    const pairActive =
+      iy < bytes.length &&
+      ((vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) ||
+        (!hasConfirmedPair &&
+          ix === 0 &&
+          iy === 1 &&
+          (vPad._axisBytes.has(0) || vPad._pendingAxisBytes.has(0)) &&
+          (vPad._axisBytes.has(1) || vPad._pendingAxisBytes.has(1))));
+    if (pairActive) {
       const vx = (bytes[ix] - 127.5) / 127.5;
       const vy = (bytes[iy] - 127.5) / 127.5;
       if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
