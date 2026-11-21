@@ -655,25 +655,68 @@ function decodeWebHidReport(vPad, bytes) {
     vPad._isDragonRiseFormat = true;
   }
 
+  const candidatePairs = [
+    [0, 1],
+    [3, 4],
+    [2, 3],
+    [1, 2],
+  ];
+  const maxAxisIdx = Math.min(4, bytes.length - 2);
+
   if (!vPad._restBytes) {
     vPad._restBytes = new Uint8Array(bytes);
     vPad._axisBytes = new Set();
-    const axisLimit = vPad._isDragonRiseFormat ? Math.min(5, bytes.length - 1) : bytes.length - 1;
-    for (let i = 0; i < axisLimit; i++) {
+    vPad._pendingAxisBytes = new Set();
+    for (let i = 0; i <= maxAxisIdx; i++) {
       const bVal = bytes[i];
       const isCenter = bVal >= 0x70 && bVal <= 0x8f;
       const isPrimaryDeflected = i <= 1 && bytes.length >= 3 && (bVal === 0x00 || bVal === 0xff);
-      if (isCenter || isPrimaryDeflected) {
+      if (isCenter || isPrimaryDeflected || bVal === 0xff) {
         vPad._axisBytes.add(i);
+      } else if (bVal === 0x00 && (i >= 3 || !vPad._axisBytes.has(0) || maxAxisIdx >= 3)) {
+        vPad._pendingAxisBytes.add(i);
       }
     }
-  } else if (vPad._isDragonRiseFormat) {
-    for (let i = 5; i < bytes.length; i++) {
-      vPad._axisBytes.delete(i);
+  } else {
+    if (vPad._isDragonRiseFormat) {
+      for (let i = 5; i < bytes.length; i++) {
+        vPad._axisBytes.delete(i);
+        vPad._pendingAxisBytes.delete(i);
+      }
+      for (let i = 0; i <= 4 && i < bytes.length; i++) {
+        if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+          vPad._axisBytes.add(i);
+          vPad._pendingAxisBytes.delete(i);
+        }
+      }
     }
-    for (let i = 0; i <= 4 && i < bytes.length; i++) {
-      if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
-        vPad._axisBytes.add(i);
+    if (vPad._pendingAxisBytes && vPad._pendingAxisBytes.size > 0) {
+      for (const pi of Array.from(vPad._pendingAxisBytes)) {
+        if (pi >= bytes.length) continue;
+        const bVal = bytes[pi];
+        if ((bVal >= 0x01 && bVal <= 0x6f) || (bVal >= 0x90 && bVal <= 0xfe)) {
+          // Non-extremum, non-center bitmask proves this byte carries discrete buttons
+          vPad._pendingAxisBytes.delete(pi);
+        } else if (bVal === 0xff) {
+          vPad._axisBytes.add(pi);
+          vPad._pendingAxisBytes.delete(pi);
+        } else if (bVal >= 0x70 && bVal <= 0x8f) {
+          // Promote when the byte returns to center alongside a valid centered/confirmed partner axis
+          for (const [ix, iy] of candidatePairs) {
+            if (iy > maxAxisIdx) continue;
+            if (ix === 1 && iy === 2 && vPad._axisBytes.has(0)) continue;
+            if (pi === ix || pi === iy) {
+              const partner = pi === ix ? iy : ix;
+              const pCentered =
+                vPad._axisBytes.has(partner) || (bytes[partner] >= 0x70 && bytes[partner] <= 0x8f);
+              if (pCentered) {
+                vPad._axisBytes.add(pi);
+                vPad._pendingAxisBytes.delete(pi);
+                break;
+              }
+            }
+          }
+        }
       }
     }
   }
@@ -684,12 +727,6 @@ function decodeWebHidReport(vPad, bytes) {
   // Detect X/Y D-Pad byte pair across standard & alternate HID axis offsets (`[0,1]`, `[3,4]`, `[2,3]`, `[1,2]`)
   let axX = 0;
   let axY = 0;
-  const candidatePairs = [
-    [0, 1],
-    [3, 4],
-    [2, 3],
-    [1, 2],
-  ];
   for (const [ix, iy] of candidatePairs) {
     if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
       const vx = (bytes[ix] - 127.5) / 127.5;
@@ -817,6 +854,7 @@ async function pairWebHidUsbReceiver() {
         existing.connected = true;
         existing._restBytes = null;
         existing._axisBytes = null;
+        existing._pendingAxisBytes = null;
         continue;
       }
       if (!dev.opened) await dev.open();
@@ -834,6 +872,7 @@ async function pairWebHidUsbReceiver() {
         _prodName: String(dev.productName || "").trim().toLowerCase(),
         _restBytes: null,
         _axisBytes: null,
+        _pendingAxisBytes: null,
         _isDragonRiseFormat: false,
         _uses10BtnMeta: false,
       };
