@@ -661,20 +661,57 @@ function decodeWebHidReport(vPad, bytes) {
     [2, 3],
     [1, 2],
   ];
-  const maxAxisIdx = Math.min(4, bytes.length - 2);
+  const threeByteFrontAxes =
+    bytes.length === 3 &&
+    bytes[0] >= 0x70 &&
+    bytes[0] <= 0x8f &&
+    bytes[1] >= 0x70 &&
+    bytes[1] <= 0x8f;
+  const maxAxisIdx = vPad._isDragonRiseFormat
+    ? Math.min(4, bytes.length - 1)
+    : threeByteFrontAxes
+      ? 1
+      : Math.min(4, bytes.length - 1);
 
   if (!vPad._restBytes) {
     vPad._restBytes = new Uint8Array(bytes);
     vPad._axisBytes = new Set();
     vPad._pendingAxisBytes = new Set();
-    for (let i = 0; i <= maxAxisIdx; i++) {
-      const bVal = bytes[i];
-      const isCenter = bVal >= 0x70 && bVal <= 0x8f;
-      const isPrimaryDeflected = i <= 1 && bytes.length >= 3 && (bVal === 0x00 || bVal === 0xff);
-      if (isCenter || isPrimaryDeflected || bVal === 0xff) {
-        vPad._axisBytes.add(i);
-      } else if (bVal === 0x00 && (i >= 3 || !vPad._axisBytes.has(0) || maxAxisIdx >= 3)) {
-        vPad._pendingAxisBytes.add(i);
+    if (bytes.length >= 2) {
+      for (let i = 0; i <= maxAxisIdx; i++) {
+        if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
+          vPad._axisBytes.add(i);
+        }
+      }
+      const pairedSet = new Set();
+      for (const [ix, iy] of candidatePairs) {
+        if (iy <= maxAxisIdx && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
+          pairedSet.add(ix);
+          pairedSet.add(iy);
+        }
+      }
+      for (let i = 0; i <= maxAxisIdx; i++) {
+        if (vPad._axisBytes.has(i)) continue;
+        const bVal = bytes[i];
+        if (bVal !== 0x00 && bVal !== 0xff) continue;
+        let hasEligiblePartner = false;
+        let hasCenteredPartner = false;
+        for (const [ix, iy] of candidatePairs) {
+          if (iy > maxAxisIdx || (i !== ix && i !== iy)) continue;
+          const p = i === ix ? iy : ix;
+          if (pairedSet.has(p)) continue;
+          const pv = bytes[p];
+          if ((pv >= 0x70 && pv <= 0x8f) || pv === 0x00 || pv === 0xff) {
+            hasEligiblePartner = true;
+            if (vPad._axisBytes.has(p)) hasCenteredPartner = true;
+          }
+        }
+        if (!hasEligiblePartner) continue;
+        if (bVal === 0xff || (pairedSet.size === 0 && i <= 1 && hasCenteredPartner)) {
+          vPad._axisBytes.add(i);
+        } else {
+          vPad._pendingAxisBytes.add(i);
+        }
       }
     }
   } else {
@@ -695,13 +732,11 @@ function decodeWebHidReport(vPad, bytes) {
         if (pi >= bytes.length) continue;
         const bVal = bytes[pi];
         if ((bVal >= 0x01 && bVal <= 0x6f) || (bVal >= 0x90 && bVal <= 0xfe)) {
-          // Non-extremum, non-center bitmask proves this byte carries discrete buttons
           vPad._pendingAxisBytes.delete(pi);
         } else if (bVal === 0xff) {
           vPad._axisBytes.add(pi);
           vPad._pendingAxisBytes.delete(pi);
         } else if (bVal >= 0x70 && bVal <= 0x8f) {
-          // Promote when the byte returns to center alongside a valid centered/confirmed partner axis
           for (const [ix, iy] of candidatePairs) {
             if (iy > maxAxisIdx) continue;
             if (ix === 1 && iy === 2 && vPad._axisBytes.has(0)) continue;
@@ -791,14 +826,9 @@ function decodeWebHidReport(vPad, bytes) {
       setBtn(9, (b6 & 0x08) !== 0);
     }
   } else {
-    // Generic fallback: exclude identified axis bytes (and any leading report header byte before the first axis)
-    let minAxisIdx = Infinity;
-    for (const ai of vPad._axisBytes) {
-      if (ai < minAxisIdx) minAxisIdx = ai;
-    }
-    const startIdx = minAxisIdx === Infinity ? 0 : minAxisIdx + 1;
+    // Generic fallback: decode all non-axis bytes from byte 0 onward
     const activeBits = [];
-    for (let bi = startIdx; bi < bytes.length; bi++) {
+    for (let bi = 0; bi < bytes.length; bi++) {
       if (vPad._axisBytes.has(bi)) continue;
       if (bi < rest.length) {
         // Clear any bit that was held on packet 0 as soon as 0 is observed in that bit
