@@ -1082,13 +1082,20 @@ impl MatchSimulation {
                     && (self.state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side)
                         || self.state.ball.last_touch_team == Some(side));
                 let is_open_play = matches!(self.state.phase, MatchPhase::OpenPlay);
+                let pitch_half_len = self.state.format.half_length();
+                let own_box_depth = self.state.format.penalty_box_depth();
+                let own_box_hw = self.state.format.penalty_box_half_width();
+                let own_goal_x_now = Fp::from_milli(-side_attack_sign * pitch_half_len.to_milli());
                 let mut kick_to_execute: Option<(u16, u16, bool, Vec2)> = None;
                 let mut skill_move_triggered: Option<(String, String, u8)> = None;
                 let mut new_buffered: Option<BufferedAction> = None;
                 {
                     let p = &mut self.state.players[s_idx][idx];
+                    let gk_in_own_box = is_gk
+                        && (p.pos.x - own_goal_x_now).abs() <= own_box_depth
+                        && p.pos.y.abs() <= own_box_hw;
 
-                    // Step vertical jump kinematics (`p.z`, `p.vz`) for aerial headers & volleys!
+                    // Step vertical jump kinematics (`p.z`, `p.vz`) for aerial headers, volleys & GK high claims!
                     if p.z > Fp::ZERO || p.vz != Fp::ZERO {
                         p.z += p.vz.mul(dt);
                         p.vz -= Fp::from_milli(9_810).mul(dt);
@@ -1098,14 +1105,21 @@ impl MatchSimulation {
                         }
                     } else if is_open_play
                         && ball_is_loose
-                        && !is_gk
                         && p.can_control_ball()
-                        && ball_z_now >= Fp::from_milli(1_180)
-                        && ball_z_now <= Fp::from_milli(2_450)
                         && p.pos.dist(ball_xy_now) <= Fp::from_milli(2_350)
+                        && ((!is_gk
+                            && ball_z_now >= Fp::from_milli(1_180)
+                            && ball_z_now <= Fp::from_milli(2_450))
+                            || (gk_in_own_box
+                                && ball_z_now >= Fp::from_milli(1_280)
+                                && ball_z_now <= Fp::from_milli(2_950)))
                     {
-                        // Athletic leap to contest aerial cross / corner header!
-                        let jump_boost = 3_280 + (p.attributes.strength as i64) * 3;
+                        // Athletic leap: outfielders contest headers; GK leaps high (`~0.80m`) to claim/punch crosses (`IMG_0365`)!
+                        let jump_boost = if is_gk {
+                            3_720 + (p.attributes.goalkeeping as i64) * 4
+                        } else {
+                            3_280 + (p.attributes.strength as i64) * 3
+                        };
                         p.vz = Fp::from_milli(jump_boost);
                     }
 
@@ -1231,13 +1245,16 @@ impl MatchSimulation {
                             }
                         }
                         PlayerActionState::Normal => {
-                            // Trigger GK dive if AI requested it
+                            // Trigger GK dive (with vertical takeoff impulse on top-corner shots!) if AI requested it
                             if let Some(intent) = ai_intent {
-                                if let Some(dive_dir) = intent.trigger_dive {
+                                if let Some((dive_dir, dive_vz_mm)) = intent.trigger_dive {
                                     p.action = PlayerActionState::Diving {
                                         ticks_left: 18,
                                         dir: dive_dir,
                                     };
+                                    if dive_vz_mm > 0 && p.z <= Fp::from_milli(80) {
+                                        p.vz = Fp::from_milli(dive_vz_mm);
+                                    }
                                 }
                             }
 
@@ -2629,11 +2646,19 @@ impl MatchSimulation {
         let prev_pos = self.state.ball.pos;
         let is_5v5 = self.state.format.players_per_side <= 6;
 
-        // Horizontal Magnus curve from side spin when moving through air
+        // Speed-proportional horizontal Magnus curve ($F_M \propto \omega \times v$): full aerodynamic bend in air, subtle English on grass
         let speed_xy = self.state.ball.vel.xy().len();
         if speed_xy > Fp::from_milli(1_800) && self.state.ball.spin_side.abs() > Fp::from_milli(45) {
             let perp = Vec2::new(-self.state.ball.vel.y, self.state.ball.vel.x).normalize_or_zero();
-            let magnus_accel = self.state.ball.spin_side.mul(Fp::from_milli(1_050));
+            let spd_scale = speed_xy
+                .div(Fp::from_milli(15_500))
+                .clamp(Fp::from_milli(450), Fp::from_milli(1_380));
+            let surf_mult = if self.state.ball.pos.z > Fp::from_milli(35) {
+                Fp::from_milli(1_080)
+            } else {
+                Fp::from_milli(310)
+            };
+            let magnus_accel = self.state.ball.spin_side.mul(surf_mult).mul(spd_scale);
             self.state.ball.vel.x += perp.x.mul(magnus_accel).mul(dt);
             self.state.ball.vel.y += perp.y.mul(magnus_accel).mul(dt);
             self.state.ball.spin_side = self.state.ball.spin_side.mul(Fp::from_milli(991));
@@ -2844,7 +2869,7 @@ impl MatchSimulation {
                     };
                     (
                         Fp::from_milli(820 + gk_bonus + dive_bonus),
-                        Fp::from_milli(2_250),
+                        Fp::from_milli(2_250) + p.z,
                     )
                 } else {
                     // Regulation 110mm ball + anatomical leg/chest reach (~520mm, +65mm anticipation for intended receiver)
@@ -2885,7 +2910,7 @@ impl MatchSimulation {
             }
         }
 
-        // 2. Goalkeeper save / claim inside own penalty area!
+        // 2. Goalkeeper save / high-cross claim / fist punch inside own penalty area!
         let attack_sign = side.attack_sign(self.state.second_half_swapped());
         let own_goal_x = Fp::from_milli(-attack_sign * half_len.to_milli());
         let in_own_box = idx == 0
@@ -2894,6 +2919,8 @@ impl MatchSimulation {
 
         if in_own_box && self.state.ball.last_touch_team == Some(side.opponent()) {
             let gk_attr = self.state.players[s_idx][0].attributes.goalkeeping as i64;
+            let gk_pos = self.state.players[s_idx][0].pos;
+            let gk_z = self.state.players[s_idx][0].z;
             let vel_toward_own_goal = if attack_sign > 0 {
                 -self.state.ball.vel.x
             } else {
@@ -2902,8 +2929,39 @@ impl MatchSimulation {
             let was_shot_threat = vel_toward_own_goal > Fp::from_milli(6_500);
             let catch_limit = Fp::from_milli(14_500 + gk_attr * 60);
 
+            let gk_vz = self.state.players[s_idx][0].vz;
+            // Crowded-box high aerial cross (`IMG_0365`): if an opposing attacker is contesting right on the GK,
+            // a leaping GK punches a whipped cross powerfully clear instead of risking a spill!
+            let crowded_high_cross = !was_shot_threat
+                && (gk_z > Fp::from_milli(110) || gk_vz > Fp::from_milli(1_500))
+                && ball_z > Fp::from_milli(1_450)
+                && ball_speed > Fp::from_milli(9_600)
+                && self.state.players[side.opponent().index()]
+                    .iter()
+                    .skip(1)
+                    .any(|opp| !opp.sent_off && opp.pos.dist(gk_pos) <= Fp::from_milli(2_100));
+
+            if crowded_high_cross {
+                let punch_y = if self.state.ball.pos.y >= Fp::ZERO {
+                    Fp::from_milli(5_600)
+                } else {
+                    Fp::from_milli(-5_600)
+                };
+                self.state.ball.vel = Vec3::new(
+                    Fp::from_int(attack_sign as i32).mul(Fp::from_milli(12_400)),
+                    punch_y,
+                    Fp::from_milli(3_550),
+                );
+                self.state.ball.spin_top = Fp::from_milli(-650);
+                self.set_last_touch(side, 0);
+                self.state.ball.pass_in_flight = None;
+                self.state.ball.assist_candidate = None;
+                self.state.players[s_idx][0].action = PlayerActionState::Cooldown { ticks_left: 11 };
+                return;
+            }
+
             if ball_speed <= catch_limit {
-                // Clean catch!
+                // Clean catch (on ground or plucked out of the air at peak jump `IMG_0365`!)
                 self.state.ball.owner = Some((side, 0));
                 self.state.ball.gk_hold_ticks = 105;
                 self.state.ball.dribble_touch_cd = 0;
@@ -2923,27 +2981,49 @@ impl MatchSimulation {
                 }
                 return;
             } else {
-                // Strong shot -> GK parries wide! Corner-bound shots are tipped past the post for a Corner Kick!
-                let parry_y_sign = if self.state.ball.pos.y >= Fp::ZERO {
-                    Fp::ONE
+                // Blistering shot -> Fingertip tip OVER the crossbar on high risers (`IMG_0356`) or parry wide (`IMG_0358`, `IMG_0364`)!
+                let goal_h = self.state.format.goal_height();
+                let goal_hw = self.state.format.goal_half_width();
+                let dist_from_line = (ball_xy.x - own_goal_x).abs();
+                let tip_over_bar = was_shot_threat
+                    && ball_z > goal_h - Fp::from_milli(680)
+                    && dist_from_line <= Fp::from_milli(3_800)
+                    && self.state.ball.pos.y.abs() <= goal_hw;
+                let save_msg = if tip_over_bar {
+                    self.state.ball.pos.z = self.state.ball.pos.z.max(goal_h + Fp::from_milli(180));
+                    self.state.ball.vel = Vec3::new(
+                        Fp::from_int(-attack_sign as i32).mul(Fp::from_milli(9_200)),
+                        self.state.ball.vel.y.mul(Fp::from_milli(450)),
+                        Fp::from_milli(4_600),
+                    );
+                    self.state.ball.spin_top = Fp::from_milli(-900);
+                    format!("{player_name} tips it over the bar!")
                 } else {
-                    Fp::NEG_ONE
+                    let parry_y_sign = if self.state.ball.pos.y >= Fp::ZERO {
+                        Fp::ONE
+                    } else {
+                        Fp::NEG_ONE
+                    };
+                    let tip_behind_for_corner = was_shot_threat
+                        && self.state.ball.pos.y.abs() > goal_hw - Fp::from_milli(680)
+                        && dist_from_line >= Fp::from_milli(550);
+                    let (rebound_x, rebound_y) = if tip_behind_for_corner {
+                        (
+                            Fp::from_int(-attack_sign as i32).mul(Fp::from_milli(4_200)),
+                            parry_y_sign.mul(Fp::from_milli(17_500)),
+                        )
+                    } else {
+                        (
+                            Fp::from_int(attack_sign as i32).mul(Fp::from_milli(5_400)),
+                            parry_y_sign.mul(Fp::from_milli(10_500)),
+                        )
+                    };
+                    self.state.ball.vel = Vec3::new(rebound_x, rebound_y, Fp::from_milli(1_800));
+                    format!("{player_name} parries wide!")
                 };
-                let tip_behind_for_corner = self.state.ball.pos.y.abs() > Fp::from_milli(920);
-                let (rebound_x, rebound_y) = if tip_behind_for_corner {
-                    (
-                        Fp::from_int(-attack_sign as i32).mul(Fp::from_milli(4_800)),
-                        parry_y_sign.mul(Fp::from_milli(16_200)),
-                    )
-                } else {
-                    (
-                        Fp::from_int(attack_sign as i32).mul(Fp::from_milli(5_200)),
-                        parry_y_sign.mul(Fp::from_milli(9_500)),
-                    )
-                };
-                self.state.ball.vel = Vec3::new(rebound_x, rebound_y, Fp::from_milli(1_800));
                 self.set_last_touch(side, 0);
                 self.state.ball.pass_in_flight = None;
+                self.state.ball.assist_candidate = None;
                 self.state.players[s_idx][0].action = PlayerActionState::Cooldown { ticks_left: 14 };
                 if was_shot_threat {
                     self.state.player_stats[s_idx][0].saves += 1;
@@ -2952,7 +3032,7 @@ impl MatchSimulation {
                         side,
                         Some(player_id),
                         None,
-                        format!("{player_name} parries wide!"),
+                        save_msg,
                     );
                 }
                 return;
@@ -4933,6 +5013,120 @@ mod tests {
             sim.state().ball.owner,
             Some((TeamSide::Home, 1)),
             "grounded slide tackle must NOT sweep a 1.25m chest-cushioned ball from below"
+        );
+    }
+
+    #[test]
+    fn goalkeeper_airborne_dive_over_bar_tip_and_high_cross_punch_work() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2026_12);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).expect("valid 5v5 snapshot");
+        sim.state.phase = MatchPhase::OpenPlay;
+
+        for idx in 1..5 {
+            sim.state.players[0][idx].pos = Vec2::from_milli(-12_000, -14_000 + (idx as i64) * 2_000);
+            sim.state.players[0][idx].vel = Vec2::ZERO;
+            sim.state.players[1][idx].pos = Vec2::from_milli(0, -14_000 + (idx as i64) * 2_000);
+            sim.state.players[1][idx].vel = Vec2::ZERO;
+        }
+
+        // 1. Airborne Top-Corner GK Dive (`IMG_0364`) + Fingertip Tip Over the Crossbar (`IMG_0356`) -> Corner Kick!
+        let half_len = sim.state().format.half_length().to_milli();
+        let goal_h = sim.state().format.goal_height().to_milli();
+        sim.state.players[1][0].pos = Vec2::from_milli(half_len - 1_200, 0);
+        sim.state.players[1][0].vel = Vec2::ZERO;
+        sim.state.players[1][0].z = Fp::ZERO;
+        sim.state.players[1][0].vz = Fp::ZERO;
+        sim.state.players[1][0].action = PlayerActionState::Normal;
+
+        sim.set_last_touch(TeamSide::Home, 1);
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(half_len - 8_200, 200, 1_100);
+        sim.state.ball.vel = Vec3::from_milli(23_500, 3_600, 3_350); // Blistering top-corner riser!
+        sim.state.ball.spin_side = Fp::ZERO;
+        sim.state.ball.spin_top = Fp::from_milli(800);
+
+        let mut peak_gk_z = Fp::ZERO;
+        let mut saw_tip_save = false;
+        for _ in 0..40 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            peak_gk_z = peak_gk_z.max(sim.state().players[1][0].z);
+            if sim
+                .state()
+                .recorded_events
+                .iter()
+                .any(|e| e.detail.contains("tips it over the bar"))
+            {
+                saw_tip_save = true;
+            }
+            if matches!(
+                sim.state().phase,
+                MatchPhase::SetPiece {
+                    kind: RestartKind::CornerKick,
+                    ..
+                }
+            ) {
+                break;
+            }
+        }
+        assert!(
+            peak_gk_z > Fp::from_milli(180),
+            "GK diving for a high top-corner riser must launch airborne ({:?})",
+            peak_gk_z
+        );
+        assert!(
+            saw_tip_save && sim.state().score[0] == 0,
+            "blistering high shot at `(goal_h = {}mm)` must be tipped over the bar without conceding",
+            goal_h
+        );
+        assert!(
+            matches!(
+                sim.state().phase,
+                MatchPhase::SetPiece {
+                    kind: RestartKind::CornerKick,
+                    team: TeamSide::Home,
+                    ..
+                }
+            ),
+            "fingertip save over the crossbar must award an attacking Corner Kick (got {:?})",
+            sim.state().phase
+        );
+
+        // 2. Crowded-Box High-Cross GK Leap & Fist Punch Clear (`IMG_0365`)!
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.controlled_idx = [4, 1];
+        sim.state.players[1][0].pos = Vec2::from_milli(half_len - 2_200, 0);
+        sim.state.players[1][0].vel = Vec2::ZERO;
+        sim.state.players[1][0].z = Fp::ZERO;
+        sim.state.players[1][0].vz = Fp::ZERO;
+        sim.state.players[1][0].action = PlayerActionState::Normal;
+        // Contesting Home striker lurking 0.5m away inside the 6-yard area!
+        sim.state.players[0][4].pos = Vec2::from_milli(half_len - 2_650, 250);
+        sim.state.players[0][4].vel = Vec2::ZERO;
+
+        sim.set_last_touch(TeamSide::Home, 2);
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(half_len - 2_650, 2_850, 2_180);
+        sim.state.ball.vel = Vec3::from_milli(1_400, -13_600, -420); // Fast whipped aerial cross across 6-yard box!
+
+        let mut gk_leapt = false;
+        let mut punched_upfield = false;
+        for _ in 0..24 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().players[1][0].z > Fp::from_milli(220) {
+                gk_leapt = true;
+            }
+            if sim.state().ball.last_touch_team == Some(TeamSide::Away)
+                && sim.state().ball.vel.x < Fp::from_milli(-9_000)
+            {
+                punched_upfield = true;
+                break;
+            }
+        }
+        assert!(
+            gk_leapt && punched_upfield,
+            "GK must leap ({gk_leapt}) and punch a crowded fast aerial cross clear upfield ({punched_upfield})"
         );
     }
 }

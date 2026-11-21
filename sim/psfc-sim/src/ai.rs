@@ -14,16 +14,18 @@ pub struct AiMoveIntent {
     pub move_dir: Vec2,
     pub sprint: bool,
     pub jockey: bool,
-    pub trigger_dive: Option<Vec2>,
+    /// Optional `(horizontal_dive_dir, vertical_takeoff_vz_mm_s)` for low skimming vs airborne top-corner dives.
+    pub trigger_dive: Option<(Vec2, i64)>,
 }
 
-/// Computes goalkeeper movement & shot-stopping dive intent for `players[side][0]`.
+/// Computes goalkeeper movement, high-cross command & 3D shot-stopping dive intent for `players[side][0]`.
 pub fn compute_goalkeeper_intent(
     state: &MatchState,
     side: TeamSide,
     human_gk_rush: bool,
 ) -> AiMoveIntent {
     let p = &state.players[side.index()][0];
+    let is_5v5 = state.format.players_per_side <= 6;
     let attack_sign = side.attack_sign(state.second_half_swapped());
     let half_len = state.format.half_length();
     let goal_half_w = state.format.goal_half_width();
@@ -75,10 +77,31 @@ pub fn compute_goalkeeper_intent(
         && dist_ball_to_goal_x < Fp::from_milli(18_000)
         && dist_ball_to_goal_x > Fp::from_milli(300)
     {
-        // Project Y at GK's X plane (or goal line if ball already close)
+        // Project 3D `(Y, Z)` at GK's X plane including aerodynamic Magnus curl (`spin_side`) & gravity!
         let dist_to_gk_x = (ball_xy.x - p.pos.x).abs();
         let t_to_gk = dist_to_gk_x.div(vel_toward_goal);
-        let projected_y = ball_xy.y + ball_vel_xy.y.mul(t_to_gk);
+        let b_spd = ball_vel_xy.len();
+        let magnus_y = if state.ball.pos.z > Fp::from_milli(35)
+            && b_spd > Fp::from_milli(1_800)
+            && state.ball.spin_side.abs() > Fp::from_milli(45)
+        {
+            let perp_y = ball_vel_xy.normalize_or_zero().x;
+            let spd_scale = b_spd
+                .div(Fp::from_milli(15_500))
+                .clamp(Fp::from_milli(450), Fp::from_milli(1_380));
+            let a_y = perp_y
+                .mul(state.ball.spin_side)
+                .mul(Fp::from_milli(1_050))
+                .mul(spd_scale);
+            a_y.mul(t_to_gk.mul(t_to_gk)).mul(Fp::HALF)
+        } else {
+            Fp::ZERO
+        };
+        let projected_y = ball_xy.y + ball_vel_xy.y.mul(t_to_gk) + magnus_y;
+        let projected_z = (state.ball.pos.z
+            + state.ball.vel.z.mul(t_to_gk)
+            - Fp::from_milli(4_905).mul(t_to_gk.mul(t_to_gk)))
+        .max(Fp::ZERO);
         let max_guard_y = goal_half_w + Fp::from_milli(900);
 
         if projected_y.abs() <= max_guard_y {
@@ -91,11 +114,18 @@ pub fn compute_goalkeeper_intent(
                     Fp::from_int(lateral_gap.signum_int()),
                 )
                 .normalize_or_zero();
+                // High/top-corner shots trigger airborne layout extension (`IMG_0364`); low skimmers stay low (`IMG_0358`, `IMG_0366`)!
+                let dive_vz_mm = if projected_z > Fp::from_milli(900) {
+                    let z_excess = (projected_z.to_milli() - 900).clamp(0, 1_550);
+                    (2_100 + (z_excess * 12) / 10).clamp(2_100, 3_950)
+                } else {
+                    280
+                };
                 return AiMoveIntent {
                     move_dir: dive_dir,
                     sprint: true,
                     jockey: false,
-                    trigger_dive: Some(dive_dir),
+                    trigger_dive: Some((dive_dir, dive_vz_mm)),
                 };
             } else {
                 let intercept = Vec2::new(p.pos.x, projected_y.clamp(-goal_half_w, goal_half_w));
@@ -107,6 +137,31 @@ pub fn compute_goalkeeper_intent(
                 };
             }
         }
+    }
+
+    // High Aerial Cross / Corner Command Zone (`IMG_0365.jpeg`!): step out to pluck/punch high balls in the 6-yard area!
+    let cross_cmd_depth = Fp::from_milli(if is_5v5 { 5_600 } else { 7_200 });
+    if state.ball.owner.is_none()
+        && matches!(state.phase, MatchPhase::OpenPlay)
+        && state.ball.pos.z > Fp::from_milli(1_250)
+        && dist_ball_to_goal_x <= cross_cmd_depth
+        && ball_xy.y.abs() <= goal_half_w + Fp::from_milli(2_200)
+    {
+        let claim_xy = predict_ball_xy_at_ticks(state, 10);
+        let clamped_claim = Vec2::new(
+            if attack_sign > 0 {
+                claim_xy.x.clamp(own_goal_x + Fp::from_milli(600), own_goal_x + cross_cmd_depth)
+            } else {
+                claim_xy.x.clamp(own_goal_x - cross_cmd_depth, own_goal_x - Fp::from_milli(600))
+            },
+            claim_xy.y.clamp(-(goal_half_w + Fp::from_milli(1_800)), goal_half_w + Fp::from_milli(1_800)),
+        );
+        return AiMoveIntent {
+            move_dir: (clamped_claim - p.pos).normalize_or_zero(),
+            sprint: true,
+            jockey: false,
+            trigger_dive: None,
+        };
     }
 
     // Rush out if loose ball is inside the box or human triggers GK rush (`BTN_CALL_RUN`)
@@ -127,7 +182,6 @@ pub fn compute_goalkeeper_intent(
     }
 
     // Standard arc positioning bisecting ball-to-goal-center angle
-    let is_5v5 = state.format.players_per_side <= 6;
     let stand_off_mm = if dist_ball_to_goal_x < Fp::from_milli(11_000) {
         if is_5v5 { 1_300 } else { 1_500 }
     } else if dist_ball_to_goal_x < Fp::from_milli(22_000) {
