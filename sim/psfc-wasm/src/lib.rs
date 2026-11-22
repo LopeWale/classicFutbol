@@ -4,6 +4,7 @@
 //! (browsers and Node.js CI) read/write linear memory buffers via exported pointers.
 
 use psfc_sim::ai::generate_cpu_input;
+use psfc_sim::input::{BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_THROUGH};
 use psfc_sim::{
     CpuDifficulty, FixtureSnapshot, Fp, InputFrame, MatchPhase, MatchSimulation, PlayerActionState,
     SideController, TeamSide,
@@ -344,7 +345,7 @@ pub extern "C" fn sim_pack_render_state() -> usize {
         PACKED_STATE.with(|buf| {
             let mut out = buf.borrow_mut();
             out.clear();
-            out.reserve(20 + pps * 2 * 10);
+            out.reserve(26 + pps * 2 * 11);
             out.extend_from_slice(&[
                 st.tick as i32,
                 st.clock_ticks as i32,
@@ -423,7 +424,11 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                 }
                 -1
             };
-            // Trailing words `[spin_side_milli, spin_top_milli, home_aim_bam, away_aim_bam, home_next_switch_idx, away_next_switch_idx]`
+            // Trailing words:
+            // `[spin_side_milli, spin_top_milli, home_aim_bam, away_aim_bam, home_next_switch_idx, away_next_switch_idx,
+            //   ball_hold_and_touch_word, player_kinematic_cue[0 .. 2*pps]]`
+            let ball_hold_and_touch = ((i32::from(st.ball.gk_hold_ticks)) << 8)
+                | (i32::from(st.ball.dribble_touch_cd) & 0xFF);
             out.extend_from_slice(&[
                 st.ball.spin_side.to_milli() as i32,
                 st.ball.spin_top.to_milli() as i32,
@@ -437,7 +442,90 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                     .best_switch_target(TeamSide::Away)
                     .map(|i| i as i32)
                     .unwrap_or(-1),
+                ball_hold_and_touch,
             ]);
+            for side_players in &st.players {
+                for p in side_players {
+                    let (kick_kind, finesse, action_ticks, dir_bam, has_dir): (
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                        i32,
+                    ) = match p.action {
+                        PlayerActionState::Charging {
+                            button,
+                            ticks,
+                            finesse,
+                            aim,
+                        } => {
+                            let kind = if (button & BTN_SHOOT) != 0 {
+                                4
+                            } else if (button & BTN_LOB) != 0 {
+                                3
+                            } else if (button & BTN_THROUGH) != 0 {
+                                2
+                            } else if (button & BTN_PASS) != 0 {
+                                1
+                            } else {
+                                0
+                            };
+                            let (bam, hd) = if aim.len() > Fp::from_milli(100) {
+                                (aim.to_bam() as i32, 1)
+                            } else {
+                                (p.facing_bam as i32, 0)
+                            };
+                            (
+                                kind,
+                                i32::from(finesse),
+                                (ticks.min(255)) as i32,
+                                bam,
+                                hd,
+                            )
+                        }
+                        PlayerActionState::Tackling { ticks_left } => {
+                            (0, 0, i32::from(ticks_left), p.facing_bam as i32, 0)
+                        }
+                        PlayerActionState::Sliding { ticks_left, dir } => {
+                            let (bam, hd) = if dir.len() > Fp::from_milli(100) {
+                                (dir.to_bam() as i32, 1)
+                            } else {
+                                (p.facing_bam as i32, 0)
+                            };
+                            (0, 0, i32::from(ticks_left), bam, hd)
+                        }
+                        PlayerActionState::Diving { ticks_left, dir } => {
+                            let (bam, hd) = if dir.len() > Fp::from_milli(100) {
+                                (dir.to_bam() as i32, 1)
+                            } else {
+                                (p.facing_bam as i32, 0)
+                            };
+                            (0, 0, i32::from(ticks_left), bam, hd)
+                        }
+                        PlayerActionState::Stumbled { ticks_left }
+                        | PlayerActionState::Cooldown { ticks_left } => {
+                            (0, 0, i32::from(ticks_left), p.facing_bam as i32, 0)
+                        }
+                        PlayerActionState::SkillMove {
+                            ticks_left, dir, ..
+                        } => {
+                            let (bam, hd) = if dir.len() > Fp::from_milli(100) {
+                                (dir.to_bam() as i32, 1)
+                            } else {
+                                (p.facing_bam as i32, 0)
+                            };
+                            (0, 0, i32::from(ticks_left), bam, hd)
+                        }
+                        PlayerActionState::Normal => (0, 0, 0, p.facing_bam as i32, 0),
+                    };
+                    let cue = (kick_kind & 0x7)
+                        | ((finesse & 0x1) << 3)
+                        | ((action_ticks & 0xFF) << 4)
+                        | ((dir_bam & 0xFFFF) << 12)
+                        | ((has_dir & 0x1) << 28);
+                    out.push(cue);
+                }
+            }
             out.len()
         })
     })
