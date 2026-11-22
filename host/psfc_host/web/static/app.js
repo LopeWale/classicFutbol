@@ -428,6 +428,11 @@ const SCREEN_TITLES = {
 };
 
 function navigateTo(screen) {
+  if (screen !== "controllers" && calibState) {
+    calibState = null;
+    const banner = document.getElementById("pad-calib-banner");
+    if (banner) banner.hidden = true;
+  }
   if (currentScreen !== screen && currentScreen !== "match" && currentScreen !== "title") {
     previousScreen = currentScreen;
   }
@@ -544,70 +549,202 @@ function classifyGamepadVendor(idStr, btnCount = 16) {
   return "USB / BT GAMEPAD";
 }
 
+function extractGamepadVidPid(idStr) {
+  const s = String(idStr || "").toLowerCase();
+  let m = s.match(/vendor:\s*([0-9a-f]{1,4})\s+product:\s*([0-9a-f]{1,4})/);
+  if (m) return `${m[1].padStart(4, "0")}:${m[2].padStart(4, "0")}`;
+  m = s.match(/\b([0-9a-f]{4})[:\-]([0-9a-f]{4})\b/);
+  if (m) return `${m[1]}:${m[2]}`;
+  return null;
+}
+
+function doesBrowserPadMatchWebHid(browserPad, vPad) {
+  const bpVidPid = extractGamepadVidPid(browserPad.id);
+  if (bpVidPid && vPad._vidPid && vPad._vidPid !== "0000:0000") {
+    return bpVidPid === vPad._vidPid;
+  }
+  const bpName = String(browserPad.id || "").trim().toLowerCase();
+  if (vPad._prodName && vPad._prodName.length >= 3) {
+    if (bpName.includes(vPad._prodName) || (bpName.length >= 3 && vPad._prodName.includes(bpName))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 /**
  * Collect all connected browser Gamepads (safely skipping sparse `null` slots on macOS/Safari/Chrome)
- * plus any WebHID direct USB receiver pads.
+ * and append WebHID fallback pads ONLY for receivers not already exposed by `navigator.getGamepads()`.
+ * Preserving the browser Gamepad backend whenever present prevents counting one receiver twice, avoids
+ * ambiguous slot replacement across identical controllers, and retains full dual-stick / 16-button input.
  */
 function getConnectedPads() {
-  const out = [];
+  const browserPads = [];
   if (navigator.getGamepads) {
     try {
       const rawList = navigator.getGamepads();
       if (rawList) {
         for (let i = 0; i < rawList.length; i++) {
           const p = rawList[i];
-          if (p && p.connected) out.push(p);
+          if (p && p.connected) browserPads.push(p);
         }
       }
     } catch (_e) {
       // Ignore transient Gamepad API access error
     }
   }
+  const out = browserPads.slice();
+  const consumedBrowserSlots = new Set();
   for (let i = 0; i < webHidPads.length; i++) {
-    if (webHidPads[i].connected) out.push(webHidPads[i]);
+    const vPad = webHidPads[i];
+    if (!vPad.connected) continue;
+    let matchedSlot = -1;
+    if (vPad._vidPid && vPad._vidPid !== "0000:0000") {
+      for (let j = 0; j < browserPads.length; j++) {
+        if (!consumedBrowserSlots.has(j) && extractGamepadVidPid(browserPads[j].id) === vPad._vidPid) {
+          matchedSlot = j;
+          break;
+        }
+      }
+    }
+    if (matchedSlot < 0) {
+      for (let j = 0; j < browserPads.length; j++) {
+        if (!consumedBrowserSlots.has(j) && doesBrowserPadMatchWebHid(browserPads[j], vPad)) {
+          matchedSlot = j;
+          break;
+        }
+      }
+    }
+    if (matchedSlot >= 0) {
+      consumedBrowserSlots.add(matchedSlot);
+    } else {
+      out.push(vPad);
+    }
   }
   return out;
 }
 
 function decodeWebHidReport(vPad, bytes) {
   if (!bytes || bytes.length === 0) return;
-  if (!vPad._restBytes) {
-    vPad._restBytes = new Uint8Array(bytes);
-    vPad._centeredBytes = new Set();
-  }
-  const rest = vPad._restBytes;
-  for (let i = 0; i < bytes.length; i++) {
-    if (bytes[i] >= 0x70 && bytes[i] <= 0x8f) {
-      vPad._centeredBytes.add(i);
-    } else if (i < rest.length && !(rest[i] >= 0x70 && rest[i] <= 0x8f)) {
-      // Clear any bit that was held on packet 0 as soon as we observe 0 in that bit
-      rest[i] &= bytes[i];
-    }
+  if (bytes.length >= 7 && (bytes[5] & 0x0f) === 0x0f) {
+    vPad._isDragonRiseFormat = true;
   }
 
-  // Detect X/Y D-Pad byte pair on standard 7/8-byte USB SNES / DragonRise / Microntek HID reports (`0x00=-1, 0x7f/0x80=0, 0xff=+1`)
-  let axX = 0;
-  let axY = 0;
   const candidatePairs = [
     [0, 1],
     [3, 4],
     [2, 3],
     [1, 2],
   ];
-  const isAxisLikeByte = (idx) =>
-    vPad._centeredBytes.has(idx) ||
-    (bytes[idx] >= 0x70 && bytes[idx] <= 0x8f) ||
-    ((idx === 0 || idx === 1) && (bytes[idx] === 0x00 || bytes[idx] === 0xff));
+  const isCenterByte = (v) => v >= 0x70 && v <= 0x8f;
+  const isFirstPacket = !vPad._restBytes;
 
+  if (isFirstPacket) {
+    vPad._restBytes = new Uint8Array(bytes);
+    vPad._axisBytes = new Set();
+    vPad._sawCenterBytes = new Set();
+    vPad._constCenterBytes = new Set();
+    for (let i = 0; i < bytes.length; i++) {
+      if (isCenterByte(bytes[i])) {
+        vPad._constCenterBytes.add(i);
+        if (i <= 4) vPad._sawCenterBytes.add(i);
+      }
+    }
+  } else {
+    for (let i = 0; i < bytes.length; i++) {
+      if (isCenterByte(bytes[i])) {
+        if (i <= 4) vPad._sawCenterBytes.add(i);
+      } else {
+        vPad._constCenterBytes.delete(i);
+      }
+    }
+  }
+
+  if (vPad._isDragonRiseFormat) {
+    for (let i = 5; i < bytes.length; i++) {
+      vPad._axisBytes.delete(i);
+    }
+    for (let i = 0; i <= 4 && i < bytes.length; i++) {
+      if (isCenterByte(bytes[i])) {
+        vPad._axisBytes.add(i);
+      }
+    }
+  }
+
+  const hasAnyConfirmedPair = () => {
+    for (const [px, py] of candidatePairs) {
+      if (py < bytes.length && vPad._axisBytes.has(px) && vPad._axisBytes.has(py)) return true;
+    }
+    return false;
+  };
+
+  // Confirm any candidate X/Y pair once both bytes have been observed in the neutral center range
+  // (including disjoint trailing pairs that consume the entire report such as [128,128,128,128] and
+  // overlapping pairs such as [1,2] behind centered byte 0), while only blocking post-packet-0
+  // overlapping expansion when it would consume the final remaining button byte (e.g. [128,128,0] -> 0x80).
   for (const [ix, iy] of candidatePairs) {
-    if (iy < bytes.length && isAxisLikeByte(ix) && isAxisLikeByte(iy)) {
+    if (iy >= bytes.length) continue;
+    if (vPad._isDragonRiseFormat && iy >= 5) continue;
+    if (vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) continue;
+    const isOverlapping = vPad._axisBytes.has(ix) || vPad._axisBytes.has(iy);
+    const newBytesNeeded = (vPad._axisBytes.has(ix) ? 0 : 1) + (vPad._axisBytes.has(iy) ? 0 : 1);
+    if (
+      !isFirstPacket &&
+      isOverlapping &&
+      hasAnyConfirmedPair() &&
+      vPad._axisBytes.size + newBytesNeeded >= bytes.length
+    ) {
+      continue;
+    }
+
+    if (vPad._sawCenterBytes.has(ix) && vPad._sawCenterBytes.has(iy)) {
+      vPad._axisBytes.add(ix);
+      vPad._axisBytes.add(iy);
+    }
+  }
+
+  const rest = vPad._restBytes;
+  const isDragonRise = bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f);
+
+  // Detect X/Y D-Pad byte pair across standard & alternate HID axis offsets (`[0,1]`, `[3,4]`, `[2,3]`, `[1,2]`)
+  const isPrimaryWakeByte = (idx) =>
+    vPad._sawCenterBytes.has(idx) ||
+    isCenterByte(bytes[idx]) ||
+    bytes[idx] === 0x00 ||
+    bytes[idx] === 0xff;
+  let usedPrimaryWake = false;
+  let axX = 0;
+  let axY = 0;
+  let confirmedUsedConstPad = false;
+  for (const [ix, iy] of candidatePairs) {
+    if (iy < bytes.length && vPad._axisBytes.has(ix) && vPad._axisBytes.has(iy)) {
       const vx = (bytes[ix] - 127.5) / 127.5;
       const vy = (bytes[iy] - 127.5) / 127.5;
       if (Math.abs(vx) > 0.35 || Math.abs(vy) > 0.35 || (axX === 0 && axY === 0)) {
         axX = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
         axY = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
-        if (axX !== 0 || axY !== 0) break;
+        if (axX !== 0 || axY !== 0) {
+          confirmedUsedConstPad = ix === 1 && iy === 2 && vPad._constCenterBytes.has(2);
+          break;
+        }
       }
+    }
+  }
+  if (
+    ((axX === 0 && axY === 0) || confirmedUsedConstPad) &&
+    bytes.length >= 2 &&
+    !(vPad._axisBytes.has(0) && vPad._axisBytes.has(1)) &&
+    isPrimaryWakeByte(0) &&
+    isPrimaryWakeByte(1)
+  ) {
+    const vx = (bytes[0] - 127.5) / 127.5;
+    const vy = (bytes[1] - 127.5) / 127.5;
+    const wx = Math.abs(vx) > 0.35 ? Math.sign(vx) : 0;
+    const wy = Math.abs(vy) > 0.35 ? Math.sign(vy) : 0;
+    if (wx !== 0 || wy !== 0) {
+      axX = wx;
+      axY = wy;
+      usedPrimaryWake = true;
     }
   }
 
@@ -617,12 +754,8 @@ function decodeWebHidReport(vPad, bytes) {
     vPad.buttons[i].value = 0;
   }
 
-  if (bytes.length >= 7 && (bytes[5] & 0x0f) === 0x0f) {
-    vPad._isDragonRiseFormat = true;
-  }
-
   // Standard DragonRise / Microntek USB SNES (`byte[5]` upper nibble = buttons 0..3, lower nibble = hat; `byte[6]` = L, R, Select, Start)
-  if (bytes.length >= 7 && (vPad._isDragonRiseFormat || (rest[5] & 0x0f) === 0x0f)) {
+  if (isDragonRise) {
     const b5 = bytes[5];
     const b6 = bytes[6];
     for (let k = 0; k < 4; k++) {
@@ -667,13 +800,19 @@ function decodeWebHidReport(vPad, bytes) {
       setBtn(9, (b6 & 0x08) !== 0);
     }
   } else {
-    // Generic fallback: map changed non-axis bit positions against resting HID report
+    // Generic fallback: decode all non-axis, non-constant-centered-padding bytes from byte 0 onward
     const activeBits = [];
     for (let bi = 0; bi < bytes.length; bi++) {
-      if (vPad._centeredBytes.has(bi) || (rest[bi] >= 0x70 && rest[bi] <= 0x8f)) continue;
-      const diff = bytes[bi] & ~rest[bi];
+      if (vPad._axisBytes.has(bi) || vPad._constCenterBytes.has(bi)) continue;
+      if (usedPrimaryWake && (bi === 0 || bi === 1)) continue;
+      if (bi < rest.length) {
+        // Clear any bit that was held on packet 0 as soon as 0 is observed in that bit
+        rest[bi] &= bytes[bi];
+      }
+      const baseByte = bi < rest.length ? rest[bi] : 0;
+      const diff = bytes[bi] & ~baseByte;
       for (let bit = 0; bit < 8; bit++) {
-        if (((rest[bi] >>> bit) & 1) === 0) {
+        if (((baseByte >>> bit) & 1) === 0) {
           activeBits.push(((diff >>> bit) & 1) === 1);
         }
       }
@@ -714,10 +853,20 @@ async function pairWebHidUsbReceiver() {
       ],
     });
     for (const dev of devices) {
-      if (webHidPads.some((p) => p._dev === dev)) continue;
+      const existing = webHidPads.find((p) => p._dev === dev);
+      if (existing) {
+        if (!dev.opened) await dev.open();
+        existing.connected = true;
+        existing._restBytes = null;
+        existing._axisBytes = null;
+        existing._sawCenterBytes = null;
+        existing._constCenterBytes = null;
+        continue;
+      }
       if (!dev.opened) await dev.open();
+      const vidPid = `${hex4(dev.vendorId)}:${hex4(dev.productId)}`;
       const vPad = {
-        id: `${dev.productName || "USB SNES Receiver"} (${hex4(dev.vendorId)}:${hex4(dev.productId)})`,
+        id: `${dev.productName || "USB SNES Receiver"} (${vidPid})`,
         index: 100 + webHidPads.length,
         connected: true,
         mapping: "",
@@ -725,8 +874,12 @@ async function pairWebHidUsbReceiver() {
         buttons: Array.from({ length: 10 }, () => ({ pressed: false, value: 0 })),
         _dev: dev,
         _isWebHid: true,
+        _vidPid: vidPid,
+        _prodName: String(dev.productName || "").trim().toLowerCase(),
         _restBytes: null,
-        _centeredBytes: null,
+        _axisBytes: null,
+        _sawCenterBytes: null,
+        _constCenterBytes: null,
         _isDragonRiseFormat: false,
         _uses10BtnMeta: false,
       };
@@ -746,7 +899,15 @@ async function pairWebHidUsbReceiver() {
 if (navigator.hid && typeof navigator.hid.addEventListener === "function") {
   navigator.hid.addEventListener("disconnect", (ev) => {
     for (const p of webHidPads) {
-      if (p._dev === ev.device) p.connected = false;
+      if (p._dev === ev.device) {
+        p.connected = false;
+        p.axes[0] = 0;
+        p.axes[1] = 0;
+        for (let bi = 0; bi < p.buttons.length; bi++) {
+          p.buttons[bi].pressed = false;
+          p.buttons[bi].value = 0;
+        }
+      }
     }
     updateGamepadBadges();
   });
@@ -1060,7 +1221,7 @@ function sampleRawGamepad(logicalSlot) {
     profile === "snes_std" ||
     (profile === "auto" && snesDetected && pad.mapping === "standard");
   const isSnesMode = isSnesUsb || isSnesStd || (useCustom && snesDetected);
-  const isSwitchSwap = profile === "switch" || isSnesStd;
+  const isSwitchSwap = profile === "switch";
   const isDirectInput =
     profile === "dinput" ||
     (profile === "auto" &&
@@ -1181,18 +1342,30 @@ function sampleRawGamepad(logicalSlot) {
       r2 = btnCount >= 10 && b(7);
       selectBtn = b(8) || (btnCount <= 9 && b(6));
       startBtn = b(9) || (btnCount <= 9 && b(7));
-    } else if (isSwitchSwap) {
-      // Physical Nintendo/SNES label match: Bottom `B` = Pass (`b(0)`), Right `A` = Shoot (`b(1)`), Left `Y` = Lob (`b(2)`), Top `X` = Through (`b(3)`)
+    } else if (isSnesStd) {
+      // W3C Standard-Mapped Bluetooth SNES (`057e:2017` / SN30): Positional Bottom `B` = Pass (`b(0)`), Right `A` = Shoot (`b(1)`), Left `Y` = Lob (`b(2)`), Top `X` = Through (`b(3)`)
       south = b(0);
       east = b(1);
       west = b(2);
       north = b(3);
       l1 = b(4);
       r1 = b(5);
-      l2 = !isSnesMode && trig(6);
-      r2 = !isSnesMode && trig(7);
-      selectBtn = b(8) || (isSnesMode && btnCount <= 9 && b(6));
-      startBtn = b(9) || (isSnesMode && btnCount <= 9 && b(7));
+      l2 = false;
+      r2 = false;
+      selectBtn = b(8) || (btnCount <= 9 && b(6));
+      startBtn = b(9) || (btnCount <= 9 && b(7));
+    } else if (isSwitchSwap) {
+      // Explicit Nintendo Switch Pro ("Swap A-B / X-Y"): swap 0<->1 and 2<->3
+      south = b(1);
+      east = b(0);
+      west = b(3);
+      north = b(2);
+      l1 = b(4);
+      r1 = b(5);
+      l2 = trig(6);
+      r2 = trig(7);
+      selectBtn = b(8);
+      startBtn = b(9);
     } else if (isDirectInput) {
       south = b(1);
       east = b(2);
@@ -1621,7 +1794,7 @@ function sampleAnyMenuGamepad() {
 }
 
 function pollGamepadMenuActions(nowMs) {
-  if (calibState) return; // Don't navigate screens while calibrating buttons!
+  if (calibState && currentScreen === "controllers") return; // Don't navigate screens while calibrating buttons!
   const gp = sampleAnyMenuGamepad();
   if (!gp) {
     prevStartBtn = false;
