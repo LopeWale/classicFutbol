@@ -111,23 +111,46 @@ class ProposalGate:
         # the score matches, while continuing to reject imports for played fixtures.
         if fx["state"] == "accepted" and fx["result_source"] == "imported" and events:
             existing_acc = self.store.get_accepted_result(fixture_id)
-            has_recorded_events = (
-                self.store.conn.execute(
-                    """
-                    SELECT 1 FROM world_event
-                    WHERE world_id = ? AND aggregate_id = ? AND type = 'imported_match_events_recorded'
-                    LIMIT 1
-                    """,
-                    (world_id, fixture_id),
-                ).fetchone()
-                is not None
+            latest_ev_row = self.store.conn.execute(
+                """
+                SELECT seq, payload_json FROM world_event
+                WHERE world_id = ? AND aggregate_id = ? AND type = 'imported_match_events_recorded'
+                ORDER BY seq DESC
+                LIMIT 1
+                """,
+                (world_id, fixture_id),
+            ).fetchone()
+
+            def _goal_event_count(ev_list: list[dict[str, Any]]) -> int:
+                return sum(
+                    1
+                    for e in ev_list
+                    if str(e.get("event_type") or e.get("type") or "")
+                    .strip()
+                    .lower()
+                    .replace("_", "")
+                    .replace("-", "")
+                    == "goal"
+                )
+
+            expected_goals = home_goals + away_goals
+            prev_events = (
+                json.loads(latest_ev_row["payload_json"]).get("events", [])
+                if latest_ev_row is not None
+                else []
+            )
+            prev_goal_count = _goal_event_count(prev_events)
+            new_goal_count = _goal_event_count(events)
+            can_enrich = latest_ev_row is None or (
+                prev_goal_count < expected_goals
+                and prev_goal_count < new_goal_count <= expected_goals
             )
             if (
                 existing_acc is not None
                 and existing_acc.get("source") == "imported"
                 and int(existing_acc["home_goals"]) == home_goals
                 and int(existing_acc["away_goals"]) == away_goals
-                and not has_recorded_events
+                and can_enrich
             ):
                 ts = utc_now_iso()
                 prop = self._record_proposal(
@@ -152,6 +175,7 @@ class ProposalGate:
                     },
                     caused_by=f"ingest:{provider}",
                     occurred_at=ts,
+                    supersedes_seq=int(latest_ev_row["seq"]) if latest_ev_row is not None else None,
                     commit=True,
                 )
                 return prop
@@ -251,7 +275,7 @@ class ProposalGate:
             "UPDATE fixture SET state = 'accepted' WHERE id = ?",
             (fixture_id,),
         )
-        self.store.conn.commit()
+        self.store.commit()
         return prop
 
     def submit_transfer_import(
@@ -293,9 +317,13 @@ class ProposalGate:
             new_shirt=new_shirt,
         )
         # Keep in-memory default catalogue synced as well when applicable
-        if any(
-            m.footballer_id == footballer_id and m.effective_to is None
-            for m in self.catalogue.clubs[from_club_id].squad
+        if (
+            from_club_id in self.catalogue.clubs
+            and to_club_id in self.catalogue.clubs
+            and any(
+                m.footballer_id == footballer_id and m.effective_to is None
+                for m in self.catalogue.clubs[from_club_id].squad
+            )
         ):
             self.catalogue.record_transfer(
                 footballer_id=footballer_id,

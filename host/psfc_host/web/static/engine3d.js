@@ -212,60 +212,829 @@ const KIT_CATALOGUE = {
     },
     banner: "STAMFORD BRIDGE · SHED END",
   },
+  "man-city": {
+    home: {
+      shirt: "#6cabdd",
+      sleeves: "#6cabdd",
+      trim: "#ffffff",
+      shorts: "#ffffff",
+      shortsStripe: "#6cabdd",
+      socks: "#6cabdd",
+      sockBand: "#ffffff",
+      numberColor: "#1e293b",
+      numberOutline: "#ffffff",
+      pattern: "shoulder_stripes",
+      boots: "#0f172a",
+      bootAccent: "#38bdf8",
+    },
+    away: {
+      shirt: "#111827",
+      sleeves: "#111827",
+      trim: "#facc15",
+      shorts: "#111827",
+      shortsStripe: "#ef4444",
+      socks: "#111827",
+      sockBand: "#facc15",
+      numberColor: "#facc15",
+      numberOutline: "#000000",
+      pattern: "pinstripes",
+      boots: "#facc15",
+      bootAccent: "#111827",
+    },
+    gk: {
+      shirt: "#22c55e",
+      sleeves: "#16a34a",
+      trim: "#ffffff",
+      shorts: "#14532d",
+      shortsStripe: "#4ade80",
+      socks: "#22c55e",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#14532d",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#22c55e",
+    },
+    banner: "ETIHAD STADIUM · SOUTH STAND",
+  },
+  brighton: {
+    home: {
+      shirt: "#0057b8",
+      sleeves: "#0057b8",
+      trim: "#ffffff",
+      shorts: "#ffffff",
+      shortsStripe: "#0057b8",
+      socks: "#0057b8",
+      sockBand: "#ffffff",
+      numberColor: "#facc15",
+      numberOutline: "#0f172a",
+      pattern: "vertical_stripes",
+      boots: "#0f172a",
+      bootAccent: "#38bdf8",
+    },
+    away: {
+      shirt: "#facc15",
+      sleeves: "#facc15",
+      trim: "#0f172a",
+      shorts: "#0f172a",
+      shortsStripe: "#facc15",
+      socks: "#facc15",
+      sockBand: "#0f172a",
+      numberColor: "#0f172a",
+      numberOutline: "#ffffff",
+      pattern: "pinstripes",
+      boots: "#0f172a",
+      bootAccent: "#facc15",
+    },
+    gk: {
+      shirt: "#ec4899",
+      sleeves: "#db2777",
+      trim: "#ffffff",
+      shorts: "#831843",
+      shortsStripe: "#f472b6",
+      socks: "#ec4899",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#831843",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#f472b6",
+    },
+    banner: "AMEX STADIUM · NORTH STAND",
+  },
+  bournemouth: {
+    home: {
+      shirt: "#da291c",
+      sleeves: "#111827",
+      trim: "#111827",
+      shorts: "#111827",
+      shortsStripe: "#da291c",
+      socks: "#111827",
+      sockBand: "#da291c",
+      numberColor: "#ffffff",
+      numberOutline: "#000000",
+      pattern: "vertical_stripes",
+      boots: "#111827",
+      bootAccent: "#ef4444",
+    },
+    away: {
+      shirt: "#f8fafc",
+      sleeves: "#f8fafc",
+      trim: "#7c3aed",
+      shorts: "#312e81",
+      shortsStripe: "#f8fafc",
+      socks: "#f8fafc",
+      sockBand: "#7c3aed",
+      numberColor: "#1e1b4b",
+      numberOutline: "#ffffff",
+      pattern: "chevron_subtle",
+      boots: "#312e81",
+      bootAccent: "#ffffff",
+    },
+    gk: {
+      shirt: "#10b981",
+      sleeves: "#059669",
+      trim: "#ffffff",
+      shorts: "#064e3b",
+      shortsStripe: "#34d399",
+      socks: "#10b981",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#064e3b",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#10b981",
+    },
+    banner: "VITALITY STADIUM · DEAN COURT",
+  },
+  leeds: {
+    home: {
+      shirt: "#f8fafc",
+      sleeves: "#f8fafc",
+      trim: "#1d428a",
+      shorts: "#f8fafc",
+      shortsStripe: "#ffcd00",
+      socks: "#f8fafc",
+      sockBand: "#1d428a",
+      numberColor: "#1d428a",
+      numberOutline: "#ffffff",
+      pattern: "shoulder_stripes",
+      boots: "#0f172a",
+      bootAccent: "#ffcd00",
+    },
+    away: {
+      shirt: "#1d428a",
+      sleeves: "#1d428a",
+      trim: "#ffcd00",
+      shorts: "#1d428a",
+      shortsStripe: "#ffcd00",
+      socks: "#1d428a",
+      sockBand: "#ffcd00",
+      numberColor: "#ffcd00",
+      numberOutline: "#0f172a",
+      pattern: "pinstripes",
+      boots: "#ffcd00",
+      bootAccent: "#1d428a",
+    },
+    gk: {
+      shirt: "#f97316",
+      sleeves: "#ea580c",
+      trim: "#ffffff",
+      shorts: "#7c2d12",
+      shortsStripe: "#fb923c",
+      socks: "#f97316",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#7c2d12",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#fb923c",
+    },
+    banner: "ELLAND ROAD · KOP STAND",
+  },
+  everton: {
+    home: {
+      shirt: "#003399",
+      sleeves: "#003399",
+      trim: "#ffffff",
+      shorts: "#ffffff",
+      shortsStripe: "#003399",
+      socks: "#ffffff",
+      sockBand: "#003399",
+      numberColor: "#ffffff",
+      numberOutline: "#0f172a",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#3b82f6",
+    },
+    away: {
+      shirt: "#fef08a",
+      sleeves: "#fef08a",
+      trim: "#1e3a8a",
+      shorts: "#1e3a8a",
+      shortsStripe: "#fef08a",
+      socks: "#fef08a",
+      sockBand: "#1e3a8a",
+      numberColor: "#1e3a8a",
+      numberOutline: "#ffffff",
+      pattern: "chevron_subtle",
+      boots: "#1e3a8a",
+      bootAccent: "#fef08a",
+    },
+    gk: {
+      shirt: "#22c55e",
+      sleeves: "#15803d",
+      trim: "#ffffff",
+      shorts: "#14532d",
+      shortsStripe: "#4ade80",
+      socks: "#22c55e",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#14532d",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#4ade80",
+    },
+    banner: "BRAMLEY-MOORE DOCK · MERSEYSIDE",
+  },
+  tottenham: {
+    home: {
+      shirt: "#f8fafc",
+      sleeves: "#132257",
+      trim: "#132257",
+      shorts: "#132257",
+      shortsStripe: "#ffffff",
+      socks: "#f8fafc",
+      sockBand: "#132257",
+      numberColor: "#132257",
+      numberOutline: "#ffffff",
+      pattern: "solid",
+      boots: "#132257",
+      bootAccent: "#ffffff",
+    },
+    away: {
+      shirt: "#0f172a",
+      sleeves: "#0f172a",
+      trim: "#38bdf8",
+      shorts: "#0f172a",
+      shortsStripe: "#38bdf8",
+      socks: "#0f172a",
+      sockBand: "#38bdf8",
+      numberColor: "#38bdf8",
+      numberOutline: "#000000",
+      pattern: "pinstripes",
+      boots: "#38bdf8",
+      bootAccent: "#0f172a",
+    },
+    gk: {
+      shirt: "#eab308",
+      sleeves: "#ca8a04",
+      trim: "#132257",
+      shorts: "#713f12",
+      shortsStripe: "#fde047",
+      socks: "#eab308",
+      sockBand: "#132257",
+      numberColor: "#132257",
+      numberOutline: "#ffffff",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#fde047",
+    },
+    banner: "NORTH LONDON · SOUTH STAND",
+  },
+  brentford: {
+    home: {
+      shirt: "#e30613",
+      sleeves: "#ffffff",
+      trim: "#ffffff",
+      shorts: "#111827",
+      shortsStripe: "#e30613",
+      socks: "#e30613",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#111827",
+      pattern: "vertical_stripes",
+      boots: "#111827",
+      bootAccent: "#ffffff",
+    },
+    away: {
+      shirt: "#38bdf8",
+      sleeves: "#38bdf8",
+      trim: "#0f172a",
+      shorts: "#0f172a",
+      shortsStripe: "#38bdf8",
+      socks: "#38bdf8",
+      sockBand: "#0f172a",
+      numberColor: "#0f172a",
+      numberOutline: "#ffffff",
+      pattern: "pinstripes",
+      boots: "#0f172a",
+      bootAccent: "#38bdf8",
+    },
+    gk: {
+      shirt: "#a855f7",
+      sleeves: "#7e22ce",
+      trim: "#ffffff",
+      shorts: "#3b0764",
+      shortsStripe: "#c084fc",
+      socks: "#a855f7",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#3b0764",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#c084fc",
+    },
+    banner: "GTECH COMMUNITY STADIUM · WEST LONDON",
+  },
+  "aston-villa": {
+    home: {
+      shirt: "#670e36",
+      sleeves: "#95bfe5",
+      trim: "#95bfe5",
+      shorts: "#ffffff",
+      shortsStripe: "#670e36",
+      socks: "#95bfe5",
+      sockBand: "#670e36",
+      numberColor: "#ffffff",
+      numberOutline: "#0f172a",
+      pattern: "arsenal_sleeves",
+      boots: "#111827",
+      bootAccent: "#95bfe5",
+    },
+    away: {
+      shirt: "#f8fafc",
+      sleeves: "#f8fafc",
+      trim: "#670e36",
+      shorts: "#670e36",
+      shortsStripe: "#95bfe5",
+      socks: "#f8fafc",
+      sockBand: "#670e36",
+      numberColor: "#670e36",
+      numberOutline: "#ffffff",
+      pattern: "pinstripes",
+      boots: "#670e36",
+      bootAccent: "#ffffff",
+    },
+    gk: {
+      shirt: "#10b981",
+      sleeves: "#059669",
+      trim: "#ffffff",
+      shorts: "#064e3b",
+      shortsStripe: "#34d399",
+      socks: "#10b981",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#064e3b",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#34d399",
+    },
+    banner: "VILLA PARK · HOLTE END",
+  },
+  newcastle: {
+    home: {
+      shirt: "#18181b",
+      sleeves: "#18181b",
+      trim: "#ffffff",
+      shorts: "#18181b",
+      shortsStripe: "#ffffff",
+      socks: "#18181b",
+      sockBand: "#ffffff",
+      numberColor: "#ef4444",
+      numberOutline: "#ffffff",
+      pattern: "vertical_stripes",
+      boots: "#111827",
+      bootAccent: "#ffffff",
+    },
+    away: {
+      shirt: "#047857",
+      sleeves: "#047857",
+      trim: "#ffffff",
+      shorts: "#ffffff",
+      shortsStripe: "#047857",
+      socks: "#047857",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#064e3b",
+      pattern: "shoulder_stripes",
+      boots: "#064e3b",
+      bootAccent: "#ffffff",
+    },
+    gk: {
+      shirt: "#38bdf8",
+      sleeves: "#0284c7",
+      trim: "#ffffff",
+      shorts: "#0c4a6e",
+      shortsStripe: "#38bdf8",
+      socks: "#38bdf8",
+      sockBand: "#ffffff",
+      numberColor: "#0f172a",
+      numberOutline: "#ffffff",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#38bdf8",
+    },
+    banner: "ST JAMES' PARK · GALLOWGATE END",
+  },
+  coventry: {
+    home: {
+      shirt: "#0593d0",
+      sleeves: "#0593d0",
+      trim: "#ffffff",
+      shorts: "#0593d0",
+      shortsStripe: "#ffffff",
+      socks: "#ffffff",
+      sockBand: "#0593d0",
+      numberColor: "#ffffff",
+      numberOutline: "#0f172a",
+      pattern: "chevron_subtle",
+      boots: "#0f172a",
+      bootAccent: "#38bdf8",
+    },
+    away: {
+      shirt: "#1e1b4b",
+      sleeves: "#1e1b4b",
+      trim: "#38bdf8",
+      shorts: "#1e1b4b",
+      shortsStripe: "#38bdf8",
+      socks: "#1e1b4b",
+      sockBand: "#38bdf8",
+      numberColor: "#ffffff",
+      numberOutline: "#000000",
+      pattern: "pinstripes",
+      boots: "#38bdf8",
+      bootAccent: "#1e1b4b",
+    },
+    gk: {
+      shirt: "#f59e0b",
+      sleeves: "#d97706",
+      trim: "#111827",
+      shorts: "#78350f",
+      shortsStripe: "#fbbf24",
+      socks: "#f59e0b",
+      sockBand: "#111827",
+      numberColor: "#111827",
+      numberOutline: "#ffffff",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#fbbf24",
+    },
+    banner: "CBS ARENA · SKY BLUE ARMY",
+  },
+  hull: {
+    home: {
+      shirt: "#f5a12d",
+      sleeves: "#111827",
+      trim: "#111827",
+      shorts: "#111827",
+      shortsStripe: "#f5a12d",
+      socks: "#f5a12d",
+      sockBand: "#111827",
+      numberColor: "#ffffff",
+      numberOutline: "#111827",
+      pattern: "vertical_stripes",
+      boots: "#111827",
+      bootAccent: "#f5a12d",
+    },
+    away: {
+      shirt: "#f8fafc",
+      sleeves: "#f8fafc",
+      trim: "#f5a12d",
+      shorts: "#111827",
+      shortsStripe: "#f5a12d",
+      socks: "#f8fafc",
+      sockBand: "#f5a12d",
+      numberColor: "#111827",
+      numberOutline: "#ffffff",
+      pattern: "pinstripes",
+      boots: "#111827",
+      bootAccent: "#f5a12d",
+    },
+    gk: {
+      shirt: "#14b8a6",
+      sleeves: "#0d9488",
+      trim: "#ffffff",
+      shorts: "#134e4a",
+      shortsStripe: "#2dd4bf",
+      socks: "#14b8a6",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#134e4a",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#2dd4bf",
+    },
+    banner: "MKM STADIUM · THE TIGERS",
+  },
+  fulham: {
+    home: {
+      shirt: "#f8fafc",
+      sleeves: "#f8fafc",
+      trim: "#111827",
+      shorts: "#111827",
+      shortsStripe: "#ef4444",
+      socks: "#f8fafc",
+      sockBand: "#111827",
+      numberColor: "#111827",
+      numberOutline: "#ffffff",
+      pattern: "shoulder_stripes",
+      boots: "#111827",
+      bootAccent: "#ef4444",
+    },
+    away: {
+      shirt: "#dc2626",
+      sleeves: "#111827",
+      trim: "#111827",
+      shorts: "#dc2626",
+      shortsStripe: "#111827",
+      socks: "#111827",
+      sockBand: "#dc2626",
+      numberColor: "#ffffff",
+      numberOutline: "#111827",
+      pattern: "vertical_stripes",
+      boots: "#111827",
+      bootAccent: "#dc2626",
+    },
+    gk: {
+      shirt: "#eab308",
+      sleeves: "#ca8a04",
+      trim: "#111827",
+      shorts: "#713f12",
+      shortsStripe: "#fde047",
+      socks: "#eab308",
+      sockBand: "#111827",
+      numberColor: "#111827",
+      numberOutline: "#ffffff",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#fde047",
+    },
+    banner: "CRAVEN COTTAGE · HAMMERSMITH END",
+  },
+  ipswich: {
+    home: {
+      shirt: "#3a64a3",
+      sleeves: "#3a64a3",
+      trim: "#ffffff",
+      shorts: "#ffffff",
+      shortsStripe: "#3a64a3",
+      socks: "#3a64a3",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#0f172a",
+      pattern: "pinstripes",
+      boots: "#111827",
+      bootAccent: "#ffffff",
+    },
+    away: {
+      shirt: "#7f1d1d",
+      sleeves: "#7f1d1d",
+      trim: "#fbbf24",
+      shorts: "#7f1d1d",
+      shortsStripe: "#fbbf24",
+      socks: "#7f1d1d",
+      sockBand: "#fbbf24",
+      numberColor: "#fbbf24",
+      numberOutline: "#000000",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#fbbf24",
+    },
+    gk: {
+      shirt: "#22c55e",
+      sleeves: "#16a34a",
+      trim: "#ffffff",
+      shorts: "#14532d",
+      shortsStripe: "#4ade80",
+      socks: "#22c55e",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#14532d",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#4ade80",
+    },
+    banner: "PORTMAN ROAD · SIR BOBBY ROBSON STAND",
+  },
+  "nottm-forest": {
+    home: {
+      shirt: "#dd0000",
+      sleeves: "#dd0000",
+      trim: "#ffffff",
+      shorts: "#ffffff",
+      shortsStripe: "#dd0000",
+      socks: "#dd0000",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#450a0a",
+      pattern: "shoulder_stripes",
+      boots: "#111827",
+      bootAccent: "#ffffff",
+    },
+    away: {
+      shirt: "#1e3a8a",
+      sleeves: "#1e3a8a",
+      trim: "#38bdf8",
+      shorts: "#1e3a8a",
+      shortsStripe: "#38bdf8",
+      socks: "#1e3a8a",
+      sockBand: "#38bdf8",
+      numberColor: "#ffffff",
+      numberOutline: "#0f172a",
+      pattern: "chevron_subtle",
+      boots: "#38bdf8",
+      bootAccent: "#1e3a8a",
+    },
+    gk: {
+      shirt: "#eab308",
+      sleeves: "#ca8a04",
+      trim: "#111827",
+      shorts: "#713f12",
+      shortsStripe: "#fde047",
+      socks: "#eab308",
+      sockBand: "#111827",
+      numberColor: "#111827",
+      numberOutline: "#ffffff",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#fde047",
+    },
+    banner: "THE CITY GROUND · TRENT END",
+  },
+  sunderland: {
+    home: {
+      shirt: "#eb172b",
+      sleeves: "#ffffff",
+      trim: "#ffffff",
+      shorts: "#111827",
+      shortsStripe: "#eb172b",
+      socks: "#111827",
+      sockBand: "#eb172b",
+      numberColor: "#111827",
+      numberOutline: "#ffffff",
+      pattern: "vertical_stripes",
+      boots: "#111827",
+      bootAccent: "#eb172b",
+    },
+    away: {
+      shirt: "#f8fafc",
+      sleeves: "#f8fafc",
+      trim: "#0284c7",
+      shorts: "#0c4a6e",
+      shortsStripe: "#f8fafc",
+      socks: "#f8fafc",
+      sockBand: "#0284c7",
+      numberColor: "#0c4a6e",
+      numberOutline: "#ffffff",
+      pattern: "chevron_subtle",
+      boots: "#0c4a6e",
+      bootAccent: "#ffffff",
+    },
+    gk: {
+      shirt: "#10b981",
+      sleeves: "#059669",
+      trim: "#ffffff",
+      shorts: "#064e3b",
+      shortsStripe: "#34d399",
+      socks: "#10b981",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#064e3b",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#34d399",
+    },
+    banner: "STADIUM OF LIGHT · ROKER END",
+  },
+  "crystal-palace": {
+    home: {
+      shirt: "#1b458f",
+      sleeves: "#c4122e",
+      trim: "#c4122e",
+      shorts: "#1b458f",
+      shortsStripe: "#c4122e",
+      socks: "#1b458f",
+      sockBand: "#c4122e",
+      numberColor: "#ffffff",
+      numberOutline: "#0f172a",
+      pattern: "vertical_stripes",
+      boots: "#111827",
+      bootAccent: "#c4122e",
+    },
+    away: {
+      shirt: "#facc15",
+      sleeves: "#facc15",
+      trim: "#1b458f",
+      shorts: "#1b458f",
+      shortsStripe: "#facc15",
+      socks: "#facc15",
+      sockBand: "#1b458f",
+      numberColor: "#1b458f",
+      numberOutline: "#ffffff",
+      pattern: "pinstripes",
+      boots: "#1b458f",
+      bootAccent: "#facc15",
+    },
+    gk: {
+      shirt: "#22c55e",
+      sleeves: "#16a34a",
+      trim: "#ffffff",
+      shorts: "#14532d",
+      shortsStripe: "#4ade80",
+      socks: "#22c55e",
+      sockBand: "#ffffff",
+      numberColor: "#ffffff",
+      numberOutline: "#14532d",
+      pattern: "solid",
+      boots: "#111827",
+      bootAccent: "#4ade80",
+    },
+    banner: "SELHURST PARK · HOLMESDALE ROAD",
+  },
 };
 
 const SKIN_TONES = ["#f4cfb0", "#e8b98e", "#d19968", "#9e663d", "#6a3f23", "#4c2b17"];
 const HAIR_COLORS = ["#141416", "#2b1d12", "#4a321f", "#7c5329", "#d4a959", "#1f242d"];
 
-// FIFA 11 "Personality+" Likeness & Somatotype Builds ("lean" | "athletic" | "power")
+// FIFA 11 "Personality+" Likeness & Somatotype Builds ("lean" | "athletic" | "power") — 2026–27 + Historical Squads
 const PLAYER_LIKENESS = {
-  "mun-gk-1": { skin: 5, hair: 0, style: "fade", beard: true, build: "power" }, // Onana
-  "mun-def-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "athletic" }, // Martinez
-  "mun-def-2": { skin: 1, hair: 1, style: "fade", beard: true, build: "athletic" },
-  "mun-def-3": { skin: 0, hair: 2, style: "swept", beard: false, build: "power" },
-  "mun-def-4": { skin: 1, hair: 2, style: "crop", beard: true, build: "athletic" },
-  "mun-mid-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "lean" }, // Bruno
-  "mun-mid-2": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // Mainoo
-  "mun-mid-3": { skin: 2, hair: 0, style: "crop", beard: false, build: "power" }, // Casemiro
-  "mun-fwd-1": { skin: 4, hair: 0, style: "fade", beard: true, build: "lean" }, // Rashford
-  "mun-fwd-2": { skin: 0, hair: 4, style: "swept", beard: false, build: "lean" }, // Garnacho
-  "mun-fwd-3": { skin: 0, hair: 4, style: "swept", beard: false, build: "power" }, // Hojlund
+  // Manchester United (2026–27 Active)
+  "mun-gk-2": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // S. Lammens #1
+  "mun-def-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "athletic" }, // L. Martinez #6
+  "mun-def-2": { skin: 1, hair: 1, style: "fade", beard: true, build: "athletic" }, // D. Dalot #2
+  "mun-def-3": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // M. de Ligt #4
+  "mun-def-5": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // L. Yoro #15
+  "mun-mid-1": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // K. Mainoo #37
+  "mun-mid-2": { skin: 1, hair: 1, style: "crop", beard: true, build: "lean" }, // B. Fernandes #8
+  "mun-mid-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // Y. Tielemans #18
+  "mun-fwd-4": { skin: 2, hair: 0, style: "fade", beard: true, build: "athletic" }, // M. Cunha #10
+  "mun-fwd-5": { skin: 5, hair: 0, style: "buzz", beard: true, build: "power" }, // B. Mbeumo #19
+  "mun-fwd-6": { skin: 0, hair: 2, style: "crop", beard: false, build: "power" }, // B. Sesko #30
 
-  "ars-gk-1": { skin: 1, hair: 1, style: "fade", beard: true, build: "athletic" }, // Raya
-  "ars-def-1": { skin: 4, hair: 0, style: "buzz", beard: false, build: "power" }, // Saliba
-  "ars-def-2": { skin: 3, hair: 0, style: "crop", beard: true, build: "power" }, // Gabriel
-  "ars-def-3": { skin: 1, hair: 2, style: "swept", beard: true, build: "athletic" }, // White
-  "ars-def-4": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" }, // Timber
-  "ars-mid-1": { skin: 0, hair: 4, style: "swept", beard: true, build: "lean" }, // Odegaard
-  "ars-mid-2": { skin: 0, hair: 2, style: "swept", beard: false, build: "power" }, // Rice
-  "ars-mid-3": { skin: 4, hair: 0, style: "fade", beard: true, build: "power" }, // Partey
-  "ars-fwd-1": { skin: 5, hair: 0, style: "curls", beard: false, build: "lean" }, // Saka
-  "ars-fwd-2": { skin: 0, hair: 2, style: "swept", beard: false, build: "athletic" }, // Havertz
-  "ars-fwd-3": { skin: 1, hair: 1, style: "crop", beard: false, build: "lean" }, // Martinelli
+  // Arsenal (2026–27 Active)
+  "ars-gk-1": { skin: 1, hair: 1, style: "fade", beard: true, build: "athletic" }, // D. Raya #1
+  "ars-def-1": { skin: 4, hair: 0, style: "buzz", beard: false, build: "power" }, // W. Saliba #2
+  "ars-def-3": { skin: 3, hair: 0, style: "crop", beard: true, build: "power" }, // Gabriel #6
+  "ars-def-5": { skin: 0, hair: 1, style: "headband", beard: false, build: "athletic" }, // R. Calafiori #33
+  "ars-def-4": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" }, // J. Timber #12
+  "ars-mid-1": { skin: 0, hair: 2, style: "swept", beard: false, build: "power" }, // D. Rice #41
+  "ars-mid-2": { skin: 0, hair: 4, style: "swept", beard: true, build: "lean" }, // M. Odegaard #8
+  "ars-mid-4": { skin: 1, hair: 4, style: "crop", beard: true, build: "athletic" }, // B. Guimaraes #39
+  "ars-fwd-1": { skin: 5, hair: 0, style: "curls", beard: false, build: "lean" }, // B. Saka #7
+  "ars-fwd-4": { skin: 4, hair: 0, style: "curls", beard: true, build: "lean" }, // E. Eze #10
+  "ars-fwd-5": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // V. Gyokeres #14
 
-  "liv-gk-1": { skin: 1, hair: 2, style: "swept", beard: true, build: "power" }, // Alisson
-  "liv-def-1": { skin: 3, hair: 0, style: "bun", beard: true, build: "power" }, // Van Dijk
-  "liv-def-2": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // Trent
-  "liv-def-3": { skin: 4, hair: 0, style: "fade", beard: true, build: "power" }, // Konate
-  "liv-def-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "lean" }, // Robertson
-  "liv-mid-1": { skin: 1, hair: 1, style: "swept", beard: true, build: "athletic" }, // Mac Allister
-  "liv-mid-2": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // Gravenberch
-  "liv-mid-3": { skin: 0, hair: 1, style: "headband", beard: true, build: "athletic" }, // Szoboszlai
-  "liv-fwd-1": { skin: 2, hair: 0, style: "curls", beard: true, build: "lean" }, // Salah
-  "liv-fwd-2": { skin: 2, hair: 0, style: "fade", beard: false, build: "lean" }, // Diaz
-  "liv-fwd-3": { skin: 1, hair: 1, style: "bun", beard: true, build: "power" }, // Nunez
+  // Liverpool (2026–27 Active)
+  "liv-gk-1": { skin: 1, hair: 2, style: "swept", beard: true, build: "power" }, // Alisson #1
+  "liv-def-1": { skin: 3, hair: 0, style: "bun", beard: true, build: "power" }, // V. van Dijk #4
+  "liv-def-5": { skin: 5, hair: 0, style: "curls", beard: false, build: "lean" }, // J. Frimpong #30
+  "liv-def-6": { skin: 3, hair: 0, style: "fade", beard: true, build: "power" }, // R. Araujo #33
+  "liv-def-7": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // M. Kerkez #6
+  "liv-mid-4": { skin: 0, hair: 3, style: "swept", beard: false, build: "lean" }, // F. Wirtz #7
+  "liv-mid-2": { skin: 0, hair: 1, style: "headband", beard: true, build: "athletic" }, // D. Szoboszlai #8
+  "liv-mid-1": { skin: 0, hair: 2, style: "crop", beard: true, build: "athletic" }, // A. Mac Allister #10
+  "liv-fwd-4": { skin: 4, hair: 0, style: "curls", beard: true, build: "lean" }, // A. Isak #9
+  "liv-fwd-5": { skin: 4, hair: 0, style: "curls", beard: false, build: "lean" }, // B. Barcola #29
+  "liv-fwd-6": { skin: 4, hair: 0, style: "curls", beard: false, build: "lean" }, // H. Ekitike #22
 
-  "che-gk-1": { skin: 1, hair: 1, style: "headgear", beard: false, build: "power" }, // Iconic Cech-style GK headgear (`IMG_0364`, `IMG_0366`)
-  "che-def-1": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" },
-  "che-def-2": { skin: 4, hair: 0, style: "curls", beard: true, build: "power" },
-  "che-def-3": { skin: 1, hair: 1, style: "headband", beard: true, build: "athletic" },
-  "che-def-4": { skin: 5, hair: 0, style: "fade", beard: false, build: "power" },
-  "che-mid-1": { skin: 0, hair: 3, style: "crop", beard: false, build: "lean" }, // Palmer
-  "che-mid-2": { skin: 4, hair: 0, style: "fade", beard: false, build: "power" }, // Caicedo
-  "che-mid-3": { skin: 1, hair: 1, style: "fade", beard: true, build: "athletic" },
-  "che-fwd-1": { skin: 5, hair: 0, style: "fade", beard: false, build: "athletic" },
-  "che-fwd-2": { skin: 4, hair: 0, style: "curls", beard: true, build: "lean" },
-  "che-fwd-3": { skin: 1, hair: 2, style: "swept", beard: false, build: "lean" },
+  // Chelsea (2026–27 Active)
+  "che-gk-2": { skin: 1, hair: 1, style: "fade", beard: false, build: "power" }, // E. Martinez #1
+  "che-def-1": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" }, // L. Colwill #6
+  "che-def-2": { skin: 4, hair: 0, style: "curls", beard: true, build: "power" }, // R. James #24
+  "che-def-3": { skin: 4, hair: 0, style: "fade", beard: true, build: "athletic" }, // W. Fofana #3
+  "che-def-5": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // J. Hato #21
+  "che-mid-1": { skin: 4, hair: 0, style: "fade", beard: false, build: "power" }, // M. Caicedo #25
+  "che-mid-2": { skin: 0, hair: 3, style: "crop", beard: false, build: "lean" }, // C. Palmer #10
+  "che-mid-4": { skin: 2, hair: 1, style: "fade", beard: true, build: "power" }, // M. Rogers #17
+  "che-fwd-4": { skin: 2, hair: 0, style: "fade", beard: true, build: "athletic" }, // Joao Pedro #9
+  "che-fwd-2": { skin: 1, hair: 1, style: "crop", beard: true, build: "lean" }, // P. Neto #7
+  "che-fwd-5": { skin: 3, hair: 0, style: "curls", beard: false, build: "lean" }, // Estevao #41
+
+  // Manchester City & Premier League Stars (2026–27 Active + Cross-Club Transfers)
+  "mci-gk-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "power" }, // G. Donnarumma #1
+  "mci-def-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "power" }, // R. Dias #3
+  "che-mid-3": { skin: 1, hair: 0, style: "fade", beard: false, build: "athletic" }, // E. Fernandez #17 (Man City)
+  "mci-mid-2": { skin: 1, hair: 1, style: "curls", beard: true, build: "athletic" }, // R. Cherki #10
+  "mci-fwd-1": { skin: 0, hair: 4, style: "bun", beard: false, build: "power" }, // E. Haaland #9
+  "mci-mid-3": { skin: 0, hair: 1, style: "fade", beard: false, build: "lean" }, // P. Foden #47
+  "mci-fwd-2": { skin: 5, hair: 0, style: "curls", beard: false, build: "athletic" }, // J. Doku #11
+  "mci-fwd-3": { skin: 5, hair: 0, style: "fade", beard: true, build: "power" }, // A. Semenyo #42
+  "bha-mid-1": { skin: 0, hair: 2, style: "swept", beard: true, build: "athletic" }, // P. Gross #13
+  "bha-fwd-1": { skin: 1, hair: 0, style: "swept", beard: false, build: "lean" }, // K. Mitoma #7
+  "eve-gk-1": { skin: 0, hair: 3, style: "swept", beard: false, build: "athletic" }, // J. Pickford #1
+  "eve-mid-2": { skin: 0, hair: 1, style: "headband", beard: true, build: "athletic" }, // J. Grealish #10
+  "eve-fwd-1": { skin: 5, hair: 0, style: "fade", beard: false, build: "power" }, // T. Barry #11
+  "tot-def-1": { skin: 0, hair: 2, style: "swept", beard: false, build: "power" }, // M. van de Ven #37
+  "tot-mid-1": { skin: 0, hair: 1, style: "swept", beard: false, build: "athletic" }, // S. Tonali #16
+  "tot-mid-2": { skin: 3, hair: 0, style: "curls", beard: false, build: "lean" }, // X. Simons #7
+  "tot-fwd-1": { skin: 2, hair: 0, style: "curls", beard: true, build: "athletic" }, // O. Marmoush #22
+  "avl-mid-1": { skin: 5, hair: 0, style: "curls", beard: false, build: "power" }, // A. Onana #24
+  "che-fwd-1": { skin: 5, hair: 0, style: "fade", beard: false, build: "athletic" }, // N. Jackson #11 (Aston Villa)
+  "mun-fwd-2": { skin: 0, hair: 4, style: "swept", beard: false, build: "lean" }, // A. Garnacho #17 (Aston Villa)
+  "lee-fwd-1": { skin: 2, hair: 0, style: "bun", beard: true, build: "power" }, // D. Calvert-Lewin #9
+  "sun-mid-1": { skin: 0, hair: 1, style: "crop", beard: false, build: "power" }, // G. Xhaka #34
+
+  // Retained Historical Pre-2026/27 Identities (for legacy worlds & frozen replays)
+  "mun-gk-1": { skin: 5, hair: 0, style: "curls", beard: true, build: "power" }, // A. Onana
+  "mun-fwd-1": { skin: 4, hair: 0, style: "fade", beard: false, build: "athletic" }, // M. Rashford
+  "mun-def-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // L. Shaw
+  "mun-mid-3": { skin: 2, hair: 1, style: "crop", beard: false, build: "power" }, // Casemiro
+  "mun-fwd-3": { skin: 0, hair: 4, style: "swept", beard: false, build: "power" }, // R. Hojlund
+  "ars-def-2": { skin: 1, hair: 1, style: "crop", beard: true, build: "athletic" }, // B. White
+  "ars-mid-3": { skin: 5, hair: 0, style: "crop", beard: true, build: "power" }, // T. Partey
+  "ars-fwd-2": { skin: 1, hair: 1, style: "crop", beard: false, build: "lean" }, // G. Martinelli
+  "ars-fwd-3": { skin: 0, hair: 2, style: "swept", beard: false, build: "lean" }, // K. Havertz
+  "liv-fwd-1": { skin: 2, hair: 0, style: "curls", beard: true, build: "athletic" }, // M. Salah
+  "liv-def-2": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" }, // T. Alexander-Arnold
+  "liv-def-3": { skin: 5, hair: 0, style: "fade", beard: true, build: "power" }, // I. Konate
+  "liv-def-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "lean" }, // A. Robertson
+  "liv-mid-3": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // R. Gravenberch
+  "liv-fwd-2": { skin: 2, hair: 0, style: "fade", beard: false, build: "lean" }, // L. Diaz
+  "liv-fwd-3": { skin: 1, hair: 1, style: "crop", beard: true, build: "athletic" }, // D. Jota
+  "che-gk-1": { skin: 3, hair: 0, style: "fade", beard: true, build: "power" }, // R. Sanchez
+  "che-def-4": { skin: 1, hair: 1, style: "curls", beard: true, build: "lean" }, // M. Cucurella
+  "che-fwd-3": { skin: 4, hair: 0, style: "fade", beard: true, build: "athletic" }, // C. Nkunku
 };
 
 const SOMATOTYPE_SCALES = {
@@ -1382,6 +2151,8 @@ const SHARED_GEO = (() => {
   // Sleek FIFA 10–12 Proportioned Pitch Indicators (`IMG_0350.webp`)
   const ring = retainGpu(new THREE.RingGeometry(0.35, 0.45, 36));
   ring.rotateX(-Math.PI * 0.5);
+  const nextRing = retainGpu(new THREE.RingGeometry(0.38, 0.435, 28));
+  nextRing.rotateX(-Math.PI * 0.5);
   const chargeArc = retainGpu(new THREE.RingGeometry(0.47, 0.56, 32));
   chargeArc.rotateX(-Math.PI * 0.5);
   const aimArrow = retainGpu(new THREE.ConeGeometry(0.095, 0.20, 4));
@@ -1390,6 +2161,12 @@ const SHARED_GEO = (() => {
   cursorCone.rotateX(Math.PI);
   const shadowDisc = retainGpu(new THREE.CircleGeometry(0.36, 20));
   shadowDisc.rotateX(-Math.PI * 0.5);
+  const setPieceTargetRing = retainGpu(new THREE.RingGeometry(0.62, 0.78, 36));
+  setPieceTargetRing.rotateX(-Math.PI * 0.5);
+  const setPieceTargetDisc = retainGpu(new THREE.CircleGeometry(0.60, 28));
+  setPieceTargetDisc.rotateX(-Math.PI * 0.5);
+  const setPieceDash = retainGpu(new THREE.PlaneGeometry(0.13, 0.62));
+  setPieceDash.rotateX(-Math.PI * 0.5);
   const grassTuft = retainGpu(createGrassTuftGeometry());
 
   return {
@@ -1420,10 +2197,14 @@ const SHARED_GEO = (() => {
     gkHeadgear,
     sNumPlane,
     ring,
+    nextRing,
     chargeArc,
     aimArrow,
     cursorCone,
     shadowDisc,
+    setPieceTargetRing,
+    setPieceTargetDisc,
+    setPieceDash,
     grassTuft,
   };
 })();
@@ -2075,6 +2856,15 @@ function createJerseyTextures(kit, shirtNumber, surname, clubShort) {
     if (kit.pattern === "pinstripes") {
       ctx.fillStyle = "rgba(148, 163, 184, 0.18)";
       for (let x = 20; x < 240; x += 24) ctx.fillRect(x, 0, 3.5, 256);
+    } else if (kit.pattern === "vertical_stripes") {
+      ctx.fillStyle = kit.trim || "#ffffff";
+      for (let x = 16; x < 240; x += 44) {
+        ctx.fillRect(x, 0, 20, 256);
+      }
+      if (isBack) {
+        ctx.fillStyle = kit.shirt;
+        ctx.fillRect(46, 56, 164, 152);
+      }
     } else if (kit.pattern === "quarters" && !isBack) {
       ctx.fillStyle = kit.trim || "#047857";
       ctx.globalAlpha = 0.88;
@@ -2702,6 +3492,18 @@ function createFootballerActor(spec) {
   ctrlRing.visible = false;
   root.add(ctrlRing);
 
+  const nextRingMat = new THREE.MeshBasicMaterial({
+    color: ringColor,
+    transparent: true,
+    opacity: 0.36,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const nextSwitchRing = new THREE.Mesh(SHARED_GEO.nextRing, nextRingMat);
+  nextSwitchRing.position.y = 0.020;
+  nextSwitchRing.visible = false;
+  root.add(nextSwitchRing);
+
   const aimWedge = new THREE.Mesh(SHARED_GEO.aimArrow, ringMat);
   aimWedge.position.set(0, 0.025, 0.53);
   aimWedge.visible = false;
@@ -2749,6 +3551,7 @@ function createFootballerActor(spec) {
     dirtLevel: 0,
     sweatLevel: 0,
     ctrlRing,
+    nextSwitchRing,
     aimWedge,
     chargeRing,
     chargeRingMat,
@@ -2852,8 +3655,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     charge,
     jumpZ = 0,
     inWall = false,
+    isThrowInTaker = false,
     refSignal = 0,
     isControlled,
+    isNextSwitch = false,
     ballX,
     ballY,
     ballZ = 0,
@@ -2954,15 +3759,23 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     actor.kickSwingTimer = Math.max(0, actor.kickSwingTimer - dt);
   }
 
-  // Clean EA FIFA 10–12 Pitch Indicators (`IMG_0350.webp` — zero giant floating black billboards!)
+  // Clean EA FIFA 10–12 Pitch Indicators + FIFA Second-Man Next-Switch Ring (`IMG_0350.webp`)
   actor.ctrlRing.visible = Boolean(isControlled);
   actor.aimWedge.visible = Boolean(isControlled);
   actor.overheadCursor.visible = Boolean(isControlled);
+  if (actor.nextSwitchRing) {
+    const showNext = Boolean(isNextSwitch && !isControlled);
+    actor.nextSwitchRing.visible = showNext;
+    if (showNext) {
+      const pulse = 0.96 + Math.sin(nowSec * 5.2) * 0.04;
+      actor.nextSwitchRing.scale.set(pulse, 1, pulse);
+    }
+  }
   if (isControlled) {
     actor.overheadCursor.position.y = 2.02 + actor.smoothJumpY + Math.sin(nowSec * 7.0) * 0.035;
     actor.overheadCursor.rotation.y = nowSec * 3.0;
     const relAimYaw =
-      aimRad !== null && charge > 0.02
+      aimRad !== null
         ? wrapAngleRad(Math.PI * 0.5 - aimRad - actor.root.rotation.y)
         : 0;
     const rAim = 0.53 + (charge > 0.02 ? charge * 0.18 : 0);
@@ -3197,7 +4010,13 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       ? 1.0 - smoothstep(0.32, 0.86, ballDistHoriz)
       : 0;
 
-  if (inWall && speed < 0.3) {
+  if (isThrowInTaker) {
+    // Planted split-step touchline throw-in stance (Law 15 both feet grounded behind/on touchline!)
+    _tmpFootL.set(0.115, SOLE_HEIGHT, 0.14);
+    _tmpFootR.set(-0.115, SOLE_HEIGHT, -0.15 - chargeCockBlend * 0.08);
+    pitchL = -0.05;
+    pitchR = 0.12;
+  } else if (inWall && speed < 0.3) {
     _tmpFootL.set(0.088, SOLE_HEIGHT, 0.01);
     _tmpFootR.set(-0.088, SOLE_HEIGHT, -0.01);
     pitchL = 0;
@@ -3284,7 +4103,16 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   );
 
   // Continuous Quaternion-Damped Upper-Limb Angular-Momentum Counter-Balance & Shielding (`IMG_0347`, `IMG_0363`!)
-  if (inWall && speed < 0.35) {
+  if (isThrowInTaker) {
+    // Authentic Two-Handed Overhead Throw-In Pose (`z = 1.82m` ball cradle + thoracic coil!)
+    const coil = chargeCockBlend;
+    dampBoneEuler(bones[B_SPINE], -0.10 - coil * 0.16, 0, 0, 0.055, dt);
+    dampBoneEuler(bones[B_CHEST], -0.12 - coil * 0.18, 0, 0, 0.055, dt);
+    dampBoneEuler(bones[B_SH_L], -2.84 - coil * 0.24, 0.18, -0.22, 0.05, dt);
+    dampBoneEuler(bones[B_SH_R], -2.84 - coil * 0.24, -0.18, 0.22, 0.05, dt);
+    dampBoneEuler(bones[B_EL_L], -0.62 - coil * 0.28, 0, -0.18, 0.05, dt);
+    dampBoneEuler(bones[B_EL_R], -0.62 - coil * 0.28, 0, 0.18, 0.05, dt);
+  } else if (inWall && speed < 0.35) {
     // Classic FIFA Free-Kick Defensive Wall Shield Pose (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
     dampBoneEuler(bones[B_SH_L], -0.34, 0.36, -0.22, 0.06, dt);
     dampBoneEuler(bones[B_SH_R], -0.34, -0.36, 0.22, 0.06, dt);
@@ -4584,6 +5412,51 @@ export class ClassicFifa3DEngine {
     this.scene.add(this.showcaseGroup);
     this.showcaseCaptains = null;
 
+    // 3D FIFA Set-Piece Aiming Trajectory & Landing Target Ring (Throw-Ins, Corners, Goal Kicks, Free Kicks)
+    this.setPieceGuide = new THREE.Group();
+    this.setPieceGuide.visible = false;
+    this.spRingMat = retainGpu(
+      new THREE.MeshBasicMaterial({
+        color: "#fbbf24",
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    this.spDiscMat = retainGpu(
+      new THREE.MeshBasicMaterial({
+        color: "#fbbf24",
+        transparent: true,
+        opacity: 0.18,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    this.spDashMat = retainGpu(
+      new THREE.MeshBasicMaterial({
+        color: "#f8fafc",
+        transparent: true,
+        opacity: 0.58,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    this.spTargetRing = new THREE.Mesh(SHARED_GEO.setPieceTargetRing, this.spRingMat);
+    this.spTargetRing.position.y = 0.026;
+    this.spTargetDisc = new THREE.Mesh(SHARED_GEO.setPieceTargetDisc, this.spDiscMat);
+    this.spTargetDisc.position.y = 0.022;
+    this.setPieceGuide.add(this.spTargetRing);
+    this.setPieceGuide.add(this.spTargetDisc);
+    this.spDashes = [];
+    for (let i = 0; i < 7; i++) {
+      const dash = new THREE.Mesh(SHARED_GEO.setPieceDash, this.spDashMat);
+      dash.position.y = 0.024;
+      this.setPieceGuide.add(dash);
+      this.spDashes.push(dash);
+    }
+    this.scene.add(this.setPieceGuide);
+
     this.netRipple = [0, 0];
     this.netImpact = [
       { strength: 0, z: 0, y: 1.2 },
@@ -4705,7 +5578,7 @@ export class ClassicFifa3DEngine {
       }
       if (pitchMat) {
         pitchMat.roughness = m === "rain" ? 0.38 : m === "day" ? 0.86 : 0.82;
-        pitchMat.metalness = m === "rain" ? 0.08 : 0.01;
+        pitchMat.metalness = m === "rain" ? 0.08 : m === "day" ? 0.01 : 0.01;
       }
       if (grassField && grassField.mesh && grassField.mesh.material) {
         grassField.mesh.material.roughness = m === "rain" ? 0.36 : 0.76;
@@ -4724,6 +5597,9 @@ export class ClassicFifa3DEngine {
     }
     if (this.refereeActor) {
       this.refereeActor.root.visible = showMatchActors;
+    }
+    if (this.setPieceGuide && mode === "showcase") {
+      this.setPieceGuide.visible = false;
     }
     this.ballMesh.visible = true;
     this.ballShadow.visible = true;
@@ -5161,6 +6037,9 @@ export class ClassicFifa3DEngine {
       const hasAimWords = currPacked.length >= spinBase + 4;
       const homeAimBam = hasAimWords ? currPacked[spinBase + 2] : -1;
       const awayAimBam = hasAimWords ? currPacked[spinBase + 3] : -1;
+      const hasNextSwitchWords = currPacked.length >= spinBase + 6;
+      const homeNextSwitch = hasNextSwitchWords ? currPacked[spinBase + 4] : -1;
+      const awayNextSwitch = hasNextSwitchWords ? currPacked[spinBase + 5] : -1;
 
       this.ballMesh.position.set(ballX, this.ballRadius + Math.max(0, ballZ), ballY);
       const bSpeed = Math.hypot(ballVx, ballVy);
@@ -5190,6 +6069,7 @@ export class ClassicFifa3DEngine {
 
       const showHudIndicators = this.viewMode === "match" && !(replayOpts && replayOpts.active);
       const wallTargetDist = pitchLen > 80 ? 9.15 : 4.6;
+      let spTakerCharge = 0;
 
       const actorCount = Math.min(pps * 2, this.actors.length);
       for (let n = 0; n < actorCount; n++) {
@@ -5254,10 +6134,20 @@ export class ClassicFifa3DEngine {
           }
         }
 
-        const isControlled = showHudIndicators && (side === 0 ? idx === homeCtrl : idx === awayCtrl);
+        const isSideCtrl = side === 0 ? idx === homeCtrl : idx === awayCtrl;
+        const isControlled = showHudIndicators && isSideCtrl;
+        const isNextSwitch =
+          showHudIndicators &&
+          !isControlled &&
+          ownerSide !== side &&
+          (side === 0 ? idx === homeNextSwitch : idx === awayNextSwitch);
         const rawAimBam = side === 0 ? homeAimBam : awayAimBam;
         const aimRad = isControlled && rawAimBam >= 0 ? (rawAimBam * Math.PI * 2) / 65536 : null;
         const isBallCarrier = showHudIndicators && ownerSide === side && ownerIdx === idx;
+        const isThrowInTaker = phase === 2 && ownerSide === side && isSideCtrl;
+        if (phase >= 2 && phase <= 6 && ownerSide === side && isSideCtrl) {
+          spTakerCharge = charge;
+        }
         const celebrating = phase === 10 && ownerSide === side;
         const inWall =
           phase === 5 &&
@@ -5281,7 +6171,9 @@ export class ClassicFifa3DEngine {
             charge,
             jumpZ,
             inWall,
+            isThrowInTaker,
             isControlled,
+            isNextSwitch,
             isBallCarrier,
             ballX,
             ballY,
@@ -5297,6 +6189,76 @@ export class ClassicFifa3DEngine {
         );
         if (phase === 3 || phase === 5 || phase === 6) {
           actor.nameplate.visible = false;
+        }
+      }
+
+      // Update 3D Set-Piece Aiming Trajectory & Landing Target Ring (Throw-Ins, Corners, Goal/Free/Penalty Kicks)
+      if (this.setPieceGuide) {
+        const spAimBam = ownerSide === 0 ? homeAimBam : ownerSide === 1 ? awayAimBam : -1;
+        if (showHudIndicators && phase >= 2 && phase <= 6 && spAimBam >= 0) {
+          this.setPieceGuide.visible = true;
+          const spColorHex = ownerSide === 0 ? 0xfbbf24 : 0x38bdf8;
+          this.spRingMat.color.setHex(spTakerCharge > 0.78 ? 0xef4444 : spColorHex);
+          this.spDiscMat.color.setHex(spColorHex);
+
+          const spRad = (spAimBam * Math.PI * 2) / 65536;
+          const dirX = Math.cos(spRad);
+          const dirY = Math.sin(spRad);
+          const is11Sp = pitchLen > 80;
+          const attSign = ownerSide === 0 ? Math.sign(gk1X || 1) : Math.sign(gk0X || -1);
+
+          let landX = ballX + dirX * 9.0;
+          let landY = ballY + dirY * 9.0;
+          if (phase === 2) {
+            // Throw-In landing zone (`5.5m..17.5m` infield along clamped aim, >= 1.85m inside touchline!)
+            const dThrow = (is11Sp ? 7.2 : 5.8) + spTakerCharge * (is11Sp ? 11.5 : 8.8);
+            landX = Math.max(-(halfL - 1.5), Math.min(halfL - 1.5, ballX + dirX * dThrow));
+            landY = Math.max(-(halfW - 1.85), Math.min(halfW - 1.85, ballY + dirY * dThrow));
+          } else if (phase === 3) {
+            // Corner Kick box target zone (Near Post -> Penalty Corridor -> Far Post as charge rises!)
+            const ySign = ballY >= 0 ? 1 : -1;
+            const baseDepth = is11Sp ? 7.8 : 5.4;
+            const goalHW = leftGoal.goalHW || 2.0;
+            const ySpan = goalHW * (is11Sp ? 1.35 : 1.15);
+            const zoneY =
+              spTakerCharge < 0.04
+                ? ySign * ySpan * 0.25
+                : spTakerCharge < 0.36
+                  ? ySign * ySpan * 0.78
+                  : spTakerCharge <= 0.72
+                    ? -ySign * ySpan * 0.12
+                    : -ySign * ySpan * 0.88;
+            const depthNudge = Math.max(-1.6, Math.min(2.0, (-dirX * attSign - 0.35) * 3.6));
+            landX = attSign * halfL - attSign * (baseDepth + depthNudge);
+            landY = Math.max(-(halfW - 1.8), Math.min(halfW - 1.8, zoneY));
+          } else {
+            const dKick = (is11Sp ? 12.0 : 8.5) + spTakerCharge * (is11Sp ? 14.0 : 9.5);
+            landX = Math.max(-(halfL + 0.5), Math.min(halfL + 0.5, ballX + dirX * dKick));
+            landY = Math.max(-(halfW - 1.2), Math.min(halfW - 1.2, ballY + dirY * dKick));
+          }
+
+          const ringPulse = 1.0 + Math.sin(nowSec * 6.0) * 0.06 + spTakerCharge * 0.18;
+          this.spTargetRing.position.set(landX, 0.026, landY);
+          this.spTargetRing.scale.set(ringPulse, 1, ringPulse);
+          this.spTargetDisc.position.set(landX, 0.022, landY);
+          this.spTargetDisc.scale.set(ringPulse, 1, ringPulse);
+
+          const dx = landX - ballX;
+          const dy = landY - ballY;
+          const chordYaw = Math.atan2(dx, dy);
+          // Lateral in-swinging arc bow on Corner Kicks (`phase === 3`)
+          const bowX = phase === 3 ? -attSign * (is11Sp ? 1.85 : 1.15) : 0;
+          for (let i = 0; i < this.spDashes.length; i++) {
+            const u = (i + 1) / (this.spDashes.length + 1);
+            const arcWeight = 4 * u * (1 - u);
+            const px = ballX + dx * u + bowX * arcWeight;
+            const py = ballY + dy * u;
+            const dash = this.spDashes[i];
+            dash.position.set(px, 0.024, py);
+            dash.rotation.y = chordYaw;
+          }
+        } else {
+          this.setPieceGuide.visible = false;
         }
       }
 
@@ -5458,8 +6420,24 @@ export class ClassicFifa3DEngine {
       const targetGoalX = targetGoalSign * halfL;
       const distToAttGoal = Math.hypot(targetGoalX - ballX, ballY);
 
-      if (phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
-        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg`!)
+      if (phase === 2 && Math.abs(ballY) > halfW * 0.65) {
+        // Authentic Sideline Throw-In Camera framing full overhead thrower above radar + 3 infield options!
+        setPieceCamKey = 2;
+        const ySign = ballY >= 0 ? 1 : -1;
+        desiredFov = 33.5;
+        camSmoothTime = 0.16;
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - targetGoalSign * 4.4)),
+          4.15 * zScale,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY + ySign * 5.3 * zScale)),
+        ];
+        targetLook = [
+          Math.max(-(halfL - 2.0), Math.min(halfL - 2.0, ballX + targetGoalSign * 2.8)),
+          0.52,
+          ballY - ySign * (is11 ? 5.2 : 4.0),
+        ];
+      } else if (phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
+        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg` — taker framed cleanly above radar!)
         setPieceCamKey = 3;
         const penSpotX = Math.sign(ballX) * (halfL - (is11 ? 11.0 : 6.2));
         const dx = penSpotX - ballX;
@@ -5467,14 +6445,16 @@ export class ClassicFifa3DEngine {
         const inv = 1.0 / Math.max(0.1, Math.hypot(dx, dz));
         const ux = dx * inv;
         const uz = dz * inv;
-        desiredFov = 34;
+        const px = -uz;
+        const pz = ux;
+        desiredFov = 35;
         camSmoothTime = 0.14;
         targetPos = [
-          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * 6.2 * zScale)),
-          3.35 * zScale,
-          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 6.2 * zScale)),
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * 5.2 * zScale + px * 0.95)),
+          3.05 * zScale,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 5.2 * zScale + pz * 0.95)),
         ];
-        targetLook = [ballX + ux * 11.5, 1.05, ballY + uz * 11.5];
+        targetLook = [ballX + ux * 7.6, 0.55, ballY + uz * 7.6];
       } else if (phase === 6 || (phase === 5 && distToAttGoal < halfL * 0.92)) {
         // Authentic Behind-the-Free-Kick / Penalty-Taker Camera (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
         setPieceCamKey = phase;

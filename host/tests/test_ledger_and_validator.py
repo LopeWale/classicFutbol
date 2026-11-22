@@ -102,21 +102,21 @@ def test_frozen_snapshot_immutability_across_external_transfer() -> None:
     app = create_app(db_path=":memory:", seed_demo=True)
     client = TestClient(app)
 
-    # 1. Freeze Round 3 Man Utd vs Arsenal snapshot
+    # 1. Freeze Matchweek 27 Man Utd vs Arsenal snapshot
     r_open = client.post(
-        "/api/fixtures/fix-r3-mun-ars/sessions",
+        "/api/fixtures/fix-mw27-mun-ars/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 300},
     )
     assert r_open.status_code == 200
-    frozen_r3 = r_open.json()["snapshot"]
-    r3_mun_ids = [p["footballer_id"] for p in frozen_r3["home"]["starters"]]
-    assert "mun-fwd-1" in r3_mun_ids  # M. Rashford is frozen into Round 3!
+    frozen_mw27 = r_open.json()["snapshot"]
+    mw27_mun_ids = [p["footballer_id"] for p in frozen_mw27["home"]["starters"]]
+    assert "mun-fwd-4" in mw27_mun_ids  # M. Cunha is frozen into Matchweek 27!
 
-    # 2. Ingest external transfer moving M. Rashford from man-utd to chelsea
+    # 2. Ingest external transfer moving M. Cunha from man-utd to chelsea
     r_tr = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/transfer",
         json={
-            "footballer_id": "mun-fwd-1",
+            "footballer_id": "mun-fwd-4",
             "from_club_id": "man-utd",
             "to_club_id": "chelsea",
             "new_shirt": 19,
@@ -125,31 +125,31 @@ def test_frozen_snapshot_immutability_across_external_transfer() -> None:
     assert r_tr.status_code == 200
     assert r_tr.json()["decision"] == "applied"
 
-    # 3. Verify Round 3 frozen snapshot is 100% UNCHANGED, while future Round 4 snapshot reflects transfer!
-    r_snap_after = client.get("/api/fixtures/fix-r3-mun-ars/snapshot")
+    # 3. Verify frozen snapshot is 100% UNCHANGED, while newly opened Matchweek 23 snapshot reflects transfer!
+    r_snap_after = client.get("/api/fixtures/fix-mw27-mun-ars/snapshot")
     assert r_snap_after.status_code == 200
     assert [
         p["footballer_id"] for p in r_snap_after.json()["snapshot"]["home"]["starters"]
-    ] == r3_mun_ids
+    ] == mw27_mun_ids
 
-    r_open_r4 = client.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+    r_open_mw23 = client.post(
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 300},
     )
-    assert r_open_r4.status_code == 200
-    r4_mun_ids = [p["footballer_id"] for p in r_open_r4.json()["snapshot"]["home"]["starters"]]
-    assert "mun-fwd-1" not in r4_mun_ids
+    assert r_open_mw23.status_code == 200
+    mw23_mun_ids = [p["footballer_id"] for p in r_open_mw23.json()["snapshot"]["home"]["starters"]]
+    assert "mun-fwd-4" not in mw23_mun_ids
 
 
 def test_proposal_gate_parks_imports_for_represented_and_played_fixtures() -> None:
     app = create_app(db_path=":memory:", seed_demo=True)
     client = TestClient(app)
 
-    # Attempt to import a real-world 0-5 result onto represented `fix-r3-mun-ars` (`played_vs_friend`)
+    # Attempt to import a real-world 0-5 result onto represented `fix-mw27-mun-ars` (`played_vs_friend`)
     r_imp = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/result",
         json={
-            "fixture_id": "fix-r3-mun-ars",
+            "fixture_id": "fix-mw27-mun-ars",
             "home_goals": 0,
             "away_goals": 5,
             "events": [{"event_type": "Goal", "footballer_id": "ars-fwd-1", "minute": 10}],
@@ -160,7 +160,7 @@ def test_proposal_gate_parks_imports_for_represented_and_played_fixtures() -> No
     assert body["decision"] == "parked"
     assert body["reason"] == "world_precedence"
 
-    # Verify Saka's inherited goals did NOT absorb the parked goal (stays at 3 from R1 + R2)
+    # Verify Saka's inherited goals did NOT absorb the parked goal (stays at 3 from MW1 + MW2 + MW6)
     players = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
     saka = next(p for p in players if p["footballer_id"] == "ars-fwd-1")
     assert saka["inherited"]["goals"] == 3
@@ -173,9 +173,9 @@ def test_wasm_to_psfc_replay_end_to_end_validation_idempotency_and_correction() 
     app = create_app(db_path=":memory:", seed_demo=True)
     client = TestClient(app)
 
-    # Open 5v5 session on Round 4 Man Utd vs Liverpool (short 360-tick = 6s halves for fast test)
+    # Open 5v5 session on Man Utd vs Liverpool (short 360-tick = 6s halves for fast test)
     r_open = client.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={
             "actor_id": "part-alex",
             "format_name": "5v5",
@@ -236,20 +236,20 @@ def test_wasm_to_psfc_replay_end_to_end_validation_idempotency_and_correction() 
 
     # 4. Commissioner `result_corrected` rebuilds standings & earned/combined stats cleanly!
     r_corr = client.post(
-        "/api/admin/fixtures/fix-r4-mun-liv/correct",
+        "/api/admin/fixtures/fix-mw23-mun-liv/correct",
         json={
             "new_home_goals": 3,
             "new_away_goals": 1,
             "new_events": [
                 {
                     "event_type": "Goal",
-                    "footballer_id": "mun-fwd-1",
+                    "footballer_id": "mun-fwd-4",
                     "assist_footballer_id": "mun-mid-2",
                     "minute": 12,
                 },
                 {
                     "event_type": "Goal",
-                    "footballer_id": "mun-fwd-1",
+                    "footballer_id": "mun-fwd-4",
                     "assist_footballer_id": "mun-mid-1",
                     "minute": 27,
                 },
@@ -261,7 +261,7 @@ def test_wasm_to_psfc_replay_end_to_end_validation_idempotency_and_correction() 
                 },
                 {
                     "event_type": "Goal",
-                    "footballer_id": "liv-fwd-1",
+                    "footballer_id": "liv-fwd-4",
                     "assist_footballer_id": None,
                     "minute": 68,
                 },
@@ -273,17 +273,264 @@ def test_wasm_to_psfc_replay_end_to_end_validation_idempotency_and_correction() 
 
     standings = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/standings").json()["standings"]
     mun_row = next(r for r in standings if r["club_id"] == "man-utd")
-    # Man Utd had 4 inherited pts (W 2-1 vs CHE, D 1-1 vs LIV) + 3 earned pts (W 3-1 vs LIV) = 7 pts!
-    assert mun_row["inherited_points"] == 4
+    # Man Utd had 8 inherited pts (MW1-10: 1W 5D 4L) + 3 earned pts (W 3-1 vs LIV) = 11 pts!
+    assert mun_row["inherited_points"] == 8
     assert mun_row["earned_points"] == 3
-    assert mun_row["points"] == 7
+    assert mun_row["points"] == 11
 
     players = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
-    rashford = next(p for p in players if p["footballer_id"] == "mun-fwd-1")
-    # Rashford had 2 inherited goals (R1 + R2) + 2 earned goals (corrected R4) = 4 combined goals!
-    assert rashford["inherited"]["goals"] == 2
-    assert rashford["earned"]["goals"] == 2
-    assert rashford["combined"]["goals"] == 4
+    cunha = next(p for p in players if p["footballer_id"] == "mun-fwd-4")
+    # M. Cunha had 2 inherited goals (MW2 + MW10) + 2 earned goals (corrected MW23) = 4 combined goals!
+    assert cunha["inherited"]["goals"] == 2
+    assert cunha["earned"]["goals"] == 2
+    assert cunha["combined"]["goals"] == 4
+
+
+def test_live_2026_27_premier_league_season_table_and_current_squads() -> None:
+    app = create_app(db_path=":memory:", seed_demo=True)
+    client = TestClient(app)
+
+    ov = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/overview").json()
+    assert ov["world"]["name"] == "Premier League 2026/27"
+    assert ov["world"]["season_label"] == "2026/27"
+    assert len(ov["clubs"]) == 20
+    assert len(ov["standings"]) == 20
+
+    # Verify promoted 2026-27 clubs (Coventry City, Hull City, Ipswich Town, Leeds, Sunderland) are present
+    club_ids = {c["club_id"] for c in ov["clubs"]}
+    assert {
+        "arsenal",
+        "brighton",
+        "man-city",
+        "bournemouth",
+        "liverpool",
+        "leeds",
+        "everton",
+        "chelsea",
+        "tottenham",
+        "brentford",
+        "aston-villa",
+        "newcastle",
+        "coventry",
+        "hull",
+        "fulham",
+        "ipswich",
+        "nottm-forest",
+        "sunderland",
+        "man-utd",
+        "crystal-palace",
+    } == club_ids
+
+    # Verify exact official Matchweek 11 (21 Nov 2026) Premier League standings & zero initial divergence
+    by_club = {r["club_id"]: r for r in ov["standings"]}
+    assert by_club["arsenal"]["points"] == 28 and by_club["arsenal"]["position"] == 1
+    assert by_club["brighton"]["points"] == 22 and by_club["brighton"]["position"] == 2
+    assert by_club["man-city"]["points"] == 22 and by_club["man-city"]["position"] == 3
+    assert by_club["bournemouth"]["points"] == 18 and by_club["bournemouth"]["position"] == 4
+    assert by_club["liverpool"]["points"] == 18 and by_club["liverpool"]["position"] == 5
+    assert by_club["man-utd"]["points"] == 8 and by_club["man-utd"]["position"] == 19
+    assert by_club["crystal-palace"]["points"] == 7 and by_club["crystal-palace"]["position"] == 20
+    assert all(r["delta_vs_real"] == 0 for r in ov["standings"])
+
+    # Verify 100% of accepted match goals (293 across 107 matches) are attributed in player projections
+    all_players = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
+    assert sum(r["gf"] for r in ov["standings"]) == 293
+    assert sum(p["inherited"]["goals"] for p in all_players) == 293
+    assert all_players[0]["footballer_id"] == "mci-fwd-1" and all_players[0]["inherited"]["goals"] == 9
+    assert all_players[1]["footballer_id"] == "liv-fwd-4" and all_players[1]["inherited"]["goals"] == 7
+
+    # Verify authentic 2026-27 squads and absence of outdated 2023/24-2024/25 players
+    rosters = ov["rosters"]
+    mun_names = {p["name"] for p in rosters["man-utd"]["squad"]}
+    ars_names = {p["name"] for p in rosters["arsenal"]["squad"]}
+    liv_names = {p["name"] for p in rosters["liverpool"]["squad"]}
+    che_names = {p["name"] for p in rosters["chelsea"]["squad"]}
+    mci_names = {p["name"] for p in rosters["man-city"]["squad"]}
+
+    assert {"S. Lammens", "M. Cunha", "B. Mbeumo", "B. Sesko", "Y. Tielemans"}.issubset(mun_names)
+    assert {"V. Gyokeres", "E. Eze", "R. Calafiori", "B. Guimaraes"}.issubset(ars_names)
+    assert {"F. Wirtz", "A. Isak", "J. Frimpong", "B. Barcola", "M. Kerkez"}.issubset(liv_names)
+    assert {"E. Martinez", "C. Palmer", "Joao Pedro", "M. Rogers", "Estevao"}.issubset(che_names)
+    assert {"G. Donnarumma", "R. Cherki", "E. Haaland", "E. Fernandez", "A. Semenyo"}.issubset(mci_names)
+
+    all_names = {p["name"] for r in rosters.values() for p in r["squad"]}
+    for outdated in (
+        "M. Rashford",
+        "Casemiro",
+        "R. Hojlund",
+        "M. Salah",
+        "T. Alexander-Arnold",
+        "L. Diaz",
+        "D. Nunez",
+        "C. Nkunku",
+        "T. Partey",
+    ):
+        assert outdated not in all_names
+
+
+def test_legacy_persistent_world_preserves_footballer_identities_and_partial_feed_enrichment() -> None:
+    from psfc_host.ingest.proposal_gate import ProposalGate
+    from psfc_host.ledger.projections import project_player_stats
+
+    # 1. Pre-existing persistent DB outside /tmp/psfc_world.db keeps legacy footballer identities (`mun-fwd-1` == M. Rashford)
+    with tempfile.TemporaryDirectory(prefix="psfc_legacy_db_") as tmp:
+        db_file = Path(tmp) / "pre_update_world.sqlite"
+        legacy_store = WorldLedgerStore(db_file)
+        legacy_cat = ClubCatalogue(legacy_pre_2026_27=True)
+        legacy_gate = ProposalGate(legacy_store, legacy_cat)
+
+        legacy_store.create_world(
+            world_id=DEFAULT_WORLD_ID,
+            name="Friends Premier Parallel Season",
+            competition_name="Premier League",
+            season_label="2025/26",
+        )
+        legacy_store.create_competition(
+            competition_id="comp-prem-2026",
+            world_id=DEFAULT_WORLD_ID,
+            name="Premier League",
+            kind="league",
+        )
+        legacy_store.create_fixture(
+            fixture_id="fix-legacy-r1-mun-che",
+            world_id=DEFAULT_WORLD_ID,
+            competition_id="comp-prem-2026",
+            stage="league",
+            round_no=1,
+            home_club_id="man-utd",
+            away_club_id="chelsea",
+            kickoff_utc="2025-08-17T15:00:00Z",
+            window_open_utc="2025-08-10T00:00:00Z",
+            window_close_utc="2025-09-01T00:00:00Z",
+            result_source="imported",
+            state="open",
+            real_home_goals=2,
+            real_away_goals=0,
+        )
+        legacy_gate.submit_fixture_result_import(
+            world_id=DEFAULT_WORLD_ID,
+            fixture_id="fix-legacy-r1-mun-che",
+            home_goals=2,
+            away_goals=0,
+            events=[
+                {"event_type": "Goal", "footballer_id": "mun-fwd-1", "minute": 21},
+                {"event_type": "Goal", "footballer_id": "mun-fwd-1", "minute": 67},
+            ],
+        )
+        legacy_gate.submit_transfer_import(
+            world_id=DEFAULT_WORLD_ID,
+            footballer_id="mun-fwd-1",
+            from_club_id="man-utd",
+            to_club_id="arsenal",
+            new_shirt=19,
+        )
+        legacy_events = legacy_store.list_events(DEFAULT_WORLD_ID)
+        legacy_store.close()
+
+        # Even if projected directly against the 2026-27 default catalogue, `mun-fwd-1` resolves to M. Rashford (never M. Cunha!)
+        modern_cat = ClubCatalogue()
+        direct_stats = project_player_stats(
+            legacy_events,
+            modern_cat.active_footballers(),
+            historical_footballers=modern_cat.all_footballers(),
+        )
+        by_fid = {p["footballer_id"]: p for p in direct_stats}
+        assert by_fid["mun-fwd-1"]["name"] == "M. Rashford"
+        assert by_fid["mun-fwd-1"]["inherited"]["goals"] == 2
+        assert by_fid["mun-fwd-4"]["name"] == "M. Cunha"
+        assert by_fid["mun-fwd-4"]["inherited"]["goals"] == 0
+
+        # Booting FastAPI on the pre-update persistent DB preserves the legacy world, Rashford's goals, and Rashford's transfer
+        app_legacy = create_app(db_path=db_file, seed_demo=True)
+        c_leg = TestClient(app_legacy)
+        players_leg = {
+            p["footballer_id"]: p
+            for p in c_leg.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
+        }
+        assert players_leg["mun-fwd-1"]["name"] == "M. Rashford"
+        assert players_leg["mun-fwd-1"]["inherited"]["goals"] == 2
+        assert "mun-fwd-4" not in players_leg
+        ars_squad = c_leg.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/arsenal/squad").json()["roster"]["squad"]
+        assert any(p["footballer_id"] == "mun-fwd-1" and p["name"] == "M. Rashford" for p in ars_squad)
+
+    # 2. Incomplete imported player-event feeds remain eligible for later enrichment via `supersedes_seq`
+    store = WorldLedgerStore(":memory:")
+    cat = ClubCatalogue()
+    gate = ProposalGate(store, cat)
+    store.create_world(
+        world_id="w-enrich",
+        name="Enrich World",
+        competition_name="Premier League",
+        season_label="2026/27",
+    )
+    store.create_competition(
+        competition_id="comp-enrich",
+        world_id="w-enrich",
+        name="Premier League",
+        kind="league",
+    )
+    store.create_fixture(
+        fixture_id="fix-bha-avl-partial",
+        world_id="w-enrich",
+        competition_id="comp-enrich",
+        stage="league",
+        round_no=1,
+        home_club_id="brighton",
+        away_club_id="aston-villa",
+        kickoff_utc="2026-08-23T13:00:00Z",
+        window_open_utc="2026-08-16T00:00:00Z",
+        window_close_utc="2026-09-06T23:59:59Z",
+        result_source="imported",
+        state="open",
+        real_home_goals=4,
+        real_away_goals=0,
+    )
+    p_initial = gate.submit_fixture_result_import(
+        world_id="w-enrich",
+        fixture_id="fix-bha-avl-partial",
+        home_goals=4,
+        away_goals=0,
+        events=[{"event_type": "Goal", "footballer_id": "bha-mid-1", "minute": 22}],
+    )
+    assert p_initial["decision"] == "applied"
+
+    p_complete = gate.submit_fixture_result_import(
+        world_id="w-enrich",
+        fixture_id="fix-bha-avl-partial",
+        home_goals=4,
+        away_goals=0,
+        events=[
+            {"event_type": "Goal", "footballer_id": "bha-mid-1", "minute": 22},
+            {"event_type": "Goal", "footballer_id": "bha-fwd-1", "minute": 41},
+            {"event_type": "Goal", "footballer_id": "bha-fwd-2", "minute": 63},
+            {"event_type": "Goal", "footballer_id": "bha-fwd-3", "minute": 84},
+        ],
+    )
+    assert p_complete["decision"] == "applied"
+    assert p_complete["reason"] == "imported_events_enriched"
+
+    enriched_stats = project_player_stats(
+        store.list_events("w-enrich"),
+        cat.active_footballers(),
+        historical_footballers=cat.all_footballers(),
+    )
+    assert sum(p["inherited"]["goals"] for p in enriched_stats) == 4
+
+    # Once all 4 goals are recorded, further duplicate imports are parked as `world_precedence`
+    p_after_full = gate.submit_fixture_result_import(
+        world_id="w-enrich",
+        fixture_id="fix-bha-avl-partial",
+        home_goals=4,
+        away_goals=0,
+        events=[
+            {"event_type": "Goal", "footballer_id": "bha-mid-1", "minute": 22},
+            {"event_type": "Goal", "footballer_id": "bha-fwd-1", "minute": 41},
+            {"event_type": "Goal", "footballer_id": "bha-fwd-2", "minute": 63},
+            {"event_type": "Goal", "footballer_id": "bha-fwd-3", "minute": 84},
+        ],
+    )
+    assert p_after_full["decision"] == "parked"
+    assert p_after_full["reason"] == "world_precedence"
 
 
 def test_browser_wasm_client_routes_serve_bundle() -> None:
@@ -302,4 +549,3 @@ def test_browser_wasm_client_routes_serve_bundle() -> None:
     r_wasm = client.get("/wasm/psfc_wasm.wasm")
     assert r_wasm.status_code == 200
     assert r_wasm.content[:4] == b"\x00asm"
-

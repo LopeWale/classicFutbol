@@ -910,11 +910,19 @@ kbd {
   padding: 10px 16px;
 }
 
-.sq-club-tabs,
+.sq-club-tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1 1 560px;
+}
+
 .sq-formation-pills {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .sq-fmt-label {
@@ -925,7 +933,19 @@ kbd {
   color: var(--text-muted);
 }
 
-.sq-club-tab,
+.sq-club-tab {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 14px;
+  letter-spacing: 0.05em;
+  padding: 5px 9px;
+  border-radius: 4px;
+  border: 1px solid var(--stroke-subtle);
+  background: rgba(15, 25, 44, 0.8);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
 .sq-fmt-pill {
   font-family: var(--font-display);
   font-weight: 800;

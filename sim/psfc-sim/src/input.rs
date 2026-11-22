@@ -26,6 +26,16 @@ pub struct InputFrame {
     pub reserved: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AutoSwitchMode {
+    /// FIFA-style ball-following auto-switch on defense, loose balls, rebounds, and air balls (default).
+    AssistedBall = 0,
+    /// Auto-switch only on loose balls and aerial balls (`z > 0.85m`).
+    AirAndLoose = 1,
+    /// Full manual switching (`BTN_SWITCH` or pass receiver only).
+    Manual = 2,
+}
+
 impl InputFrame {
     pub const IDLE: Self = Self {
         move_x: 0,
@@ -64,6 +74,20 @@ impl InputFrame {
             let pitch_slot = ((self.reserved >> 5) & 0x1F) as usize;
             let bench_idx = (self.reserved & 0x1F) as usize;
             Some((pitch_slot, bench_idx))
+        }
+    }
+
+    #[inline]
+    pub const fn encode_auto_switch_mode(mode: AutoSwitchMode) -> u16 {
+        ((mode as u16) & 0x3) << 12
+    }
+
+    #[inline]
+    pub const fn auto_switch_mode(self) -> AutoSwitchMode {
+        match (self.reserved >> 12) & 0x3 {
+            1 => AutoSwitchMode::AirAndLoose,
+            2 => AutoSwitchMode::Manual,
+            _ => AutoSwitchMode::AssistedBall,
         }
     }
 

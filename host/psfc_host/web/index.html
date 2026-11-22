@@ -30,7 +30,7 @@
     <div class="ct-center" id="ct-screen-title">MAIN MENU</div>
 
     <div class="ct-status">
-      <div class="ct-chip" id="top-world-chip">2026/27 PREMIER PARALLEL</div>
+      <div class="ct-chip" id="top-world-chip">2026/27 · PREMIER LEAGUE</div>
       <div class="ct-chip ct-chip-pad" id="gamepad-status-pill">PAD / KEYBOARD READY</div>
       <button class="ct-chip ct-chip-btn" id="btn-audio-toggle" type="button">SFX: ON</button>
     </div>
@@ -41,7 +41,7 @@
   <!-- ===================================================================== -->
   <section id="screen-title" class="game-screen active" data-screen="title">
     <div class="title-center">
-      <div class="title-season-tag">OFFICIAL SHARED-WORLD FOOTBALL · 2026/27 EDITION</div>
+      <div class="title-season-tag">OFFICIAL 2026/27 PREMIER LEAGUE · MATCHWEEK 11 LIVE</div>
       <h1 class="title-logo">
         <span class="title-logo-top">CLASSIC FUTBOL</span>
         <span class="title-logo-main">PARALLEL SEASON FC</span>
@@ -94,8 +94,8 @@
       <aside class="hub-spotlight">
         <div class="spotlight-card" id="hub-next-match-card">
           <div class="sp-eyebrow">NEXT OFFICIAL PARALLEL FIXTURE</div>
-          <div class="sp-matchup" id="hub-next-matchup">MAN UTD vs LIVERPOOL</div>
-          <div class="sp-meta" id="hub-next-meta">Premier League · Playable Official Session</div>
+          <div class="sp-matchup" id="hub-next-matchup">LIV vs MUN</div>
+          <div class="sp-meta" id="hub-next-meta">Premier League · Matchweek 11 · Playable Official Session</div>
           <button class="console-btn console-btn-gold" id="btn-hub-play-official" type="button">
             PLAY OFFICIAL MATCH ▶
           </button>
@@ -215,6 +215,15 @@
               <button class="step-arrow" id="pm-wx-prev" type="button">◀</button>
               <span class="pm-s-val" id="pm-wx-val">FLOODLIT NIGHT</span>
               <button class="step-arrow" id="pm-wx-next" type="button">▶</button>
+            </div>
+          </div>
+
+          <div class="pm-setting-row">
+            <span class="pm-s-label">AUTO-SWITCH</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-sw-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-sw-val">ASSISTED (BALL)</span>
+              <button class="step-arrow" id="pm-sw-next" type="button">▶</button>
             </div>
           </div>
         </div>
@@ -351,6 +360,7 @@
         <div class="season-filter-bar">
           <div class="comp-pills" id="comp-filter-pills">
             <button class="comp-pill active" data-comp="all" type="button">ALL COMPETITIONS</button>
+            <button class="comp-pill" data-comp="upcoming" type="button">LIVE &amp; UPCOMING</button>
             <button class="comp-pill" data-comp="league" type="button">PREMIER LEAGUE</button>
             <button class="comp-pill" data-comp="knockout" type="button">FA PARALLEL CUP</button>
           </div>
@@ -378,8 +388,8 @@
       <div class="season-pane" id="spane-standings" hidden>
         <div class="cup-header-bar">
           <div>
-            <h2 class="pane-h2" id="world-name">FRIENDS PREMIER PARALLEL SEASON</h2>
-            <p class="pane-sub">Projected strictly from League stage results · Inherited real-world baseline + Earned 5v5 points</p>
+            <h2 class="pane-h2" id="world-name">PREMIER LEAGUE 2026/27</h2>
+            <p class="pane-sub">Projected strictly from League stage results · Inherited 2026/27 Premier League baseline + Earned 5v5 points</p>
           </div>
           <button class="console-btn console-btn-gold" id="btn-rollover-season" type="button">
             COMPLETE SEASON &amp; ROLLOVER →
@@ -438,7 +448,7 @@
             <h3>KICKOFF APPOINTMENTS &amp; WORLD ADMIN</h3>
             <p class="pane-sub">Schedule friend-vs-friend match windows or test Proposal Gate takeover protection.</p>
             <div class="comm-btn-row">
-              <button class="console-btn console-btn-secondary" id="btn-propose-appt" type="button">Propose MUN vs ARS Kickoff</button>
+              <button class="console-btn console-btn-secondary" id="btn-propose-appt" type="button">Propose ARS vs MUN Kickoff (MW16)</button>
               <button class="console-btn console-btn-secondary" id="btn-test-gate" type="button">Test Takeover Gate</button>
               <button class="console-btn console-btn-ghost" id="btn-reset-world" type="button">Reset Demo World</button>
             </div>
@@ -559,13 +569,13 @@
             </ul>
           </div>
           <div class="ctrl-map-box">
-            <h3>OFF THE BALL (DEFENDING &amp; MENUS)</h3>
+            <h3>OFF THE BALL (ASSISTED DEFENDING)</h3>
             <ul>
-              <li><span>Switch Defender + Jockey</span> <strong>SNES L / LB / L1 / Q / F</strong></li>
-              <li><span>Aimed Standing Tackle</span> <strong>SNES B (Bottom) / Cross / E</strong></li>
-              <li><span>Aimed Sweeping Slide</span> <strong>SNES Y (Left) / Square / C</strong></li>
+              <li><span>Auto-Switch (Follows Ball) + Manual</span> <strong>SNES L / LB / L1 / Q</strong></li>
+              <li><span>Assisted Goal-Side Jockey</span> <strong>SNES L / LT / L2 / F</strong></li>
+              <li><span>Assisted Standing Tackle</span> <strong>SNES B (Bottom) / Cross / E</strong></li>
+              <li><span>Assisted Sweeping Slide</span> <strong>SNES Y (Left) / Square / C</strong></li>
               <li><span>Team Press / GK Rush</span> <strong>SNES X (Top) / RB / R1 / R</strong></li>
-              <li><span>Sprint Track-Back</span> <strong>SNES R / RT / Shift</strong></li>
               <li><span>Start / Pause / Replay</span> <strong>START / SELECT / Esc / Tab</strong></li>
             </ul>
           </div>
@@ -638,6 +648,7 @@
     <div class="match-top-right">
       <button class="hud-mini-btn" id="btn-hud-zoom-out" type="button" title="Zoom Out (- or Scroll Down)">ZOOM −</button>
       <button class="hud-mini-btn" id="btn-hud-zoom-in" type="button" title="Zoom In (+ or Scroll Up)">ZOOM +</button>
+      <button class="hud-mini-btn" id="btn-hud-sw" type="button" title="Cycle Player Auto-Switching Mode">SW: BALL</button>
       <button class="hud-mini-btn" id="btn-hud-wx" type="button" title="Cycle Weather &amp; Lighting (M)">WX: NIGHT</button>
       <button class="hud-mini-btn" id="btn-hud-cam" type="button" title="Cycle Broadcast Camera (V)">CAM: TELE</button>
       <button class="hud-mini-btn" id="btn-hud-replay" type="button" title="Instant Replay (Tab)">REPLAY</button>
@@ -707,6 +718,7 @@
               <button class="console-btn console-btn-primary" id="btn-pause-resume" type="button">RESUME MATCH</button>
               <button class="console-btn console-btn-gold" id="btn-pause-subs-toggle" type="button">LIVE SUBSTITUTIONS (BENCH)</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-replay" type="button">INSTANT REPLAY THEATER</button>
+              <button class="console-btn console-btn-secondary" id="btn-pause-sw" type="button">AUTO-SWITCH: ASSISTED (BALL)</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-cam" type="button">CAMERA ANGLE: TELE BROADCAST</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-wx" type="button">WEATHER: FLOODLIT NIGHT</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-sim" type="button">FAST-FORWARD TO FULL-TIME</button>

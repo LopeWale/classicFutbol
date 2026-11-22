@@ -412,15 +412,31 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                         }
                         return cp.facing_bam as i32;
                     }
+                    if let MatchPhase::SetPiece {
+                        team, taker_idx, ..
+                    } = st.phase
+                    {
+                        if team.index() == side_idx && taker_idx == c_idx {
+                            return cp.facing_bam as i32;
+                        }
+                    }
                 }
                 -1
             };
-            // Trailing words `[spin_side_milli, spin_top_milli, home_aim_bam, away_aim_bam]` preserve all header & player offsets
+            // Trailing words `[spin_side_milli, spin_top_milli, home_aim_bam, away_aim_bam, home_next_switch_idx, away_next_switch_idx]`
             out.extend_from_slice(&[
                 st.ball.spin_side.to_milli() as i32,
                 st.ball.spin_top.to_milli() as i32,
                 aim_bam_for(0),
                 aim_bam_for(1),
+                sess.sim
+                    .best_switch_target(TeamSide::Home)
+                    .map(|i| i as i32)
+                    .unwrap_or(-1),
+                sess.sim
+                    .best_switch_target(TeamSide::Away)
+                    .map(|i| i as i32)
+                    .unwrap_or(-1),
             ]);
             out.len()
         })

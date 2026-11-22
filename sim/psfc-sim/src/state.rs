@@ -243,6 +243,9 @@ pub struct MatchState {
     pub controlled_idx: [usize; 2],
     pub prev_buttons: [u16; 2],
     pub switch_cooldown: [u8; 2],
+    /// Grace window ticks (`~1.2s`) preserving a manual `BTN_SWITCH` selection before auto-switching resumes.
+    #[serde(default)]
+    pub manual_switch_lock: [u8; 2],
     /// Pre-contact `~233ms` (`14`-tick) input lookahead buffer per team for crisp one-touch play.
     #[serde(default)]
     pub input_buffer: [Option<BufferedAction>; 2],
@@ -340,6 +343,8 @@ impl MatchState {
         h.u16(self.prev_buttons[1]);
         h.u8(self.switch_cooldown[0]);
         h.u8(self.switch_cooldown[1]);
+        h.u8(self.manual_switch_lock[0]);
+        h.u8(self.manual_switch_lock[1]);
         h.u8(self.subs_used[0]);
         h.u8(self.subs_used[1]);
         for slot in &self.input_buffer {

@@ -31,7 +31,28 @@ const PHASE_LABELS = {
   12: "FULL-TIME",
 };
 
-const CLUB_ORDER = ["man-utd", "arsenal", "liverpool", "chelsea"];
+const CLUB_ORDER = [
+  "arsenal",
+  "brighton",
+  "man-city",
+  "bournemouth",
+  "liverpool",
+  "leeds",
+  "everton",
+  "chelsea",
+  "tottenham",
+  "brentford",
+  "aston-villa",
+  "newcastle",
+  "coventry",
+  "hull",
+  "fulham",
+  "ipswich",
+  "nottm-forest",
+  "sunderland",
+  "man-utd",
+  "crystal-palace",
+];
 const SIDE_MODES = [
   { id: "home_vs_cpu", label: "P1 HOME vs CPU" },
   { id: "away_vs_cpu", label: "CPU vs P1 AWAY" },
@@ -52,6 +73,12 @@ const DIFF_OPTIONS = [
   { code: 1, name: "Easy", label: "AMATEUR" },
   { code: 2, name: "Normal", label: "PROFESSIONAL" },
   { code: 3, name: "Hard", label: "WORLD CLASS" },
+];
+const AUTO_SWITCH_STORAGE_KEY = "psfc_auto_switch_mode_v1";
+const AUTO_SWITCH_OPTIONS = [
+  { code: 0, short: "BALL", label: "ASSISTED (BALL)" },
+  { code: 1, short: "AIR", label: "AIR & LOOSE" },
+  { code: 2, short: "MANUAL", label: "MANUAL ONLY" },
 ];
 
 // Normalized (x%, y%) coordinates on the vertical 2D tactical pitch board (bottom = own goal, top = opponent goal)
@@ -353,6 +380,13 @@ let pmSideIdx = 0; // 0 = P1 Home vs CPU, 1 = CPU vs P1 Away, 2 = 2P Couch, 3 = 
 let pmFmtIdx = 0; // 0 = 5v5, 1 = 11v11
 let pmDurIdx = 1; // 2 min default
 let pmDiffIdx = 1; // Professional (Normal)
+let autoSwitchIdx = (() => {
+  try {
+    const raw = parseInt(localStorage.getItem(AUTO_SWITCH_STORAGE_KEY) || "0", 10);
+    if (Number.isInteger(raw) && raw >= 0 && raw < AUTO_SWITCH_OPTIONS.length) return raw;
+  } catch (_e) {}
+  return 0; // Default: ASSISTED (BALL)
+})();
 let pendingOfficialFixture = null; // Set when entering Pre-Match from an Official Parallel Fixture!
 
 // Live match & deterministic substitution state
@@ -1622,6 +1656,7 @@ function stepFocusedPreMatchRow(dir) {
     ["pm-diff-prev", "pm-diff-next"],
     ["pm-cam-prev", "pm-cam-next"],
     ["pm-wx-prev", "pm-wx-next"],
+    ["pm-sw-prev", "pm-sw-next"],
   ];
   const pair = pairs[pmFocusedRowIdx];
   if (!pair) return;
@@ -1694,7 +1729,7 @@ window.addEventListener("keydown", (ev) => {
       stepFocusedPreMatchRow(1);
     } else if (ev.code === "KeyY") {
       ev.preventDefault();
-      activeSquadClub = pmHomeClub;
+      activeSquadClub = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? pmAwayClub : pmHomeClub;
       navigateTo("squad");
     } else if (ev.code === "Enter") {
       ev.preventDefault();
@@ -1878,7 +1913,7 @@ function pollGamepadMenuActions(nowMs) {
       navigateTo(pendingOfficialFixture ? "season" : "menu");
     } else if (gp.north || gp.west) {
       prevPadNavTick = nowMs + 320;
-      activeSquadClub = pmHomeClub;
+      activeSquadClub = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? pmAwayClub : pmHomeClub;
       navigateTo("squad");
     }
   } else if (currentScreen === "controllers") {
@@ -1895,6 +1930,151 @@ function pollGamepadMenuActions(nowMs) {
 
 // --- Background Attract Match & Match Session Lifecycle ---
 
+function _mkOfflineAttrs(pace, drib, pass, shoot, tackle, pos, str, gk) {
+  return {
+    pace,
+    acceleration: pace,
+    dribbling: drib,
+    passing: pass,
+    shooting: shoot,
+    tackling: tackle,
+    positioning: pos,
+    stamina: 85,
+    strength: str,
+    goalkeeping: gk,
+  };
+}
+
+const OFFLINE_2026_CLUBS = {
+  "man-utd": {
+    club_id: "man-utd",
+    club_name: "Manchester United",
+    short_name: "MUN",
+    primary_color: "#DA291C",
+    secondary_color: "#FFFFFF",
+    formation_5v5: "1-2-1",
+    formation_11v11: "4-3-3",
+    squad: [
+      { footballer_id: "mun-gk-2", name: "S. Lammens", shirt_number: 1, role: "Goalkeeper", attributes: _mkOfflineAttrs(56, 48, 80, 35, 42, 81, 76, 82) },
+      { footballer_id: "mun-def-1", name: "L. Martinez", shirt_number: 6, role: "Defender", attributes: _mkOfflineAttrs(77, 70, 83, 60, 86, 86, 82, 15) },
+      { footballer_id: "mun-mid-1", name: "K. Mainoo", shirt_number: 37, role: "Midfielder", attributes: _mkOfflineAttrs(80, 86, 84, 75, 78, 82, 72, 12) },
+      { footballer_id: "mun-mid-2", name: "B. Fernandes", shirt_number: 8, role: "Midfielder", attributes: _mkOfflineAttrs(76, 85, 90, 86, 70, 84, 72, 12) },
+      { footballer_id: "mun-fwd-4", name: "M. Cunha", shirt_number: 10, role: "Forward", attributes: _mkOfflineAttrs(86, 87, 82, 84, 44, 85, 79, 10) },
+      { footballer_id: "mun-def-2", name: "D. Dalot", shirt_number: 2, role: "Defender", attributes: _mkOfflineAttrs(85, 72, 79, 60, 80, 80, 77, 15) },
+      { footballer_id: "mun-def-3", name: "M. de Ligt", shirt_number: 4, role: "Defender", attributes: _mkOfflineAttrs(74, 68, 75, 58, 85, 85, 88, 15) },
+      { footballer_id: "mun-def-5", name: "L. Yoro", shirt_number: 15, role: "Defender", attributes: _mkOfflineAttrs(83, 70, 78, 56, 84, 84, 82, 15) },
+      { footballer_id: "mun-mid-4", name: "Y. Tielemans", shirt_number: 18, role: "Midfielder", attributes: _mkOfflineAttrs(71, 82, 86, 80, 75, 82, 74, 12) },
+      { footballer_id: "mun-fwd-5", name: "B. Mbeumo", shirt_number: 19, role: "Forward", attributes: _mkOfflineAttrs(89, 85, 80, 85, 44, 85, 77, 10) },
+      { footballer_id: "mun-fwd-6", name: "B. Sesko", shirt_number: 30, role: "Forward", attributes: _mkOfflineAttrs(88, 80, 73, 84, 44, 85, 86, 10) },
+    ],
+  },
+  arsenal: {
+    club_id: "arsenal",
+    club_name: "Arsenal",
+    short_name: "ARS",
+    primary_color: "#EF0107",
+    secondary_color: "#FFFFFF",
+    formation_5v5: "1-2-1",
+    formation_11v11: "4-3-3",
+    squad: [
+      { footballer_id: "ars-gk-1", name: "D. Raya", shirt_number: 1, role: "Goalkeeper", attributes: _mkOfflineAttrs(56, 48, 85, 35, 42, 87, 76, 88) },
+      { footballer_id: "ars-def-1", name: "W. Saliba", shirt_number: 2, role: "Defender", attributes: _mkOfflineAttrs(84, 72, 82, 58, 90, 90, 87, 15) },
+      { footballer_id: "ars-mid-1", name: "D. Rice", shirt_number: 41, role: "Midfielder", attributes: _mkOfflineAttrs(80, 83, 86, 78, 89, 86, 84, 12) },
+      { footballer_id: "ars-mid-2", name: "M. Odegaard", shirt_number: 8, role: "Midfielder", attributes: _mkOfflineAttrs(79, 90, 91, 84, 68, 85, 70, 12) },
+      { footballer_id: "ars-fwd-1", name: "B. Saka", shirt_number: 7, role: "Forward", attributes: _mkOfflineAttrs(89, 90, 86, 87, 48, 86, 76, 10) },
+      { footballer_id: "ars-def-3", name: "Gabriel", shirt_number: 6, role: "Defender", attributes: _mkOfflineAttrs(78, 68, 76, 62, 88, 88, 89, 15) },
+      { footballer_id: "ars-def-5", name: "R. Calafiori", shirt_number: 33, role: "Defender", attributes: _mkOfflineAttrs(81, 76, 83, 64, 85, 85, 83, 15) },
+      { footballer_id: "ars-def-4", name: "J. Timber", shirt_number: 12, role: "Defender", attributes: _mkOfflineAttrs(84, 78, 82, 60, 84, 84, 80, 15) },
+      { footballer_id: "ars-mid-4", name: "B. Guimaraes", shirt_number: 39, role: "Midfielder", attributes: _mkOfflineAttrs(77, 85, 87, 79, 84, 84, 78, 12) },
+      { footballer_id: "ars-fwd-4", name: "E. Eze", shirt_number: 10, role: "Forward", attributes: _mkOfflineAttrs(85, 90, 84, 83, 46, 84, 74, 10) },
+      { footballer_id: "ars-fwd-5", name: "V. Gyokeres", shirt_number: 14, role: "Forward", attributes: _mkOfflineAttrs(87, 83, 77, 88, 44, 87, 88, 10) },
+    ],
+  },
+};
+
+function buildOffline2026Snapshot(formatName, seed, halfTicks, homeCtrl, awayCtrl, homeClubId, awayClubId) {
+  const is11 = formatName === "11v11";
+  const rosters = (latestOverview && latestOverview.rosters) || {};
+  const buildSide = (cid, fallbackKey) => {
+    const r = rosters[cid];
+    if (r && Array.isArray(r.squad) && r.squad.length >= 5) {
+      const clean = (m) => ({
+        footballer_id: m.footballer_id,
+        name: m.name,
+        shirt_number: m.shirt_number,
+        role: m.role,
+        attributes: m.attributes,
+      });
+      const starters = is11
+        ? r.squad.slice(0, 11).map(clean)
+        : r.squad.filter((m) => m.selected_5v5).slice(0, 5).map(clean);
+      const stIds = new Set(starters.map((m) => m.footballer_id));
+      const substitutes = r.squad.filter((m) => !stIds.has(m.footballer_id)).map(clean);
+      return {
+        club_id: r.club_id,
+        club_name: r.name,
+        short_name: r.short_name,
+        primary_color: r.primary_color,
+        secondary_color: r.secondary_color,
+        formation: is11 ? r.formation_11v11 : r.formation_5v5,
+        starters,
+        substitutes,
+      };
+    }
+    const fb = OFFLINE_2026_CLUBS[cid] || OFFLINE_2026_CLUBS[fallbackKey];
+    const count = is11 ? 11 : 5;
+    return {
+      club_id: fb.club_id,
+      club_name: fb.club_name,
+      short_name: fb.short_name,
+      primary_color: fb.primary_color,
+      secondary_color: fb.secondary_color,
+      formation: is11 ? fb.formation_11v11 : fb.formation_5v5,
+      starters: fb.squad.slice(0, count),
+      substitutes: fb.squad.slice(count),
+    };
+  };
+
+  return {
+    fixture_id: "offline-2026-27",
+    gameplay_version: "0.1.0-5v5",
+    seed,
+    format: is11
+      ? {
+          name: "11v11",
+          players_per_side: 11,
+          pitch_length_mm: 105000,
+          pitch_width_mm: 68000,
+          goal_width_mm: 7320,
+          goal_height_mm: 2440,
+          penalty_box_depth_mm: 16500,
+          penalty_box_width_mm: 40320,
+          center_circle_radius_mm: 9150,
+        }
+      : {
+          name: "5v5",
+          players_per_side: 5,
+          pitch_length_mm: 56000,
+          pitch_width_mm: 36000,
+          goal_width_mm: 4000,
+          goal_height_mm: 2100,
+          penalty_box_depth_mm: 9000,
+          penalty_box_width_mm: 18000,
+          center_circle_radius_mm: 5500,
+        },
+    rules: {
+      half_duration_ticks: halfTicks,
+      offsides_enabled: is11,
+      fouls_enabled: true,
+      extra_time_enabled: false,
+      home_controller: homeCtrl,
+      away_controller: awayCtrl,
+    },
+    home: buildSide(homeClubId || "man-utd", "man-utd"),
+    away: buildSide(awayClubId || "arsenal", "arsenal"),
+  };
+}
+
 async function startAttractBackgroundMatch() {
   if (!wasm || attractRestartInFlight) return;
   attractRestartInFlight = true;
@@ -1904,7 +2084,7 @@ async function startAttractBackgroundMatch() {
   paused = false;
   fulltimeShown = false;
 
-  const seedLo = 20261120;
+  const seedLo = 20261121;
   try {
     try {
       const res = await fetch("/api/exhibition/snapshot", {
@@ -1912,8 +2092,8 @@ async function startAttractBackgroundMatch() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           world_id: activeWorldId,
-          home_club_id: "man-utd",
-          away_club_id: "arsenal",
+          home_club_id: "liverpool",
+          away_club_id: "man-utd",
           format_name: "5v5",
           half_duration_ticks: 14400,
           home_controller: { kind: "Cpu", difficulty: "Hard" },
@@ -1934,18 +2114,113 @@ async function startAttractBackgroundMatch() {
         }
       }
     } catch (_e) {
-      // Offline fallback
+      // Offline 2026–27 snapshot fallback
     }
 
     if (seq !== matchSessionSeq || !isAttractMatch || currentScreen === "match") return;
-    if (wasm.sim_init_preset(0, seedLo, 0, 14400, 3, 3)) {
-      currentSnapshot = JSON.parse(wasmReadText());
+    const offlineSnap = buildOffline2026Snapshot(
+      "5v5",
+      seedLo,
+      14400,
+      { kind: "Cpu", difficulty: "Hard" },
+      { kind: "Cpu", difficulty: "Hard" },
+      "man-utd",
+      "arsenal"
+    );
+    wasmWriteInputText(JSON.stringify(offlineSnap));
+    if (wasm.sim_init_from_snapshot_json()) {
+      currentSnapshot = offlineSnap;
       engine3d.loadSnapshotScene(currentSnapshot);
       resetSimInterpState();
     }
   } finally {
     attractRestartInFlight = false;
   }
+}
+
+function getAvailableClubOrder() {
+  const rosters = latestOverview && latestOverview.rosters;
+  if (rosters && typeof rosters === "object") {
+    const clubIds = Object.keys(rosters);
+    if (clubIds.length > 0) {
+      return CLUB_ORDER.filter((c) => clubIds.includes(c)).concat(
+        clubIds.filter((c) => !CLUB_ORDER.includes(c))
+      );
+    }
+  }
+  return Object.keys(OFFLINE_2026_CLUBS);
+}
+
+function getClubRosterWithFallback(clubId) {
+  const rosters = (latestOverview && latestOverview.rosters) || {};
+  if (rosters[clubId]) return rosters[clubId];
+  const fb = OFFLINE_2026_CLUBS[clubId];
+  if (!fb) return null;
+  return {
+    club_id: fb.club_id,
+    name: fb.club_name,
+    short_name: fb.short_name,
+    stadium: fb.club_id === "arsenal" ? "Emirates Stadium" : "Old Trafford",
+    primary_color: fb.primary_color,
+    secondary_color: fb.secondary_color,
+    formation_5v5: fb.formation_5v5,
+    formation_11v11: fb.formation_11v11,
+    squad: fb.squad.map((p, idx) => ({
+      ...p,
+      overall: Math.round(
+        (p.attributes.pace + p.attributes.passing + p.attributes.shooting + p.attributes.positioning) / 4
+      ),
+      selected_5v5: idx < 5,
+      default_starter_5v5: idx < 5,
+    })),
+  };
+}
+
+function getOfficialFixtureRepresentation(fx) {
+  const assignments = (latestOverview && latestOverview.assignments) || [];
+  const homeClubId = fx.homeClubId || (fx.home_club && fx.home_club.club_id) || fx.home_club_id;
+  const awayClubId = fx.awayClubId || (fx.away_club && fx.away_club.club_id) || fx.away_club_id;
+  const homeAsgn = assignments.find((a) => a.club_id === homeClubId) || null;
+  const awayAsgn = assignments.find((a) => a.club_id === awayClubId) || null;
+  const homeRep = Boolean(homeAsgn);
+  const awayRep = Boolean(awayAsgn);
+  const actorId =
+    (homeAsgn && homeAsgn.participant_id) ||
+    (awayAsgn && awayAsgn.participant_id) ||
+    "part-alex";
+  return { homeClubId, awayClubId, homeRep, awayRep, actorId };
+}
+
+function getAllowedOfficialSideIndices(fx) {
+  if (!fx || fx.result_source === "played_vs_friend") return [0, 1, 2, 3];
+  const rep = getOfficialFixtureRepresentation(fx);
+  if (rep.awayRep && !rep.homeRep) return [1, 3];
+  if (rep.homeRep && !rep.awayRep) return [0, 3];
+  return [0, 1, 3];
+}
+
+function defaultOfficialSideIdx(fx) {
+  if (!fx) return 0;
+  if (fx.result_source === "played_vs_friend") return 2;
+  const rep = getOfficialFixtureRepresentation(fx);
+  if (rep.awayRep && !rep.homeRep) return 1;
+  return 0;
+}
+
+function normalizeOfficialSideIdx(fx, idx) {
+  if (!fx) return idx;
+  const allowed = getAllowedOfficialSideIndices(fx);
+  return allowed.includes(idx) ? idx : defaultOfficialSideIdx(fx);
+}
+
+function sideIdxFromSnapshotRules(rules) {
+  if (!rules) return pmSideIdx;
+  const hHuman = rules.home_controller && rules.home_controller.kind === "Human";
+  const aHuman = rules.away_controller && rules.away_controller.kind === "Human";
+  if (hHuman && aHuman) return 2;
+  if (!hHuman && aHuman) return 1;
+  if (hHuman && !aHuman) return 0;
+  return 3;
 }
 
 function resolvePreMatchControllers() {
@@ -2038,29 +2313,24 @@ async function launchSelectedMatch() {
   GameAudio.uiConfirm();
 
   const fmtName = FORMAT_OPTIONS[pmFmtIdx].id;
-  const fmtCode = fmtName === "11v11" ? 1 : 0;
   const halfTicks = DURATION_OPTIONS[pmDurIdx].ticks;
-  const ctrls = resolvePreMatchControllers();
 
   // Official Parallel Season Fixture Session
   if (pendingOfficialFixture) {
     const fx = pendingOfficialFixture;
-    const awayCtrl =
-      fx.result_source === "played_vs_friend" && SIDE_MODES[pmSideIdx].id === "local_2p"
-        ? { kind: "Human" }
-        : ctrls.awaySpec.kind === "Human" && fx.result_source !== "played_vs_friend"
-          ? { kind: "Cpu", difficulty: DIFF_OPTIONS[pmDiffIdx].name }
-          : ctrls.awaySpec;
+    pmSideIdx = normalizeOfficialSideIdx(fx, pmSideIdx);
+    const ctrls = resolvePreMatchControllers();
+    const rep = getOfficialFixtureRepresentation(fx);
 
     const res = await fetch(`/api/fixtures/${encodeURIComponent(fx.id)}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        actor_id: "part-alex",
+        actor_id: rep.actorId,
         format_name: fmtName,
         half_duration_ticks: halfTicks,
         home_controller: ctrls.homeSpec,
-        away_controller: awayCtrl,
+        away_controller: ctrls.awaySpec,
       }),
     });
     if (!res.ok) {
@@ -2074,9 +2344,11 @@ async function launchSelectedMatch() {
       alert(`Engine snapshot error: ${wasmReadText()}`);
       return;
     }
+    pmSideIdx = sideIdxFromSnapshotRules(payload.snapshot.rules);
     activeOfficialSession = {
       sessionId: payload.session_id,
       fixtureId: payload.fixture_id,
+      actorId: rep.actorId,
       submitting: false,
       completed: false,
     };
@@ -2085,6 +2357,8 @@ async function launchSelectedMatch() {
     refreshWorldOverview();
     return;
   }
+
+  const ctrls = resolvePreMatchControllers();
 
   // Exhibition Kick Off Match
   activeOfficialSession = null;
@@ -2116,12 +2390,21 @@ async function launchSelectedMatch() {
       }
     }
   } catch (_e) {
-    // Fallback preset
+    // Offline 2026–27 snapshot fallback
   }
 
-  if (wasm.sim_init_preset(fmtCode, seedLo, 0, halfTicks, ctrls.homeCode, ctrls.awayCode)) {
-    const snap = JSON.parse(wasmReadText());
-    setupLiveMatchHud(snap, `EXHIBITION · ${snap.format.name}`);
+  const offlineSnap = buildOffline2026Snapshot(
+    fmtName,
+    seedLo,
+    halfTicks,
+    ctrls.homeSpec,
+    ctrls.awaySpec,
+    pmHomeClub,
+    pmAwayClub
+  );
+  wasmWriteInputText(JSON.stringify(offlineSnap));
+  if (wasm.sim_init_from_snapshot_json()) {
+    setupLiveMatchHud(offlineSnap, `EXHIBITION · ${offlineSnap.format.name}`);
   }
 }
 
@@ -2151,7 +2434,7 @@ async function submitOfficialSessionResult() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        actor_id: "part-alex",
+        actor_id: activeOfficialSession.actorId || "part-alex",
         frames_hex: log.frames_hex,
         claimed_final_hash_hex: log.claimed_final_hash_hex,
         claimed_score: log.claimed_score,
@@ -2197,8 +2480,7 @@ function computeClubRatings(roster) {
 }
 
 function renderPreMatchTeamCard(prefix, clubId, kitColorHex, kitTextColorHex) {
-  const rosters = (latestOverview && latestOverview.rosters) || {};
-  const r = rosters[clubId];
+  const r = getClubRosterWithFallback(clubId);
   if (!r) return;
 
   const crest = document.getElementById(`pm-${prefix}-crest`);
@@ -2234,14 +2516,20 @@ function renderPreMatchTeamCard(prefix, clubId, kitColorHex, kitTextColorHex) {
 }
 
 function renderPreMatchScreen() {
-  const rosters = (latestOverview && latestOverview.rosters) || {};
   const locked = Boolean(pendingOfficialFixture);
 
   if (locked) {
     pmHomeClub = pendingOfficialFixture.homeClubId;
     pmAwayClub = pendingOfficialFixture.awayClubId;
-  } else if (pmAwayClub === pmHomeClub) {
-    pmAwayClub = CLUB_ORDER.find((c) => c !== pmHomeClub) || "arsenal";
+    pmSideIdx = normalizeOfficialSideIdx(pendingOfficialFixture, pmSideIdx);
+  } else {
+    const availableClubs = getAvailableClubOrder();
+    if (!availableClubs.includes(pmHomeClub)) {
+      pmHomeClub = availableClubs[0] || "man-utd";
+    }
+    if (!availableClubs.includes(pmAwayClub) || pmAwayClub === pmHomeClub) {
+      pmAwayClub = availableClubs.find((c) => c !== pmHomeClub) || pmHomeClub;
+    }
   }
 
   document.getElementById("pm-home-prev").disabled = locked;
@@ -2253,8 +2541,8 @@ function renderPreMatchScreen() {
     ? `OFFICIAL · ${pendingOfficialFixture.stageLabel}`
     : "EXHIBITION MATCH";
 
-  const hRoster = rosters[pmHomeClub];
-  const aRoster = rosters[pmAwayClub];
+  const hRoster = getClubRosterWithFallback(pmHomeClub);
+  const aRoster = getClubRosterWithFallback(pmAwayClub);
   const kits = resolveMatchKits(
     pmHomeClub,
     pmAwayClub,
@@ -2274,17 +2562,37 @@ function renderPreMatchScreen() {
   document.getElementById("pm-diff-val").textContent = DIFF_OPTIONS[pmDiffIdx].label;
   document.getElementById("pm-cam-val").textContent = CAMERA_LABELS[engine3d.cameraMode];
   syncWeatherLabels();
+  syncAutoSwitchLabels();
 
   engine3d.updatePreMatchShowcase(hRoster, aRoster);
 }
 
-// --- Match HUD, Weather, Live Substitutions, Radar, Pause & Instant Replay ---
+// --- Match HUD, Weather, Auto-Switch, Live Substitutions, Radar, Pause & Instant Replay ---
 
 function showGoalBroadcastBanner(title, sub, ticks = 150) {
   document.getElementById("goal-banner-title").textContent = title;
   document.getElementById("goal-banner-sub").textContent = sub;
   document.getElementById("goal-banner").hidden = false;
   goalBannerTicks = ticks;
+}
+
+function syncAutoSwitchLabels() {
+  const opt = AUTO_SWITCH_OPTIONS[autoSwitchIdx] || AUTO_SWITCH_OPTIONS[0];
+  const pmEl = document.getElementById("pm-sw-val");
+  if (pmEl) pmEl.textContent = opt.label;
+  const hudEl = document.getElementById("btn-hud-sw");
+  if (hudEl) hudEl.textContent = `SW: ${opt.short}`;
+  const pauseEl = document.getElementById("btn-pause-sw");
+  if (pauseEl) pauseEl.textContent = `AUTO-SWITCH: ${opt.label}`;
+}
+
+function stepAutoSwitch(dir = 1) {
+  autoSwitchIdx = (autoSwitchIdx + dir + AUTO_SWITCH_OPTIONS.length) % AUTO_SWITCH_OPTIONS.length;
+  try {
+    localStorage.setItem(AUTO_SWITCH_STORAGE_KEY, String(autoSwitchIdx));
+  } catch (_e) {}
+  syncAutoSwitchLabels();
+  GameAudio.uiTick(590);
 }
 
 function syncWeatherLabels() {
@@ -2861,10 +3169,13 @@ function mainLoop(nowMs) {
           hIn = samplePrimaryHumanInput(true);
         }
 
+        const swBits = ((AUTO_SWITCH_OPTIONS[autoSwitchIdx]?.code ?? 0) & 0x3) << 12;
         for (let s = 0; s < steps; s++) {
           if (currSimPacked) prevSimPacked = currSimPacked;
-          const hBtns = ((hIn.btns & 0xffff) | ((queuedSubReserved[0] & 0xffff) << 16)) >>> 0;
-          const aBtns = ((aIn.btns & 0xffff) | ((queuedSubReserved[1] & 0xffff) << 16)) >>> 0;
+          const hReserved = (queuedSubReserved[0] | swBits) & 0xffff;
+          const aReserved = (queuedSubReserved[1] | swBits) & 0xffff;
+          const hBtns = ((hIn.btns & 0xffff) | (hReserved << 16)) >>> 0;
+          const aBtns = ((aIn.btns & 0xffff) | (aReserved << 16)) >>> 0;
           queuedSubReserved[0] = 0;
           queuedSubReserved[1] = 0;
 
@@ -2954,12 +3265,35 @@ function roleBadgeMeta(role) {
 
 function renderSquadBuilder() {
   if (!latestOverview || !latestOverview.rosters) return;
+  const orderedIds = getAvailableClubOrder();
+  if (!latestOverview.rosters[activeSquadClub] && orderedIds.length > 0) {
+    activeSquadClub = orderedIds[0];
+  }
   const roster = latestOverview.rosters[activeSquadClub];
   if (!roster) return;
 
-  document.querySelectorAll(".sq-club-tab").forEach((btn) => {
-    btn.classList.toggle("active", btn.getAttribute("data-club") === activeSquadClub);
-  });
+  const tabsEl = document.getElementById("sq-club-tabs");
+  if (tabsEl) {
+    tabsEl.innerHTML = "";
+    for (const cid of orderedIds) {
+      const cr = latestOverview.rosters[cid];
+      if (!cr) continue;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `sq-club-tab${cid === activeSquadClub ? " active" : ""}`;
+      btn.setAttribute("data-club", cid);
+      btn.title = cr.name;
+      btn.textContent = cr.short_name || cid.toUpperCase();
+      btn.addEventListener("click", () => {
+        activeSquadClub = cid;
+        swapArmedStarterId = null;
+        document.getElementById("squad-save-msg").hidden = true;
+        GameAudio.uiTick();
+        renderSquadBuilder();
+      });
+      tabsEl.appendChild(btn);
+    }
+  }
 
   const draft = ensureClubDraft(roster);
   document.querySelectorAll(".sq-fmt-pill").forEach((btn) => {
@@ -3204,7 +3538,13 @@ function buildFixtureCardElement(fx) {
         ? "Parallel-Only Divergent Tie"
         : "";
 
-  let actionHtml = `<span>${fx.accepted_source === "imported" ? "Inherited" : "Verified"}</span>`;
+  let actionHtml = `<span>${
+    fx.state === "accepted"
+      ? fx.accepted_source === "imported"
+        ? "Inherited"
+        : "Verified"
+      : "Awaiting Real Kickoff"
+  }</span>`;
   if (isPlayable) {
     actionHtml = `<button class="console-btn console-btn-primary btn-play-fx" type="button" style="font-size:14px;padding:6px 14px">
       ${fx.state === "in_session" ? "RESUME MATCH ▶" : "PLAY OFFICIAL ▶"}
@@ -3243,7 +3583,7 @@ function buildFixtureCardElement(fx) {
         result_source: fx.result_source,
         stageLabel: stageBadge,
       };
-      pmSideIdx = fx.result_source === "played_vs_friend" ? 2 : 0;
+      pmSideIdx = defaultOfficialSideIdx(pendingOfficialFixture);
       GameAudio.uiConfirm();
       navigateTo("prematch");
     });
@@ -3283,20 +3623,27 @@ async function refreshWorldOverview() {
   const data = await res.json();
   latestOverview = data;
 
-  document.getElementById("top-world-chip").textContent = `${data.world.season_label} · ${data.world.name}`;
-  document.getElementById("world-name").textContent = `${data.world.name} (${data.world.season_label})`;
+  const hasSeasonInName = String(data.world.name || "").includes(String(data.world.season_label || ""));
+  document.getElementById("top-world-chip").textContent = hasSeasonInName
+    ? data.world.name.toUpperCase()
+    : `${data.world.season_label} · ${data.world.name}`;
+  document.getElementById("world-name").textContent = hasSeasonInName
+    ? data.world.name
+    : `${data.world.name} (${data.world.season_label})`;
 
   const repLabel = data.assignments
     .map((a) => `${a.club_id.toUpperCase()} (${a.participant_name.split(" ")[0]})`)
     .join(", ");
   document.getElementById("world-meta").textContent = `Represented: ${repLabel || "None"}`;
 
-  // Main Menu Spotlight Card (Next Playable Official Fixture + Mini Standings)
-  const nextPlayable = data.fixtures.find(
-    (fx) =>
-      fx.state !== "accepted" &&
-      (fx.result_source === "played_vs_friend" || fx.result_source === "played_vs_cpu")
-  );
+  // Main Menu Spotlight Card (Next Playable Official Fixture chronologically by kickoff_utc + Mini Standings)
+  const nextPlayable = data.fixtures
+    .filter(
+      (fx) =>
+        fx.state !== "accepted" &&
+        (fx.result_source === "played_vs_friend" || fx.result_source === "played_vs_cpu")
+    )
+    .sort((a, b) => String(a.kickoff_utc || "").localeCompare(String(b.kickoff_utc || "")))[0];
   const hubMatchup = document.getElementById("hub-next-matchup");
   const hubMeta = document.getElementById("hub-next-meta");
   const hubPlayBtn = document.getElementById("btn-hub-play-official");
@@ -3319,7 +3666,7 @@ async function refreshWorldOverview() {
         result_source: nextPlayable.result_source,
         stageLabel: stg.toUpperCase(),
       };
-      pmSideIdx = nextPlayable.result_source === "played_vs_friend" ? 2 : 0;
+      pmSideIdx = defaultOfficialSideIdx(pendingOfficialFixture);
       GameAudio.uiConfirm();
       navigateTo("prematch");
     };
@@ -3332,18 +3679,35 @@ async function refreshWorldOverview() {
   }
 
   const miniTbody = document.querySelector("#hub-mini-standings tbody");
-  miniTbody.innerHTML = data.standings
-    .map(
-      (r) => `
+  const topSix = data.standings.slice(0, 6);
+  const extraRep = data.standings.filter((r) => r.position > 6 && r.represented);
+  const miniRows = [];
+  for (const r of topSix) {
+    miniRows.push(`
       <tr>
         <td>${r.position}</td>
         <td><strong>${r.short_name}</strong> ${r.represented ? "★" : ""}</td>
         <td>${r.played}</td>
         <td>${r.gd > 0 ? `+${r.gd}` : r.gd}</td>
         <td><strong>${r.points}</strong></td>
-      </tr>`
-    )
-    .join("");
+      </tr>`);
+  }
+  if (extraRep.length > 0) {
+    if (extraRep[0].position > 7) {
+      miniRows.push(`<tr><td colspan="5" style="text-align:center;opacity:0.45;padding:2px 0">· · ·</td></tr>`);
+    }
+    for (const r of extraRep) {
+      miniRows.push(`
+        <tr>
+          <td>${r.position}</td>
+          <td><strong>${r.short_name}</strong> ★</td>
+          <td>${r.played}</td>
+          <td>${r.gd > 0 ? `+${r.gd}` : r.gd}</td>
+          <td><strong>${r.points}</strong></td>
+        </tr>`);
+    }
+  }
+  miniTbody.innerHTML = miniRows.join("");
 
   // Honours banner
   const honStrip = document.getElementById("honours-strip");
@@ -3356,14 +3720,30 @@ async function refreshWorldOverview() {
     honStrip.hidden = true;
   }
 
-  // Season Fixtures Grid
+  // Season Fixtures Grid — show open/live/upcoming fixtures chronologically by kickoff_utc first, then completed fixtures newest-first!
   const fxGrid = document.getElementById("fixture-list");
   fxGrid.innerHTML = "";
-  const filtered = data.fixtures.filter((fx) => {
-    if (activeCompFilter === "league") return fx.stage === "league";
-    if (activeCompFilter === "knockout") return fx.stage !== "league";
-    return true;
-  });
+  const filtered = data.fixtures
+    .filter((fx) => {
+      if (activeCompFilter === "upcoming") return fx.state !== "accepted";
+      if (activeCompFilter === "league") return fx.stage === "league";
+      if (activeCompFilter === "knockout") return fx.stage !== "league";
+      return true;
+    })
+    .slice()
+    .sort((a, b) => {
+      const aDone = a.state === "accepted" ? 1 : 0;
+      const bDone = b.state === "accepted" ? 1 : 0;
+      if (aDone !== bDone) return aDone - bDone;
+      if (aDone === 0) {
+        const cmpKo = String(a.kickoff_utc || "").localeCompare(String(b.kickoff_utc || ""));
+        if (cmpKo !== 0) return cmpKo;
+        return a.round - b.round;
+      }
+      const cmpKoDesc = String(b.kickoff_utc || "").localeCompare(String(a.kickoff_utc || ""));
+      if (cmpKoDesc !== 0) return cmpKoDesc;
+      return b.round - a.round;
+    });
   filtered.forEach((fx) => fxGrid.appendChild(buildFixtureCardElement(fx)));
 
   // FA Parallel Cup Bracket Grid
@@ -3380,7 +3760,7 @@ async function refreshWorldOverview() {
       return `
         <tr>
           <td>${r.position}</td>
-          <td><strong>${r.name}</strong> ${r.represented ? "🎮" : ""}</td>
+          <td><strong>${r.club_name || r.name}</strong> ${r.represented ? "🎮" : ""}</td>
           <td>${r.played}</td>
           <td>${r.won} - ${r.drawn} - ${r.lost}</td>
           <td>${r.gd > 0 ? `+${r.gd}` : r.gd}</td>
@@ -3472,12 +3852,23 @@ document.getElementById("btn-hub-full-table").addEventListener("click", () => {
 
 // Pre-Match Steppers
 function stepClub(current, dir, avoid) {
-  let idx = CLUB_ORDER.indexOf(current);
-  for (let i = 0; i < CLUB_ORDER.length; i++) {
-    idx = (idx + dir + CLUB_ORDER.length) % CLUB_ORDER.length;
-    if (CLUB_ORDER[idx] !== avoid) return CLUB_ORDER[idx];
+  const order = getAvailableClubOrder();
+  if (order.length === 0) return current;
+  let idx = order.indexOf(current);
+  if (idx < 0) idx = 0;
+  for (let i = 0; i < order.length; i++) {
+    idx = (idx + dir + order.length) % order.length;
+    if (order[idx] !== avoid) return order[idx];
   }
-  return current;
+  return order[0];
+}
+
+function stepSideMode(dir) {
+  const allowed = getAllowedOfficialSideIndices(pendingOfficialFixture);
+  let pos = allowed.indexOf(pmSideIdx);
+  if (pos < 0) pos = 0;
+  pos = (pos + dir + allowed.length) % allowed.length;
+  pmSideIdx = allowed[pos];
 }
 
 document.getElementById("pm-home-prev").addEventListener("click", () => {
@@ -3502,12 +3893,12 @@ document.getElementById("pm-away-next").addEventListener("click", () => {
 });
 
 document.getElementById("pm-side-prev").addEventListener("click", () => {
-  pmSideIdx = (pmSideIdx - 1 + SIDE_MODES.length) % SIDE_MODES.length;
+  stepSideMode(-1);
   GameAudio.uiTick();
   renderPreMatchScreen();
 });
 document.getElementById("pm-side-next").addEventListener("click", () => {
-  pmSideIdx = (pmSideIdx + 1) % SIDE_MODES.length;
+  stepSideMode(1);
   GameAudio.uiTick();
   renderPreMatchScreen();
 });
@@ -3559,13 +3950,19 @@ document.getElementById("pm-wx-prev").addEventListener("click", () => {
 document.getElementById("pm-wx-next").addEventListener("click", () => {
   cycleMatchWeather();
 });
+document.getElementById("pm-sw-prev").addEventListener("click", () => {
+  stepAutoSwitch(-1);
+});
+document.getElementById("pm-sw-next").addEventListener("click", () => {
+  stepAutoSwitch(1);
+});
 
 document.getElementById("btn-pm-back").addEventListener("click", () => {
   GameAudio.uiTick(380);
   navigateTo(pendingOfficialFixture ? "season" : "menu");
 });
 document.getElementById("btn-pm-squads").addEventListener("click", () => {
-  activeSquadClub = pmHomeClub;
+  activeSquadClub = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? pmAwayClub : pmHomeClub;
   GameAudio.uiConfirm();
   navigateTo("squad");
 });
@@ -3615,7 +4012,7 @@ document.getElementById("btn-play-with-squad").addEventListener("click", async (
   pendingOfficialFixture = null;
   pmHomeClub = activeSquadClub;
   if (pmAwayClub === pmHomeClub) {
-    pmAwayClub = activeSquadClub === "arsenal" ? "man-utd" : "arsenal";
+    pmAwayClub = stepClub(pmHomeClub, 1, pmHomeClub);
   }
   pmFmtIdx = 0;
   navigateTo("prematch");
@@ -3689,10 +4086,10 @@ document.getElementById("btn-rollover-season").addEventListener("click", async (
 });
 
 document.getElementById("btn-propose-appt").addEventListener("click", async () => {
-  await fetch("/api/fixtures/fix-r3-mun-ars/appointments", {
+  await fetch("/api/fixtures/fix-mw16-ars-mun/appointments", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ proposed_by: "part-alex", proposed_at_utc: "2026-08-30T20:00:00Z" }),
+    body: JSON.stringify({ proposed_by: "part-alex", proposed_at_utc: "2026-12-20T16:30:00Z" }),
   });
   await refreshWorldOverview();
 });
@@ -3701,7 +4098,7 @@ document.getElementById("btn-test-gate").addEventListener("click", async () => {
   const res = await fetch(`/api/worlds/${encodeURIComponent(activeWorldId)}/ingest/result`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ fixture_id: "fix-r3-mun-ars", home_goals: 1, away_goals: 4, events: [] }),
+    body: JSON.stringify({ fixture_id: "fix-mw16-ars-mun", home_goals: 1, away_goals: 4, events: [] }),
   });
   const out = await res.json();
   const box = document.getElementById("gate-msg");
@@ -3719,7 +4116,7 @@ document.getElementById("btn-reset-world").addEventListener("click", async () =>
     return;
   }
   activeWorldId = DEFAULT_WORLD_ID;
-  box.textContent = "Demo world reset to Round 3.";
+  box.textContent = "Demo world reset to 2026/27 Premier League Matchweek 11.";
   await refreshWorldOverview();
 });
 
@@ -3861,6 +4258,7 @@ document.getElementById("btn-hud-zoom-in").addEventListener("click", () => {
   engine3d.adjustZoom(-0.09);
   GameAudio.uiTick(560);
 });
+document.getElementById("btn-hud-sw").addEventListener("click", () => stepAutoSwitch(1));
 document.getElementById("btn-hud-wx").addEventListener("click", cycleMatchWeather);
 document.getElementById("btn-hud-cam").addEventListener("click", cycleMatchCamera);
 document.getElementById("btn-hud-replay").addEventListener("click", toggleInstantReplay);
@@ -3869,6 +4267,7 @@ document.getElementById("btn-hud-pause").addEventListener("click", togglePauseMo
 document.getElementById("btn-pause-resume").addEventListener("click", togglePauseModal);
 document.getElementById("btn-pause-subs-toggle").addEventListener("click", () => togglePauseSubsDrawer());
 document.getElementById("btn-pause-replay").addEventListener("click", toggleInstantReplay);
+document.getElementById("btn-pause-sw").addEventListener("click", () => stepAutoSwitch(1));
 document.getElementById("btn-pause-cam").addEventListener("click", cycleMatchCamera);
 document.getElementById("btn-pause-wx").addEventListener("click", cycleMatchWeather);
 document.getElementById("btn-subs-home").addEventListener("click", () => {
@@ -3918,6 +4317,7 @@ document.getElementById("btn-ft-hub").addEventListener("click", () => {
 // --- Boot Sequence ---
 
 async function bootGame() {
+  syncAutoSwitchLabels();
   updateGamepadBadges();
   await refreshWorldOverview();
 

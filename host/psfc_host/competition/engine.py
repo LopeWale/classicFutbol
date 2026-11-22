@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 import hashlib
 import math
 import random
@@ -135,6 +136,12 @@ class CompetitionEngine:
             caused_by=actor_id,
         )
 
+        latest_sf_ko = max(str(sf["kickoff_utc"]) for sf in semis)
+        sf_dt = datetime.fromisoformat(latest_sf_ko.replace("Z", "+00:00")).astimezone(timezone.utc)
+        final_ko_dt = (sf_dt + timedelta(days=26)).replace(hour=16, minute=30, second=0)
+        final_close_dt = (final_ko_dt + timedelta(days=14)).replace(hour=23, minute=59, second=59)
+        final_open_utc = min(str(sf["window_open_utc"]) for sf in semis)
+
         final_fx = self.store.create_fixture(
             fixture_id=final_id,
             world_id=world_id,
@@ -143,9 +150,9 @@ class CompetitionEngine:
             round_no=max(int(sf["round"]) for sf in semis) + 1,
             home_club_id=home_finalist,
             away_club_id=away_finalist,
-            kickoff_utc="2026-10-18T16:30:00Z",
-            window_open_utc="2026-08-01T00:00:00Z",
-            window_close_utc="2026-12-31T23:59:59Z",
+            kickoff_utc=final_ko_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            window_open_utc=final_open_utc,
+            window_close_utc=final_close_dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
             result_source=result_source,
             state="open",
             extra_time_enabled=True,
@@ -354,11 +361,26 @@ class CompetitionEngine:
         """Award end-of-season honours, determine qualification, and roll over to a new Parallel Season."""
         world = self.store.get_world(world_id)
         events = self.store.list_events(world_id)
-        clubs = self._clubs_summary()
+        world_cat = self.catalogue.for_world(self.store, world_id)
+        clubs = {
+            cid: {
+                "club_id": c.club_id,
+                "name": c.name,
+                "short_name": c.short_name,
+                "country": c.country,
+                "stadium": c.stadium,
+                "primary_color": c.primary_color,
+                "secondary_color": c.secondary_color,
+            }
+            for cid, c in world_cat.clubs.items()
+        }
         rep = set(self.store.represented_clubs(world_id).keys())
         standings = project_standings(events, clubs, represented_club_ids=rep)["standings"]
-        world_cat = self.catalogue.for_world(self.store, world_id)
-        players = project_player_stats(events, world_cat.all_footballers())
+        players = project_player_stats(
+            events,
+            world_cat.active_footballers(),
+            historical_footballers=world_cat.all_footballers(),
+        )
         ts = utc_now_iso()
 
         honours: list[dict[str, Any]] = []
@@ -504,26 +526,28 @@ class CompetitionEngine:
                 baseline_summary={"rolled_over_from_world": world_id},
             )
 
-        # Seed opening Round 1 fixtures in the rolled-over season
+        # Seed opening Matchweek 1 fixtures across all clubs in the rolled-over 2027/28 season
         club_ids = list(clubs.keys())
-        if len(club_ids) >= 4:
-            for idx, (hc, ac) in enumerate([(club_ids[0], club_ids[1]), (club_ids[2], club_ids[3])], start=1):
-                src = self.store.compute_advance_result_source(next_world_id, hc, ac, has_real_equivalent=True)
-                self.store.create_fixture(
-                    fixture_id=f"fix-{next_world_id}-r1-{idx}",
-                    world_id=next_world_id,
-                    competition_id=next_league_id,
-                    stage="league",
-                    round_no=1,
-                    home_club_id=hc,
-                    away_club_id=ac,
-                    kickoff_utc="2027-08-15T15:00:00Z",
-                    window_open_utc=ts,
-                    window_close_utc="2027-12-31T23:59:59Z",
-                    result_source=src,
-                    state="open",
-                    caused_by=actor_id,
-                )
+        pairings = [
+            (club_ids[i], club_ids[i + 1]) for i in range(0, len(club_ids) - 1, 2)
+        ]
+        for idx, (hc, ac) in enumerate(pairings, start=1):
+            src = self.store.compute_advance_result_source(next_world_id, hc, ac, has_real_equivalent=True)
+            self.store.create_fixture(
+                fixture_id=f"fix-{next_world_id}-r1-{idx}",
+                world_id=next_world_id,
+                competition_id=next_league_id,
+                stage="league",
+                round_no=1,
+                home_club_id=hc,
+                away_club_id=ac,
+                kickoff_utc="2027-08-13T19:00:00Z",
+                window_open_utc=ts,
+                window_close_utc="2027-12-31T23:59:59Z",
+                result_source=src,
+                state="open",
+                caused_by=actor_id,
+            )
 
         self.store.append_event(
             world_id=world_id,

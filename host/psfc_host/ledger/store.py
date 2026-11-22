@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -260,6 +262,7 @@ class WorldLedgerStore:
 
     def __init__(self, db_path: str | Path = ":memory:") -> None:
         self.db_path = str(db_path)
+        self._batch_depth = 0
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(SCHEMA_SQL)
@@ -268,6 +271,25 @@ class WorldLedgerStore:
     @property
     def conn(self) -> sqlite3.Connection:
         return self._conn
+
+    def commit(self) -> None:
+        if self._batch_depth == 0:
+            self._conn.commit()
+
+    @contextmanager
+    def batch(self) -> Iterator[None]:
+        self._batch_depth += 1
+        try:
+            yield
+        except Exception:
+            self._batch_depth -= 1
+            if self._batch_depth == 0:
+                self._conn.rollback()
+            raise
+        else:
+            self._batch_depth -= 1
+            if self._batch_depth == 0:
+                self._conn.commit()
 
     def close(self) -> None:
         self._conn.close()
@@ -308,7 +330,7 @@ class WorldLedgerStore:
             ),
         )
         if commit:
-            self._conn.commit()
+            self.commit()
         seq = int(cur.lastrowid)
         return {
             "seq": seq,
@@ -556,7 +578,7 @@ class WorldLedgerStore:
             commit=False,
         )
         self._refresh_future_result_sources(world_id, from_round=effective_from_round, caused_by=participant_id)
-        self._conn.commit()
+        self.commit()
         return self.list_assignments(world_id)[-1]
 
     def list_assignments(self, world_id: str) -> list[dict[str, Any]]:
@@ -817,7 +839,7 @@ class WorldLedgerStore:
                 commit=False,
             )
             transitioned.append(fid)
-        self._conn.commit()
+        self.commit()
         return [self.get_fixture(fid) for fid in transitioned]
 
     def resolve_awaiting_admin_fixture(
@@ -875,7 +897,7 @@ class WorldLedgerStore:
             "UPDATE fixture SET state = 'accepted', result_source = 'admin' WHERE id = ?",
             (fixture_id,),
         )
-        self._conn.commit()
+        self.commit()
         return self.get_accepted_result(fixture_id) or {}
 
     def get_frozen_snapshot(self, fixture_id: str) -> dict[str, Any] | None:
@@ -949,7 +971,7 @@ class WorldLedgerStore:
             """,
             (new_home_goals, new_away_goals, ts, corr_ev["seq"], fixture_id),
         )
-        self._conn.commit()
+        self.commit()
         return self.get_accepted_result(fixture_id) or {}
 
     def record_honour(

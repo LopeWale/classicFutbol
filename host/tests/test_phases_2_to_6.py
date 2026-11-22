@@ -86,18 +86,18 @@ def test_snake_case_and_pascal_case_events_project_cleanly_and_cup_does_not_poll
             "new_events": [
                 {
                     "event_type": "goal",
-                    "footballer_id": "mun-fwd-1",
+                    "footballer_id": "mun-fwd-4",
                     "assist_footballer_id": "mun-mid-2",
                     "minute": 18,
                 },
                 {
                     "event_type": "skill_move",
-                    "footballer_id": "mun-fwd-1",
+                    "footballer_id": "mun-fwd-4",
                     "minute": 17,
                 },
                 {
                     "event_type": "save",
-                    "footballer_id": "mun-gk-1",
+                    "footballer_id": "mun-gk-2",
                     "minute": 70,
                 },
             ],
@@ -113,12 +113,12 @@ def test_snake_case_and_pascal_case_events_project_cleanly_and_cup_does_not_poll
 
     # Earned & combined player stats DO include official Cup goals, skill_moves, and saves!
     players = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
-    rashford = next(p for p in players if p["footballer_id"] == "mun-fwd-1")
-    assert rashford["inherited"]["goals"] == 2
-    assert rashford["earned"]["goals"] == 1
-    assert rashford["combined"]["goals"] == 3
-    assert rashford["earned"]["skill_moves"] == 1
-    assert rashford["combined"]["skill_moves"] == 1
+    cunha = next(p for p in players if p["footballer_id"] == "mun-fwd-4")
+    assert cunha["inherited"]["goals"] == 2
+    assert cunha["earned"]["goals"] == 1
+    assert cunha["combined"]["goals"] == 3
+    assert cunha["earned"]["skill_moves"] == 1
+    assert cunha["combined"]["skill_moves"] == 1
 
 
 def test_knockout_cup_extra_time_and_penalty_shootout_replay_validation() -> None:
@@ -259,22 +259,51 @@ def test_overdue_playing_window_transitions_to_awaiting_admin_never_real_score()
     app = create_app(db_path=":memory:", seed_demo=True)
     client = TestClient(app)
 
+    # 1. On 1 Jan 2027, overdue Nov 2026 ties expire, while Jan/Feb 2027 league ties & Apr 2027 Cup SFs stay open & playable!
+    r_jan = client.post(
+        f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
+        json={"as_of_utc": "2027-01-01T00:00:00Z"},
+    )
+    assert r_jan.status_code == 200
+    jan_transitioned = {f["id"] for f in r_jan.json()["transitioned"]}
+    assert "fix-mw11-liv-mun" in jan_transitioned
+    assert "fix-mw12-mun-bre" in jan_transitioned
+    for future_id in (
+        "fix-mw16-ars-mun",
+        "fix-mw23-mun-liv",
+        "fix-mw27-mun-ars",
+        "fix-cup-sf1-mun-liv",
+        "fix-cup-sf2-ars-che",
+    ):
+        assert future_id not in jan_transitioned
+
+    # Verify Jan 2027 & Apr 2027 fixtures remain open and accept official sessions in 2027
+    by_id_jan = {
+        f["id"]: f
+        for f in client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/fixtures").json()["fixtures"]
+    }
+    assert by_id_jan["fix-mw23-mun-liv"]["state"] == "open"
+    assert by_id_jan["fix-mw27-mun-ars"]["state"] == "open"
+    assert by_id_jan["fix-cup-sf1-mun-liv"]["state"] == "open"
+
+    # 2. After mid-March 2027 (`2027-03-20`), unplayed Jan & Feb 2027 league ties expire to `awaiting_admin` without substituting real scores, while Apr Cup SFs stay open!
     r_exp = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
-        json={"as_of_utc": "2027-02-01T00:00:00Z"},
+        json={"as_of_utc": "2027-03-20T00:00:00Z"},
     )
     assert r_exp.status_code == 200
     transitioned_ids = {f["id"] for f in r_exp.json()["transitioned"]}
-    assert "fix-r3-mun-ars" in transitioned_ids
-    assert "fix-r4-mun-liv" in transitioned_ids
+    assert "fix-mw27-mun-ars" in transitioned_ids
+    assert "fix-mw23-mun-liv" in transitioned_ids
+    assert "fix-cup-sf1-mun-liv" not in transitioned_ids
 
-    fx_r3 = next(
+    fx_mw27 = next(
         f
         for f in client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/fixtures").json()["fixtures"]
-        if f["id"] == "fix-r3-mun-ars"
+        if f["id"] == "fix-mw27-mun-ars"
     )
-    assert fx_r3["state"] == "awaiting_admin"
-    assert fx_r3["accepted_home_goals"] is None  # Real score was NOT substituted!
+    assert fx_mw27["state"] == "awaiting_admin"
+    assert fx_mw27["accepted_home_goals"] is None  # Real score was NOT substituted!
 
 
 def test_provider_feed_adapter_and_identity_resolution_queue() -> None:
@@ -315,11 +344,11 @@ def test_provider_feed_adapter_and_identity_resolution_queue() -> None:
             "external_away_club_id": "ext-club-mystery-88",
             "home_goals": 3,
             "away_goals": 0,
-            "target_fixture_id": "fix-r3-liv-che",
+            "target_fixture_id": "fix-mw15-liv-che",
         },
     )
     assert r_retry.status_code == 200
-    assert r_retry.json()["proposal"]["target_id"] == "fix-r3-liv-che"
+    assert r_retry.json()["proposal"]["target_id"] == "fix-mw15-liv-che"
 
 
 def test_kickoff_appointments_propose_and_accept() -> None:
@@ -327,8 +356,8 @@ def test_kickoff_appointments_propose_and_accept() -> None:
     client = TestClient(app)
 
     r_prop = client.post(
-        "/api/fixtures/fix-r3-mun-ars/appointments",
-        json={"proposed_by": "part-alex", "proposed_at_utc": "2026-08-30T19:30:00Z"},
+        "/api/fixtures/fix-mw27-mun-ars/appointments",
+        json={"proposed_by": "part-alex", "proposed_at_utc": "2027-02-27T19:30:00Z"},
     )
     assert r_prop.status_code == 200
     appt_id = r_prop.json()["appointment"]["id"]
@@ -425,7 +454,7 @@ def test_online_lobby_ready_pause_budget_disconnect_abandonment_and_relay_input_
 
     # 1. Lobby ready-check, 3-pause budget exhaustion, disconnect, and abandonment -> `awaiting_admin`
     r_open = client.post(
-        "/api/fixtures/fix-r3-mun-ars/sessions",
+        "/api/fixtures/fix-mw27-mun-ars/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 120},
     )
     sess_id = r_open.json()["session_id"]
@@ -451,13 +480,13 @@ def test_online_lobby_ready_pause_budget_disconnect_abandonment_and_relay_input_
     fx = next(
         f
         for f in client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/fixtures").json()["fixtures"]
-        if f["id"] == "fix-r3-mun-ars"
+        if f["id"] == "fix-mw27-mun-ars"
     )
     assert fx["state"] == "awaiting_admin"
 
     # 2. Relay input batch recording reconstructs full `frames_hex` for `complete_session`!
     r_open2 = client.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={
             "actor_id": "part-alex",
             "format_name": "5v5",
@@ -523,18 +552,18 @@ def test_custom_5v5_lineup_selection_from_11_man_squad_and_replay_verification()
     assert roster["formation_5v5"] == "1-2-1"
     assert roster["custom_lineup_active"] is False
     assert roster["starter_ids_5v5"] == [
-        "mun-gk-1",
+        "mun-gk-2",
         "mun-def-1",
         "mun-mid-1",
         "mun-mid-2",
-        "mun-fwd-1",
+        "mun-fwd-4",
     ]
 
     # 2. Reject invalid 5v5 lineups (e.g. missing goalkeeper or wrong count) with 422
     r_no_gk = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
         json={
-            "starter_ids": ["mun-def-1", "mun-def-2", "mun-mid-1", "mun-mid-2", "mun-fwd-1"],
+            "starter_ids": ["mun-def-1", "mun-def-2", "mun-mid-1", "mun-mid-2", "mun-fwd-4"],
             "formation_5v5": "1-2-1",
         },
     )
@@ -544,14 +573,14 @@ def test_custom_5v5_lineup_selection_from_11_man_squad_and_replay_verification()
     r_four = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
         json={
-            "starter_ids": ["mun-gk-1", "mun-def-2", "mun-mid-2", "mun-fwd-2"],
+            "starter_ids": ["mun-gk-2", "mun-def-2", "mun-mid-2", "mun-fwd-5"],
             "formation_5v5": "1-2-1",
         },
     )
     assert r_four.status_code == 422
 
-    # 3. Save a custom 5v5 lineup swapping in Dalot (mun-def-2), Garnacho (mun-fwd-2), and Hojlund (mun-fwd-3) + 1-1-2 Attack formation
-    custom_ids = ["mun-fwd-3", "mun-fwd-2", "mun-gk-1", "mun-def-2", "mun-mid-2"]
+    # 3. Save a custom 5v5 lineup swapping in Dalot (mun-def-2), Mbeumo (mun-fwd-5), and Sesko (mun-fwd-6) + 1-1-2 Attack formation
+    custom_ids = ["mun-fwd-6", "mun-fwd-5", "mun-gk-2", "mun-def-2", "mun-mid-2"]
     r_save = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
         json={
@@ -565,7 +594,7 @@ def test_custom_5v5_lineup_selection_from_11_man_squad_and_replay_verification()
     assert saved_roster["custom_lineup_active"] is True
     assert saved_roster["formation_5v5"] == "1-1-2"
     # Tactically ordered GK -> DEF -> MID -> FWD (preserving selection order within same role)
-    expected_ordered = ["mun-gk-1", "mun-def-2", "mun-mid-2", "mun-fwd-3", "mun-fwd-2"]
+    expected_ordered = ["mun-gk-2", "mun-def-2", "mun-mid-2", "mun-fwd-6", "mun-fwd-5"]
     assert saved_roster["starter_ids_5v5"] == expected_ordered
 
     events = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/events").json()["events"]
@@ -590,7 +619,7 @@ def test_custom_5v5_lineup_selection_from_11_man_squad_and_replay_verification()
 
     # 5. Official session freezes custom 5v5 starters + formation and passes WASM -> psfc-replay verification!
     r_open = client.post(
-        "/api/fixtures/fix-r3-mun-ars/sessions",
+        "/api/fixtures/fix-mw27-mun-ars/sessions",
         json={
             "actor_id": "part-alex",
             "format_name": "5v5",
@@ -693,7 +722,7 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
         r_tr = c1.post(
             f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/transfer",
             json={
-                "footballer_id": "mun-fwd-1",
+                "footballer_id": "mun-fwd-4",
                 "from_club_id": "man-utd",
                 "to_club_id": "chelsea",
                 "new_shirt": 19,
@@ -707,8 +736,8 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
 
         che_squad = c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/chelsea/squad").json()["roster"]["squad"]
         mun_squad = c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/squad").json()["roster"]["squad"]
-        assert any(p["footballer_id"] == "mun-fwd-1" for p in che_squad)
-        assert not any(p["footballer_id"] == "mun-fwd-1" for p in mun_squad)
+        assert any(p["footballer_id"] == "mun-fwd-4" for p in che_squad)
+        assert not any(p["footballer_id"] == "mun-fwd-4" for p in mun_squad)
 
         # Cross-world fixture ownership check: `world-independent` CANNOT import `fix-r5-liv-che`!
         r_cross = c2.post(
@@ -731,10 +760,10 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
             for r in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/standings").json()["standings"]
             if r["club_id"] == "liverpool"
         )
-        salah_before = next(
+        isak_before = next(
             p["inherited"]["goals"]
             for p in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
-            if p["footballer_id"] == "liv-fwd-1"
+            if p["footballer_id"] == "liv-fwd-4"
         )
 
         r_enrich = c2.post(
@@ -743,7 +772,7 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
                 "fixture_id": "fix-r5-liv-che",
                 "home_goals": 2,
                 "away_goals": 0,
-                "events": [{"event_type": "Goal", "footballer_id": "liv-fwd-1", "minute": 55}],
+                "events": [{"event_type": "Goal", "footballer_id": "liv-fwd-4", "minute": 55}],
             },
         )
         assert r_enrich.status_code == 200
@@ -755,13 +784,13 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
             for r in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/standings").json()["standings"]
             if r["club_id"] == "liverpool"
         )
-        salah_after = next(
+        isak_after = next(
             p["inherited"]["goals"]
             for p in c2.get(f"/api/worlds/{DEFAULT_WORLD_ID}/players").json()["players"]
-            if p["footballer_id"] == "liv-fwd-1"
+            if p["footballer_id"] == "liv-fwd-4"
         )
         assert liv_pts_after == liv_pts_before
-        assert salah_after == salah_before + 1
+        assert isak_after == isak_before + 1
 
         # Subsequent duplicate enrichment is parked
         r_dup_enrich = c2.post(
@@ -770,7 +799,7 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
                 "fixture_id": "fix-r5-liv-che",
                 "home_goals": 2,
                 "away_goals": 0,
-                "events": [{"event_type": "Goal", "footballer_id": "liv-fwd-1", "minute": 55}],
+                "events": [{"event_type": "Goal", "footballer_id": "liv-fwd-4", "minute": 55}],
             },
         )
         assert r_dup_enrich.json()["decision"] == "parked"
@@ -809,7 +838,7 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
     cm = TestClient(app_mem)
 
     r_open = cm.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 180},
     )
     assert r_open.status_code == 200
@@ -823,13 +852,13 @@ def test_codex_review_security_and_invariant_guards(monkeypatch: pytest.MonkeyPa
     assert r_unfin.status_code == 422
     assert "FullTime" in r_unfin.json()["detail"]
 
-    # Expiring overdue window transitions `fix-r3-mun-ars` to `awaiting_admin` -> `open_session` MUST reject (`409`)!
+    # Expiring overdue window on 10 Jan 2027 transitions Dec 2026 `fix-mw16-ars-mun` to `awaiting_admin` -> `open_session` MUST reject (`409`)!
     cm.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/expire-windows",
         json={"as_of_utc": "2027-01-10T00:00:00Z"},
     )
     r_blocked = cm.post(
-        "/api/fixtures/fix-r3-mun-ars/sessions",
+        "/api/fixtures/fix-mw16-ars-mun/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5"},
     )
     assert r_blocked.status_code == 409
@@ -841,7 +870,7 @@ def test_codex_pr3_stale_saved_lineup_fallback_and_rollover_transfer_inheritance
     client = TestClient(app)
 
     # [P2] Save Man Utd's default five, then transfer one of those starters away.
-    default_ids = ["mun-gk-1", "mun-def-1", "mun-mid-1", "mun-mid-2", "mun-fwd-1"]
+    default_ids = ["mun-gk-2", "mun-def-1", "mun-mid-1", "mun-mid-2", "mun-fwd-4"]
     r_save = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/lineup",
         json={"starter_ids": default_ids, "formation_5v5": "2-2", "actor_id": "part-alex"},
@@ -849,17 +878,17 @@ def test_codex_pr3_stale_saved_lineup_fallback_and_rollover_transfer_inheritance
     assert r_save.status_code == 200
     r_tr = client.post(
         f"/api/worlds/{DEFAULT_WORLD_ID}/ingest/transfer",
-        json={"footballer_id": "mun-fwd-1", "from_club_id": "man-utd", "to_club_id": "chelsea", "new_shirt": 19},
+        json={"footballer_id": "mun-fwd-4", "from_club_id": "man-utd", "to_club_id": "chelsea", "new_shirt": 19},
     )
     assert r_tr.status_code == 200
 
-    # Displayed roster falls back to valid defaults (no mun-fwd-1) ...
+    # Displayed roster falls back to valid defaults (no mun-fwd-4) ...
     roster = client.get(f"/api/worlds/{DEFAULT_WORLD_ID}/clubs/man-utd/squad").json()["roster"]
-    assert "mun-fwd-1" not in roster["starter_ids_5v5"]
+    assert "mun-fwd-4" not in roster["starter_ids_5v5"]
 
     # ... and the official session still opens using the same fallback instead of erroring.
     r_open = client.post(
-        "/api/fixtures/fix-r4-mun-liv/sessions",
+        "/api/fixtures/fix-mw23-mun-liv/sessions",
         json={"actor_id": "part-alex", "format_name": "5v5", "half_duration_ticks": 180},
     )
     assert r_open.status_code == 200, r_open.text
@@ -873,7 +902,7 @@ def test_codex_pr3_stale_saved_lineup_fallback_and_rollover_transfer_inheritance
     snap = r_exh.json()["snapshot"]
     home = snap["home"] if "home" in snap else snap["teams"][0]
     home_ids = [p["footballer_id"] for p in home["starters"]]
-    assert "mun-fwd-1" not in home_ids
+    assert "mun-fwd-4" not in home_ids
     assert home["formation"] == "2-2"
 
     # Explicit invalid overrides are still strictly rejected.
@@ -897,8 +926,8 @@ def test_codex_pr3_stale_saved_lineup_fallback_and_rollover_transfer_inheritance
     child_id = r_roll.json()["next_world"]["id"]
     che = client.get(f"/api/worlds/{child_id}/clubs/chelsea/squad").json()["roster"]["squad"]
     mun = client.get(f"/api/worlds/{child_id}/clubs/man-utd/squad").json()["roster"]["squad"]
-    assert any(p["footballer_id"] == "mun-fwd-1" for p in che)
-    assert not any(p["footballer_id"] == "mun-fwd-1" for p in mun)
+    assert any(p["footballer_id"] == "mun-fwd-4" for p in che)
+    assert not any(p["footballer_id"] == "mun-fwd-4" for p in mun)
 
     # Late transfer import against the completed parent world is parked and never leaks into child_id
     r_late = client.post(
