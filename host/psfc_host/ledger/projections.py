@@ -225,14 +225,16 @@ def _empty_stat_bucket() -> dict[str, int]:
 def project_player_stats(
     events: list[dict[str, Any]],
     footballers: dict[str, dict[str, Any]],
+    historical_footballers: dict[str, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Project `inherited`, `earned`, and `combined` footballer statistics strictly from match events."""
     outcomes = _resolve_active_fixture_outcomes(events)
     stats_by_player: dict[str, dict[str, Any]] = {}
+    lookup = {**(historical_footballers or {}), **footballers}
 
     def _ensure_player(fid: str) -> dict[str, Any]:
         if fid not in stats_by_player:
-            meta = footballers.get(
+            meta = lookup.get(
                 fid,
                 {
                     "footballer_id": fid,

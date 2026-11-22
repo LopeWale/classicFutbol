@@ -252,12 +252,21 @@ def create_app(
         competition_engine = CompetitionEngine(store, catalogue)
         if seed_demo:
             ensure_demo_world(store, catalogue)
-        # Rehydrate persisted squad transfers onto the base catalogue on startup
-        existing_world_ids = [w["id"] for w in store.list_worlds()]
-        if DEFAULT_WORLD_ID in existing_world_ids:
-            catalogue.replay_transfer_events(store.list_events(DEFAULT_WORLD_ID))
-        elif len(existing_world_ids) == 1:
-            catalogue.replay_transfer_events(store.list_events(existing_world_ids[0]))
+        # Rehydrate persisted squad transfers (and legacy pre-2026/27 intervals if opening an older DB)
+        existing_worlds = {w["id"]: w for w in store.list_worlds()}
+        target_wid: str | None = None
+        if DEFAULT_WORLD_ID in existing_worlds:
+            target_wid = DEFAULT_WORLD_ID
+        elif len(existing_worlds) == 1:
+            target_wid = next(iter(existing_worlds))
+        if target_wid is not None:
+            if ClubCatalogue.is_legacy_world(existing_worlds[target_wid]):
+                catalogue = ClubCatalogue(legacy_pre_2026_27=True)
+                gate = ProposalGate(store, catalogue)
+                sessions = MatchSessionService(store, catalogue)
+                adapter = ProviderFeedAdapter(store, gate)
+                competition_engine = CompetitionEngine(store, catalogue)
+            catalogue.replay_transfer_events(store.list_events(target_wid))
 
         state_holder["store"] = store
         state_holder["catalogue"] = catalogue
@@ -350,7 +359,11 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(exc)) from exc
         cat = _world_catalogue(world_id)
         events = store.list_events(world_id)
-        stats = project_player_stats(events, cat.all_footballers())
+        stats = project_player_stats(
+            events,
+            cat.active_footballers(),
+            historical_footballers=cat.all_footballers(),
+        )
         return {"world_id": world_id, "players": stats}
 
     @app.get("/api/worlds/{world_id}/fixtures")
@@ -398,7 +411,11 @@ def create_app(
         assignments = store.list_assignments(world_id)
         rep = {a["club_id"] for a in assignments}
         standings_proj = project_standings(events, clubs, represented_club_ids=rep)
-        player_stats = project_player_stats(events, cat.all_footballers())
+        player_stats = project_player_stats(
+            events,
+            cat.active_footballers(),
+            historical_footballers=cat.all_footballers(),
+        )
         fixtures = store.list_fixtures(world_id)
         for f in fixtures:
             f["home_club"] = clubs.get(f["home_club_id"])

@@ -184,11 +184,13 @@ UPCOMING_2026_27_FIXTURES: list[tuple[str, int, str, str, str]] = [
     ("fix-mw27-mun-ars", 27, "man-utd", "arsenal", "2027-02-27T16:30:00Z"),
 ]
 
-# Authentic 2026–27 goal, assist, and clean-sheet save events mapped onto completed matches.
+# Authentic 2026–27 headline goal, assist, and clean-sheet save events mapped onto completed matches.
+# Remaining goals in multi-goal ties are deterministically completed by `_complete_seeded_match_events`
+# so all 107 completed matches record 100% of their 293 accepted goals.
 SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
     "fix-mw1-ars-cov": [
         {"event_type": "Goal", "footballer_id": "ars-fwd-1", "assist_footballer_id": "ars-mid-2", "minute": 18},
-        {"event_type": "Goal", "footballer_id": "ars-fwd-3", "assist_footballer_id": "ars-fwd-2", "minute": 52},
+        {"event_type": "Goal", "footballer_id": "ars-fwd-5", "assist_footballer_id": "ars-fwd-4", "minute": 52},
         {"event_type": "Goal", "footballer_id": "ars-mid-2", "assist_footballer_id": "ars-mid-1", "minute": 79},
         {"event_type": "Save", "footballer_id": "ars-gk-1", "minute": 64},
     ],
@@ -207,51 +209,51 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
     ],
     "fix-mw1-mci-bou": [
         {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "mci-mid-2", "minute": 14},
-        {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "mci-mid-1", "minute": 68},
+        {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "che-mid-3", "minute": 68},
     ],
     "fix-mw1-new-liv": [
-        {"event_type": "Goal", "footballer_id": "liv-fwd-1", "assist_footballer_id": "liv-mid-1", "minute": 27},
-        {"event_type": "Goal", "footballer_id": "liv-fwd-1", "assist_footballer_id": "liv-mid-2", "minute": 81},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-4", "assist_footballer_id": "liv-mid-4", "minute": 27},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-4", "assist_footballer_id": "liv-mid-2", "minute": 81},
     ],
     "fix-mw1-ful-che": [
-        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "che-mid-2", "minute": 19},
-        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "che-mid-3", "minute": 55},
-        {"event_type": "Goal", "footballer_id": "che-mid-3", "assist_footballer_id": "che-mid-2", "minute": 86},
+        {"event_type": "Goal", "footballer_id": "che-fwd-4", "assist_footballer_id": "che-mid-2", "minute": 19},
+        {"event_type": "Goal", "footballer_id": "che-fwd-4", "assist_footballer_id": "che-mid-4", "minute": 55},
+        {"event_type": "Goal", "footballer_id": "che-mid-4", "assist_footballer_id": "che-mid-2", "minute": 86},
     ],
     "fix-mw2-cry-mci": [
         {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "mci-mid-2", "minute": 21},
         {"event_type": "Goal", "footballer_id": "mci-mid-2", "assist_footballer_id": "mci-fwd-1", "minute": 43},
         {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "mci-mid-3", "minute": 67},
-        {"event_type": "Goal", "footballer_id": "mci-mid-2", "assist_footballer_id": "mci-mid-1", "minute": 84},
+        {"event_type": "Goal", "footballer_id": "mci-mid-2", "assist_footballer_id": "che-mid-3", "minute": 84},
     ],
     "fix-mw2-liv-nfo": [
-        {"event_type": "Goal", "footballer_id": "liv-fwd-1", "assist_footballer_id": "liv-mid-1", "minute": 35},
-        {"event_type": "Goal", "footballer_id": "liv-mid-1", "assist_footballer_id": "liv-fwd-1", "minute": 72},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-4", "assist_footballer_id": "liv-mid-4", "minute": 35},
+        {"event_type": "Goal", "footballer_id": "liv-mid-4", "assist_footballer_id": "liv-fwd-4", "minute": 72},
     ],
     "fix-mw2-bou-eve": [
         {"event_type": "Goal", "footballer_id": "bou-fwd-1", "assist_footballer_id": "bou-mid-1", "minute": 49},
     ],
     "fix-mw2-che-bha": [
-        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "che-mid-2", "minute": 16},
-        {"event_type": "Goal", "footballer_id": "che-mid-3", "assist_footballer_id": "che-fwd-1", "minute": 39},
-        {"event_type": "Goal", "footballer_id": "che-mid-3", "assist_footballer_id": "che-mid-1", "minute": 61},
+        {"event_type": "Goal", "footballer_id": "che-fwd-4", "assist_footballer_id": "che-mid-2", "minute": 16},
+        {"event_type": "Goal", "footballer_id": "che-mid-4", "assist_footballer_id": "che-fwd-4", "minute": 39},
+        {"event_type": "Goal", "footballer_id": "che-mid-4", "assist_footballer_id": "che-mid-1", "minute": 61},
         {"event_type": "Goal", "footballer_id": "che-mid-2", "assist_footballer_id": None, "minute": 78},
         {"event_type": "Goal", "footballer_id": "bha-mid-1", "assist_footballer_id": "bha-fwd-2", "minute": 53},
     ],
     "fix-mw2-mun-ips": [
-        {"event_type": "Goal", "footballer_id": "mun-fwd-2", "assist_footballer_id": "mun-mid-2", "minute": 11},
-        {"event_type": "Goal", "footballer_id": "mun-fwd-1", "assist_footballer_id": "mun-mid-1", "minute": 29},
-        {"event_type": "Goal", "footballer_id": "mun-mid-2", "assist_footballer_id": "mun-fwd-1", "minute": 54},
-        {"event_type": "Goal", "footballer_id": "mun-fwd-2", "assist_footballer_id": "mun-mid-2", "minute": 73},
-        {"event_type": "Goal", "footballer_id": "mun-fwd-3", "assist_footballer_id": "mun-def-2", "minute": 88},
+        {"event_type": "Goal", "footballer_id": "mun-fwd-5", "assist_footballer_id": "mun-mid-2", "minute": 11},
+        {"event_type": "Goal", "footballer_id": "mun-fwd-4", "assist_footballer_id": "mun-mid-1", "minute": 29},
+        {"event_type": "Goal", "footballer_id": "mun-mid-2", "assist_footballer_id": "mun-fwd-4", "minute": 54},
+        {"event_type": "Goal", "footballer_id": "mun-fwd-5", "assist_footballer_id": "mun-mid-2", "minute": 73},
+        {"event_type": "Goal", "footballer_id": "mun-fwd-6", "assist_footballer_id": "mun-def-2", "minute": 88},
     ],
     "fix-mw2-avl-ars": [
         {"event_type": "Goal", "footballer_id": "ars-fwd-1", "assist_footballer_id": "ars-mid-2", "minute": 63},
         {"event_type": "Save", "footballer_id": "ars-gk-1", "minute": 87},
     ],
     "fix-mw3-ips-liv": [
-        {"event_type": "Goal", "footballer_id": "liv-fwd-1", "assist_footballer_id": "liv-mid-1", "minute": 58},
-        {"event_type": "Goal", "footballer_id": "liv-mid-2", "assist_footballer_id": "liv-mid-1", "minute": 76},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-4", "assist_footballer_id": "liv-mid-4", "minute": 58},
+        {"event_type": "Goal", "footballer_id": "liv-mid-2", "assist_footballer_id": "liv-mid-4", "minute": 76},
         {"event_type": "Save", "footballer_id": "liv-gk-1", "minute": 44},
     ],
     "fix-mw3-new-bou": [
@@ -264,16 +266,16 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
     ],
     "fix-mw3-eve-mun": [
         {"event_type": "Goal", "footballer_id": "eve-fwd-1", "assist_footballer_id": "eve-mid-2", "minute": 24},
-        {"event_type": "Goal", "footballer_id": "mun-mid-2", "assist_footballer_id": "mun-fwd-1", "minute": 48},
-        {"event_type": "Goal", "footballer_id": "mun-fwd-2", "assist_footballer_id": "mun-mid-3", "minute": 77},
+        {"event_type": "Goal", "footballer_id": "mun-mid-2", "assist_footballer_id": "mun-fwd-4", "minute": 48},
+        {"event_type": "Goal", "footballer_id": "mun-fwd-5", "assist_footballer_id": "mun-mid-4", "minute": 77},
     ],
     "fix-mw3-ars-che": [
-        {"event_type": "Goal", "footballer_id": "ars-fwd-3", "assist_footballer_id": "ars-fwd-1", "minute": 28},
-        {"event_type": "Goal", "footballer_id": "che-mid-2", "assist_footballer_id": "che-fwd-1", "minute": 60},
-        {"event_type": "Goal", "footballer_id": "ars-fwd-2", "assist_footballer_id": "ars-mid-2", "minute": 83},
+        {"event_type": "Goal", "footballer_id": "ars-fwd-5", "assist_footballer_id": "ars-fwd-1", "minute": 28},
+        {"event_type": "Goal", "footballer_id": "che-mid-2", "assist_footballer_id": "che-fwd-4", "minute": 60},
+        {"event_type": "Goal", "footballer_id": "ars-fwd-4", "assist_footballer_id": "ars-mid-2", "minute": 83},
     ],
     "fix-mw4-avl-nfo": [
-        {"event_type": "Goal", "footballer_id": "avl-fwd-1", "assist_footballer_id": "avl-mid-2", "minute": 37},
+        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "avl-mid-2", "minute": 37},
     ],
     "fix-mw4-bou-bre": [
         {"event_type": "Goal", "footballer_id": "bou-fwd-1", "assist_footballer_id": "bou-mid-2", "minute": 25},
@@ -287,7 +289,7 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
         {"event_type": "Save", "footballer_id": "eve-gk-1", "minute": 81},
     ],
     "fix-mw4-sun-ars": [
-        {"event_type": "Goal", "footballer_id": "ars-fwd-3", "assist_footballer_id": "ars-mid-1", "minute": 34},
+        {"event_type": "Goal", "footballer_id": "ars-fwd-5", "assist_footballer_id": "ars-mid-1", "minute": 34},
         {"event_type": "Goal", "footballer_id": "ars-mid-2", "assist_footballer_id": "ars-fwd-1", "minute": 75},
         {"event_type": "Save", "footballer_id": "ars-gk-1", "minute": 68},
     ],
@@ -296,15 +298,15 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
         {"event_type": "Save", "footballer_id": "bha-gk-1", "minute": 59},
     ],
     "fix-mw4-mun-mci": [
-        {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "mci-mid-1", "minute": 64},
+        {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "che-mid-3", "minute": 64},
         {"event_type": "Save", "footballer_id": "mci-gk-1", "minute": 88},
     ],
     "fix-mw4-lee-new": [
         {"event_type": "Goal", "footballer_id": "lee-fwd-1", "assist_footballer_id": "lee-fwd-3", "minute": 41},
     ],
     "fix-mw5-tot-avl": [
-        {"event_type": "Goal", "footballer_id": "avl-fwd-1", "assist_footballer_id": "avl-mid-2", "minute": 32},
-        {"event_type": "Goal", "footballer_id": "avl-fwd-1", "assist_footballer_id": "avl-fwd-2", "minute": 85},
+        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "avl-mid-2", "minute": 32},
+        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "mun-fwd-2", "minute": 85},
     ],
     "fix-mw5-bha-ars": [
         {"event_type": "Goal", "footballer_id": "bha-mid-1", "assist_footballer_id": "bha-fwd-1", "minute": 27},
@@ -317,7 +319,7 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
         {"event_type": "Save", "footballer_id": "eve-gk-1", "minute": 86},
     ],
     "fix-mw5-bou-liv": [
-        {"event_type": "Goal", "footballer_id": "liv-fwd-1", "assist_footballer_id": "liv-mid-1", "minute": 69},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-4", "assist_footballer_id": "liv-mid-4", "minute": 69},
         {"event_type": "Save", "footballer_id": "liv-gk-1", "minute": 90},
     ],
     "fix-mw5-lee-cry": [
@@ -338,12 +340,12 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
         {"event_type": "Goal", "footballer_id": "lee-fwd-1", "assist_footballer_id": "lee-mid-1", "minute": 54},
     ],
     "fix-mw6-avl-bre": [
-        {"event_type": "Goal", "footballer_id": "avl-fwd-1", "assist_footballer_id": "avl-mid-1", "minute": 44},
+        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "avl-mid-1", "minute": 44},
     ],
     "fix-mw6-che-bou": [
-        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "che-mid-2", "minute": 15},
-        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "che-fwd-2", "minute": 42},
-        {"event_type": "Goal", "footballer_id": "che-mid-3", "assist_footballer_id": "che-mid-2", "minute": 67},
+        {"event_type": "Goal", "footballer_id": "che-fwd-4", "assist_footballer_id": "che-mid-2", "minute": 15},
+        {"event_type": "Goal", "footballer_id": "che-fwd-4", "assist_footballer_id": "che-fwd-2", "minute": 42},
+        {"event_type": "Goal", "footballer_id": "che-mid-4", "assist_footballer_id": "che-mid-2", "minute": 67},
         {"event_type": "Goal", "footballer_id": "che-mid-2", "assist_footballer_id": None, "minute": 81},
     ],
     "fix-mw6-sun-bha": [
@@ -354,16 +356,16 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
     ],
     "fix-mw6-liv-mci": [
         {"event_type": "Goal", "footballer_id": "mci-fwd-1", "assist_footballer_id": "mci-mid-2", "minute": 29},
-        {"event_type": "Goal", "footballer_id": "mci-mid-2", "assist_footballer_id": "mci-mid-1", "minute": 57},
+        {"event_type": "Goal", "footballer_id": "mci-mid-2", "assist_footballer_id": "che-mid-3", "minute": 57},
         {"event_type": "Goal", "footballer_id": "mci-fwd-2", "assist_footballer_id": "mci-mid-3", "minute": 84},
         {"event_type": "Save", "footballer_id": "mci-gk-1", "minute": 72},
     ],
     "fix-mw7-eve-che": [
-        {"event_type": "Goal", "footballer_id": "che-mid-3", "assist_footballer_id": "che-mid-2", "minute": 62},
+        {"event_type": "Goal", "footballer_id": "che-mid-4", "assist_footballer_id": "che-mid-2", "minute": 62},
     ],
     "fix-mw7-bre-liv": [
-        {"event_type": "Goal", "footballer_id": "liv-fwd-1", "assist_footballer_id": "liv-mid-1", "minute": 38},
-        {"event_type": "Goal", "footballer_id": "liv-mid-1", "assist_footballer_id": "liv-mid-2", "minute": 83},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-4", "assist_footballer_id": "liv-mid-4", "minute": 38},
+        {"event_type": "Goal", "footballer_id": "liv-mid-4", "assist_footballer_id": "liv-mid-2", "minute": 83},
     ],
     "fix-mw7-bou-sun": [
         {"event_type": "Goal", "footballer_id": "bou-fwd-1", "assist_footballer_id": "bou-mid-2", "minute": 31},
@@ -374,18 +376,18 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
     ],
     "fix-mw7-lee-mun": [
         {"event_type": "Goal", "footballer_id": "lee-fwd-1", "assist_footballer_id": "lee-mid-2", "minute": 36},
-        {"event_type": "Goal", "footballer_id": "mun-mid-3", "assist_footballer_id": "mun-mid-2", "minute": 78},
+        {"event_type": "Goal", "footballer_id": "mun-mid-4", "assist_footballer_id": "mun-mid-2", "minute": 78},
     ],
     "fix-mw7-nfo-ars": [
-        {"event_type": "Goal", "footballer_id": "ars-mid-2", "assist_footballer_id": "ars-fwd-2", "minute": 67},
+        {"event_type": "Goal", "footballer_id": "ars-mid-2", "assist_footballer_id": "ars-fwd-4", "minute": 67},
         {"event_type": "Save", "footballer_id": "ars-gk-1", "minute": 85},
     ],
     "fix-mw8-avl-mci": [
-        {"event_type": "Goal", "footballer_id": "avl-fwd-1", "assist_footballer_id": "avl-mid-2", "minute": 59},
+        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "avl-mid-2", "minute": 59},
     ],
     "fix-mw8-ars-eve": [
-        {"event_type": "Goal", "footballer_id": "ars-fwd-3", "assist_footballer_id": "ars-mid-2", "minute": 33},
-        {"event_type": "Goal", "footballer_id": "ars-fwd-2", "assist_footballer_id": "ars-fwd-1", "minute": 76},
+        {"event_type": "Goal", "footballer_id": "ars-fwd-5", "assist_footballer_id": "ars-mid-2", "minute": 33},
+        {"event_type": "Goal", "footballer_id": "ars-fwd-4", "assist_footballer_id": "ars-fwd-1", "minute": 76},
         {"event_type": "Save", "footballer_id": "ars-gk-1", "minute": 80},
     ],
     "fix-mw8-che-tot": [
@@ -394,8 +396,8 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
         {"event_type": "Save", "footballer_id": "tot-gk-1", "minute": 70},
     ],
     "fix-mw8-liv-bha": [
-        {"event_type": "Goal", "footballer_id": "liv-fwd-1", "assist_footballer_id": "liv-mid-1", "minute": 29},
-        {"event_type": "Goal", "footballer_id": "liv-fwd-2", "assist_footballer_id": "liv-mid-1", "minute": 74},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-4", "assist_footballer_id": "liv-mid-4", "minute": 29},
+        {"event_type": "Goal", "footballer_id": "liv-fwd-5", "assist_footballer_id": "liv-mid-4", "minute": 74},
         {"event_type": "Save", "footballer_id": "liv-gk-1", "minute": 68},
     ],
     "fix-mw8-mun-bou": [
@@ -416,7 +418,7 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
         {"event_type": "Save", "footballer_id": "tot-gk-1", "minute": 79},
     ],
     "fix-mw9-liv-ars": [
-        {"event_type": "Goal", "footballer_id": "ars-def-2", "assist_footballer_id": "ars-fwd-1", "minute": 64},
+        {"event_type": "Goal", "footballer_id": "ars-def-3", "assist_footballer_id": "ars-fwd-1", "minute": 64},
         {"event_type": "Save", "footballer_id": "ars-gk-1", "minute": 89},
     ],
     "fix-mw9-new-eve": [
@@ -437,26 +439,158 @@ SEEDED_MATCH_EVENTS: dict[str, list[dict[str, Any]]] = {
         {"event_type": "Save", "footballer_id": "bha-gk-1", "minute": 75},
     ],
     "fix-mw10-mun-avl": [
-        {"event_type": "Goal", "footballer_id": "mun-mid-2", "assist_footballer_id": "mun-fwd-1", "minute": 14},
-        {"event_type": "Goal", "footballer_id": "mun-fwd-2", "assist_footballer_id": "mun-mid-2", "minute": 39},
-        {"event_type": "Goal", "footballer_id": "mun-fwd-1", "assist_footballer_id": "mun-mid-1", "minute": 66},
+        {"event_type": "Goal", "footballer_id": "mun-mid-2", "assist_footballer_id": "mun-fwd-4", "minute": 14},
+        {"event_type": "Goal", "footballer_id": "mun-fwd-5", "assist_footballer_id": "mun-mid-2", "minute": 39},
+        {"event_type": "Goal", "footballer_id": "mun-fwd-4", "assist_footballer_id": "mun-mid-1", "minute": 66},
         {"event_type": "Goal", "footballer_id": "mun-mid-2", "assist_footballer_id": None, "minute": 87},
-        {"event_type": "Goal", "footballer_id": "avl-fwd-1", "assist_footballer_id": "avl-fwd-2", "minute": 52},
+        {"event_type": "Goal", "footballer_id": "che-fwd-1", "assist_footballer_id": "mun-fwd-2", "minute": 52},
     ],
     "fix-mw11-tot-ips": [
         {"event_type": "Save", "footballer_id": "tot-gk-1", "minute": 77},
     ],
     "fix-mw11-new-ars": [
         {"event_type": "Goal", "footballer_id": "new-fwd-1", "assist_footballer_id": "new-mid-2", "minute": 24},
-        {"event_type": "Goal", "footballer_id": "ars-mid-3", "assist_footballer_id": "ars-mid-2", "minute": 51},
+        {"event_type": "Goal", "footballer_id": "ars-mid-4", "assist_footballer_id": "ars-mid-2", "minute": 51},
         {"event_type": "Goal", "footballer_id": "new-mid-1", "assist_footballer_id": "new-fwd-2", "minute": 72},
-        {"event_type": "Goal", "footballer_id": "ars-def-3", "assist_footballer_id": "ars-mid-1", "minute": 89},
+        {"event_type": "Goal", "footballer_id": "ars-def-5", "assist_footballer_id": "ars-mid-1", "minute": 89},
     ],
 }
+
+# Headline Golden Boot scorers whose exact goal totals are pinned by `SEEDED_MATCH_EVENTS`.
+_PINNED_SCORER_IDS: frozenset[str] = frozenset(
+    {
+        "mci-fwd-1",  # E. Haaland (9)
+        "liv-fwd-4",  # A. Isak (7)
+        "che-fwd-1",  # N. Jackson (6)
+        "eve-fwd-1",  # T. Barry (6)
+        "mci-mid-2",  # R. Cherki (5)
+        "bou-fwd-1",  # Evanilson (5)
+        "bou-mid-2",  # M. Tavernier (5)
+        "che-fwd-4",  # Joao Pedro (5)
+        "che-mid-4",  # M. Rogers (5)
+        "mun-mid-2",  # B. Fernandes (4)
+        "mun-fwd-5",  # B. Mbeumo (4)
+        "lee-fwd-1",  # D. Calvert-Lewin (4)
+        "bha-mid-1",  # P. Gross (4)
+        "ars-fwd-5",  # V. Gyokeres (4)
+        "ars-fwd-1",  # B. Saka (3)
+        "ars-mid-2",  # M. Odegaard (3)
+        "che-mid-2",  # C. Palmer (3)
+        "mun-fwd-4",  # M. Cunha (2)
+    }
+)
 
 
 def _fixture_id(rnd: int, home: str, away: str) -> str:
     return f"fix-mw{rnd}-{_CLUB_SLUG[home]}-{_CLUB_SLUG[away]}"
+
+
+def _complete_seeded_match_events(catalogue: ClubCatalogue) -> dict[str, list[dict[str, Any]]]:
+    """Build complete player-event feeds for all 107 completed matches so every accepted goal is attributed."""
+    club_active_ids: dict[str, set[str]] = {}
+    club_gk_id: dict[str, str] = {}
+    club_scorer_pool: dict[str, list[str]] = {}
+    club_creator_pool: dict[str, list[str]] = {}
+    rr_idx: dict[str, int] = {}
+
+    role_rank = {"Forward": 0, "Midfielder": 1, "Defender": 2}
+    for cid, club in catalogue.clubs.items():
+        active = [m for m in club.squad if m.effective_to is None]
+        club_active_ids[cid] = {m.footballer_id for m in active}
+        gk = next((m.footballer_id for m in active if m.role == "Goalkeeper"), active[0].footballer_id)
+        club_gk_id[cid] = gk
+        outfield = sorted(
+            [m for m in active if m.role != "Goalkeeper"],
+            key=lambda m: (role_rank.get(m.role, 3), not m.starter_5v5, m.shirt_number),
+        )
+        non_pinned = [m.footballer_id for m in outfield if m.footballer_id not in _PINNED_SCORER_IDS]
+        club_scorer_pool[cid] = non_pinned or [m.footballer_id for m in outfield]
+        club_creator_pool[cid] = [
+            m.footballer_id for m in outfield if m.role in ("Midfielder", "Forward")
+        ] or [m.footballer_id for m in outfield]
+        rr_idx[cid] = 0
+
+    completed_feeds: dict[str, list[dict[str, Any]]] = {}
+    for rnd, home, away, _ko, hg, ag in COMPLETED_2026_27_RESULTS:
+        fid = _fixture_id(rnd, home, away)
+        evs = [dict(e) for e in SEEDED_MATCH_EVENTS.get(fid, [])]
+        used_minutes = {int(e.get("minute", 45)) for e in evs}
+
+        home_ids = club_active_ids[home]
+        away_ids = club_active_ids[away]
+        cur_hg = sum(
+            1 for e in evs if e.get("event_type") == "Goal" and e.get("footballer_id") in home_ids
+        )
+        cur_ag = sum(
+            1 for e in evs if e.get("event_type") == "Goal" and e.get("footballer_id") in away_ids
+        )
+
+        def _next_minute(seed_min: int) -> int:
+            m = max(6, min(90, seed_min))
+            while m in used_minutes and m < 90:
+                m += 1
+            while m in used_minutes and m > 5:
+                m -= 1
+            used_minutes.add(m)
+            return m
+
+        for g_i in range(max(0, hg - cur_hg)):
+            pool = club_scorer_pool[home]
+            idx = rr_idx[home]
+            rr_idx[home] = idx + 1
+            scorer = pool[idx % len(pool)]
+            creators = [p for p in club_creator_pool[home] if p != scorer]
+            assist = creators[(idx + g_i) % len(creators)] if creators and (idx % 3 != 2) else None
+            evs.append(
+                {
+                    "event_type": "Goal",
+                    "footballer_id": scorer,
+                    "assist_footballer_id": assist,
+                    "minute": _next_minute(17 + ((rnd * 7 + g_i * 23) % 69)),
+                }
+            )
+
+        for g_i in range(max(0, ag - cur_ag)):
+            pool = club_scorer_pool[away]
+            idx = rr_idx[away]
+            rr_idx[away] = idx + 1
+            scorer = pool[idx % len(pool)]
+            creators = [p for p in club_creator_pool[away] if p != scorer]
+            assist = creators[(idx + g_i) % len(creators)] if creators and (idx % 3 != 2) else None
+            evs.append(
+                {
+                    "event_type": "Goal",
+                    "footballer_id": scorer,
+                    "assist_footballer_id": assist,
+                    "minute": _next_minute(21 + ((rnd * 11 + g_i * 19) % 66)),
+                }
+            )
+
+        if ag == 0 and not any(
+            e.get("event_type") == "Save" and e.get("footballer_id") == club_gk_id[home] for e in evs
+        ):
+            evs.append(
+                {
+                    "event_type": "Save",
+                    "footballer_id": club_gk_id[home],
+                    "minute": _next_minute(74 + (rnd % 14)),
+                }
+            )
+        if hg == 0 and not any(
+            e.get("event_type") == "Save" and e.get("footballer_id") == club_gk_id[away] for e in evs
+        ):
+            evs.append(
+                {
+                    "event_type": "Save",
+                    "footballer_id": club_gk_id[away],
+                    "minute": _next_minute(78 + (rnd % 11)),
+                }
+            )
+
+        evs.sort(key=lambda e: int(e.get("minute", 45)))
+        completed_feeds[fid] = evs
+
+    return completed_feeds
 
 
 def _playing_window_for_kickoff(kickoff_utc: str, *, grace_days: int = 14) -> tuple[str, str]:
@@ -485,6 +619,7 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
 
     gate = ProposalGate(store, catalogue)
     cartridge_svc = CartridgeSyncService(store)
+    complete_events = _complete_seeded_match_events(catalogue)
 
     with store.batch():
         store.create_world(
@@ -541,7 +676,7 @@ def ensure_demo_world(store: WorldLedgerStore, catalogue: ClubCatalogue) -> str:
                 fixture_id=fid,
                 home_goals=hg,
                 away_goals=ag,
-                events=SEEDED_MATCH_EVENTS.get(fid, []),
+                events=complete_events[fid],
             )
 
         # 2. Create open upcoming Matchweek 11 (Sun/Mon 22–23 Nov), Matchweek 12 (27–29 Nov), & featured winter fixtures

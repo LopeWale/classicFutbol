@@ -175,7 +175,7 @@ impl FixtureSnapshot {
 pub fn sample_manchester_united(players_per_side: usize) -> TeamSnapshot {
     let full = vec![
         PlayerSnapshot {
-            footballer_id: "mun-gk-1".to_string(),
+            footballer_id: "mun-gk-2".to_string(),
             name: "S. Lammens".to_string(),
             shirt_number: 1,
             role: PlayerRole::Goalkeeper,
@@ -203,7 +203,7 @@ pub fn sample_manchester_united(players_per_side: usize) -> TeamSnapshot {
             attributes: PlayerAttributes::midfielder(76, 85, 90, 86, 70),
         },
         PlayerSnapshot {
-            footballer_id: "mun-fwd-1".to_string(),
+            footballer_id: "mun-fwd-4".to_string(),
             name: "M. Cunha".to_string(),
             shirt_number: 10,
             role: PlayerRole::Forward,
@@ -224,28 +224,28 @@ pub fn sample_manchester_united(players_per_side: usize) -> TeamSnapshot {
             attributes: PlayerAttributes::defender(74, 85, 75, 88),
         },
         PlayerSnapshot {
-            footballer_id: "mun-def-4".to_string(),
+            footballer_id: "mun-def-5".to_string(),
             name: "L. Yoro".to_string(),
             shirt_number: 15,
             role: PlayerRole::Defender,
             attributes: PlayerAttributes::defender(83, 84, 78, 82),
         },
         PlayerSnapshot {
-            footballer_id: "mun-mid-3".to_string(),
+            footballer_id: "mun-mid-4".to_string(),
             name: "Y. Tielemans".to_string(),
             shirt_number: 18,
             role: PlayerRole::Midfielder,
             attributes: PlayerAttributes::midfielder(71, 82, 86, 80, 75),
         },
         PlayerSnapshot {
-            footballer_id: "mun-fwd-2".to_string(),
+            footballer_id: "mun-fwd-5".to_string(),
             name: "B. Mbeumo".to_string(),
             shirt_number: 19,
             role: PlayerRole::Forward,
             attributes: PlayerAttributes::forward(89, 85, 80, 85, 77),
         },
         PlayerSnapshot {
-            footballer_id: "mun-fwd-3".to_string(),
+            footballer_id: "mun-fwd-6".to_string(),
             name: "B. Sesko".to_string(),
             shirt_number: 30,
             role: PlayerRole::Forward,
@@ -305,14 +305,14 @@ pub fn sample_arsenal(players_per_side: usize) -> TeamSnapshot {
             attributes: PlayerAttributes::forward(89, 90, 86, 87, 76),
         },
         PlayerSnapshot {
-            footballer_id: "ars-def-2".to_string(),
+            footballer_id: "ars-def-3".to_string(),
             name: "Gabriel".to_string(),
             shirt_number: 6,
             role: PlayerRole::Defender,
             attributes: PlayerAttributes::defender(78, 88, 76, 89),
         },
         PlayerSnapshot {
-            footballer_id: "ars-def-3".to_string(),
+            footballer_id: "ars-def-5".to_string(),
             name: "R. Calafiori".to_string(),
             shirt_number: 33,
             role: PlayerRole::Defender,
@@ -326,21 +326,21 @@ pub fn sample_arsenal(players_per_side: usize) -> TeamSnapshot {
             attributes: PlayerAttributes::defender(84, 84, 82, 80),
         },
         PlayerSnapshot {
-            footballer_id: "ars-mid-3".to_string(),
+            footballer_id: "ars-mid-4".to_string(),
             name: "B. Guimaraes".to_string(),
             shirt_number: 39,
             role: PlayerRole::Midfielder,
             attributes: PlayerAttributes::midfielder(77, 85, 87, 79, 84),
         },
         PlayerSnapshot {
-            footballer_id: "ars-fwd-2".to_string(),
+            footballer_id: "ars-fwd-4".to_string(),
             name: "E. Eze".to_string(),
             shirt_number: 10,
             role: PlayerRole::Forward,
             attributes: PlayerAttributes::forward(85, 90, 84, 83, 74),
         },
         PlayerSnapshot {
-            footballer_id: "ars-fwd-3".to_string(),
+            footballer_id: "ars-fwd-5".to_string(),
             name: "V. Gyokeres".to_string(),
             shirt_number: 14,
             role: PlayerRole::Forward,

@@ -156,11 +156,116 @@ class ClubRecord:
 class ClubCatalogue:
     """In-memory / World-scoped club and footballer catalogue with historical interval support."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, legacy_pre_2026_27: bool = False) -> None:
         self.clubs: dict[str, ClubRecord] = {}
-        self._load_defaults()
+        if legacy_pre_2026_27:
+            self._load_legacy_pre_2026_27()
+        else:
+            self._load_defaults()
+
+    def _load_legacy_pre_2026_27(self) -> None:
+        """Preserve exact pre-2026/27 4-club roster intervals for pre-existing persistent legacy worlds."""
+        self.clubs = {
+            "man-utd": ClubRecord(
+                club_id="man-utd",
+                name="Manchester United",
+                short_name="MUN",
+                country="England",
+                stadium="Old Trafford",
+                primary_color="#DA291C",
+                secondary_color="#FFFFFF",
+                formation_5v5="1-2-1",
+                formation_11v11="4-3-3",
+                squad=[
+                    SquadMemberRecord("mun-gk-1", "A. Onana", 24, "Goalkeeper", _gk_attrs(83, 81, 84), starter_5v5=True),
+                    SquadMemberRecord("mun-def-1", "L. Martinez", 6, "Defender", _def_attrs(77, 86, 83, 82), starter_5v5=True),
+                    SquadMemberRecord("mun-mid-1", "K. Mainoo", 37, "Midfielder", _mid_attrs(79, 85, 83, 74, 77), starter_5v5=True),
+                    SquadMemberRecord("mun-mid-2", "B. Fernandes", 8, "Midfielder", _mid_attrs(76, 84, 90, 86, 70), starter_5v5=True),
+                    SquadMemberRecord("mun-fwd-1", "M. Rashford", 10, "Forward", _fwd_attrs(90, 85, 78, 84, 76), starter_5v5=True),
+                    SquadMemberRecord("mun-def-2", "D. Dalot", 20, "Defender", _def_attrs(85, 80, 78, 76)),
+                    SquadMemberRecord("mun-def-3", "M. de Ligt", 4, "Defender", _def_attrs(74, 85, 75, 88)),
+                    SquadMemberRecord("mun-def-4", "L. Shaw", 23, "Defender", _def_attrs(80, 81, 80, 79)),
+                    SquadMemberRecord("mun-mid-3", "Casemiro", 18, "Midfielder", _mid_attrs(66, 74, 79, 73, 86)),
+                    SquadMemberRecord("mun-fwd-2", "A. Garnacho", 17, "Forward", _fwd_attrs(89, 84, 75, 79, 67)),
+                    SquadMemberRecord("mun-fwd-3", "R. Hojlund", 9, "Forward", _fwd_attrs(86, 78, 70, 81, 83)),
+                ],
+            ),
+            "arsenal": ClubRecord(
+                club_id="arsenal",
+                name="Arsenal",
+                short_name="ARS",
+                country="England",
+                stadium="Emirates Stadium",
+                primary_color="#EF0107",
+                secondary_color="#063672",
+                formation_5v5="1-2-1",
+                formation_11v11="4-3-3",
+                squad=[
+                    SquadMemberRecord("ars-gk-1", "D. Raya", 22, "Goalkeeper", _gk_attrs(85, 84, 83), starter_5v5=True),
+                    SquadMemberRecord("ars-def-1", "W. Saliba", 2, "Defender", _def_attrs(83, 88, 80, 86), starter_5v5=True),
+                    SquadMemberRecord("ars-mid-1", "D. Rice", 41, "Midfielder", _mid_attrs(79, 82, 84, 76, 87), starter_5v5=True),
+                    SquadMemberRecord("ars-mid-2", "M. Odegaard", 8, "Midfielder", _mid_attrs(78, 89, 90, 82, 67), starter_5v5=True),
+                    SquadMemberRecord("ars-fwd-1", "B. Saka", 7, "Forward", _fwd_attrs(88, 88, 84, 85, 74), starter_5v5=True),
+                    SquadMemberRecord("ars-def-2", "B. White", 4, "Defender", _def_attrs(80, 84, 79, 78)),
+                    SquadMemberRecord("ars-def-3", "Gabriel", 6, "Defender", _def_attrs(77, 87, 75, 88)),
+                    SquadMemberRecord("ars-def-4", "J. Timber", 12, "Defender", _def_attrs(83, 82, 80, 79)),
+                    SquadMemberRecord("ars-mid-3", "T. Partey", 5, "Midfielder", _mid_attrs(73, 80, 83, 72, 83)),
+                    SquadMemberRecord("ars-fwd-2", "G. Martinelli", 11, "Forward", _fwd_attrs(91, 86, 77, 80, 70)),
+                    SquadMemberRecord("ars-fwd-3", "K. Havertz", 29, "Forward", _fwd_attrs(81, 82, 80, 81, 79)),
+                ],
+            ),
+            "liverpool": ClubRecord(
+                club_id="liverpool",
+                name="Liverpool",
+                short_name="LIV",
+                country="England",
+                stadium="Anfield",
+                primary_color="#C8102E",
+                secondary_color="#F6EB61",
+                formation_5v5="1-2-1",
+                formation_11v11="4-3-3",
+                squad=[
+                    SquadMemberRecord("liv-gk-1", "Alisson", 1, "Goalkeeper", _gk_attrs(89, 88, 85), starter_5v5=True),
+                    SquadMemberRecord("liv-def-1", "V. van Dijk", 4, "Defender", _def_attrs(79, 90, 81, 91), starter_5v5=True),
+                    SquadMemberRecord("liv-mid-1", "A. Mac Allister", 10, "Midfielder", _mid_attrs(75, 85, 87, 82, 79), starter_5v5=True),
+                    SquadMemberRecord("liv-mid-2", "D. Szoboszlai", 8, "Midfielder", _mid_attrs(84, 84, 85, 84, 70), starter_5v5=True),
+                    SquadMemberRecord("liv-fwd-1", "M. Salah", 11, "Forward", _fwd_attrs(89, 88, 84, 89, 76), starter_5v5=True),
+                    SquadMemberRecord("liv-def-2", "T. Alexander-Arnold", 66, "Defender", _def_attrs(78, 76, 91, 73)),
+                    SquadMemberRecord("liv-def-3", "I. Konate", 5, "Defender", _def_attrs(82, 85, 73, 89)),
+                    SquadMemberRecord("liv-def-4", "A. Robertson", 26, "Defender", _def_attrs(82, 81, 83, 75)),
+                    SquadMemberRecord("liv-mid-3", "R. Gravenberch", 38, "Midfielder", _mid_attrs(80, 84, 82, 75, 78)),
+                    SquadMemberRecord("liv-fwd-2", "L. Diaz", 7, "Forward", _fwd_attrs(90, 88, 78, 81, 72)),
+                    SquadMemberRecord("liv-fwd-3", "D. Jota", 20, "Forward", _fwd_attrs(84, 84, 76, 85, 74)),
+                ],
+            ),
+            "chelsea": ClubRecord(
+                club_id="chelsea",
+                name="Chelsea",
+                short_name="CHE",
+                country="England",
+                stadium="Stamford Bridge",
+                primary_color="#034694",
+                secondary_color="#FFFFFF",
+                formation_5v5="1-2-1",
+                formation_11v11="4-3-3",
+                squad=[
+                    SquadMemberRecord("che-gk-1", "R. Sanchez", 1, "Goalkeeper", _gk_attrs(80, 79, 78), starter_5v5=True),
+                    SquadMemberRecord("che-def-1", "L. Colwill", 6, "Defender", _def_attrs(79, 82, 81, 82), starter_5v5=True),
+                    SquadMemberRecord("che-mid-1", "M. Caicedo", 25, "Midfielder", _mid_attrs(80, 80, 82, 68, 85), starter_5v5=True),
+                    SquadMemberRecord("che-mid-2", "C. Palmer", 20, "Midfielder", _mid_attrs(82, 88, 88, 87, 56), starter_5v5=True),
+                    SquadMemberRecord("che-fwd-1", "N. Jackson", 15, "Forward", _fwd_attrs(88, 81, 74, 79, 78), starter_5v5=True),
+                    SquadMemberRecord("che-def-2", "R. James", 24, "Defender", _def_attrs(81, 84, 84, 84)),
+                    SquadMemberRecord("che-def-3", "W. Fofana", 29, "Defender", _def_attrs(82, 82, 74, 81)),
+                    SquadMemberRecord("che-def-4", "M. Cucurella", 3, "Defender", _def_attrs(79, 81, 79, 72)),
+                    SquadMemberRecord("che-mid-3", "E. Fernandez", 8, "Midfielder", _mid_attrs(73, 82, 86, 76, 75)),
+                    SquadMemberRecord("che-fwd-2", "P. Neto", 7, "Forward", _fwd_attrs(90, 85, 79, 77, 68)),
+                    SquadMemberRecord("che-fwd-3", "C. Nkunku", 18, "Forward", _fwd_attrs(83, 86, 82, 83, 71)),
+                ],
+            ),
+        }
 
     def _load_defaults(self) -> None:
+        _hist = {"effective_from": "2023-08-01T00:00:00Z", "effective_to": "2026-07-31T23:59:59Z"}
         self.clubs = {
             "arsenal": ClubRecord(
                 club_id="arsenal",
@@ -178,12 +283,17 @@ class ClubCatalogue:
                     SquadMemberRecord("ars-mid-1", "D. Rice", 41, "Midfielder", _mid_attrs(80, 83, 86, 78, 89), starter_5v5=True),
                     SquadMemberRecord("ars-mid-2", "M. Odegaard", 8, "Midfielder", _mid_attrs(79, 90, 91, 84, 68), starter_5v5=True),
                     SquadMemberRecord("ars-fwd-1", "B. Saka", 7, "Forward", _fwd_attrs(89, 90, 86, 87, 76), starter_5v5=True),
-                    SquadMemberRecord("ars-def-2", "Gabriel", 6, "Defender", _def_attrs(78, 88, 76, 89)),
-                    SquadMemberRecord("ars-def-3", "R. Calafiori", 33, "Defender", _def_attrs(81, 85, 83, 83)),
+                    SquadMemberRecord("ars-def-3", "Gabriel", 6, "Defender", _def_attrs(78, 88, 76, 89)),
+                    SquadMemberRecord("ars-def-5", "R. Calafiori", 33, "Defender", _def_attrs(81, 85, 83, 83)),
                     SquadMemberRecord("ars-def-4", "J. Timber", 12, "Defender", _def_attrs(84, 84, 82, 80)),
-                    SquadMemberRecord("ars-mid-3", "B. Guimaraes", 39, "Midfielder", _mid_attrs(77, 85, 87, 79, 84)),
-                    SquadMemberRecord("ars-fwd-2", "E. Eze", 10, "Forward", _fwd_attrs(85, 90, 84, 83, 74)),
-                    SquadMemberRecord("ars-fwd-3", "V. Gyokeres", 14, "Forward", _fwd_attrs(87, 83, 77, 88, 88)),
+                    SquadMemberRecord("ars-mid-4", "B. Guimaraes", 39, "Midfielder", _mid_attrs(77, 85, 87, 79, 84)),
+                    SquadMemberRecord("ars-fwd-4", "E. Eze", 10, "Forward", _fwd_attrs(85, 90, 84, 83, 74)),
+                    SquadMemberRecord("ars-fwd-5", "V. Gyokeres", 14, "Forward", _fwd_attrs(87, 83, 77, 88, 88)),
+                    # Closed historical intervals preserving pre-2026/27 footballer IDs
+                    SquadMemberRecord("ars-def-2", "B. White", 4, "Defender", _def_attrs(80, 84, 79, 78), **_hist),
+                    SquadMemberRecord("ars-mid-3", "T. Partey", 5, "Midfielder", _mid_attrs(73, 80, 83, 72, 83), **_hist),
+                    SquadMemberRecord("ars-fwd-2", "G. Martinelli", 11, "Forward", _fwd_attrs(91, 86, 77, 80, 70), **_hist),
+                    SquadMemberRecord("ars-fwd-3", "K. Havertz", 29, "Forward", _fwd_attrs(81, 82, 80, 81, 79), **_hist),
                 ],
             ),
             "brighton": ClubRecord(
@@ -223,7 +333,7 @@ class ClubCatalogue:
                 squad=[
                     SquadMemberRecord("mci-gk-1", "G. Donnarumma", 1, "Goalkeeper", _gk_attrs(89, 86, 79), starter_5v5=True),
                     SquadMemberRecord("mci-def-1", "R. Dias", 3, "Defender", _def_attrs(76, 89, 82, 89), starter_5v5=True),
-                    SquadMemberRecord("mci-mid-1", "E. Fernandez", 17, "Midfielder", _mid_attrs(75, 84, 88, 79, 78), starter_5v5=True),
+                    SquadMemberRecord("che-mid-3", "E. Fernandez", 17, "Midfielder", _mid_attrs(75, 84, 88, 79, 78), starter_5v5=True),
                     SquadMemberRecord("mci-mid-2", "R. Cherki", 10, "Midfielder", _mid_attrs(82, 91, 87, 82, 55), starter_5v5=True),
                     SquadMemberRecord("mci-fwd-1", "E. Haaland", 9, "Forward", _fwd_attrs(89, 81, 73, 94, 93), starter_5v5=True),
                     SquadMemberRecord("mci-def-2", "J. Gvardiol", 24, "Defender", _def_attrs(82, 86, 83, 85)),
@@ -271,15 +381,23 @@ class ClubCatalogue:
                 squad=[
                     SquadMemberRecord("liv-gk-1", "Alisson", 1, "Goalkeeper", _gk_attrs(89, 88, 85), starter_5v5=True),
                     SquadMemberRecord("liv-def-1", "V. van Dijk", 4, "Defender", _def_attrs(78, 90, 82, 91), starter_5v5=True),
-                    SquadMemberRecord("liv-mid-1", "F. Wirtz", 7, "Midfielder", _mid_attrs(83, 91, 89, 84, 62), starter_5v5=True),
+                    SquadMemberRecord("liv-mid-4", "F. Wirtz", 7, "Midfielder", _mid_attrs(83, 91, 89, 84, 62), starter_5v5=True),
                     SquadMemberRecord("liv-mid-2", "D. Szoboszlai", 8, "Midfielder", _mid_attrs(84, 85, 86, 84, 72), starter_5v5=True),
-                    SquadMemberRecord("liv-fwd-1", "A. Isak", 9, "Forward", _fwd_attrs(88, 88, 80, 90, 79), starter_5v5=True),
-                    SquadMemberRecord("liv-def-2", "J. Frimpong", 30, "Defender", _def_attrs(93, 77, 81, 70)),
-                    SquadMemberRecord("liv-def-3", "R. Araujo", 33, "Defender", _def_attrs(84, 87, 75, 88)),
-                    SquadMemberRecord("liv-def-4", "M. Kerkez", 6, "Defender", _def_attrs(86, 80, 79, 77)),
-                    SquadMemberRecord("liv-mid-3", "A. Mac Allister", 10, "Midfielder", _mid_attrs(75, 85, 87, 82, 80)),
-                    SquadMemberRecord("liv-fwd-2", "B. Barcola", 29, "Forward", _fwd_attrs(92, 88, 80, 82, 72)),
-                    SquadMemberRecord("liv-fwd-3", "H. Ekitike", 22, "Forward", _fwd_attrs(86, 84, 76, 83, 78)),
+                    SquadMemberRecord("liv-fwd-4", "A. Isak", 9, "Forward", _fwd_attrs(88, 88, 80, 90, 79), starter_5v5=True),
+                    SquadMemberRecord("liv-def-5", "J. Frimpong", 30, "Defender", _def_attrs(93, 77, 81, 70)),
+                    SquadMemberRecord("liv-def-6", "R. Araujo", 33, "Defender", _def_attrs(84, 87, 75, 88)),
+                    SquadMemberRecord("liv-def-7", "M. Kerkez", 6, "Defender", _def_attrs(86, 80, 79, 77)),
+                    SquadMemberRecord("liv-mid-1", "A. Mac Allister", 10, "Midfielder", _mid_attrs(75, 85, 87, 82, 80)),
+                    SquadMemberRecord("liv-fwd-5", "B. Barcola", 29, "Forward", _fwd_attrs(92, 88, 80, 82, 72)),
+                    SquadMemberRecord("liv-fwd-6", "H. Ekitike", 22, "Forward", _fwd_attrs(86, 84, 76, 83, 78)),
+                    # Closed historical intervals preserving pre-2026/27 footballer IDs
+                    SquadMemberRecord("liv-fwd-1", "M. Salah", 11, "Forward", _fwd_attrs(89, 88, 84, 89, 76), **_hist),
+                    SquadMemberRecord("liv-def-2", "T. Alexander-Arnold", 66, "Defender", _def_attrs(78, 76, 91, 73), **_hist),
+                    SquadMemberRecord("liv-def-3", "I. Konate", 5, "Defender", _def_attrs(82, 85, 73, 89), **_hist),
+                    SquadMemberRecord("liv-def-4", "A. Robertson", 26, "Defender", _def_attrs(82, 81, 83, 75), **_hist),
+                    SquadMemberRecord("liv-mid-3", "R. Gravenberch", 38, "Midfielder", _mid_attrs(80, 84, 82, 75, 78), **_hist),
+                    SquadMemberRecord("liv-fwd-2", "L. Diaz", 7, "Forward", _fwd_attrs(90, 88, 78, 81, 72), **_hist),
+                    SquadMemberRecord("liv-fwd-3", "D. Jota", 20, "Forward", _fwd_attrs(84, 84, 76, 85, 74), **_hist),
                 ],
             ),
             "leeds": ClubRecord(
@@ -341,17 +459,23 @@ class ClubCatalogue:
                 formation_5v5="1-2-1",
                 formation_11v11="4-3-3",
                 squad=[
-                    SquadMemberRecord("che-gk-1", "E. Martinez", 1, "Goalkeeper", _gk_attrs(87, 86, 83), starter_5v5=True),
+                    SquadMemberRecord("che-gk-2", "E. Martinez", 1, "Goalkeeper", _gk_attrs(87, 86, 83), starter_5v5=True),
                     SquadMemberRecord("che-def-1", "L. Colwill", 6, "Defender", _def_attrs(80, 84, 82, 83), starter_5v5=True),
                     SquadMemberRecord("che-mid-1", "M. Caicedo", 25, "Midfielder", _mid_attrs(81, 82, 84, 70, 87), starter_5v5=True),
                     SquadMemberRecord("che-mid-2", "C. Palmer", 10, "Midfielder", _mid_attrs(82, 89, 89, 88, 56), starter_5v5=True),
-                    SquadMemberRecord("che-fwd-1", "Joao Pedro", 9, "Forward", _fwd_attrs(86, 87, 81, 85, 78), starter_5v5=True),
+                    SquadMemberRecord("che-fwd-4", "Joao Pedro", 9, "Forward", _fwd_attrs(86, 87, 81, 85, 78), starter_5v5=True),
                     SquadMemberRecord("che-def-2", "R. James", 24, "Defender", _def_attrs(81, 85, 85, 84)),
                     SquadMemberRecord("che-def-3", "W. Fofana", 3, "Defender", _def_attrs(82, 83, 75, 82)),
-                    SquadMemberRecord("che-def-4", "J. Hato", 21, "Defender", _def_attrs(83, 82, 81, 79)),
-                    SquadMemberRecord("che-mid-3", "M. Rogers", 17, "Midfielder", _mid_attrs(85, 87, 83, 83, 68)),
+                    SquadMemberRecord("che-def-5", "J. Hato", 21, "Defender", _def_attrs(83, 82, 81, 79)),
+                    SquadMemberRecord("che-mid-4", "M. Rogers", 17, "Midfielder", _mid_attrs(85, 87, 83, 83, 68)),
                     SquadMemberRecord("che-fwd-2", "P. Neto", 7, "Forward", _fwd_attrs(91, 86, 80, 79, 69)),
-                    SquadMemberRecord("che-fwd-3", "Estevao", 41, "Forward", _fwd_attrs(88, 90, 81, 80, 64)),
+                    SquadMemberRecord("che-fwd-5", "Estevao", 41, "Forward", _fwd_attrs(88, 90, 81, 80, 64)),
+                    # Closed historical intervals preserving pre-2026/27 footballer IDs
+                    SquadMemberRecord("che-gk-1", "R. Sanchez", 1, "Goalkeeper", _gk_attrs(80, 79, 78), **_hist),
+                    SquadMemberRecord("che-fwd-1", "N. Jackson", 15, "Forward", _fwd_attrs(88, 81, 74, 79, 78), **_hist),
+                    SquadMemberRecord("che-def-4", "M. Cucurella", 3, "Defender", _def_attrs(79, 81, 79, 72), **_hist),
+                    SquadMemberRecord("che-mid-3", "E. Fernandez", 8, "Midfielder", _mid_attrs(73, 82, 86, 76, 75), **_hist),
+                    SquadMemberRecord("che-fwd-3", "C. Nkunku", 18, "Forward", _fwd_attrs(83, 86, 82, 83, 71), **_hist),
                 ],
             ),
             "tottenham": ClubRecord(
@@ -417,12 +541,12 @@ class ClubCatalogue:
                     SquadMemberRecord("avl-def-1", "P. Torres", 14, "Defender", _def_attrs(76, 84, 85, 81), starter_5v5=True),
                     SquadMemberRecord("avl-mid-1", "A. Onana", 24, "Midfielder", _mid_attrs(81, 79, 80, 72, 85), starter_5v5=True),
                     SquadMemberRecord("avl-mid-2", "J. McGinn", 7, "Midfielder", _mid_attrs(76, 82, 83, 78, 80), starter_5v5=True),
-                    SquadMemberRecord("avl-fwd-1", "N. Jackson", 11, "Forward", _fwd_attrs(89, 83, 76, 83, 80), starter_5v5=True),
+                    SquadMemberRecord("che-fwd-1", "N. Jackson", 11, "Forward", _fwd_attrs(89, 83, 76, 83, 80), starter_5v5=True),
                     SquadMemberRecord("avl-def-2", "M. Cash", 2, "Defender", _def_attrs(83, 79, 77, 77)),
                     SquadMemberRecord("avl-def-3", "I. Maatsen", 22, "Defender", _def_attrs(88, 77, 79, 70)),
                     SquadMemberRecord("avl-def-4", "T. Mings", 5, "Defender", _def_attrs(75, 82, 74, 87)),
                     SquadMemberRecord("avl-mid-3", "B. Kamara", 8, "Midfielder", _mid_attrs(75, 80, 82, 68, 85)),
-                    SquadMemberRecord("avl-fwd-2", "A. Garnacho", 17, "Forward", _fwd_attrs(90, 85, 76, 80, 68)),
+                    SquadMemberRecord("mun-fwd-2", "A. Garnacho", 17, "Forward", _fwd_attrs(90, 85, 76, 80, 68)),
                     SquadMemberRecord("avl-fwd-3", "T. Abraham", 18, "Forward", _fwd_attrs(81, 78, 72, 81, 83)),
                 ],
             ),
@@ -605,17 +729,24 @@ class ClubCatalogue:
                 formation_5v5="1-2-1",
                 formation_11v11="4-3-3",
                 squad=[
-                    SquadMemberRecord("mun-gk-1", "S. Lammens", 1, "Goalkeeper", _gk_attrs(82, 81, 80), starter_5v5=True),
+                    SquadMemberRecord("mun-gk-2", "S. Lammens", 1, "Goalkeeper", _gk_attrs(82, 81, 80), starter_5v5=True),
                     SquadMemberRecord("mun-def-1", "L. Martinez", 6, "Defender", _def_attrs(77, 86, 83, 82), starter_5v5=True),
                     SquadMemberRecord("mun-mid-1", "K. Mainoo", 37, "Midfielder", _mid_attrs(80, 86, 84, 75, 78), starter_5v5=True),
                     SquadMemberRecord("mun-mid-2", "B. Fernandes", 8, "Midfielder", _mid_attrs(76, 85, 90, 86, 70), starter_5v5=True),
-                    SquadMemberRecord("mun-fwd-1", "M. Cunha", 10, "Forward", _fwd_attrs(86, 87, 82, 84, 79), starter_5v5=True),
+                    SquadMemberRecord("mun-fwd-4", "M. Cunha", 10, "Forward", _fwd_attrs(86, 87, 82, 84, 79), starter_5v5=True),
                     SquadMemberRecord("mun-def-2", "D. Dalot", 2, "Defender", _def_attrs(85, 80, 79, 77)),
                     SquadMemberRecord("mun-def-3", "M. de Ligt", 4, "Defender", _def_attrs(74, 85, 75, 88)),
-                    SquadMemberRecord("mun-def-4", "L. Yoro", 15, "Defender", _def_attrs(83, 84, 78, 82)),
-                    SquadMemberRecord("mun-mid-3", "Y. Tielemans", 18, "Midfielder", _mid_attrs(71, 82, 86, 80, 75)),
-                    SquadMemberRecord("mun-fwd-2", "B. Mbeumo", 19, "Forward", _fwd_attrs(89, 85, 80, 85, 77)),
-                    SquadMemberRecord("mun-fwd-3", "B. Sesko", 30, "Forward", _fwd_attrs(88, 80, 73, 84, 86)),
+                    SquadMemberRecord("mun-def-5", "L. Yoro", 15, "Defender", _def_attrs(83, 84, 78, 82)),
+                    SquadMemberRecord("mun-mid-4", "Y. Tielemans", 18, "Midfielder", _mid_attrs(71, 82, 86, 80, 75)),
+                    SquadMemberRecord("mun-fwd-5", "B. Mbeumo", 19, "Forward", _fwd_attrs(89, 85, 80, 85, 77)),
+                    SquadMemberRecord("mun-fwd-6", "B. Sesko", 30, "Forward", _fwd_attrs(88, 80, 73, 84, 86)),
+                    # Closed historical intervals preserving pre-2026/27 footballer IDs
+                    SquadMemberRecord("mun-gk-1", "A. Onana", 24, "Goalkeeper", _gk_attrs(83, 81, 84), **_hist),
+                    SquadMemberRecord("mun-fwd-1", "M. Rashford", 10, "Forward", _fwd_attrs(90, 85, 78, 84, 76), **_hist),
+                    SquadMemberRecord("mun-def-4", "L. Shaw", 23, "Defender", _def_attrs(80, 81, 80, 79), **_hist),
+                    SquadMemberRecord("mun-mid-3", "Casemiro", 18, "Midfielder", _mid_attrs(66, 74, 79, 73, 86), **_hist),
+                    SquadMemberRecord("mun-fwd-2", "A. Garnacho", 17, "Forward", _fwd_attrs(89, 84, 75, 79, 67), **_hist),
+                    SquadMemberRecord("mun-fwd-3", "R. Hojlund", 9, "Forward", _fwd_attrs(86, 78, 70, 81, 83), **_hist),
                 ],
             ),
             "crystal-palace": ClubRecord(
@@ -644,7 +775,24 @@ class ClubCatalogue:
             ),
         }
 
+    def active_footballers(self) -> dict[str, dict[str, Any]]:
+        """Return metadata for all currently active (`effective_to is None`) squad members."""
+        out: dict[str, dict[str, Any]] = {}
+        for club in self.clubs.values():
+            for m in club.squad:
+                if m.effective_to is None:
+                    out[m.footballer_id] = {
+                        "footballer_id": m.footballer_id,
+                        "name": m.name,
+                        "club_id": club.club_id,
+                        "club_short": club.short_name,
+                        "shirt_number": m.shirt_number,
+                        "role": m.role,
+                    }
+        return out
+
     def all_footballers(self) -> dict[str, dict[str, Any]]:
+        """Return metadata for all active AND historical closed-interval footballers (active takes precedence)."""
         out: dict[str, dict[str, Any]] = {}
         for club in self.clubs.values():
             for m in club.squad:
@@ -735,23 +883,38 @@ class ClubCatalogue:
                 applied += 1
         return applied
 
+    @staticmethod
+    def is_legacy_world(world: dict[str, Any] | None) -> bool:
+        """Return True when a world record predates the 2026/27 20-club catalogue."""
+        if not world:
+            return False
+        if world.get("name") == "Friends Premier Parallel Season":
+            return True
+        slabel = str(world.get("season_label") or "").strip()
+        return slabel in ("2023/24", "2024/25", "2025/26")
+
     def for_world(self, store: Any, world_id: str) -> ClubCatalogue:
         """Build a world-scoped catalogue from default squads + transfer events of the whole season lineage.
 
         A rolled-over child world inherits its parent's squads, so transfers are replayed
-        root-ancestor first, then each descendant down to `world_id`.
+        root-ancestor first, then each descendant down to `world_id`. Pre-existing legacy
+        worlds retain their pre-2026/27 intervals.
         """
         lineage: list[str] = []
         seen: set[str] = set()
         current: str | None = world_id
+        root_world: dict[str, Any] | None = None
         while current and current not in seen:
             seen.add(current)
             lineage.append(current)
             try:
-                current = store.get_world(current).get("parent_world_id")
+                w = store.get_world(current)
+                root_world = w
+                current = w.get("parent_world_id")
             except KeyError:
                 break
-        cat = ClubCatalogue()
+        is_legacy = self.is_legacy_world(root_world)
+        cat = ClubCatalogue(legacy_pre_2026_27=is_legacy)
         ordered = list(reversed(lineage))
         for idx, wid in enumerate(ordered):
             events = store.list_events(wid)

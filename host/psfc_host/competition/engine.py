@@ -361,11 +361,26 @@ class CompetitionEngine:
         """Award end-of-season honours, determine qualification, and roll over to a new Parallel Season."""
         world = self.store.get_world(world_id)
         events = self.store.list_events(world_id)
-        clubs = self._clubs_summary()
+        world_cat = self.catalogue.for_world(self.store, world_id)
+        clubs = {
+            cid: {
+                "club_id": c.club_id,
+                "name": c.name,
+                "short_name": c.short_name,
+                "country": c.country,
+                "stadium": c.stadium,
+                "primary_color": c.primary_color,
+                "secondary_color": c.secondary_color,
+            }
+            for cid, c in world_cat.clubs.items()
+        }
         rep = set(self.store.represented_clubs(world_id).keys())
         standings = project_standings(events, clubs, represented_club_ids=rep)["standings"]
-        world_cat = self.catalogue.for_world(self.store, world_id)
-        players = project_player_stats(events, world_cat.all_footballers())
+        players = project_player_stats(
+            events,
+            world_cat.active_footballers(),
+            historical_footballers=world_cat.all_footballers(),
+        )
         ts = utc_now_iso()
 
         honours: list[dict[str, Any]] = []

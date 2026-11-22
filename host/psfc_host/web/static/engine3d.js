@@ -937,64 +937,64 @@ const KIT_CATALOGUE = {
 const SKIN_TONES = ["#f4cfb0", "#e8b98e", "#d19968", "#9e663d", "#6a3f23", "#4c2b17"];
 const HAIR_COLORS = ["#141416", "#2b1d12", "#4a321f", "#7c5329", "#d4a959", "#1f242d"];
 
-// FIFA 11 "Personality+" Likeness & Somatotype Builds ("lean" | "athletic" | "power") — 2026–27 Squads
+// FIFA 11 "Personality+" Likeness & Somatotype Builds ("lean" | "athletic" | "power") — 2026–27 + Historical Squads
 const PLAYER_LIKENESS = {
-  // Manchester United (2026–27)
-  "mun-gk-1": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // S. Lammens #1
+  // Manchester United (2026–27 Active)
+  "mun-gk-2": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // S. Lammens #1
   "mun-def-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "athletic" }, // L. Martinez #6
   "mun-def-2": { skin: 1, hair: 1, style: "fade", beard: true, build: "athletic" }, // D. Dalot #2
   "mun-def-3": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // M. de Ligt #4
-  "mun-def-4": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // L. Yoro #15
+  "mun-def-5": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // L. Yoro #15
   "mun-mid-1": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // K. Mainoo #37
   "mun-mid-2": { skin: 1, hair: 1, style: "crop", beard: true, build: "lean" }, // B. Fernandes #8
-  "mun-mid-3": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // Y. Tielemans #18
-  "mun-fwd-1": { skin: 2, hair: 0, style: "fade", beard: true, build: "athletic" }, // M. Cunha #10
-  "mun-fwd-2": { skin: 5, hair: 0, style: "buzz", beard: true, build: "power" }, // B. Mbeumo #19
-  "mun-fwd-3": { skin: 0, hair: 2, style: "crop", beard: false, build: "power" }, // B. Sesko #30
+  "mun-mid-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // Y. Tielemans #18
+  "mun-fwd-4": { skin: 2, hair: 0, style: "fade", beard: true, build: "athletic" }, // M. Cunha #10
+  "mun-fwd-5": { skin: 5, hair: 0, style: "buzz", beard: true, build: "power" }, // B. Mbeumo #19
+  "mun-fwd-6": { skin: 0, hair: 2, style: "crop", beard: false, build: "power" }, // B. Sesko #30
 
-  // Arsenal (2026–27)
+  // Arsenal (2026–27 Active)
   "ars-gk-1": { skin: 1, hair: 1, style: "fade", beard: true, build: "athletic" }, // D. Raya #1
   "ars-def-1": { skin: 4, hair: 0, style: "buzz", beard: false, build: "power" }, // W. Saliba #2
-  "ars-def-2": { skin: 3, hair: 0, style: "crop", beard: true, build: "power" }, // Gabriel #6
-  "ars-def-3": { skin: 0, hair: 1, style: "headband", beard: false, build: "athletic" }, // R. Calafiori #33
+  "ars-def-3": { skin: 3, hair: 0, style: "crop", beard: true, build: "power" }, // Gabriel #6
+  "ars-def-5": { skin: 0, hair: 1, style: "headband", beard: false, build: "athletic" }, // R. Calafiori #33
   "ars-def-4": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" }, // J. Timber #12
   "ars-mid-1": { skin: 0, hair: 2, style: "swept", beard: false, build: "power" }, // D. Rice #41
   "ars-mid-2": { skin: 0, hair: 4, style: "swept", beard: true, build: "lean" }, // M. Odegaard #8
-  "ars-mid-3": { skin: 1, hair: 4, style: "crop", beard: true, build: "athletic" }, // B. Guimaraes #39
+  "ars-mid-4": { skin: 1, hair: 4, style: "crop", beard: true, build: "athletic" }, // B. Guimaraes #39
   "ars-fwd-1": { skin: 5, hair: 0, style: "curls", beard: false, build: "lean" }, // B. Saka #7
-  "ars-fwd-2": { skin: 4, hair: 0, style: "curls", beard: true, build: "lean" }, // E. Eze #10
-  "ars-fwd-3": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // V. Gyokeres #14
+  "ars-fwd-4": { skin: 4, hair: 0, style: "curls", beard: true, build: "lean" }, // E. Eze #10
+  "ars-fwd-5": { skin: 0, hair: 3, style: "swept", beard: false, build: "power" }, // V. Gyokeres #14
 
-  // Liverpool (2026–27)
+  // Liverpool (2026–27 Active)
   "liv-gk-1": { skin: 1, hair: 2, style: "swept", beard: true, build: "power" }, // Alisson #1
   "liv-def-1": { skin: 3, hair: 0, style: "bun", beard: true, build: "power" }, // V. van Dijk #4
-  "liv-def-2": { skin: 5, hair: 0, style: "curls", beard: false, build: "lean" }, // J. Frimpong #30
-  "liv-def-3": { skin: 3, hair: 0, style: "fade", beard: true, build: "power" }, // R. Araujo #33
-  "liv-def-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // M. Kerkez #6
-  "liv-mid-1": { skin: 0, hair: 3, style: "swept", beard: false, build: "lean" }, // F. Wirtz #7
+  "liv-def-5": { skin: 5, hair: 0, style: "curls", beard: false, build: "lean" }, // J. Frimpong #30
+  "liv-def-6": { skin: 3, hair: 0, style: "fade", beard: true, build: "power" }, // R. Araujo #33
+  "liv-def-7": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // M. Kerkez #6
+  "liv-mid-4": { skin: 0, hair: 3, style: "swept", beard: false, build: "lean" }, // F. Wirtz #7
   "liv-mid-2": { skin: 0, hair: 1, style: "headband", beard: true, build: "athletic" }, // D. Szoboszlai #8
-  "liv-mid-3": { skin: 0, hair: 2, style: "crop", beard: true, build: "athletic" }, // A. Mac Allister #10
-  "liv-fwd-1": { skin: 4, hair: 0, style: "curls", beard: true, build: "lean" }, // A. Isak #9
-  "liv-fwd-2": { skin: 4, hair: 0, style: "curls", beard: false, build: "lean" }, // B. Barcola #29
-  "liv-fwd-3": { skin: 4, hair: 0, style: "curls", beard: false, build: "lean" }, // H. Ekitike #22
+  "liv-mid-1": { skin: 0, hair: 2, style: "crop", beard: true, build: "athletic" }, // A. Mac Allister #10
+  "liv-fwd-4": { skin: 4, hair: 0, style: "curls", beard: true, build: "lean" }, // A. Isak #9
+  "liv-fwd-5": { skin: 4, hair: 0, style: "curls", beard: false, build: "lean" }, // B. Barcola #29
+  "liv-fwd-6": { skin: 4, hair: 0, style: "curls", beard: false, build: "lean" }, // H. Ekitike #22
 
-  // Chelsea (2026–27)
-  "che-gk-1": { skin: 1, hair: 1, style: "fade", beard: false, build: "power" }, // E. Martinez #1
+  // Chelsea (2026–27 Active)
+  "che-gk-2": { skin: 1, hair: 1, style: "fade", beard: false, build: "power" }, // E. Martinez #1
   "che-def-1": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" }, // L. Colwill #6
   "che-def-2": { skin: 4, hair: 0, style: "curls", beard: true, build: "power" }, // R. James #24
   "che-def-3": { skin: 4, hair: 0, style: "fade", beard: true, build: "athletic" }, // W. Fofana #3
-  "che-def-4": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // J. Hato #21
+  "che-def-5": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // J. Hato #21
   "che-mid-1": { skin: 4, hair: 0, style: "fade", beard: false, build: "power" }, // M. Caicedo #25
   "che-mid-2": { skin: 0, hair: 3, style: "crop", beard: false, build: "lean" }, // C. Palmer #10
-  "che-mid-3": { skin: 2, hair: 1, style: "fade", beard: true, build: "power" }, // M. Rogers #17
-  "che-fwd-1": { skin: 2, hair: 0, style: "fade", beard: true, build: "athletic" }, // Joao Pedro #9
+  "che-mid-4": { skin: 2, hair: 1, style: "fade", beard: true, build: "power" }, // M. Rogers #17
+  "che-fwd-4": { skin: 2, hair: 0, style: "fade", beard: true, build: "athletic" }, // Joao Pedro #9
   "che-fwd-2": { skin: 1, hair: 1, style: "crop", beard: true, build: "lean" }, // P. Neto #7
-  "che-fwd-3": { skin: 3, hair: 0, style: "curls", beard: false, build: "lean" }, // Estevao #41
+  "che-fwd-5": { skin: 3, hair: 0, style: "curls", beard: false, build: "lean" }, // Estevao #41
 
-  // Manchester City & Premier League Stars (2026–27)
+  // Manchester City & Premier League Stars (2026–27 Active + Cross-Club Transfers)
   "mci-gk-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "power" }, // G. Donnarumma #1
   "mci-def-1": { skin: 1, hair: 1, style: "crop", beard: true, build: "power" }, // R. Dias #3
-  "mci-mid-1": { skin: 1, hair: 0, style: "fade", beard: false, build: "athletic" }, // E. Fernandez #17
+  "che-mid-3": { skin: 1, hair: 0, style: "fade", beard: false, build: "athletic" }, // E. Fernandez #17 (Man City)
   "mci-mid-2": { skin: 1, hair: 1, style: "curls", beard: true, build: "athletic" }, // R. Cherki #10
   "mci-fwd-1": { skin: 0, hair: 4, style: "bun", beard: false, build: "power" }, // E. Haaland #9
   "mci-mid-3": { skin: 0, hair: 1, style: "fade", beard: false, build: "lean" }, // P. Foden #47
@@ -1010,10 +1010,31 @@ const PLAYER_LIKENESS = {
   "tot-mid-2": { skin: 3, hair: 0, style: "curls", beard: false, build: "lean" }, // X. Simons #7
   "tot-fwd-1": { skin: 2, hair: 0, style: "curls", beard: true, build: "athletic" }, // O. Marmoush #22
   "avl-mid-1": { skin: 5, hair: 0, style: "curls", beard: false, build: "power" }, // A. Onana #24
-  "avl-fwd-1": { skin: 5, hair: 0, style: "fade", beard: false, build: "athletic" }, // N. Jackson #11
-  "avl-fwd-2": { skin: 0, hair: 4, style: "swept", beard: false, build: "lean" }, // A. Garnacho #17
+  "che-fwd-1": { skin: 5, hair: 0, style: "fade", beard: false, build: "athletic" }, // N. Jackson #11 (Aston Villa)
+  "mun-fwd-2": { skin: 0, hair: 4, style: "swept", beard: false, build: "lean" }, // A. Garnacho #17 (Aston Villa)
   "lee-fwd-1": { skin: 2, hair: 0, style: "bun", beard: true, build: "power" }, // D. Calvert-Lewin #9
   "sun-mid-1": { skin: 0, hair: 1, style: "crop", beard: false, build: "power" }, // G. Xhaka #34
+
+  // Retained Historical Pre-2026/27 Identities (for legacy worlds & frozen replays)
+  "mun-gk-1": { skin: 5, hair: 0, style: "curls", beard: true, build: "power" }, // A. Onana
+  "mun-fwd-1": { skin: 4, hair: 0, style: "fade", beard: false, build: "athletic" }, // M. Rashford
+  "mun-def-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "athletic" }, // L. Shaw
+  "mun-mid-3": { skin: 2, hair: 1, style: "crop", beard: false, build: "power" }, // Casemiro
+  "mun-fwd-3": { skin: 0, hair: 4, style: "swept", beard: false, build: "power" }, // R. Hojlund
+  "ars-def-2": { skin: 1, hair: 1, style: "crop", beard: true, build: "athletic" }, // B. White
+  "ars-mid-3": { skin: 5, hair: 0, style: "crop", beard: true, build: "power" }, // T. Partey
+  "ars-fwd-2": { skin: 1, hair: 1, style: "crop", beard: false, build: "lean" }, // G. Martinelli
+  "ars-fwd-3": { skin: 0, hair: 2, style: "swept", beard: false, build: "lean" }, // K. Havertz
+  "liv-fwd-1": { skin: 2, hair: 0, style: "curls", beard: true, build: "athletic" }, // M. Salah
+  "liv-def-2": { skin: 3, hair: 0, style: "curls", beard: false, build: "athletic" }, // T. Alexander-Arnold
+  "liv-def-3": { skin: 5, hair: 0, style: "fade", beard: true, build: "power" }, // I. Konate
+  "liv-def-4": { skin: 0, hair: 2, style: "crop", beard: false, build: "lean" }, // A. Robertson
+  "liv-mid-3": { skin: 4, hair: 0, style: "curls", beard: false, build: "athletic" }, // R. Gravenberch
+  "liv-fwd-2": { skin: 2, hair: 0, style: "fade", beard: false, build: "lean" }, // L. Diaz
+  "liv-fwd-3": { skin: 1, hair: 1, style: "crop", beard: true, build: "athletic" }, // D. Jota
+  "che-gk-1": { skin: 3, hair: 0, style: "fade", beard: true, build: "power" }, // R. Sanchez
+  "che-def-4": { skin: 1, hair: 1, style: "curls", beard: true, build: "lean" }, // M. Cucurella
+  "che-fwd-3": { skin: 4, hair: 0, style: "fade", beard: true, build: "athletic" }, // C. Nkunku
 };
 
 const SOMATOTYPE_SCALES = {
