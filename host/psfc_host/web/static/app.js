@@ -1542,7 +1542,7 @@ window.addEventListener("keydown", (ev) => {
       stepFocusedPreMatchRow(1);
     } else if (ev.code === "KeyY") {
       ev.preventDefault();
-      activeSquadClub = pmHomeClub;
+      activeSquadClub = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? pmAwayClub : pmHomeClub;
       navigateTo("squad");
     } else if (ev.code === "Enter") {
       ev.preventDefault();
@@ -1726,7 +1726,7 @@ function pollGamepadMenuActions(nowMs) {
       navigateTo(pendingOfficialFixture ? "season" : "menu");
     } else if (gp.north || gp.west) {
       prevPadNavTick = nowMs + 320;
-      activeSquadClub = pmHomeClub;
+      activeSquadClub = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? pmAwayClub : pmHomeClub;
       navigateTo("squad");
     }
   } else if (currentScreen === "controllers") {
@@ -1951,6 +1951,91 @@ async function startAttractBackgroundMatch() {
   }
 }
 
+function getAvailableClubOrder() {
+  const rosters = latestOverview && latestOverview.rosters;
+  if (rosters && typeof rosters === "object") {
+    const clubIds = Object.keys(rosters);
+    if (clubIds.length > 0) {
+      return CLUB_ORDER.filter((c) => clubIds.includes(c)).concat(
+        clubIds.filter((c) => !CLUB_ORDER.includes(c))
+      );
+    }
+  }
+  return Object.keys(OFFLINE_2026_CLUBS);
+}
+
+function getClubRosterWithFallback(clubId) {
+  const rosters = (latestOverview && latestOverview.rosters) || {};
+  if (rosters[clubId]) return rosters[clubId];
+  const fb = OFFLINE_2026_CLUBS[clubId];
+  if (!fb) return null;
+  return {
+    club_id: fb.club_id,
+    name: fb.club_name,
+    short_name: fb.short_name,
+    stadium: fb.club_id === "arsenal" ? "Emirates Stadium" : "Old Trafford",
+    primary_color: fb.primary_color,
+    secondary_color: fb.secondary_color,
+    formation_5v5: fb.formation_5v5,
+    formation_11v11: fb.formation_11v11,
+    squad: fb.squad.map((p, idx) => ({
+      ...p,
+      overall: Math.round(
+        (p.attributes.pace + p.attributes.passing + p.attributes.shooting + p.attributes.positioning) / 4
+      ),
+      selected_5v5: idx < 5,
+      default_starter_5v5: idx < 5,
+    })),
+  };
+}
+
+function getOfficialFixtureRepresentation(fx) {
+  const assignments = (latestOverview && latestOverview.assignments) || [];
+  const homeClubId = fx.homeClubId || (fx.home_club && fx.home_club.club_id) || fx.home_club_id;
+  const awayClubId = fx.awayClubId || (fx.away_club && fx.away_club.club_id) || fx.away_club_id;
+  const homeAsgn = assignments.find((a) => a.club_id === homeClubId) || null;
+  const awayAsgn = assignments.find((a) => a.club_id === awayClubId) || null;
+  const homeRep = Boolean(homeAsgn);
+  const awayRep = Boolean(awayAsgn);
+  const actorId =
+    (homeAsgn && homeAsgn.participant_id) ||
+    (awayAsgn && awayAsgn.participant_id) ||
+    "part-alex";
+  return { homeClubId, awayClubId, homeRep, awayRep, actorId };
+}
+
+function getAllowedOfficialSideIndices(fx) {
+  if (!fx || fx.result_source === "played_vs_friend") return [0, 1, 2, 3];
+  const rep = getOfficialFixtureRepresentation(fx);
+  if (rep.awayRep && !rep.homeRep) return [1, 3];
+  if (rep.homeRep && !rep.awayRep) return [0, 3];
+  return [0, 1, 3];
+}
+
+function defaultOfficialSideIdx(fx) {
+  if (!fx) return 0;
+  if (fx.result_source === "played_vs_friend") return 2;
+  const rep = getOfficialFixtureRepresentation(fx);
+  if (rep.awayRep && !rep.homeRep) return 1;
+  return 0;
+}
+
+function normalizeOfficialSideIdx(fx, idx) {
+  if (!fx) return idx;
+  const allowed = getAllowedOfficialSideIndices(fx);
+  return allowed.includes(idx) ? idx : defaultOfficialSideIdx(fx);
+}
+
+function sideIdxFromSnapshotRules(rules) {
+  if (!rules) return pmSideIdx;
+  const hHuman = rules.home_controller && rules.home_controller.kind === "Human";
+  const aHuman = rules.away_controller && rules.away_controller.kind === "Human";
+  if (hHuman && aHuman) return 2;
+  if (!hHuman && aHuman) return 1;
+  if (hHuman && !aHuman) return 0;
+  return 3;
+}
+
 function resolvePreMatchControllers() {
   const diff = DIFF_OPTIONS[pmDiffIdx];
   const sideMode = SIDE_MODES[pmSideIdx].id;
@@ -2042,27 +2127,23 @@ async function launchSelectedMatch() {
 
   const fmtName = FORMAT_OPTIONS[pmFmtIdx].id;
   const halfTicks = DURATION_OPTIONS[pmDurIdx].ticks;
-  const ctrls = resolvePreMatchControllers();
 
   // Official Parallel Season Fixture Session
   if (pendingOfficialFixture) {
     const fx = pendingOfficialFixture;
-    const awayCtrl =
-      fx.result_source === "played_vs_friend" && SIDE_MODES[pmSideIdx].id === "local_2p"
-        ? { kind: "Human" }
-        : ctrls.awaySpec.kind === "Human" && fx.result_source !== "played_vs_friend"
-          ? { kind: "Cpu", difficulty: DIFF_OPTIONS[pmDiffIdx].name }
-          : ctrls.awaySpec;
+    pmSideIdx = normalizeOfficialSideIdx(fx, pmSideIdx);
+    const ctrls = resolvePreMatchControllers();
+    const rep = getOfficialFixtureRepresentation(fx);
 
     const res = await fetch(`/api/fixtures/${encodeURIComponent(fx.id)}/sessions`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        actor_id: "part-alex",
+        actor_id: rep.actorId,
         format_name: fmtName,
         half_duration_ticks: halfTicks,
         home_controller: ctrls.homeSpec,
-        away_controller: awayCtrl,
+        away_controller: ctrls.awaySpec,
       }),
     });
     if (!res.ok) {
@@ -2076,9 +2157,11 @@ async function launchSelectedMatch() {
       alert(`Engine snapshot error: ${wasmReadText()}`);
       return;
     }
+    pmSideIdx = sideIdxFromSnapshotRules(payload.snapshot.rules);
     activeOfficialSession = {
       sessionId: payload.session_id,
       fixtureId: payload.fixture_id,
+      actorId: rep.actorId,
       submitting: false,
       completed: false,
     };
@@ -2087,6 +2170,8 @@ async function launchSelectedMatch() {
     refreshWorldOverview();
     return;
   }
+
+  const ctrls = resolvePreMatchControllers();
 
   // Exhibition Kick Off Match
   activeOfficialSession = null;
@@ -2162,7 +2247,7 @@ async function submitOfficialSessionResult() {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        actor_id: "part-alex",
+        actor_id: activeOfficialSession.actorId || "part-alex",
         frames_hex: log.frames_hex,
         claimed_final_hash_hex: log.claimed_final_hash_hex,
         claimed_score: log.claimed_score,
@@ -2208,8 +2293,7 @@ function computeClubRatings(roster) {
 }
 
 function renderPreMatchTeamCard(prefix, clubId, kitColorHex, kitTextColorHex) {
-  const rosters = (latestOverview && latestOverview.rosters) || {};
-  const r = rosters[clubId];
+  const r = getClubRosterWithFallback(clubId);
   if (!r) return;
 
   const crest = document.getElementById(`pm-${prefix}-crest`);
@@ -2245,14 +2329,20 @@ function renderPreMatchTeamCard(prefix, clubId, kitColorHex, kitTextColorHex) {
 }
 
 function renderPreMatchScreen() {
-  const rosters = (latestOverview && latestOverview.rosters) || {};
   const locked = Boolean(pendingOfficialFixture);
 
   if (locked) {
     pmHomeClub = pendingOfficialFixture.homeClubId;
     pmAwayClub = pendingOfficialFixture.awayClubId;
-  } else if (pmAwayClub === pmHomeClub) {
-    pmAwayClub = CLUB_ORDER.find((c) => c !== pmHomeClub) || "arsenal";
+    pmSideIdx = normalizeOfficialSideIdx(pendingOfficialFixture, pmSideIdx);
+  } else {
+    const availableClubs = getAvailableClubOrder();
+    if (!availableClubs.includes(pmHomeClub)) {
+      pmHomeClub = availableClubs[0] || "man-utd";
+    }
+    if (!availableClubs.includes(pmAwayClub) || pmAwayClub === pmHomeClub) {
+      pmAwayClub = availableClubs.find((c) => c !== pmHomeClub) || pmHomeClub;
+    }
   }
 
   document.getElementById("pm-home-prev").disabled = locked;
@@ -2264,8 +2354,8 @@ function renderPreMatchScreen() {
     ? `OFFICIAL · ${pendingOfficialFixture.stageLabel}`
     : "EXHIBITION MATCH";
 
-  const hRoster = rosters[pmHomeClub];
-  const aRoster = rosters[pmAwayClub];
+  const hRoster = getClubRosterWithFallback(pmHomeClub);
+  const aRoster = getClubRosterWithFallback(pmAwayClub);
   const kits = resolveMatchKits(
     pmHomeClub,
     pmAwayClub,
@@ -2965,18 +3055,19 @@ function roleBadgeMeta(role) {
 
 function renderSquadBuilder() {
   if (!latestOverview || !latestOverview.rosters) return;
+  const orderedIds = getAvailableClubOrder();
+  if (!latestOverview.rosters[activeSquadClub] && orderedIds.length > 0) {
+    activeSquadClub = orderedIds[0];
+  }
   const roster = latestOverview.rosters[activeSquadClub];
   if (!roster) return;
 
   const tabsEl = document.getElementById("sq-club-tabs");
   if (tabsEl) {
-    const clubIds = Object.keys(latestOverview.rosters);
-    const orderedIds = CLUB_ORDER.filter((c) => clubIds.includes(c)).concat(
-      clubIds.filter((c) => !CLUB_ORDER.includes(c))
-    );
     tabsEl.innerHTML = "";
     for (const cid of orderedIds) {
       const cr = latestOverview.rosters[cid];
+      if (!cr) continue;
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = `sq-club-tab${cid === activeSquadClub ? " active" : ""}`;
@@ -3282,7 +3373,7 @@ function buildFixtureCardElement(fx) {
         result_source: fx.result_source,
         stageLabel: stageBadge,
       };
-      pmSideIdx = fx.result_source === "played_vs_friend" ? 2 : 0;
+      pmSideIdx = defaultOfficialSideIdx(pendingOfficialFixture);
       GameAudio.uiConfirm();
       navigateTo("prematch");
     });
@@ -3365,7 +3456,7 @@ async function refreshWorldOverview() {
         result_source: nextPlayable.result_source,
         stageLabel: stg.toUpperCase(),
       };
-      pmSideIdx = nextPlayable.result_source === "played_vs_friend" ? 2 : 0;
+      pmSideIdx = defaultOfficialSideIdx(pendingOfficialFixture);
       GameAudio.uiConfirm();
       navigateTo("prematch");
     };
@@ -3551,12 +3642,23 @@ document.getElementById("btn-hub-full-table").addEventListener("click", () => {
 
 // Pre-Match Steppers
 function stepClub(current, dir, avoid) {
-  let idx = CLUB_ORDER.indexOf(current);
-  for (let i = 0; i < CLUB_ORDER.length; i++) {
-    idx = (idx + dir + CLUB_ORDER.length) % CLUB_ORDER.length;
-    if (CLUB_ORDER[idx] !== avoid) return CLUB_ORDER[idx];
+  const order = getAvailableClubOrder();
+  if (order.length === 0) return current;
+  let idx = order.indexOf(current);
+  if (idx < 0) idx = 0;
+  for (let i = 0; i < order.length; i++) {
+    idx = (idx + dir + order.length) % order.length;
+    if (order[idx] !== avoid) return order[idx];
   }
-  return current;
+  return order[0];
+}
+
+function stepSideMode(dir) {
+  const allowed = getAllowedOfficialSideIndices(pendingOfficialFixture);
+  let pos = allowed.indexOf(pmSideIdx);
+  if (pos < 0) pos = 0;
+  pos = (pos + dir + allowed.length) % allowed.length;
+  pmSideIdx = allowed[pos];
 }
 
 document.getElementById("pm-home-prev").addEventListener("click", () => {
@@ -3581,12 +3683,12 @@ document.getElementById("pm-away-next").addEventListener("click", () => {
 });
 
 document.getElementById("pm-side-prev").addEventListener("click", () => {
-  pmSideIdx = (pmSideIdx - 1 + SIDE_MODES.length) % SIDE_MODES.length;
+  stepSideMode(-1);
   GameAudio.uiTick();
   renderPreMatchScreen();
 });
 document.getElementById("pm-side-next").addEventListener("click", () => {
-  pmSideIdx = (pmSideIdx + 1) % SIDE_MODES.length;
+  stepSideMode(1);
   GameAudio.uiTick();
   renderPreMatchScreen();
 });
@@ -3644,7 +3746,7 @@ document.getElementById("btn-pm-back").addEventListener("click", () => {
   navigateTo(pendingOfficialFixture ? "season" : "menu");
 });
 document.getElementById("btn-pm-squads").addEventListener("click", () => {
-  activeSquadClub = pmHomeClub;
+  activeSquadClub = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? pmAwayClub : pmHomeClub;
   GameAudio.uiConfirm();
   navigateTo("squad");
 });
@@ -3694,7 +3796,7 @@ document.getElementById("btn-play-with-squad").addEventListener("click", async (
   pendingOfficialFixture = null;
   pmHomeClub = activeSquadClub;
   if (pmAwayClub === pmHomeClub) {
-    pmAwayClub = activeSquadClub === "arsenal" ? "man-utd" : "arsenal";
+    pmAwayClub = stepClub(pmHomeClub, 1, pmHomeClub);
   }
   pmFmtIdx = 0;
   navigateTo("prematch");
