@@ -1,14 +1,15 @@
 //! Deterministic 60 Hz football simulation engine (`MatchSimulation`).
 
 use crate::ai::{
-    best_ball_intercept_for_player, compute_goalkeeper_intent, compute_outfield_ai_intent,
-    generate_cpu_input, world_anchor_for_player,
+    best_ball_intercept_for_player, choose_safe_gk_distribution, compute_goalkeeper_intent,
+    compute_outfield_ai_intent, generate_cpu_input, predict_ball_xy_at_ticks,
+    world_anchor_for_player,
 };
 use crate::config::{formation_anchors, SideController, TeamSide, TICKS_PER_SECOND};
 use crate::events::{MatchEvent, MatchEventType, PlayerMatchStats};
 use crate::input::{
-    InputFrame, BTN_CALL_RUN, BTN_JOCKEY, BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_SKILL, BTN_SLIDE,
-    BTN_SPRINT, BTN_SWITCH, BTN_TACKLE, BTN_THROUGH,
+    AutoSwitchMode, InputFrame, BTN_CALL_RUN, BTN_JOCKEY, BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_SKILL,
+    BTN_SLIDE, BTN_SPRINT, BTN_SWITCH, BTN_TACKLE, BTN_THROUGH,
 };
 use crate::math::{angle_diff_bam, atan2_bam, turn_toward_bam, Fp, Vec2, Vec3};
 use crate::rng::DeterministicRng;
@@ -100,6 +101,7 @@ impl MatchSimulation {
                 controlled_idx: [default_ctrl_home, default_ctrl_away],
                 prev_buttons: [0, 0],
                 switch_cooldown: [0, 0],
+                manual_switch_lock: [0, 0],
                 input_buffer: [None, None],
                 subs_used: [0, 0],
                 players: [home_players, away_players],
@@ -208,6 +210,9 @@ impl MatchSimulation {
 
         for c in &mut self.state.switch_cooldown {
             *c = c.saturating_sub(1);
+        }
+        for m in &mut self.state.manual_switch_lock {
+            *m = m.saturating_sub(1);
         }
         for slot in &mut self.state.input_buffer {
             if let Some(mut buf) = *slot {
@@ -318,75 +323,160 @@ impl MatchSimulation {
                 taker_idx,
                 wait_ticks,
             } => {
-                let side_in = inputs[team.index()];
-                let prev = self.state.prev_buttons[team.index()];
+                let t_s_idx = team.index();
+                let side_in = inputs[t_s_idx];
+                let prev = self.state.prev_buttons[t_s_idx];
                 let action_btns = side_in.buttons & CHARGE_MASK;
                 let just_pressed = action_btns != 0 && (prev & CHARGE_MASK) == 0;
 
-                // Allow slight aiming / teammate drifting while maintaining FreeKick defensive wall
+                // Step dynamic set-piece staging (ThrowIn triangle, Corner box runs, FreeKick wall)
                 self.step_set_piece_movement(kind, team, taker_idx, spot);
 
-                if just_pressed || wait_ticks >= 180 {
-                    let chosen_btn = if action_btns != 0 {
-                        action_btns
-                    } else {
-                        match kind {
-                            RestartKind::CornerKick => BTN_LOB,
-                            RestartKind::PenaltyKick => BTN_SHOOT,
-                            RestartKind::FreeKick => {
-                                let attack_sign = team.attack_sign(self.state.second_half_swapped());
-                                let opp_goal = Vec2::new(
-                                    Fp::from_milli(attack_sign * self.state.format.half_length().to_milli()),
-                                    Fp::ZERO,
-                                );
-                                let shoot_range = if self.state.format.players_per_side <= 6 {
-                                    Fp::from_milli(16_500)
-                                } else {
-                                    Fp::from_milli(25_000)
-                                };
-                                if spot.dist(opp_goal) <= shoot_range {
-                                    BTN_SHOOT
-                                } else {
-                                    BTN_PASS
+                // Live Left-Stick / D-Pad aiming updates taker's facing & overhead ball hold!
+                let raw_stick = if side_in.aim_vec().len() > Fp::from_milli(150) {
+                    side_in.aim_vec()
+                } else {
+                    side_in.move_vec()
+                };
+                let user_steering = raw_stick.len() > Fp::from_milli(140);
+                let live_aim = if user_steering {
+                    let clamped = self.clamp_set_piece_aim(kind, team, spot, raw_stick);
+                    self.state.players[t_s_idx][taker_idx].facing_bam = clamped.to_bam();
+                    clamped
+                } else {
+                    let cur_dir = Vec2::from_bam(self.state.players[t_s_idx][taker_idx].facing_bam, Fp::ONE);
+                    self.clamp_set_piece_aim(kind, team, spot, cur_dir)
+                };
+
+                // Keep Throw-In ball raised overhead in the thrower's hands (`z = 1.82m`)!
+                if kind == RestartKind::ThrowIn {
+                    let taker_pos = self.state.players[t_s_idx][taker_idx].pos;
+                    let hold_xy = taker_pos + live_aim.scale(Fp::from_milli(110));
+                    self.state.ball.pos = Vec3::new(hold_xy.x, hold_xy.y, Fp::from_milli(1_820));
+                }
+
+                // Hold-to-charge & release-to-deliver set piece!
+                let taker_action = self.state.players[t_s_idx][taker_idx].action;
+                let mut fire_delivery: Option<(u16, u16, bool, Vec2)> = None;
+                match taker_action {
+                    PlayerActionState::Charging {
+                        button,
+                        ticks,
+                        finesse,
+                        aim: prev_aim,
+                    } => {
+                        let primary_btn = if (button & BTN_SHOOT) != 0 {
+                            BTN_SHOOT
+                        } else {
+                            button & CHARGE_MASK
+                        };
+                        let still_held = (side_in.buttons & primary_btn) != 0;
+                        let next_ticks = ticks + 1;
+                        let next_finesse = finesse || side_in.pressed(BTN_JOCKEY);
+                        let eff_aim = if user_steering {
+                            live_aim
+                        } else if prev_aim.len() > Fp::from_milli(120) {
+                            prev_aim
+                        } else {
+                            live_aim
+                        };
+                        self.state.players[t_s_idx][taker_idx].facing_bam = eff_aim.to_bam();
+                        if !still_held || next_ticks >= MAX_CHARGE_TICKS {
+                            self.state.players[t_s_idx][taker_idx].action =
+                                PlayerActionState::Cooldown { ticks_left: 8 };
+                            fire_delivery = Some((button, next_ticks, next_finesse, eff_aim));
+                        } else {
+                            self.state.players[t_s_idx][taker_idx].action = PlayerActionState::Charging {
+                                button,
+                                ticks: next_ticks,
+                                finesse: next_finesse,
+                                aim: eff_aim,
+                            };
+                        }
+                    }
+                    _ => {
+                        let timeout_ticks = if user_steering { 360 } else { 210 };
+                        if just_pressed {
+                            let single_btn = if (action_btns & BTN_SHOOT) != 0 {
+                                BTN_SHOOT
+                            } else if (action_btns & BTN_LOB) != 0 {
+                                BTN_LOB
+                            } else if (action_btns & BTN_THROUGH) != 0 {
+                                BTN_THROUGH
+                            } else {
+                                BTN_PASS
+                            };
+                            self.state.players[t_s_idx][taker_idx].action = PlayerActionState::Charging {
+                                button: single_btn,
+                                ticks: 1,
+                                finesse: side_in.pressed(BTN_JOCKEY),
+                                aim: live_aim,
+                            };
+                        } else if wait_ticks >= timeout_ticks {
+                            let default_btn = match kind {
+                                RestartKind::CornerKick => BTN_LOB,
+                                RestartKind::PenaltyKick => BTN_SHOOT,
+                                RestartKind::GoalKick => {
+                                    let (b, _, _) = choose_safe_gk_distribution(&self.state, team);
+                                    b
                                 }
-                            }
-                            _ => BTN_PASS,
-                        }
-                    };
-                    let attack_sign = team.attack_sign(self.state.second_half_swapped());
-                    let fallback_aim = match kind {
-                        RestartKind::CornerKick => {
-                            let y_inward = if spot.y > Fp::ZERO {
-                                Fp::NEG_ONE
-                            } else {
-                                Fp::ONE
+                                RestartKind::FreeKick => {
+                                    let attack_sign = team.attack_sign(self.state.second_half_swapped());
+                                    let opp_goal = Vec2::new(
+                                        Fp::from_milli(attack_sign * self.state.format.half_length().to_milli()),
+                                        Fp::ZERO,
+                                    );
+                                    let shoot_range = if self.state.format.players_per_side <= 6 {
+                                        Fp::from_milli(16_500)
+                                    } else {
+                                        Fp::from_milli(25_000)
+                                    };
+                                    if spot.dist(opp_goal) <= shoot_range {
+                                        BTN_SHOOT
+                                    } else {
+                                        BTN_PASS
+                                    }
+                                }
+                                RestartKind::ThrowIn => BTN_PASS,
                             };
-                            Vec2::new(Fp::from_milli(-attack_sign * 200), y_inward).normalize_or_zero()
-                        }
-                        RestartKind::FreeKick if chosen_btn == BTN_SHOOT => {
-                            let goal_x = Fp::from_milli(attack_sign * self.state.format.half_length().to_milli());
-                            let corner_y = if spot.y >= Fp::ZERO {
-                                -self.state.format.goal_half_width().mul(Fp::from_milli(580))
-                            } else {
-                                self.state.format.goal_half_width().mul(Fp::from_milli(580))
+                            let default_charge = match kind {
+                                RestartKind::PenaltyKick => 14,
+                                RestartKind::CornerKick | RestartKind::GoalKick => 16,
+                                RestartKind::FreeKick if default_btn == BTN_SHOOT => 16,
+                                _ => 11,
                             };
-                            (Vec2::new(goal_x, corner_y) - spot).normalize_or_zero()
+                            fire_delivery = Some((
+                                default_btn,
+                                default_charge,
+                                kind == RestartKind::FreeKick,
+                                live_aim,
+                            ));
                         }
-                        _ => Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO),
-                    };
-                    let aim = if side_in.move_vec().len() > Fp::from_milli(150) {
-                        side_in.move_vec()
-                    } else {
-                        fallback_aim
-                    };
+                    }
+                }
+
+                // Allow defender on non-taking team to switch markers during SetPiece!
+                let def_side = team.opponent();
+                let d_idx = def_side.index();
+                let def_in = inputs[d_idx];
+                let def_prev = self.state.prev_buttons[d_idx];
+                if def_in.pressed(BTN_SWITCH) && (def_prev & BTN_SWITCH) == 0 {
+                    self.switch_player(def_side, def_in.aim_vec());
+                    self.state.switch_cooldown[d_idx] = 12;
+                }
+
+                if let Some((chosen_btn, charge_ticks, finesse, aim)) = fire_delivery {
                     self.state.phase = MatchPhase::OpenPlay;
-                    let charge = match kind {
-                        RestartKind::PenaltyKick => 14,
-                        RestartKind::CornerKick | RestartKind::GoalKick => 18,
-                        RestartKind::FreeKick if chosen_btn == BTN_SHOOT => 16,
-                        _ => 11,
-                    };
-                    self.execute_kick(team, taker_idx, chosen_btn, charge, kind == RestartKind::FreeKick, aim);
+                    self.execute_set_piece_delivery(
+                        kind,
+                        team,
+                        taker_idx,
+                        spot,
+                        chosen_btn,
+                        charge_ticks,
+                        finesse,
+                        aim,
+                    );
                 } else {
                     self.state.phase = MatchPhase::SetPiece {
                         kind,
@@ -429,20 +519,30 @@ impl MatchSimulation {
             }
         }
 
-        // 1. Handle player switching & teammate run triggers per team
+        // 1. Handle manual player switching, FIFA-style assisted ball-following auto-switching, & teammate runs
         for side in [TeamSide::Home, TeamSide::Away] {
             let s_idx = side.index();
             let inp = inputs[s_idx];
             let prev = self.state.prev_buttons[s_idx];
 
-            // Manual player switch when not possessing ball on current player
+            // Manual player switch (`BTN_SWITCH`) is ALWAYS available immediately on rising edge when not owning the ball!
             let switch_rising = inp.pressed(BTN_SWITCH) && (prev & BTN_SWITCH) == 0;
-            if switch_rising && self.state.switch_cooldown[s_idx] == 0 {
-                let owns_ball = self.state.ball.owner == Some((side, self.state.controlled_idx[s_idx]));
-                if !owns_ball {
-                    self.switch_player(side, inp.aim_vec());
-                    self.state.switch_cooldown[s_idx] = 12;
-                }
+            let owns_ball = self.state.ball.owner == Some((side, self.state.controlled_idx[s_idx]));
+            if switch_rising && !owns_ball {
+                self.switch_player(side, inp.aim_vec());
+                self.state.switch_cooldown[s_idx] = 12;
+                self.state.manual_switch_lock[s_idx] = 75;
+            } else {
+                // Assisted Auto-Switching following the ball when team doesn't possess it
+                let side_ctrl = match side {
+                    TeamSide::Home => self.state.rules.home_controller,
+                    TeamSide::Away => self.state.rules.away_controller,
+                };
+                let auto_mode = match side_ctrl {
+                    SideController::Human => external_inputs[s_idx].auto_switch_mode(),
+                    SideController::Cpu(_) => AutoSwitchMode::AssistedBall,
+                };
+                self.auto_switch_player(side, auto_mode);
             }
 
             // Teammate run trigger when team owns ball (`BTN_CALL_RUN` rising edge)
@@ -547,6 +647,7 @@ impl MatchSimulation {
             Vec2::from_milli(-k_sign * 380, 180);
         self.state.ball.owner = Some((kicking_team, k_idx));
         self.set_last_touch(kicking_team, k_idx);
+        self.state.manual_switch_lock = [0, 0];
         self.state.phase = MatchPhase::KickOff {
             team: kicking_team,
             wait_ticks: 0,
@@ -555,7 +656,10 @@ impl MatchSimulation {
 
     fn setup_set_piece(&mut self, kind: RestartKind, team: TeamSide, spot: Vec2) {
         let half_len = self.state.format.half_length();
+        let half_wid = self.state.format.half_width();
         let attack_sign = team.attack_sign(self.state.second_half_swapped());
+        let is_5v5 = self.state.format.players_per_side <= 6;
+        self.state.manual_switch_lock = [0, 0];
 
         // Pick taker
         let count = self.state.players[team.index()].len();
@@ -565,6 +669,23 @@ impl MatchSimulation {
                 .rev()
                 .find(|&i| !self.state.players[team.index()][i].sent_off)
                 .unwrap_or(0),
+            RestartKind::CornerKick => {
+                // Prefer midfielder/winger with highest passing for crisp corner delivery
+                let mut best = 1.min(count.saturating_sub(1));
+                let mut best_pass = -1_i32;
+                for (idx, p) in self.state.players[team.index()].iter().enumerate().skip(1) {
+                    if p.sent_off {
+                        continue;
+                    }
+                    let sc = (p.attributes.passing as i32)
+                        + if p.role == PlayerRole::Midfielder { 8 } else { 0 };
+                    if sc > best_pass {
+                        best_pass = sc;
+                        best = idx;
+                    }
+                }
+                best
+            }
             _ => {
                 let mut best = 1.min(count.saturating_sub(1));
                 let mut best_d = Fp::from_int(9999);
@@ -589,8 +710,13 @@ impl MatchSimulation {
         let mut set_piece_team_meta: [Option<(String, String)>; 2] = [None, None];
         set_piece_team_meta[team.index()] = Some((taker_fid.clone(), taker_fname.clone()));
         let taker_meta = (team, taker_fid, taker_fname);
+        let init_ball_z = if kind == RestartKind::ThrowIn {
+            Fp::from_milli(1_820)
+        } else {
+            Fp::ZERO
+        };
         self.state.ball = BallState {
-            pos: Vec3::new(spot.x, spot.y, Fp::ZERO),
+            pos: Vec3::new(spot.x, spot.y, init_ball_z),
             vel: Vec3::ZERO,
             spin_side: Fp::ZERO,
             spin_top: Fp::ZERO,
@@ -605,27 +731,58 @@ impl MatchSimulation {
             assist_candidate: None,
         };
 
-        // Reset action states and place taker on spot
+        // Reset velocities & action states
         for s in [TeamSide::Home, TeamSide::Away] {
             for p in &mut self.state.players[s.index()] {
                 p.vel = Vec2::ZERO;
+                p.z = Fp::ZERO;
+                p.vz = Fp::ZERO;
                 p.action = PlayerActionState::Normal;
             }
         }
 
-        let taker = &mut self.state.players[team.index()][taker_idx];
-        taker.pos = spot - Vec2::from_milli(attack_sign * 300, 0);
-        taker.facing_bam = if attack_sign > 0 { 0 } else { 32768 };
+        // Place taker & initial facing based on restart type!
+        let y_sign = if spot.y >= Fp::ZERO { 1_i64 } else { -1_i64 };
+        let (taker_pos, init_aim) = match kind {
+            RestartKind::ThrowIn => {
+                let touch_pos = Vec2::new(
+                    spot.x,
+                    Fp::from_milli(y_sign * (half_wid.to_milli() + 60)),
+                );
+                let infield_aim = Vec2::new(
+                    Fp::from_milli(attack_sign * 340),
+                    Fp::from_milli(-y_sign * 940),
+                )
+                .normalize_or_zero();
+                (touch_pos, infield_aim)
+            }
+            RestartKind::CornerKick => {
+                let arc_pos = spot
+                    - Vec2::from_milli(attack_sign * 260, -y_sign * 260);
+                let pen_x = Fp::from_milli(
+                    attack_sign * (half_len.to_milli() - if is_5v5 { 5_800 } else { 9_800 }),
+                );
+                let box_aim = (Vec2::new(pen_x, Fp::ZERO) - spot).normalize_or_zero();
+                (arc_pos, box_aim)
+            }
+            RestartKind::FreeKick => {
+                let opp_goal = Vec2::new(Fp::from_milli(attack_sign * half_len.to_milli()), Fp::ZERO);
+                let to_goal = (opp_goal - spot).normalize_or_zero();
+                (spot - to_goal.scale(Fp::from_milli(340)), to_goal)
+            }
+            _ => (
+                spot - Vec2::from_milli(attack_sign * 320, 0),
+                Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO),
+            ),
+        };
+        {
+            let taker = &mut self.state.players[team.index()][taker_idx];
+            taker.pos = taker_pos;
+            taker.facing_bam = init_aim.to_bam();
+        }
         self.state.controlled_idx[team.index()] = taker_idx;
 
-        // Enforce minimum opponent distance from restart spot & arrange FreeKick defensive wall!
         let opp = team.opponent();
-        let is_5v5 = self.state.format.players_per_side <= 6;
-        let min_dist = if is_5v5 {
-            Fp::from_milli(4_500)
-        } else {
-            Fp::from_milli(9_150)
-        };
         let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
         let opp_goal = Vec2::new(opp_goal_x, Fp::ZERO);
 
@@ -633,11 +790,47 @@ impl MatchSimulation {
             for (idx, p) in self.state.players[opp.index()].iter_mut().enumerate() {
                 if idx == 0 {
                     p.pos = opp_goal;
+                    p.facing_bam = if attack_sign > 0 { 32768 } else { 0 };
                 } else {
                     p.pos.x = spot.x - Fp::from_milli(attack_sign * 3_500);
                 }
             }
+        } else if matches!(
+            kind,
+            RestartKind::ThrowIn | RestartKind::CornerKick | RestartKind::GoalKick
+        ) {
+            let (att_marks, def_marks) =
+                self.compute_set_piece_targets(kind, team, taker_idx, spot);
+            for (idx, m_pos, m_face) in att_marks {
+                let p = &mut self.state.players[team.index()][idx];
+                p.pos = m_pos;
+                p.facing_bam = m_face;
+            }
+            for (idx, m_pos, m_face) in def_marks {
+                let p = &mut self.state.players[opp.index()][idx];
+                p.pos = m_pos;
+                p.facing_bam = m_face;
+            }
+            // Select nearest outfield defender for opponent side
+            let mut best_def = 1.min(self.state.players[opp.index()].len().saturating_sub(1));
+            let mut best_d = Fp::from_int(9999);
+            for (idx, p) in self.state.players[opp.index()].iter().enumerate().skip(1) {
+                if !p.sent_off {
+                    let d = p.pos.dist(spot);
+                    if d < best_d {
+                        best_d = d;
+                        best_def = idx;
+                    }
+                }
+            }
+            self.state.controlled_idx[opp.index()] = best_def;
         } else {
+            // FreeKick: enforce minimum legal distance & form defensive wall!
+            let min_dist = if is_5v5 {
+                Fp::from_milli(4_500)
+            } else {
+                Fp::from_milli(9_150)
+            };
             for (idx, p) in self.state.players[opp.index()].iter_mut().enumerate() {
                 if idx == 0 || p.sent_off {
                     continue;
@@ -653,7 +846,6 @@ impl MatchSimulation {
                 }
             }
 
-            // Form a shoulder-to-shoulder Defensive Wall on dangerous Free Kicks!
             let wall_assignments = self.compute_free_kick_wall(kind, team, spot);
             for (w_idx, w_pos, w_facing) in wall_assignments {
                 let p = &mut self.state.players[opp.index()][w_idx];
@@ -670,6 +862,307 @@ impl MatchSimulation {
             taker_idx,
             wait_ticks: 0,
         };
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn compute_set_piece_targets(
+        &self,
+        kind: RestartKind,
+        taking_team: TeamSide,
+        taker_idx: usize,
+        spot: Vec2,
+    ) -> (Vec<(usize, Vec2, u16)>, Vec<(usize, Vec2, u16)>) {
+        let is_5v5 = self.state.format.players_per_side <= 6;
+        let half_len = self.state.format.half_length();
+        let half_wid = self.state.format.half_width();
+        let attack_sign = taking_team.attack_sign(self.state.second_half_swapped());
+        let opp = taking_team.opponent();
+        let y_sign = if spot.y >= Fp::ZERO { 1_i64 } else { -1_i64 };
+        let clamp_in = |pt: Vec2| -> Vec2 {
+            pt.clamp_box(
+                half_len - Fp::from_milli(1_450),
+                half_wid - Fp::from_milli(1_550),
+            )
+        };
+
+        let mut att_out = Vec::new();
+        let mut def_out = Vec::new();
+
+        match kind {
+            RestartKind::ThrowIn => {
+                // Sort taking outfield teammates by proximity to throw-in spot so nearest teammates check to ball!
+                let mut mates: Vec<(i64, usize)> = self.state.players[taking_team.index()]
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|&(i, p)| i != taker_idx && !p.sent_off)
+                    .map(|(i, p)| (p.pos.dist(spot).to_milli(), i))
+                    .collect();
+                mates.sort_by_key(|&(d, i)| (d, i));
+
+                let short_check = clamp_in(Vec2::new(
+                    spot.x - Fp::from_milli(attack_sign * 1_650),
+                    spot.y - Fp::from_milli(y_sign * 4_600),
+                ));
+                let down_line = clamp_in(Vec2::new(
+                    spot.x + Fp::from_milli(attack_sign * (if is_5v5 { 6_800 } else { 9_400 })),
+                    spot.y - Fp::from_milli(y_sign * 3_400),
+                ));
+                let infield_pocket = clamp_in(Vec2::new(
+                    spot.x + Fp::from_milli(attack_sign * 2_200),
+                    spot.y - Fp::from_milli(y_sign * (if is_5v5 { 9_800 } else { 13_500 })),
+                ));
+                let triangle = [short_check, down_line, infield_pocket];
+
+                let mut marked_targets = Vec::new();
+                for (slot, &(_, m_idx)) in mates.iter().enumerate() {
+                    let tgt = if slot < triangle.len() {
+                        triangle[slot]
+                    } else {
+                        let base = world_anchor_for_player(&self.state, taking_team, m_idx, Fp::ZERO);
+                        clamp_in(Vec2::new(
+                            base.x.lerp(spot.x, Fp::from_milli(420)),
+                            base.y,
+                        ))
+                    };
+                    let face_bam = (spot - tgt).to_bam();
+                    att_out.push((m_idx, tgt, face_bam));
+                    marked_targets.push(tgt);
+                }
+
+                // Keep taking GK in own goal area
+                let own_goal_x = Fp::from_milli(-attack_sign * half_len.to_milli());
+                if !self.state.players[taking_team.index()][0].sent_off {
+                    let gk_pos = Vec2::new(
+                        own_goal_x + Fp::from_milli(attack_sign * 2_200),
+                        Fp::ZERO,
+                    );
+                    att_out.push((0, gk_pos, if attack_sign > 0 { 0 } else { 32768 }));
+                }
+
+                // Defending GK & goal-side markers (`2.0m` goal-side of throw-in receivers, >= `2.8m` from thrower!)
+                let def_goal = Vec2::new(Fp::from_milli(attack_sign * half_len.to_milli()), Fp::ZERO);
+                if !self.state.players[opp.index()][0].sent_off {
+                    let d_gk = Vec2::new(
+                        def_goal.x - Fp::from_milli(attack_sign * 1_900),
+                        spot.y.mul(Fp::from_milli(120)),
+                    );
+                    def_out.push((0, d_gk, (spot - d_gk).to_bam()));
+                }
+
+                let mut defs: Vec<(i64, usize)> = self.state.players[opp.index()]
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|(_, p)| !p.sent_off)
+                    .map(|(i, p)| (p.pos.dist(spot).to_milli(), i))
+                    .collect();
+                defs.sort_by_key(|&(d, i)| (d, i));
+
+                for (slot, &(_, d_idx)) in defs.iter().enumerate() {
+                    let raw_mark = if let Some(&r_tgt) = marked_targets.get(slot) {
+                        let to_goal = (def_goal - r_tgt).normalize_or_zero();
+                        let cushion = if slot == 0 { 2_250 } else { 1_850 };
+                        r_tgt + to_goal.scale(Fp::from_milli(cushion))
+                    } else {
+                        world_anchor_for_player(&self.state, opp, d_idx, Fp::ZERO)
+                    };
+                    let mut m_pos = clamp_in(raw_mark);
+                    if m_pos.dist(spot) < Fp::from_milli(2_800) {
+                        let away = (m_pos - spot).normalize_or_zero();
+                        m_pos = clamp_in(spot + away.scale(Fp::from_milli(2_800)));
+                    }
+                    def_out.push((d_idx, m_pos, (spot - m_pos).to_bam()));
+                }
+            }
+            RestartKind::CornerKick => {
+                let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
+                let own_goal_x = -opp_goal_x;
+                let opp_goal = Vec2::new(opp_goal_x, Fp::ZERO);
+
+                // Order attacking teammates so Forwards/Midfielders attack prime header spots in the box!
+                let mut mates: Vec<usize> = (1..self.state.players[taking_team.index()].len())
+                    .rev()
+                    .filter(|&i| i != taker_idx && !self.state.players[taking_team.index()][i].sent_off)
+                    .collect();
+                // Keep highest-tackling defender back as last slot in 11v11
+                mates.sort_by_key(|&i| {
+                    let p = &self.state.players[taking_team.index()][i];
+                    let role_pri = match p.role {
+                        PlayerRole::Forward => 0,
+                        PlayerRole::Midfielder => 1,
+                        PlayerRole::Defender => 2,
+                        PlayerRole::Goalkeeper => 3,
+                    };
+                    (role_pri, -(p.attributes.shooting as i32))
+                });
+
+                let box_targets: Vec<Vec2> = if is_5v5 {
+                    vec![
+                        // 0: Central Penalty-Spot Power Header
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 5_800),
+                            Fp::from_milli(-y_sign * 350),
+                        ),
+                        // 1: Near-Post Dart
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 4_150),
+                            Fp::from_milli(y_sign * 1_750),
+                        ),
+                        // 2: Short-Corner / Edge-of-Box Support (`BTN_PASS` target!)
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 6_300),
+                            Fp::from_milli(y_sign * (half_wid.to_milli() - 5_600)),
+                        ),
+                    ]
+                } else {
+                    vec![
+                        // 0: Central Six-Yard / Penalty Corridor
+                        Vec2::new(opp_goal_x - Fp::from_milli(attack_sign * 7_400), Fp::ZERO),
+                        // 1: Near-Post Flicker
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 5_200),
+                            Fp::from_milli(y_sign * 2_500),
+                        ),
+                        // 2: Far-Post Back-Stick Tower
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 6_900),
+                            Fp::from_milli(-y_sign * 3_350),
+                        ),
+                        // 3: Penalty-Spot Late Runner
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 10_800),
+                            Fp::from_milli(-y_sign * 950),
+                        ),
+                        // 4: Short-Corner Winger
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 6_800),
+                            Fp::from_milli(y_sign * (half_wid.to_milli() - 7_600)),
+                        ),
+                        // 5 & 6: Edge-of-Box Rebound Shooters
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 18_200),
+                            Fp::from_milli(3_600),
+                        ),
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 18_200),
+                            Fp::from_milli(-3_600),
+                        ),
+                        // 7 & 8: Stay-Back Counter-Attack Cover Defenders
+                        Vec2::new(Fp::from_milli(-attack_sign * 6_200), Fp::from_milli(7_600)),
+                        Vec2::new(Fp::from_milli(-attack_sign * 6_200), Fp::from_milli(-7_600)),
+                    ]
+                };
+
+                let mut active_box_marks = Vec::new();
+                for (slot, &m_idx) in mates.iter().enumerate() {
+                    let tgt = clamp_in(
+                        box_targets
+                            .get(slot)
+                            .copied()
+                            .unwrap_or_else(|| Vec2::new(Fp::ZERO, Fp::ZERO)),
+                    );
+                    let face = (spot - tgt).lerp(opp_goal - tgt, Fp::from_milli(350)).to_bam();
+                    att_out.push((m_idx, tgt, face));
+                    active_box_marks.push(tgt);
+                }
+
+                if !self.state.players[taking_team.index()][0].sent_off {
+                    let gk_pos = Vec2::new(
+                        own_goal_x + Fp::from_milli(attack_sign * 3_500),
+                        Fp::ZERO,
+                    );
+                    att_out.push((0, gk_pos, if attack_sign > 0 { 0 } else { 32768 }));
+                }
+
+                // Defending GK on 6-yard line + defending outfielders marking goal-side inside the box!
+                if !self.state.players[opp.index()][0].sent_off {
+                    let d_gk = Vec2::new(
+                        opp_goal_x - Fp::from_milli(attack_sign * (if is_5v5 { 1_300 } else { 1_650 })),
+                        Fp::from_milli(y_sign * 360),
+                    );
+                    def_out.push((0, d_gk, (spot - d_gk).to_bam()));
+                }
+
+                let min_corner_dist = Fp::from_milli(if is_5v5 { 4_600 } else { 9_250 });
+                let defs: Vec<usize> = (1..self.state.players[opp.index()].len())
+                    .filter(|&i| !self.state.players[opp.index()][i].sent_off)
+                    .collect();
+
+                for (slot, &d_idx) in defs.iter().enumerate() {
+                    let raw_mark = if slot == 0 {
+                        // Near-post zonal guard!
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 2_250),
+                            Fp::from_milli(y_sign * 1_550),
+                        )
+                    } else if let Some(&att_pt) = active_box_marks.get(slot - 1) {
+                        if (att_pt.x - opp_goal_x).abs() <= Fp::from_milli(24_000) {
+                            let to_goal = (opp_goal - att_pt).normalize_or_zero();
+                            att_pt + to_goal.scale(Fp::from_milli(1_150))
+                        } else {
+                            // Leave counter-attacking striker near halfway line!
+                            Vec2::new(Fp::from_milli(-attack_sign * 2_500), Fp::ZERO)
+                        }
+                    } else {
+                        Vec2::new(
+                            opp_goal_x - Fp::from_milli(attack_sign * 8_500),
+                            Fp::ZERO,
+                        )
+                    };
+                    let mut m_pos = clamp_in(raw_mark);
+                    if m_pos.dist(spot) < min_corner_dist {
+                        let away = (m_pos - spot).normalize_or_zero();
+                        m_pos = clamp_in(spot + away.scale(min_corner_dist));
+                    }
+                    def_out.push((d_idx, m_pos, (spot - m_pos).to_bam()));
+                }
+            }
+            RestartKind::GoalKick => {
+                let own_goal_x = Fp::from_milli(-attack_sign * half_len.to_milli());
+                let box_depth = self.state.format.penalty_box_depth();
+                let box_hw = self.state.format.penalty_box_half_width();
+
+                let mates: Vec<usize> = (1..self.state.players[taking_team.index()].len())
+                    .filter(|&i| !self.state.players[taking_team.index()][i].sent_off)
+                    .collect();
+                for (slot, &m_idx) in mates.iter().enumerate() {
+                    let tgt = if slot == 0 {
+                        clamp_in(Vec2::new(
+                            own_goal_x + Fp::from_milli(attack_sign * (box_depth.to_milli() + 1_600)),
+                            -box_hw.mul(Fp::from_milli(850)),
+                        ))
+                    } else if slot == 1 {
+                        clamp_in(Vec2::new(
+                            own_goal_x + Fp::from_milli(attack_sign * (box_depth.to_milli() + 1_600)),
+                            box_hw.mul(Fp::from_milli(850)),
+                        ))
+                    } else {
+                        world_anchor_for_player(&self.state, taking_team, m_idx, Fp::ZERO)
+                    };
+                    att_out.push((m_idx, tgt, (spot - tgt).to_bam()));
+                }
+
+                // Opponents must stay outside the penalty area on a Goal Kick!
+                for (idx, p) in self.state.players[opp.index()].iter().enumerate() {
+                    if idx == 0 || p.sent_off {
+                        continue;
+                    }
+                    let mut tgt = world_anchor_for_player(&self.state, opp, idx, Fp::ZERO);
+                    let min_clear_x = own_goal_x
+                        + Fp::from_milli(attack_sign * (box_depth.to_milli() + 2_600));
+                    if attack_sign > 0 {
+                        tgt.x = tgt.x.max(min_clear_x);
+                    } else {
+                        tgt.x = tgt.x.min(min_clear_x);
+                    }
+                    def_out.push((idx, clamp_in(tgt), (spot - tgt).to_bam()));
+                }
+            }
+            _ => {}
+        }
+
+        (att_out, def_out)
     }
 
     fn compute_free_kick_wall(
@@ -746,9 +1239,58 @@ impl MatchSimulation {
         spot: Vec2,
     ) {
         let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
-        let wall = self.compute_free_kick_wall(kind, taking_team, spot);
         let opp = taking_team.opponent();
 
+        if matches!(
+            kind,
+            RestartKind::ThrowIn | RestartKind::CornerKick | RestartKind::GoalKick
+        ) {
+            let (att_marks, def_marks) =
+                self.compute_set_piece_targets(kind, taking_team, taker_idx, spot);
+            // Subtle live check-to-ball / box-jostle movement so set pieces feel alive!
+            let phase_wave = ((self.state.tick as i64 % 80) - 40).abs() - 20; // -20 .. +20
+            let attack_sign = taking_team.attack_sign(self.state.second_half_swapped());
+            for (idx, base_tgt, face_bam) in att_marks {
+                if idx == taker_idx || self.state.players[taking_team.index()][idx].sent_off {
+                    continue;
+                }
+                let jostle = if idx > 0 && kind == RestartKind::CornerKick {
+                    Vec2::from_milli(attack_sign * phase_wave * 18, ((idx as i64 % 2) * 2 - 1) * phase_wave * 12)
+                } else if idx > 0 && kind == RestartKind::ThrowIn {
+                    let to_spot = (spot - base_tgt).normalize_or_zero();
+                    to_spot.scale(Fp::from_milli((20 + phase_wave) * 20))
+                } else {
+                    Vec2::ZERO
+                };
+                let goal_pt = base_tgt + jostle;
+                let p = &mut self.state.players[taking_team.index()][idx];
+                let delta = goal_pt - p.pos;
+                if delta.len() > Fp::from_milli(120) {
+                    let step = delta.normalize_or_zero().scale(Fp::from_milli(2_200)).scale(dt);
+                    p.pos += step.clamp_len(delta.len());
+                    p.vel = delta.normalize_or_zero().scale(Fp::from_milli(950));
+                } else {
+                    p.vel = Vec2::ZERO;
+                }
+                p.facing_bam = face_bam;
+            }
+            for (idx, base_tgt, face_bam) in def_marks {
+                if self.state.players[opp.index()][idx].sent_off {
+                    continue;
+                }
+                let p = &mut self.state.players[opp.index()][idx];
+                let delta = base_tgt - p.pos;
+                if delta.len() > Fp::from_milli(120) {
+                    let step = delta.normalize_or_zero().scale(Fp::from_milli(2_100)).scale(dt);
+                    p.pos += step.clamp_len(delta.len());
+                }
+                p.vel = Vec2::ZERO;
+                p.facing_bam = face_bam;
+            }
+            return;
+        }
+
+        let wall = self.compute_free_kick_wall(kind, taking_team, spot);
         for side in [TeamSide::Home, TeamSide::Away] {
             let count = self.state.players[side.index()].len();
             for idx in 0..count {
@@ -776,6 +1318,509 @@ impl MatchSimulation {
                 }
             }
         }
+    }
+
+    fn clamp_set_piece_aim(
+        &self,
+        kind: RestartKind,
+        team: TeamSide,
+        spot: Vec2,
+        raw_dir: Vec2,
+    ) -> Vec2 {
+        let attack_sign = team.attack_sign(self.state.second_half_swapped());
+        let dir = if raw_dir.len() > Fp::from_milli(100) {
+            raw_dir.normalize_or_zero()
+        } else {
+            Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO)
+        };
+        match kind {
+            RestartKind::ThrowIn => {
+                // Guarantee Throw-In ALWAYS points >= 17° infield (never straight along or outside touchline!)
+                let y_inward_sign = if spot.y >= Fp::ZERO {
+                    Fp::NEG_ONE
+                } else {
+                    Fp::ONE
+                };
+                let inward_comp = dir.y.mul(y_inward_sign);
+                if inward_comp >= Fp::from_milli(300) {
+                    dir
+                } else {
+                    let x_comp = if dir.x.abs() > Fp::from_milli(80) {
+                        dir.x
+                    } else {
+                        Fp::from_milli(attack_sign * 600)
+                    };
+                    Vec2::new(x_comp, y_inward_sign.mul(Fp::from_milli(340))).normalize_or_zero()
+                }
+            }
+            RestartKind::CornerKick => {
+                // Guarantee Corner Kick stays inside end-line & touchline (`inward_x >= 0.08`, `inward_y >= 0.22`)
+                let x_inward_sign = Fp::from_int(-attack_sign as i32);
+                let y_inward_sign = if spot.y >= Fp::ZERO {
+                    Fp::NEG_ONE
+                } else {
+                    Fp::ONE
+                };
+                let cx = dir.x.mul(x_inward_sign).max(Fp::from_milli(90));
+                let cy = dir.y.mul(y_inward_sign).max(Fp::from_milli(240));
+                Vec2::new(x_inward_sign.mul(cx), y_inward_sign.mul(cy)).normalize_or_zero()
+            }
+            RestartKind::GoalKick => {
+                let fwd = dir.x.mul(Fp::from_int(attack_sign as i32)).max(Fp::from_milli(280));
+                Vec2::new(Fp::from_int(attack_sign as i32).mul(fwd), dir.y).normalize_or_zero()
+            }
+            _ => dir,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_set_piece_delivery(
+        &mut self,
+        kind: RestartKind,
+        team: TeamSide,
+        taker_idx: usize,
+        spot: Vec2,
+        chosen_btn: u16,
+        charge_ticks: u16,
+        finesse: bool,
+        aim: Vec2,
+    ) {
+        match kind {
+            RestartKind::ThrowIn => {
+                self.execute_throw_in(team, taker_idx, chosen_btn, charge_ticks, aim, spot);
+            }
+            RestartKind::CornerKick => {
+                self.execute_corner_kick(
+                    team,
+                    taker_idx,
+                    chosen_btn,
+                    charge_ticks,
+                    finesse,
+                    aim,
+                    spot,
+                );
+            }
+            RestartKind::GoalKick => {
+                // Step taker onto ball and ensure GK never passes straight into an opponent!
+                self.state.players[team.index()][taker_idx].pos =
+                    spot - Vec2::from_milli(team.attack_sign(self.state.second_half_swapped()) * 280, 0);
+                let (safe_btn, safe_charge, safe_aim) =
+                    choose_safe_gk_distribution(&self.state, team);
+                let use_aim = if aim.dist(Vec2::new(
+                    Fp::from_int(team.attack_sign(self.state.second_half_swapped()) as i32),
+                    Fp::ZERO,
+                )) < Fp::from_milli(220)
+                {
+                    safe_aim
+                } else {
+                    aim
+                };
+                let use_btn = if chosen_btn == BTN_PASS && safe_btn == BTN_LOB && use_aim == safe_aim {
+                    BTN_LOB
+                } else {
+                    chosen_btn
+                };
+                let use_charge = charge_ticks.max(safe_charge.min(14));
+                self.execute_kick(team, taker_idx, use_btn, use_charge, finesse, use_aim);
+            }
+            _ => {
+                self.execute_kick(team, taker_idx, chosen_btn, charge_ticks, finesse, aim);
+            }
+        }
+    }
+
+    fn execute_throw_in(
+        &mut self,
+        side: TeamSide,
+        taker_idx: usize,
+        button: u16,
+        charge_ticks: u16,
+        aim_dir: Vec2,
+        spot: Vec2,
+    ) {
+        let s_idx = side.index();
+        let opp_s_idx = side.opponent().index();
+        let is_5v5 = self.state.format.players_per_side <= 6;
+        let half_len = self.state.format.half_length();
+        let half_wid = self.state.format.half_width();
+        let attack_sign = side.attack_sign(self.state.second_half_swapped());
+        let y_sign = if spot.y >= Fp::ZERO { 1_i64 } else { -1_i64 };
+
+        let charge_norm = Fp::from_ratio(
+            charge_ticks.clamp(1, MAX_CHARGE_TICKS) as i64,
+            MAX_CHARGE_TICKS as i64,
+        );
+        let aim_norm = self.clamp_set_piece_aim(RestartKind::ThrowIn, side, spot, aim_dir);
+
+        // Step thrower cleanly inside touchline after release so he immediately rejoins open play!
+        let step_in_pos = Vec2::new(
+            spot.x,
+            Fp::from_milli(y_sign * (half_wid.to_milli() - 320)),
+        );
+        self.state.players[s_idx][taker_idx].pos = step_in_pos;
+        self.state.players[s_idx][taker_idx].facing_bam = aim_norm.to_bam();
+        self.state.players[s_idx][taker_idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
+
+        let kicker_id = self.state.players[s_idx][taker_idx].footballer_id.clone();
+        let kicker_name = self.state.players[s_idx][taker_idx].name.clone();
+        self.state.player_stats[s_idx][taker_idx].passes_attempted += 1;
+
+        let is_space_throw = (button & (BTN_THROUGH | BTN_LOB)) != 0;
+        let pref_dist = Fp::from_milli(4_500)
+            + charge_norm.mul(Fp::from_milli(if is_5v5 { 13_500 } else { 18_500 }));
+
+        // Assisted Throw-In Receiver Lock (`±74°` cone around stick, weighted by force & openness)
+        let mut best_recv: Option<(usize, Vec2)> = None;
+        let mut best_score = Fp::from_int(-999_999);
+        for (idx, mate) in self.state.players[s_idx].iter().enumerate().skip(1) {
+            if idx == taker_idx || mate.sent_off {
+                continue;
+            }
+            let lead = if is_space_throw {
+                let space_step = (aim_norm.scale(Fp::from_milli(550))
+                    + Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO).scale(Fp::from_milli(450)))
+                .normalize_or_zero();
+                mate.pos
+                    + space_step.scale(Fp::from_milli(2_200) + charge_norm.mul(Fp::from_milli(3_400)))
+            } else {
+                mate.pos + mate.vel.scale(Fp::from_milli(200))
+            };
+            let to_m = lead - spot;
+            let dist = to_m.len();
+            if dist < Fp::from_milli(1_800) || dist > Fp::from_milli(26_000) {
+                continue;
+            }
+            let align = to_m.normalize_or_zero().dot(aim_norm);
+            if align < Fp::from_milli(260) {
+                continue;
+            }
+            let mut opp_clr = Fp::from_milli(8_000);
+            for opp in self.state.players[opp_s_idx].iter().skip(1) {
+                if !opp.sent_off {
+                    opp_clr = opp_clr.min(opp.pos.dist(lead));
+                }
+            }
+            let sc = align.mul(Fp::from_int(32))
+                - (dist - pref_dist).abs().mul(Fp::from_milli(880))
+                + opp_clr.min(Fp::from_milli(4_500)).mul(Fp::from_milli(420));
+            if sc > best_score {
+                best_score = sc;
+                best_recv = Some((idx, lead));
+            }
+        }
+
+        let (receiver_idx, mut target_pos) = best_recv.unwrap_or_else(|| {
+            let manual_pt = spot + aim_norm.scale(pref_dist);
+            let mut nearest_i = (1..self.state.players[s_idx].len())
+                .find(|&i| i != taker_idx && !self.state.players[s_idx][i].sent_off)
+                .unwrap_or(taker_idx);
+            let mut nearest_d = Fp::from_int(999_999);
+            for (i, mate) in self.state.players[s_idx].iter().enumerate().skip(1) {
+                if i != taker_idx && !mate.sent_off {
+                    let d = mate.pos.dist(manual_pt);
+                    if d < nearest_d {
+                        nearest_d = d;
+                        nearest_i = i;
+                    }
+                }
+            }
+            (nearest_i, manual_pt)
+        });
+
+        // Strictly clamp target at least `1.85m` inside the touchline so a throw-in NEVER drifts out of play!
+        target_pos = target_pos.clamp_box(
+            half_len - Fp::from_milli(1_500),
+            half_wid - Fp::from_milli(1_850),
+        );
+
+        let launch_xy = Vec2::new(
+            spot.x,
+            Fp::from_milli(y_sign * (half_wid.to_milli() - 360)),
+        );
+        let launch_z = Fp::from_milli(1_820);
+        let delta = target_pos - launch_xy;
+        let dist = delta.len().max(Fp::from_milli(2_000));
+        let dir = delta.normalize_or_zero();
+        self.state.players[s_idx][taker_idx].facing_bam = dir.to_bam();
+
+        // Authentic Two-Handed Overhead Throw Arc (`z = 1.82m -> 0.42m` at receiver!)
+        let horiz_speed = (Fp::from_milli(8_400)
+            + dist.mul(Fp::from_milli(360))
+            + charge_norm.mul(Fp::from_milli(2_800)))
+        .clamp(Fp::from_milli(9_200), Fp::from_milli(16_800));
+        let flight_t = dist.div(horiz_speed);
+        let target_z = Fp::from_milli(if is_space_throw { 580 } else { 380 });
+        // Solve z(t) = z0 + vz*t - 0.5*g_eff*t^2 => vz = (target_z - z0)/t + 0.5*g_eff*t
+        let vz = ((target_z - launch_z).div(flight_t) + Fp::from_milli(4_650).mul(flight_t))
+            .clamp(Fp::from_milli(-1_200), Fp::from_milli(5_800));
+
+        self.state.ball.owner = None;
+        self.state.ball.gk_hold_ticks = 0;
+        self.state.ball.dribble_touch_cd = 0;
+        self.state.ball.pos = Vec3::new(launch_xy.x, launch_xy.y, launch_z);
+        self.state.ball.vel = Vec3::new(dir.x.mul(horiz_speed), dir.y.mul(horiz_speed), vz);
+        self.state.ball.spin_side = Fp::ZERO;
+        self.state.ball.spin_top = Fp::from_milli(-580);
+        self.set_last_touch(side, taker_idx);
+
+        if is_space_throw && receiver_idx != 0 && receiver_idx != taker_idx {
+            self.state.players[s_idx][receiver_idx].run_boost_ticks = 45;
+        }
+        // Law 11: NO offside offence directly from a Throw-In!
+        self.state.ball.pass_in_flight = Some(PassInFlight {
+            team: side,
+            passer_idx: taker_idx,
+            passer_id: kicker_id.clone(),
+            passer_name: kicker_name.clone(),
+            intended_receiver_idx: receiver_idx,
+            target_pos,
+            launched_tick: self.state.tick,
+            receiver_was_offside: false,
+        });
+        if receiver_idx != 0 {
+            self.state.controlled_idx[s_idx] = receiver_idx;
+        }
+
+        self.emit_event(
+            MatchEventType::Pass,
+            side,
+            Some(kicker_id),
+            None,
+            format!("{kicker_name} throws in"),
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_corner_kick(
+        &mut self,
+        side: TeamSide,
+        taker_idx: usize,
+        button: u16,
+        charge_ticks: u16,
+        finesse: bool,
+        aim_dir: Vec2,
+        spot: Vec2,
+    ) {
+        let s_idx = side.index();
+        let is_5v5 = self.state.format.players_per_side <= 6;
+        let half_len = self.state.format.half_length();
+        let half_wid = self.state.format.half_width();
+        let goal_half_w = self.state.format.goal_half_width();
+        let attack_sign = side.attack_sign(self.state.second_half_swapped());
+        let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
+        let y_sign = if spot.y >= Fp::ZERO { 1_i64 } else { -1_i64 };
+
+        let charge_norm = Fp::from_ratio(
+            charge_ticks.clamp(1, MAX_CHARGE_TICKS) as i64,
+            MAX_CHARGE_TICKS as i64,
+        );
+        let aim_norm = self.clamp_set_piece_aim(RestartKind::CornerKick, side, spot, aim_dir);
+
+        let kicker_id = self.state.players[s_idx][taker_idx].footballer_id.clone();
+        let kicker_name = self.state.players[s_idx][taker_idx].name.clone();
+        self.state.players[s_idx][taker_idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
+        self.state.player_stats[s_idx][taker_idx].passes_attempted += 1;
+
+        // Option A: Short Ground Corner (`BTN_PASS` or `BTN_THROUGH`) -> crisp pass to Short-Corner support!
+        if (button & (BTN_PASS | BTN_THROUGH)) != 0 {
+            let mut best_short_idx = taker_idx;
+            let mut best_sc = Fp::from_int(-999_999);
+            for (idx, mate) in self.state.players[s_idx].iter().enumerate().skip(1) {
+                if idx == taker_idx || mate.sent_off {
+                    continue;
+                }
+                let to_m = mate.pos - spot;
+                let dist = to_m.len();
+                if dist < Fp::from_milli(1_500) {
+                    continue;
+                }
+                let align = to_m.normalize_or_zero().dot(aim_norm);
+                let sc = align.mul(Fp::from_int(26)) - dist.mul(Fp::from_milli(950));
+                if sc > best_sc {
+                    best_sc = sc;
+                    best_short_idx = idx;
+                }
+            }
+            let target_pos = if best_short_idx != taker_idx {
+                let mp = self.state.players[s_idx][best_short_idx].pos;
+                if (button & BTN_THROUGH) != 0 {
+                    (mp + Vec2::from_milli(-attack_sign * 1_600, -y_sign * 1_800)).clamp_box(
+                        half_len - Fp::from_milli(1_200),
+                        half_wid - Fp::from_milli(1_200),
+                    )
+                } else {
+                    mp
+                }
+            } else {
+                (spot + aim_norm.scale(Fp::from_milli(6_500))).clamp_box(
+                    half_len - Fp::from_milli(1_200),
+                    half_wid - Fp::from_milli(1_200),
+                )
+            };
+            let delta = target_pos - spot;
+            let dist = delta.len().max(Fp::ONE);
+            let dir = delta.normalize_or_zero();
+            let spd = (Fp::from_milli(9_800)
+                + dist.mul(Fp::from_milli(420))
+                + charge_norm.mul(Fp::from_milli(4_500)))
+            .clamp(Fp::from_milli(10_500), Fp::from_milli(19_500));
+
+            self.state.players[s_idx][taker_idx].facing_bam = dir.to_bam();
+            self.state.ball.owner = None;
+            self.state.ball.gk_hold_ticks = 0;
+            self.state.ball.pos = Vec3::new(spot.x, spot.y, Fp::ZERO);
+            self.state.ball.vel = Vec3::new(dir.x.mul(spd), dir.y.mul(spd), Fp::ZERO);
+            self.state.ball.spin_side = Fp::ZERO;
+            self.state.ball.spin_top = Fp::from_milli(-520);
+            self.set_last_touch(side, taker_idx);
+            self.state.ball.pass_in_flight = Some(PassInFlight {
+                team: side,
+                passer_idx: taker_idx,
+                passer_id: kicker_id.clone(),
+                passer_name: kicker_name.clone(),
+                intended_receiver_idx: best_short_idx,
+                target_pos,
+                launched_tick: self.state.tick,
+                receiver_was_offside: false,
+            });
+            if best_short_idx != 0 && best_short_idx != taker_idx {
+                self.state.controlled_idx[s_idx] = best_short_idx;
+            }
+            self.emit_event(
+                MatchEventType::Pass,
+                side,
+                Some(kicker_id),
+                None,
+                format!("{kicker_name} plays a short corner"),
+            );
+            return;
+        }
+
+        // Option B: Whipped In-Swinging Aerial Corner (`BTN_LOB` or `BTN_SHOOT`)!
+        // Power (`charge_norm`) selects Near Post (<36%), Central Penalty Corridor (36-72%), or Far Post (>72%)!
+        let base_depth_mm = if is_5v5 { 5_400 } else { 7_800 };
+        // Stick steering along X nudges delivery closer to 6-yard line or deeper toward penalty spot (`±2.2m`)
+        let stick_depth_nudge = (-aim_norm.x.mul(Fp::from_int(attack_sign as i32)) - Fp::from_milli(350))
+            .clamp(Fp::from_milli(-450), Fp::from_milli(550))
+            .mul(Fp::from_milli(3_600));
+        let zone_x = opp_goal_x
+            - Fp::from_int(attack_sign as i32)
+                .mul(Fp::from_milli(base_depth_mm) + stick_depth_nudge);
+
+        let y_span = goal_half_w.mul(Fp::from_milli(if is_5v5 { 1_150 } else { 1_350 }));
+        let zone_y = if charge_norm < Fp::from_milli(360) {
+            // Near post
+            Fp::from_int(y_sign as i32).mul(y_span.mul(Fp::from_milli(780)))
+        } else if charge_norm <= Fp::from_milli(720) {
+            // Central / Penalty spot
+            Fp::from_int(-y_sign as i32).mul(y_span.mul(Fp::from_milli(120)))
+        } else {
+            // Far post
+            Fp::from_int(-y_sign as i32).mul(y_span.mul(Fp::from_milli(880)))
+        };
+        let ideal_zone = Vec2::new(zone_x, zone_y);
+
+        // Lock onto the best attacking header target in the box near `ideal_zone`!
+        let mut target_idx = taker_idx;
+        let mut best_box_d = Fp::from_int(999_999);
+        for (idx, mate) in self.state.players[s_idx].iter().enumerate().skip(1) {
+            if idx == taker_idx || mate.sent_off {
+                continue;
+            }
+            if (mate.pos.x - opp_goal_x).abs() > Fp::from_milli(if is_5v5 { 12_000 } else { 19_000 }) {
+                continue;
+            }
+            let d = mate.pos.dist(ideal_zone);
+            if d < best_box_d {
+                best_box_d = d;
+                target_idx = idx;
+            }
+        }
+
+        let target_pos = if target_idx != taker_idx {
+            let mp = self.state.players[s_idx][target_idx].pos;
+            ideal_zone.lerp(mp, Fp::from_milli(580))
+        } else {
+            ideal_zone
+        }
+        .clamp_box(
+            half_len - Fp::from_milli(1_150),
+            half_wid - Fp::from_milli(1_500),
+        );
+
+        //Whipped in-swinging Magnus curve (`spin_side`) + exact ballistic lift so cross arrives at header height (`z ≈ 1.88m`)!
+        let whip_mag: i64 = if finesse || (button & BTN_SHOOT) != 0 {
+            4_400
+        } else {
+            3_300
+        };
+        // From corner `(attack_sign * +L, y_sign * +W)` flying roughly `-y_sign * Y`:
+        // `perp = (-vel.y, vel.x) ≈ (y_sign, 0)`, so `spin_side = attack_sign * y_sign * whip_mag` bends INWARD toward goal!
+        let spin_side = Fp::from_milli(attack_sign * y_sign * whip_mag);
+        let spin_top = Fp::from_milli(-1_050);
+
+        // Pre-compensate initial aim slightly outward so the Magnus curve bends the ball right onto `target_pos`!
+        let raw_delta = target_pos - spot;
+        let dist = raw_delta.len().max(Fp::from_milli(4_000));
+        let horiz_speed = if is_5v5 {
+            (Fp::from_milli(14_600) + charge_norm.mul(Fp::from_milli(4_400)))
+                .clamp(Fp::from_milli(14_500), Fp::from_milli(19_200))
+        } else {
+            (Fp::from_milli(17_800) + charge_norm.mul(Fp::from_milli(5_600)))
+                .clamp(Fp::from_milli(17_800), Fp::from_milli(23_600))
+        };
+        let flight_t = dist.div(horiz_speed);
+        let curve_comp_x = -Fp::from_int(attack_sign as i32)
+            .mul(Fp::from_milli(whip_mag / 2))
+            .mul(flight_t.mul(flight_t));
+        let aimed_pt = Vec2::new(target_pos.x + curve_comp_x, target_pos.y);
+        let dir = (aimed_pt - spot).normalize_or_zero();
+
+        // Target arrival height `z_hdr = 1.86m`; effective downward accel with backspin `-1.05` is `9.81 - 0.75 ≈ 9.06 m/s^2` -> `0.5 * g_eff ≈ 4.53`
+        let desired_hdr_z = Fp::from_milli(1_860);
+        let vz = (desired_hdr_z.div(flight_t) + Fp::from_milli(4_530).mul(flight_t))
+            .clamp(Fp::from_milli(3_400), Fp::from_milli(9_400));
+
+        self.state.players[s_idx][taker_idx].facing_bam = dir.to_bam();
+        self.state.ball.owner = None;
+        self.state.ball.gk_hold_ticks = 0;
+        self.state.ball.pos = Vec3::new(spot.x, spot.y, Fp::from_milli(90));
+        self.state.ball.vel = Vec3::new(dir.x.mul(horiz_speed), dir.y.mul(horiz_speed), vz);
+        self.state.ball.spin_side = spin_side;
+        self.state.ball.spin_top = spin_top;
+        self.set_last_touch(side, taker_idx);
+
+        // Trigger attacking leap runs inside the box and switch control to the target header jumper!
+        for (idx, mate) in self.state.players[s_idx].iter_mut().enumerate().skip(1) {
+            if idx != taker_idx
+                && !mate.sent_off
+                && (mate.pos.x - opp_goal_x).abs() <= Fp::from_milli(15_000)
+            {
+                mate.run_boost_ticks = 40;
+            }
+        }
+        // Law 11: NO offside offence directly from a Corner Kick!
+        self.state.ball.pass_in_flight = Some(PassInFlight {
+            team: side,
+            passer_idx: taker_idx,
+            passer_id: kicker_id.clone(),
+            passer_name: kicker_name.clone(),
+            intended_receiver_idx: target_idx,
+            target_pos,
+            launched_tick: self.state.tick,
+            receiver_was_offside: false,
+        });
+        if target_idx != 0 && target_idx != taker_idx {
+            self.state.controlled_idx[s_idx] = target_idx;
+        }
+
+        self.emit_event(
+            MatchEventType::Pass,
+            side,
+            Some(kicker_id),
+            None,
+            format!("{kicker_name} whips in the corner"),
+        );
     }
 
     pub fn apply_substitution(&mut self, side: TeamSide, pitch_slot: usize, bench_idx: usize) -> bool {
@@ -968,49 +2013,175 @@ impl MatchSimulation {
         }
     }
 
-    fn switch_player(&mut self, side: TeamSide, aim_dir: Vec2) {
+    fn defensive_switch_utility(&self, side: TeamSide, idx: usize) -> i64 {
         let s_idx = side.index();
-        let current = self.state.controlled_idx[s_idx];
-        let cur_pos = self.state.players[s_idx][current].pos;
+        let p = &self.state.players[s_idx][idx];
         let ball_xy = self.state.ball.pos.xy();
         let attack_sign = side.attack_sign(self.state.second_half_swapped());
         let own_goal_x = Fp::from_milli(-attack_sign * self.state.format.half_length().to_milli());
         let to_own_goal = (Vec2::new(own_goal_x, Fp::ZERO) - ball_xy).normalize_or_zero();
-        let use_directional = aim_dir.len() > Fp::from_milli(300);
-        let aim_norm = aim_dir.normalize_or_zero();
 
-        let mut best_idx = current;
-        let mut best_score = Fp::from_int(-999_999);
+        let (_, intercept_ticks) = best_ball_intercept_for_player(&self.state, side, idx);
+        let dist_ball_mm = p.pos.dist(ball_xy).to_milli();
 
+        let air_land_pen =
+            if self.state.ball.owner.is_none() && self.state.ball.pos.z > Fp::from_milli(850) {
+                let landing_xy = predict_ball_xy_at_ticks(&self.state, 22);
+                (p.pos.dist(landing_xy).to_milli() * 150) / 1_000
+            } else {
+                0
+            };
+
+        let rel_ball = (p.pos - ball_xy).normalize_or_zero();
+        let goal_align = rel_ball.dot(to_own_goal);
+        let goal_side_bonus = if goal_align > Fp::from_milli(120) {
+            if self.state.ball.owner.is_some() {
+                2_450
+            } else {
+                1_650
+            }
+        } else if dist_ball_mm <= 1_950 {
+            // Very close presser right on the ball carrier's shoulder remains a valid switch option
+            750
+        } else {
+            0
+        };
+
+        -(intercept_ticks as i64) * 195 - (dist_ball_mm * 75) / 1_000 - air_land_pen + goal_side_bonus
+    }
+
+    /// Returns the outfield player index (`1..count`) that a neutral defensive `BTN_SWITCH` will select next,
+    /// or `None` when `side` already possesses the ball. Used by both `switch_player` and 3D HUD indicators.
+    pub fn best_switch_target(&self, side: TeamSide) -> Option<usize> {
+        if self.state.ball.owner.map(|(s, _)| s) == Some(side) {
+            return None;
+        }
+        let s_idx = side.index();
+        let current = self.state.controlled_idx[s_idx];
+        let mut best_idx: Option<usize> = None;
+        let mut best_u = i64::MIN;
         for (idx, p) in self.state.players[s_idx].iter().enumerate() {
             if idx == 0 || idx == current || p.sent_off {
                 continue;
             }
-            let score = if use_directional {
+            let u = self.defensive_switch_utility(side, idx);
+            if u > best_u {
+                best_u = u;
+                best_idx = Some(idx);
+            }
+        }
+        best_idx
+    }
+
+    fn switch_player(&mut self, side: TeamSide, aim_dir: Vec2) {
+        let s_idx = side.index();
+        let current = self.state.controlled_idx[s_idx];
+        let cur_pos = self.state.players[s_idx][current].pos;
+        let use_directional = aim_dir.len() > Fp::from_milli(300);
+
+        if use_directional {
+            let aim_norm = aim_dir.normalize_or_zero();
+            let mut best_idx = current;
+            let mut best_score = Fp::from_int(-999_999);
+            for (idx, p) in self.state.players[s_idx].iter().enumerate() {
+                if idx == 0 || idx == current || p.sent_off {
+                    continue;
+                }
                 let rel = p.pos - cur_pos;
                 let dist = rel.len().max(Fp::ONE);
                 let align = rel.normalize_or_zero().dot(aim_norm);
                 if align < Fp::from_milli(160) {
                     continue;
                 }
-                align.mul(Fp::from_int(22)) - dist.mul(Fp::from_milli(320))
-            } else {
-                let (_, intercept_ticks) = best_ball_intercept_for_player(&self.state, side, idx);
-                let rel_ball = (p.pos - ball_xy).normalize_or_zero();
-                let goal_side_bonus = if rel_ball.dot(to_own_goal) > Fp::from_milli(150) {
-                    Fp::from_milli(1_950)
-                } else {
-                    Fp::ZERO
-                };
-                -Fp::from_milli((intercept_ticks as i64) * 145) + goal_side_bonus
-            };
+                let score = align.mul(Fp::from_int(22)) - dist.mul(Fp::from_milli(320));
+                if score > best_score {
+                    best_score = score;
+                    best_idx = idx;
+                }
+            }
+            if best_idx != current {
+                self.state.controlled_idx[s_idx] = best_idx;
+                return;
+            }
+        }
 
-            if score > best_score {
-                best_score = score;
+        if let Some(next_idx) = self.best_switch_target(side) {
+            self.state.controlled_idx[s_idx] = next_idx;
+        }
+    }
+
+    fn auto_switch_player(&mut self, side: TeamSide, mode: AutoSwitchMode) {
+        if mode == AutoSwitchMode::Manual {
+            return;
+        }
+        // Never auto-switch away while our team owns the ball!
+        if self.state.ball.owner.map(|(s, _)| s) == Some(side) {
+            return;
+        }
+        // In AirAndLoose mode, only auto-switch on loose balls or aerial balls (`z > 0.85m`)
+        if mode == AutoSwitchMode::AirAndLoose
+            && self.state.ball.owner.is_some()
+            && self.state.ball.pos.z <= Fp::from_milli(850)
+        {
+            return;
+        }
+
+        let s_idx = side.index();
+        if self.state.manual_switch_lock[s_idx] > 0 || self.state.switch_cooldown[s_idx] > 0 {
+            return;
+        }
+
+        let current = self.state.controlled_idx[s_idx];
+        // While our own pass is cleanly in flight toward `intended_receiver_idx`, keep that receiver active!
+        if let Some(ref pf) = self.state.ball.pass_in_flight {
+            if pf.team == side
+                && self.state.tick.saturating_sub(pf.launched_tick) <= 50
+                && current != 0
+                && !self.state.players[s_idx][current].sent_off
+            {
+                return;
+            }
+        }
+
+        // Never interrupt an active standing tackle or sliding lunge mid-animation!
+        if current > 0
+            && matches!(
+                self.state.players[s_idx][current].action,
+                PlayerActionState::Tackling { .. } | PlayerActionState::Sliding { .. }
+            )
+        {
+            return;
+        }
+
+        let mut best_idx = current;
+        let mut best_u = i64::MIN;
+        for (idx, p) in self.state.players[s_idx].iter().enumerate().skip(1) {
+            if p.sent_off {
+                continue;
+            }
+            let u = self.defensive_switch_utility(side, idx);
+            if u > best_u {
+                best_u = u;
                 best_idx = idx;
             }
         }
-        self.state.controlled_idx[s_idx] = best_idx;
+
+        if best_idx == current || best_idx == 0 {
+            return;
+        }
+
+        let force_switch = current == 0 || self.state.players[s_idx][current].sent_off;
+        let cur_u = if force_switch {
+            i64::MIN / 2
+        } else {
+            self.defensive_switch_utility(side, current)
+        };
+
+        // ~5.5-tick utility hysteresis so control follows the ball decisively without 1-tick flickering!
+        if force_switch || best_u >= cur_u + 1_120 {
+            self.state.controlled_idx[s_idx] = best_idx;
+            self.state.switch_cooldown[s_idx] = 14;
+        }
     }
 
     fn trigger_teammate_run(&mut self, side: TeamSide) {
@@ -1076,11 +2247,20 @@ impl MatchSimulation {
                 let current_tick = self.state.tick;
                 let side_attack_sign = side.attack_sign(self.state.second_half_swapped());
                 let ball_xy_now = self.state.ball.pos.xy();
+                let pred_ball_xy =
+                    ball_xy_now + self.state.ball.vel.xy().scale(Fp::from_milli(50));
                 let ball_z_now = self.state.ball.pos.z;
                 let ball_is_loose = self.state.ball.owner.is_none();
                 let own_team_receiving = ball_is_loose
                     && (self.state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side)
                         || self.state.ball.last_touch_team == Some(side));
+                let my_pass_target: Option<Vec2> = self
+                    .state
+                    .ball
+                    .pass_in_flight
+                    .as_ref()
+                    .filter(|pf| pf.team == side && pf.intended_receiver_idx == idx && ball_is_loose)
+                    .map(|pf| pf.target_pos);
                 let is_open_play = matches!(self.state.phase, MatchPhase::OpenPlay);
                 let pitch_half_len = self.state.format.half_length();
                 let own_box_depth = self.state.format.penalty_box_depth();
@@ -1127,7 +2307,7 @@ impl MatchSimulation {
                     match p.action {
                         PlayerActionState::Tackling { ticks_left } => {
                             if ticks_left <= 1 {
-                                p.action = PlayerActionState::Cooldown { ticks_left: 12 };
+                                p.action = PlayerActionState::Cooldown { ticks_left: 11 };
                             } else {
                                 p.action = PlayerActionState::Tackling {
                                     ticks_left: ticks_left - 1,
@@ -1136,7 +2316,7 @@ impl MatchSimulation {
                         }
                         PlayerActionState::Sliding { ticks_left, dir } => {
                             if ticks_left <= 1 {
-                                p.action = PlayerActionState::Cooldown { ticks_left: 18 };
+                                p.action = PlayerActionState::Cooldown { ticks_left: 17 };
                             } else {
                                 p.action = PlayerActionState::Sliding {
                                     ticks_left: ticks_left - 1,
@@ -1355,18 +2535,39 @@ impl MatchSimulation {
                                             ttl_ticks: INPUT_BUFFER_TTL_TICKS,
                                         });
                                     } else if !own_team_receiving {
-                                        // Defending tackle / slide triggers with aimed lunge orientation!
+                                        // FIFA-Style Assisted Tackle & Slide Homing Cone (`±97°` around stick / `±105°` neutral)
                                         let tackle_rising =
                                             side_input.pressed(BTN_TACKLE) && (prev_btns & BTN_TACKLE) == 0;
                                         let slide_rising =
                                             side_input.pressed(BTN_SLIDE) && (prev_btns & BTN_SLIDE) == 0;
+                                        let mv = side_input.move_vec();
+                                        let to_pred = pred_ball_xy - p.pos;
+                                        let d_pred = to_pred.len();
+                                        let to_pred_dir = to_pred.normalize_or_zero();
+                                        let stick_active = mv.len() > Fp::from_milli(155);
+                                        let mv_norm = mv.normalize_or_zero();
+                                        let cur_fwd = Vec2::from_bam(p.facing_bam, Fp::ONE);
+
                                         if slide_rising {
-                                            let dir = if side_input.move_vec().len() > Fp::from_milli(150) {
-                                                side_input.move_vec().normalize_or_zero()
-                                            } else if p.pos.dist(ball_xy_now) <= Fp::from_milli(2_400) {
-                                                (ball_xy_now - p.pos).normalize_or_zero()
+                                            let in_assist_cone = d_pred <= Fp::from_milli(3_750)
+                                                && d_pred > Fp::from_milli(60)
+                                                && if stick_active {
+                                                    mv_norm.dot(to_pred_dir) >= Fp::from_milli(-120)
+                                                } else {
+                                                    cur_fwd.dot(to_pred_dir) >= Fp::from_milli(-260)
+                                                };
+                                            let dir = if in_assist_cone {
+                                                if stick_active {
+                                                    (to_pred_dir.scale(Fp::from_milli(820))
+                                                        + mv_norm.scale(Fp::from_milli(180)))
+                                                    .normalize_or_zero()
+                                                } else {
+                                                    to_pred_dir
+                                                }
+                                            } else if stick_active {
+                                                mv_norm
                                             } else {
-                                                Vec2::from_bam(p.facing_bam, Fp::ONE)
+                                                cur_fwd
                                             };
                                             p.facing_bam = dir.to_bam();
                                             p.action = PlayerActionState::Sliding {
@@ -1374,12 +2575,25 @@ impl MatchSimulation {
                                                 dir,
                                             };
                                         } else if tackle_rising {
-                                            let lunge_dir = if side_input.move_vec().len() > Fp::from_milli(160) {
-                                                side_input.move_vec().normalize_or_zero()
-                                            } else if p.pos.dist(ball_xy_now) <= Fp::from_milli(2_100) {
-                                                (ball_xy_now - p.pos).normalize_or_zero()
+                                            let in_assist_cone = d_pred <= Fp::from_milli(2_850)
+                                                && d_pred > Fp::from_milli(60)
+                                                && if stick_active {
+                                                    mv_norm.dot(to_pred_dir) >= Fp::from_milli(-120)
+                                                } else {
+                                                    cur_fwd.dot(to_pred_dir) >= Fp::from_milli(-260)
+                                                };
+                                            let lunge_dir = if in_assist_cone {
+                                                if stick_active && d_pred > Fp::from_milli(1_650) {
+                                                    (to_pred_dir.scale(Fp::from_milli(860))
+                                                        + mv_norm.scale(Fp::from_milli(140)))
+                                                    .normalize_or_zero()
+                                                } else {
+                                                    to_pred_dir
+                                                }
+                                            } else if stick_active {
+                                                mv_norm
                                             } else {
-                                                Vec2::from_bam(p.facing_bam, Fp::ONE)
+                                                cur_fwd
                                             };
                                             p.facing_bam = lunge_dir.to_bam();
                                             p.action = PlayerActionState::Tackling { ticks_left: 13 };
@@ -1392,8 +2606,8 @@ impl MatchSimulation {
 
                     let is_5v5 = self.state.format.players_per_side <= 6;
 
-                    // Determine desired velocity for this tick
-                    let (move_dir, sprint, jockey) = if is_controlled {
+                    // Determine desired velocity for this tick (including Assisted Jockey Containment!)
+                    let (mut move_dir, sprint, jockey) = if is_controlled {
                         (
                             side_input.move_vec(),
                             side_input.pressed(BTN_SPRINT),
@@ -1404,6 +2618,55 @@ impl MatchSimulation {
                     } else {
                         (Vec2::ZERO, false, false)
                     };
+
+                    if is_controlled && jockey && !has_ball && !is_gk {
+                        let d_pred = p.pos.dist(pred_ball_xy);
+                        if d_pred <= Fp::from_milli(4_600) && d_pred >= Fp::from_milli(420) {
+                            let own_goal = Vec2::new(own_goal_x_now, Fp::ZERO);
+                            let contain_pt = pred_ball_xy
+                                + (own_goal - pred_ball_xy)
+                                    .normalize_or_zero()
+                                    .scale(Fp::from_milli(820));
+                            let contain_pull = (contain_pt - p.pos).clamp_len(Fp::ONE);
+                            if move_dir.len() <= Fp::from_milli(150) {
+                                move_dir = contain_pull.scale(Fp::from_milli(680));
+                            } else {
+                                move_dir = (move_dir.scale(Fp::from_milli(720))
+                                    + contain_pull.scale(Fp::from_milli(280)))
+                                .clamp_len(Fp::ONE);
+                            }
+                        }
+                    } else if is_controlled && !has_ball && !is_gk {
+                        // FIFA-Style Assisted Pass-Receiver Tracking: step toward incoming teammate pass / cross
+                        // instead of standing frozen or overrunning the pass line right after auto-switch!
+                        if let Some(pf_target) = my_pass_target {
+                            let d_ball_now = p.pos.dist(ball_xy_now);
+                            let meet_pt = if d_ball_now < Fp::from_milli(4_200) {
+                                pred_ball_xy.lerp(pf_target, Fp::from_milli(380))
+                            } else {
+                                pf_target
+                            };
+                            let to_meet = meet_pt - p.pos;
+                            let d_meet = to_meet.len();
+                            if d_meet > Fp::from_milli(180) {
+                                let meet_dir = to_meet.normalize_or_zero();
+                                if move_dir.len() <= Fp::from_milli(155) {
+                                    let scale = if d_meet > Fp::from_milli(900) {
+                                        Fp::from_milli(940)
+                                    } else {
+                                        Fp::from_milli(650)
+                                    };
+                                    move_dir = meet_dir.scale(scale);
+                                } else if move_dir.normalize_or_zero().dot(meet_dir) > Fp::from_milli(-250) {
+                                    move_dir = (move_dir.scale(Fp::from_milli(640))
+                                        + meet_dir.scale(Fp::from_milli(360)))
+                                    .clamp_len(Fp::ONE);
+                                }
+                            } else if move_dir.len() <= Fp::from_milli(155) {
+                                p.facing_bam = (ball_xy_now - p.pos).to_bam();
+                            }
+                        }
+                    }
 
                     // Stamina update
                     let moving = move_dir.len() > Fp::from_milli(150);
@@ -1424,15 +2687,18 @@ impl MatchSimulation {
                     if sprint && !jockey {
                         top_speed = top_speed.mul(Fp::from_milli(if is_5v5 { 1_205 } else { 1_220 }));
                     } else if jockey {
-                        top_speed = top_speed.mul(Fp::from_milli(if has_ball { 740 } else { 690 }));
+                        top_speed = top_speed.mul(Fp::from_milli(if has_ball { 740 } else { 785 }));
                     }
                     if has_ball {
                         let drib_keep = 885 + (p.attributes.dribbling as i64);
                         top_speed = top_speed.mul(Fp::from_milli(drib_keep.min(975)));
                     }
 
-                    // Anisotropic human speed envelope: 100% forward along heading, ~85% lateral strafe, ~75% backpedal
-                    if moving && !matches!(p.action, PlayerActionState::SkillMove { .. }) {
+                    // Anisotropic human speed envelope (skip backpedal penalty during defensive jockey footwork!)
+                    if moving
+                        && !(jockey && !has_ball)
+                        && !matches!(p.action, PlayerActionState::SkillMove { .. })
+                    {
                         let heading = Vec2::from_bam(p.facing_bam, Fp::ONE);
                         let move_norm = move_dir.normalize_or_zero();
                         let align_milli = move_norm.dot(heading).to_milli(); // [-1000, +1000]
@@ -1442,17 +2708,17 @@ impl MatchSimulation {
 
                     let desired_vel = match p.action {
                         PlayerActionState::Sliding { ticks_left, dir } => {
-                            let burst = Fp::from_milli(4_200 + (ticks_left as i64) * 220);
+                            let burst = Fp::from_milli(4_300 + (ticks_left as i64) * 225);
                             dir.scale(burst)
                         }
                         PlayerActionState::Diving { ticks_left, dir } => {
                             let gk_burst = Fp::from_milli(
-                                4_500 + (p.attributes.goalkeeping as i64) * 35 + (ticks_left as i64) * 90,
+                                4_900 + (p.attributes.goalkeeping as i64) * 38 + (ticks_left as i64) * 95,
                             );
                             dir.scale(gk_burst)
                         }
                         PlayerActionState::Tackling { ticks_left } => {
-                            let lunge = Fp::from_milli(1_400 + (ticks_left as i64) * 180);
+                            let lunge = Fp::from_milli(1_750 + (ticks_left as i64) * 195);
                             Vec2::from_bam(p.facing_bam, lunge)
                         }
                         PlayerActionState::SkillMove { dir, .. } => {
@@ -1592,79 +2858,98 @@ impl MatchSimulation {
         self.state.ball.owner = None;
         self.state.ball.gk_hold_ticks = 0;
         self.state.ball.dribble_touch_cd = 0;
+        self.state.manual_switch_lock = [0, 0];
         self.set_last_touch(side, kicker_idx);
         self.state.players[s_idx][kicker_idx].action = PlayerActionState::Cooldown {
             ticks_left: if is_5v5 { 7 } else { 10 },
         };
 
-        let aim_norm = if aim_dir.len() > Fp::from_milli(100) {
+        let mut aim_norm = if aim_dir.len() > Fp::from_milli(100) {
             aim_dir.normalize_or_zero()
         } else {
             Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO)
         };
 
         if (button & BTN_SHOOT) != 0 {
-            // --- SHOOTING: Direction Ray × Shot Type × Charge Force × Body Composure ---
+            // --- FIFA-STYLE ASSISTED SHOOTING: Goal-Frame Mapping × Shot Type × Force × Composure ---
             self.state.ball.pass_in_flight = None;
             self.state.player_stats[s_idx][kicker_idx].shots += 1;
 
             let is_chip_shot = (button & BTN_LOB) != 0;
             let aim_toward_goal = aim_norm.x.mul(Fp::from_int(attack_sign as i32));
             let dx_goal = (opp_goal_x - kicker_pos.x).abs().max(Fp::from_milli(1_500));
+            let opp_gk_y = self.state.players[side.opponent().index()][0].pos.y;
 
-            // 1. Semi-assisted Goal-Plane Raycast (`65%` exact stick ray intersection + `35%` post-frame mapping):
-            // Aiming diagonally from ANY spot on the pitch steers naturally to the near or far post,
-            // while aiming sharply wide or backward pulls the shot wide!
-            let target_y_base = if aim_toward_goal < Fp::from_milli(-300) {
-                // Aiming away from goal -> off-balance dragged hook wide of the post!
+            // 1. Assisted Goal-Frame Mapping:
+            // - Unless aiming sharply backward (`< -0.45`), map stick lateral input smoothly inside the posts
+            //   (`±0.83..0.86 * goal_half_w`) so diagonal 8-way D-Pad / SNES / stick shots tuck into the corners
+            //   instead of projecting 2-4m wide, AND cross-box lateral cuts (`aim_x ≈ 0`) automatically turn & shoot at goal!
+            // - On neutral forward aim (`|aim_y| < 0.16`), if the GK is pulled off-center (`|opp_gk_y| > 0.32m`),
+            //   assist placement toward the open side of the net!
+            let target_y_base = if aim_toward_goal < Fp::from_milli(-450) {
                 let wide_sign = if aim_norm.y >= Fp::ZERO { Fp::ONE } else { Fp::NEG_ONE };
                 wide_sign.mul(goal_half_w.mul(Fp::from_milli(1_380)))
             } else {
-                let eff_ax = aim_toward_goal.max(Fp::from_milli(280));
-                let ray_y = (kicker_pos.y + dx_goal.mul(aim_norm.y).div(eff_ax)).clamp(
-                    -goal_half_w.mul(Fp::from_milli(1_340)),
-                    goal_half_w.mul(Fp::from_milli(1_340)),
-                );
                 let frame_reach = if finesse {
-                    Fp::from_milli(910)
+                    Fp::from_milli(865)
                 } else {
-                    Fp::from_milli(880)
+                    Fp::from_milli(825)
                 };
-                let frame_y = aim_norm.y.clamp(Fp::NEG_ONE, Fp::ONE).mul(goal_half_w.mul(frame_reach));
-                ray_y.mul(Fp::from_milli(650)) + frame_y.mul(Fp::from_milli(350))
+                if aim_norm.y.abs() < Fp::from_milli(160) && aim_toward_goal > Fp::from_milli(250) {
+                    if opp_gk_y.abs() > Fp::from_milli(320) {
+                        -Fp::from_int(opp_gk_y.signum_int())
+                            .mul(goal_half_w.mul(Fp::from_milli(580)))
+                    } else {
+                        Fp::ZERO
+                    }
+                } else {
+                    let eff_ax = aim_toward_goal.max(Fp::from_milli(420));
+                    let ray_y = (kicker_pos.y + dx_goal.mul(aim_norm.y).div(eff_ax)).clamp(
+                        -goal_half_w.mul(Fp::from_milli(920)),
+                        goal_half_w.mul(Fp::from_milli(920)),
+                    );
+                    let frame_y = aim_norm
+                        .y
+                        .clamp(Fp::NEG_ONE, Fp::ONE)
+                        .mul(goal_half_w.mul(frame_reach));
+                    (frame_y.mul(Fp::from_milli(820)) + ray_y.mul(Fp::from_milli(180))).clamp(
+                        -goal_half_w.mul(Fp::from_milli(885)),
+                        goal_half_w.mul(Fp::from_milli(885)),
+                    )
+                }
             };
 
-            // 2. Body-Angle & Sprint Composure Penalty (shooting on a 140° blind turn or flat-out sprint widens dispersion & trims power)
+            // 2. Body-Angle & Sprint Composure Penalty (shooting on a 150° blind turn or flat-out sprint widens dispersion)
             let raw_goal_dir = (Vec2::new(opp_goal_x, target_y_base) - kicker_pos).normalize_or_zero();
             let body_cos = pre_kick_heading.dot(raw_goal_dir); // +1 set on laces, -1 180° blind spin
             let turn_penalty = if body_cos < Fp::ZERO {
-                (-body_cos).mul(Fp::from_milli(850)) // 0 .. 0.85
-            } else if body_cos < Fp::from_milli(500) {
-                (Fp::from_milli(500) - body_cos).mul(Fp::from_milli(450))
+                (-body_cos).mul(Fp::from_milli(720))
+            } else if body_cos < Fp::from_milli(350) {
+                (Fp::from_milli(350) - body_cos).mul(Fp::from_milli(340))
             } else {
                 Fp::ZERO
             };
-            let sprint_penalty = if kicker_speed > Fp::from_milli(6_400) {
-                Fp::from_milli(320)
+            let sprint_penalty = if kicker_speed > Fp::from_milli(6_600) {
+                Fp::from_milli(240)
             } else {
                 Fp::ZERO
             };
-            let overcharge_err = if !is_chip_shot && charge_norm > Fp::from_milli(800) {
-                (charge_norm - Fp::from_milli(800)).mul(Fp::from_int(3)) // 0 .. 0.60 extra scatter on red bar!
+            let overcharge_err = if !is_chip_shot && charge_norm > Fp::from_milli(840) {
+                (charge_norm - Fp::from_milli(840)).mul(Fp::from_int(3))
             } else {
                 Fp::ZERO
             };
 
-            let base_err_mm = ((105_i64 - kicker_attrs.shooting as i64).max(7))
+            let base_err_mm = ((105_i64 - kicker_attrs.shooting as i64).max(5))
                 * if finesse {
-                    8
+                    6
                 } else if charge_norm < Fp::from_milli(280) {
-                    10
+                    8
                 } else {
-                    15
+                    11
                 };
             let err_mult = Fp::ONE + turn_penalty + sprint_penalty + overcharge_err;
-            let max_err_mm = Fp::from_milli(base_err_mm).mul(err_mult).to_milli().max(40);
+            let max_err_mm = Fp::from_milli(base_err_mm).mul(err_mult).to_milli().max(30);
             let err_y = self.state.rng.range_milli(-max_err_mm, max_err_mm);
             let target_y = target_y_base + err_y;
 
@@ -1672,10 +2957,12 @@ impl MatchSimulation {
             let dir_xy = (target_xy - kicker_pos).normalize_or_zero();
             self.state.players[s_idx][kicker_idx].facing_bam = dir_xy.to_bam();
 
-            // 3. 5-Mode Shot Kinematics × Force Curve (`0..100%` charge)
-            let power_keep = (Fp::ONE - turn_penalty.mul(Fp::from_milli(180)))
-                .clamp(Fp::from_milli(820), Fp::ONE);
-            let base_speed_mm = 16_400 + (kicker_attrs.shooting as i64) * 68;
+            // 3. 5-Mode Shot + Assisted Aerial Header / Volley Kinematics × Force Curve (`0..100%` charge)
+            let launch_z = self.state.ball.pos.z.max(Fp::from_milli(110));
+            let is_aerial_finish = !is_chip_shot && launch_z > Fp::from_milli(1_050);
+            let power_keep = (Fp::ONE - turn_penalty.mul(Fp::from_milli(160)))
+                .clamp(Fp::from_milli(840), Fp::ONE);
+            let base_speed_mm = 16_600 + (kicker_attrs.shooting as i64) * 68;
             let charge_boost_mm = charge_norm.mul(Fp::from_milli(10_400)).to_milli();
 
             let (speed, vz, spin_side, spin_top) = if is_chip_shot {
@@ -1687,10 +2974,29 @@ impl MatchSimulation {
                 .mul(power_keep);
                 let chip_vz = Fp::from_milli(5_600) + charge_norm.mul(Fp::from_milli(2_750));
                 (chip_spd, chip_vz, Fp::ZERO, Fp::from_milli(-2_350))
+            } else if is_aerial_finish && charge_norm <= Fp::from_milli(860) {
+                // Assisted Downward Header / Scissor Volley on Corners & Wing Crosses (`launch_z > 1.05m`)!
+                let hdr_spd = Fp::from_milli(((base_speed_mm + charge_boost_mm / 2) * 86) / 100)
+                    .mul(power_keep);
+                let flight_t = dx_goal.div(hdr_spd.max(Fp::from_int(10)));
+                let goal_z = (Fp::from_milli(850) + charge_norm.mul(Fp::from_milli(650)))
+                    .min(self.state.format.goal_height() - Fp::from_milli(280));
+                let hdr_vz = ((goal_z - launch_z).div(flight_t) + Fp::from_milli(4_750).mul(flight_t))
+                    .clamp(Fp::from_milli(-2_400), Fp::from_milli(2_200));
+                (hdr_spd, hdr_vz, Fp::ZERO, Fp::from_milli(1_350))
             } else if finesse {
                 // Mode 2: Inside-of-Boot Finesse Curler (`BTN_JOCKEY + BTN_SHOOT`) — accurate corner bender!
-                let fin_spd = Fp::from_milli(((base_speed_mm + charge_boost_mm) * 86) / 100).mul(power_keep);
-                let fin_vz = Fp::from_milli(880) + charge_norm.mul(Fp::from_milli(3_950));
+                let fin_spd = Fp::from_milli(((base_speed_mm + charge_boost_mm) * 87) / 100).mul(power_keep);
+                let raw_fin_vz = Fp::from_milli(860) + charge_norm.mul(Fp::from_milli(3_650));
+                let max_bar_vz = ((self.state.format.goal_height() - Fp::from_milli(260) - launch_z)
+                    .div(dx_goal.div(fin_spd.max(Fp::from_int(10))))
+                    + Fp::from_milli(4_600).mul(dx_goal.div(fin_spd.max(Fp::from_int(10)))))
+                .max(Fp::from_milli(1_100));
+                let fin_vz = if charge_norm <= Fp::from_milli(840) {
+                    raw_fin_vz.min(max_bar_vz)
+                } else {
+                    raw_fin_vz
+                };
                 let curl_mag = if is_5v5 { 5_850 } else { 4_950 };
                 let curl = if target_y >= Fp::ZERO {
                     Fp::from_milli(-curl_mag)
@@ -1702,29 +3008,34 @@ impl MatchSimulation {
                 // Mode 3: Low Driven Skimmer (`quick tap < 28%`) — skids flat beneath diving keeper!
                 let low_spd = Fp::from_milli(base_speed_mm + charge_boost_mm + 900).mul(power_keep);
                 let low_vz = Fp::from_milli(340) + charge_norm.mul(Fp::from_milli(1_550));
-                let swerve = self.state.rng.range_milli(-650, 650);
+                let swerve = self.state.rng.range_milli(-520, 520);
                 (low_spd, low_vz, swerve, Fp::from_milli(980))
-            } else if charge_norm <= Fp::from_milli(800) {
-                // Mode 4: Sweet-Spot Dipping Instep Laces (`28% .. 80%` Green/Gold bar) — rises & dips viciously!
+            } else if charge_norm <= Fp::from_milli(840) {
+                // Mode 4: Sweet-Spot Dipping Instep Laces (`28% .. 84%` Green/Gold bar) — assisted under-the-bar elevation!
                 let drv_spd = Fp::from_milli(base_speed_mm + charge_boost_mm).mul(power_keep);
-                let drv_vz = Fp::from_milli(820) + charge_norm.mul(Fp::from_milli(4_150));
-                let swerve = self.state.rng.range_milli(-950, 950);
+                let ft = dx_goal.div(drv_spd.max(Fp::from_int(10)));
+                let raw_drv_vz = Fp::from_milli(800) + charge_norm.mul(Fp::from_milli(3_850));
+                let max_bar_vz = ((self.state.format.goal_height() - Fp::from_milli(220) - launch_z)
+                    .div(ft)
+                    + Fp::from_milli(4_750).mul(ft))
+                .max(Fp::from_milli(1_250));
+                let drv_vz = raw_drv_vz.min(max_bar_vz);
+                let swerve = self.state.rng.range_milli(-780, 780);
                 let dip_top = Fp::from_milli(1_750) + charge_norm.mul(Fp::from_milli(1_250));
                 (drv_spd, drv_vz, swerve, dip_top)
             } else {
-                // Mode 5: Overcharged Red-Bar Thunderbolt (`> 80%`) — max venom, steep lift risks crossbar / skying over!
-                let over_t = (charge_norm - Fp::from_milli(800)).mul(Fp::from_int(5)); // 0 .. 1.0
+                // Mode 5: Overcharged Red-Bar Thunderbolt (`> 84%`) — max venom, steep lift risks crossbar / skying over!
+                let over_t = (charge_norm - Fp::from_milli(840)).mul(Fp::from_int(6)); // 0 .. ~1.0
                 let composure_sky = ((100_i64 - kicker_attrs.shooting as i64).max(4)) * 22;
                 let blast_spd = Fp::from_milli(base_speed_mm + charge_boost_mm + 800).mul(power_keep);
-                let blast_vz = Fp::from_milli(4_140)
-                    + over_t.mul(Fp::from_milli(2_550 + composure_sky))
+                let blast_vz = Fp::from_milli(4_350)
+                    + over_t.mul(Fp::from_milli(2_450 + composure_sky))
                     + turn_penalty.mul(Fp::from_milli(1_200));
-                let swerve = self.state.rng.range_milli(-1_350, 1_350);
+                let swerve = self.state.rng.range_milli(-1_250, 1_250);
                 (blast_spd, blast_vz, swerve, Fp::from_milli(1_450))
             };
 
             // Predict vertical height at goal plane to accurately classify `on_target`
-            let launch_z = self.state.ball.pos.z.max(Fp::from_milli(110));
             let flight_t = dx_goal.div(speed.max(Fp::from_int(8)));
             let est_goal_z = launch_z
                 + vz.mul(flight_t)
@@ -1741,6 +3052,10 @@ impl MatchSimulation {
 
             let shot_label = if is_chip_shot {
                 "chips"
+            } else if is_aerial_finish && launch_z > Fp::from_milli(1_380) {
+                "heads"
+            } else if is_aerial_finish {
+                "volleys"
             } else if finesse {
                 "curls"
             } else if charge_norm < Fp::from_milli(280) {
@@ -1758,12 +3073,36 @@ impl MatchSimulation {
             return;
         }
 
-        // --- PASSING: Direction Cone × Pass Type (`Pass` / `Driven` / `Through` / `Lob-Cross`) × Charge Force ---
+        // --- FIFA-STYLE ASSISTED PASSING: Wide Cone × Blocker Avoidance × GK-Safe Through-Balls ---
         self.state.player_stats[s_idx][kicker_idx].passes_attempted += 1;
         let is_through = (button & BTN_THROUGH) != 0;
         let is_lob = (button & BTN_LOB) != 0;
-        let is_driven = finesse; // `BTN_JOCKEY` modifier = Driven Laser Ground Pass / Threaded Through / Whipped Cross!
+        let is_driven = finesse;
         let opp_s_idx = side.opponent().index();
+
+        // Assisted GK Outlet Protection: if GK passes with neutral stick or straight at a pressing striker,
+        // steer onto the safest open teammate!
+        if kicker_idx == 0 {
+            let (_, _, safe_gk_aim) = choose_safe_gk_distribution(&self.state, side);
+            let mut blocked_by_presser = false;
+            for opp in &self.state.players[opp_s_idx] {
+                if opp.sent_off {
+                    continue;
+                }
+                let rel = opp.pos - kicker_pos;
+                let along = rel.dot(aim_norm);
+                if along > Fp::from_milli(800) && along < Fp::from_milli(9_500) {
+                    let lat = (rel - aim_norm.scale(along)).len();
+                    if lat < Fp::from_milli(1_950) {
+                        blocked_by_presser = true;
+                        break;
+                    }
+                }
+            }
+            if aim_dir.len() <= Fp::from_milli(220) || blocked_by_presser {
+                aim_norm = safe_gk_aim;
+            }
+        }
 
         // Detect Attacking Wing Crossing Zone (`BTN_LOB` from wide in attacking third aiming toward the box!)
         let in_attacking_wing = is_lob
@@ -1773,23 +3112,23 @@ impl MatchSimulation {
                 < Fp::from_milli(250);
 
         // Preferred pass distance controlled directly by `charge_norm` (`0% -> 100%`):
-        // Light tap targets short layoff (~4m); firm hold skips near player to hit far teammate (~24-32m)!
         let pref_dist = if is_5v5 {
             Fp::from_milli(3_800) + charge_norm.mul(Fp::from_milli(20_500))
         } else {
             Fp::from_milli(4_500) + charge_norm.mul(Fp::from_milli(28_500))
         };
 
-        // Strict directional stick cone (`cos(49°) = 0.656` for Pass/Lob, `cos(54°) = 0.585` for Through-Ball)
-        // so the pass NEVER overrides your stick direction by 90°!
+        // Generous FIFA Assisted Stick Cone (`±74°`, `cos >= 0.275`) so 8-way D-Pad / SNES diagonal inputs
+        // reliably lock onto teammates without hijacking deliberate 90° open-space passes (`cos == 0`)!
         let min_cone_align = if in_attacking_wing {
-            Fp::from_milli(220)
+            Fp::from_milli(200)
         } else if is_through {
-            Fp::from_milli(585)
+            Fp::from_milli(250)
         } else {
-            Fp::from_milli(655)
+            Fp::from_milli(275)
         };
 
+        let opp_gk_pos = self.state.players[opp_s_idx][0].pos;
         let mut best_receiver: Option<(usize, Vec2)> = None;
         let mut best_score = Fp::from_int(-999_999);
 
@@ -1801,14 +3140,12 @@ impl MatchSimulation {
                 continue;
             }
 
-            let lead_pos = if in_attacking_wing {
-                // Force (`charge_norm`) selects Near-Post (<32%), Penalty-Spot (32-72%), or Far-Post (>72%) cross zone!
+            let mut lead_pos = if in_attacking_wing {
                 let box_x = Fp::from_milli(
                     attack_sign * (half_len.to_milli() - if is_5v5 { 5_600 } else { 9_200 }),
                 );
                 let cross_y_span = self.state.format.goal_half_width().mul(Fp::from_milli(1_350));
                 let inward_sign = if kicker_pos.y >= Fp::ZERO { Fp::NEG_ONE } else { Fp::ONE };
-                // Near post = -inward_sign, Far post = +inward_sign
                 let zone_bias = (charge_norm.mul(Fp::from_int(2)) - Fp::ONE).clamp(Fp::NEG_ONE, Fp::ONE);
                 let zone_y = inward_sign.mul(zone_bias).mul(cross_y_span);
                 Vec2::new(
@@ -1816,20 +3153,28 @@ impl MatchSimulation {
                     mate.pos.y.mul(Fp::from_milli(400)) + zone_y.mul(Fp::from_milli(600)),
                 )
             } else if is_through {
-                // Steerable Through-Ball: `charge_norm` controls space lead (`2.4m -> 10.2m`) along `65% stick + 35% run lane`!
+                // Steerable Assisted Through-Ball: leads runner into space while clamping short of GK's hands!
                 let base_lane = if mate.vel.len() > Fp::from_milli(900) {
                     mate.vel.normalize_or_zero()
                 } else {
                     Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO)
                 };
-                let space_dir = (aim_norm.scale(Fp::from_milli(650)) + base_lane.scale(Fp::from_milli(350)))
+                let space_dir = (aim_norm.scale(Fp::from_milli(580)) + base_lane.scale(Fp::from_milli(420)))
                     .normalize_or_zero();
                 let lead_dist = Fp::from_milli(if is_5v5 { 2_300 } else { 2_800 })
                     + charge_norm.mul(Fp::from_milli(if is_5v5 { 7_400 } else { 9_800 }));
-                mate.pos + space_dir.scale(lead_dist) + mate.vel.scale(Fp::from_milli(240))
+                let mut raw_lead = mate.pos + space_dir.scale(lead_dist) + mate.vel.scale(Fp::from_milli(240));
+                let gk_safe_depth = half_len - Fp::from_milli(if is_5v5 { 4_800 } else { 7_400 });
+                if raw_lead.x.mul(Fp::from_int(attack_sign as i32)) > gk_safe_depth
+                    && raw_lead.y.abs() <= goal_half_w + Fp::from_milli(2_100)
+                    && opp_gk_pos.dist(raw_lead) + Fp::from_milli(900) < mate.pos.dist(raw_lead)
+                {
+                    raw_lead.x = Fp::from_int(attack_sign as i32).mul(gk_safe_depth);
+                }
+                raw_lead
             } else {
-                // Ground / Lob pass to feet (leading current stride slightly)
-                mate.pos + mate.vel.scale(Fp::from_milli(250))
+                // Assisted Ground / Lob pass to feet (leading current stride)
+                mate.pos + mate.vel.scale(Fp::from_milli(240))
             };
 
             let to_mate = lead_pos - kicker_pos;
@@ -1837,29 +3182,48 @@ impl MatchSimulation {
             if dist < Fp::from_milli(1_100) {
                 continue;
             }
-            let align = to_mate.normalize_or_zero().dot(aim_norm);
+            let lane_dir = to_mate.normalize_or_zero();
+            let align = lane_dir.dot(aim_norm);
             if align < min_cone_align {
                 continue;
             }
 
             let dist_diff = (dist - pref_dist).abs();
             let mut nearest_opp = Fp::from_milli(7_500);
+            let mut lane_blocked_pen = Fp::ZERO;
             for opp in self.state.players[opp_s_idx].iter().skip(1) {
-                if !opp.sent_off {
-                    nearest_opp = nearest_opp.min(opp.pos.dist(lead_pos));
+                if opp.sent_off {
+                    continue;
+                }
+                nearest_opp = nearest_opp.min(opp.pos.dist(lead_pos));
+                if !is_lob && !in_attacking_wing {
+                    let rel = opp.pos - kicker_pos;
+                    let along = rel.dot(lane_dir);
+                    if along > Fp::from_milli(1_000) && along < dist - Fp::from_milli(750) {
+                        let lat_d = (rel - lane_dir.scale(along)).len();
+                        if lat_d < Fp::from_milli(1_150) {
+                            lane_blocked_pen = Fp::from_milli(2_600);
+                        }
+                    }
                 }
             }
-            let open_bonus = nearest_opp.min(Fp::from_milli(4_500)).mul(Fp::from_milli(340));
-            // Strong alignment + strong `pref_dist` force matching so tap vs hold selects near vs far teammate!
-            let score = align.mul(Fp::from_int(34)) - dist_diff.mul(Fp::from_milli(920)) + open_bonus;
+            let open_bonus = nearest_opp.min(Fp::from_milli(4_500)).mul(Fp::from_milli(360));
+            // Strong alignment + `pref_dist` force matching + open-lane preference!
+            let score =
+                align.mul(Fp::from_int(32)) - dist_diff.mul(Fp::from_milli(920)) + open_bonus - lane_blocked_pen;
             if score > best_score {
                 best_score = score;
+                // Keep pass target comfortably inside touchlines
+                lead_pos = lead_pos.clamp_box(
+                    half_len - Fp::from_milli(1_150),
+                    half_wid - Fp::from_milli(1_150),
+                );
                 best_receiver = Some((idx, lead_pos));
             }
         }
 
-        // Manual Directional Fallback: if no teammate stands inside your stick cone, pass along your EXACT `aim_norm`
-        // at distance `pref_dist` and assign whichever teammate can converge onto that ball fastest!
+        let locked_teammate = best_receiver.is_some();
+        // Manual Directional Fallback when deliberately aiming into an empty lane outside `±74°` of any teammate
         let (receiver_idx, mut target_pos) = best_receiver.unwrap_or_else(|| {
             let manual_target = kicker_pos + aim_norm.scale(pref_dist);
             let mut fastest_idx = (1..self.state.players[s_idx].len())
@@ -1877,6 +3241,40 @@ impl MatchSimulation {
             }
             (fastest_idx, manual_target)
         });
+
+        // Assisted Interception-Avoiding Lane Shift & Curl: if an opponent stands close to a ground/through pass line,
+        // arc `target_pos` into the open corridor and zip + bend the pass around the defender's reach!
+        let mut lane_avoid_spin = Fp::ZERO;
+        let mut bypassing_blocker = false;
+        if locked_teammate && !is_lob && !in_attacking_wing {
+            let init_delta = target_pos - kicker_pos;
+            let init_dist = init_delta.len().max(Fp::ONE);
+            let init_dir = init_delta.normalize_or_zero();
+            let perp = Vec2::new(-init_dir.y, init_dir.x);
+            for opp in self.state.players[opp_s_idx].iter().skip(1) {
+                if opp.sent_off {
+                    continue;
+                }
+                let rel = opp.pos - kicker_pos;
+                let along = rel.dot(init_dir);
+                if along > Fp::from_milli(1_100) && along < init_dist - Fp::from_milli(850) {
+                    let lat = rel.dot(perp);
+                    if lat.abs() < Fp::from_milli(1_950) {
+                        let open_sign = if lat >= Fp::ZERO { Fp::NEG_ONE } else { Fp::ONE };
+                        // Ensure mid-flight arc clears the moving defender by >= 2.2m on the open side
+                        // while return Magnus curl bends the ball back into the checking receiver's stride!
+                        let bend_mag = if is_through || is_driven { 4_600 } else { 3_900 };
+                        let needed_clear = (Fp::from_milli(2_350) - lat.abs()).max(Fp::from_milli(950));
+                        let aim_arc = (needed_clear.mul(Fp::from_milli(1_450)))
+                            .clamp(Fp::from_milli(1_250), Fp::from_milli(2_550));
+                        target_pos += perp.scale(open_sign.mul(aim_arc));
+                        lane_avoid_spin = (-open_sign).mul(Fp::from_milli(bend_mag));
+                        bypassing_blocker = true;
+                        break;
+                    }
+                }
+            }
+        }
 
         let max_x = half_len - Fp::from_milli(1_150);
         let max_y = half_wid - Fp::from_milli(950);
@@ -1897,23 +3295,23 @@ impl MatchSimulation {
         let raw_pass_dir = delta.normalize_or_zero();
         self.state.players[s_idx][kicker_idx].facing_bam = raw_pass_dir.to_bam();
 
-        // Body-angle pass accuracy: clean forward pass is pinpoint; 150°-180° blind spin adds realistic error!
+        // Tight assisted pass accuracy (only 150°-180° blind spin adds noticeable scatter)
         let pass_body_cos = pre_kick_heading.dot(raw_pass_dir);
-        let blind_turn_mult = if pass_body_cos < Fp::from_milli(-200) {
-            Fp::from_milli(2_100)
-        } else if pass_body_cos < Fp::from_milli(400) {
-            Fp::from_milli(1_350)
+        let blind_turn_mult = if pass_body_cos < Fp::from_milli(-350) {
+            Fp::from_milli(1_850)
+        } else if pass_body_cos < Fp::from_milli(250) {
+            Fp::from_milli(1_200)
         } else {
             Fp::ONE
         };
-        let base_pass_err = ((102_i64 - kicker_attrs.passing as i64).max(4)) * if is_driven { 8 } else { 5 };
+        let base_pass_err = ((102_i64 - kicker_attrs.passing as i64).max(3)) * if is_driven { 5 } else { 3 };
         let eff_pass_err = Fp::from_milli(base_pass_err).mul(blind_turn_mult).to_milli();
         let lateral_err = self.state.rng.range_milli(-eff_pass_err, eff_pass_err);
         let dir = (delta + Vec2::new(-delta.y, delta.x).normalize_or_zero().scale(lateral_err))
             .normalize_or_zero();
 
         // Compute Speed, Vertical Loft & 3D Spin (`spin_side`, `spin_top`) from Pass Type × Charge Force!
-        let mut pass_spin_side = Fp::ZERO;
+        let mut pass_spin_side = lane_avoid_spin;
         let (horiz_speed, vz, pass_spin_top) = if in_attacking_wing {
             // Whipped / Floated Wing Cross with in-swinging Magnus curve!
             let spd = if is_driven {
@@ -1938,7 +3336,7 @@ impl MatchSimulation {
             };
             (spd, lift, Fp::from_milli(-1_250))
         } else if is_lob {
-            // Open-Field Chipped Pass / Flighted Switch: tap = dainty 3.4 m/s dink; full bar = booming 8.4 m/s switch!
+            // Open-Field Chipped Pass / Flighted Switch
             let spd = (Fp::from_milli(8_200)
                 + dist.mul(Fp::from_milli(370))
                 + charge_norm.mul(Fp::from_milli(6_800)))
@@ -1951,47 +3349,31 @@ impl MatchSimulation {
             let check_backspin = Fp::from_milli(-1_750) - charge_norm.mul(Fp::from_milli(850));
             (spd, lift, check_backspin)
         } else if is_through {
-            // Space-Splitting Through-Ball: weighted pace + checking underspin + automatic defender-lane curve!
+            // Space-Splitting Through-Ball: weighted pace + checking underspin + defender-lane curve!
+            let blocker_zip = if bypassing_blocker { Fp::from_milli(2_400) } else { Fp::ZERO };
             let spd = (Fp::from_milli(8_600)
+                + blocker_zip
                 + dist.mul(Fp::from_milli(440))
                 + charge_norm.mul(Fp::from_milli(6_400)))
             .clamp(Fp::from_milli(9_000), Fp::from_milli(22_600));
-            let perp = Vec2::new(-dir.y, dir.x);
-            for opp in self.state.players[opp_s_idx].iter().skip(1) {
-                if opp.sent_off {
-                    continue;
-                }
-                let rel = opp.pos - kicker_pos;
-                let along = rel.dot(dir);
-                if along > Fp::from_milli(1_200) && along < dist - Fp::from_milli(800) {
-                    let lat = rel.dot(perp);
-                    if lat.abs() < Fp::from_milli(1_850) {
-                        let bend_mag = if is_driven { 4_600 } else { 3_100 };
-                        pass_spin_side = if lat >= Fp::ZERO {
-                            Fp::from_milli(-bend_mag)
-                        } else {
-                            Fp::from_milli(bend_mag)
-                        };
-                        break;
-                    }
-                }
-            }
             (spd, Fp::ZERO, Fp::from_milli(-1_150))
         } else if is_driven {
-            // Driven Laser Ground Pass (`BTN_JOCKEY + BTN_PASS`): zips flat at 20-25 m/s through tight lines!
+            // Driven Laser Ground Pass (`BTN_JOCKEY + BTN_PASS`): zips flat at 18.2-24.5 m/s through tight lines!
             let spd = (Fp::from_milli(17_800)
-                + dist.mul(Fp::from_milli(260))
-                + charge_norm.mul(Fp::from_milli(4_800)))
-            .clamp(Fp::from_milli(18_200), Fp::from_milli(25_200));
-            (spd, Fp::ZERO, Fp::from_milli(450))
+                + dist.mul(Fp::from_milli(250))
+                + charge_norm.mul(Fp::from_milli(4_600)))
+            .clamp(Fp::from_milli(18_200), Fp::from_milli(24_500));
+            (spd, Fp::ZERO, Fp::from_milli(350))
         } else {
-            // Standard Pro Ground Pass: cushioned ~8.5 m/s short tap -> crisp ~22.5 m/s long ground pass!
+            // Standard Assisted Ground Pass: cushioned ~8.2 m/s short tap -> crisp ~21.8 m/s long ground pass!
+            let blocker_zip = if bypassing_blocker { Fp::from_milli(3_200) } else { Fp::ZERO };
             let spd = (Fp::from_milli(6_900)
-                + dist.mul(Fp::from_milli(460))
-                + charge_norm.mul(Fp::from_milli(6_200)))
-            .clamp(Fp::from_milli(7_600), Fp::from_milli(22_600));
+                + blocker_zip
+                + dist.mul(Fp::from_milli(450))
+                + charge_norm.mul(Fp::from_milli(6_000)))
+            .clamp(Fp::from_milli(7_600), Fp::from_milli(22_400));
             let skim_vz = if dist > Fp::from_milli(12_000) && charge_norm > Fp::from_milli(620) {
-                Fp::from_milli(240)
+                Fp::from_milli(220)
             } else {
                 Fp::ZERO
             };
@@ -2084,7 +3466,7 @@ impl MatchSimulation {
 
         let def_count = self.state.players[d_s_idx].len();
 
-        // Layer 1: Passive Jockey / Step-In Foot Interception when a defender positions cleanly on the exposed ball
+        // Layer 1: Assisted Jockey / Step-In Foot Interception when a defender positions cleanly on the exposed ball
         // between the carrier and the ball (gated by shin/knee vertical reach `<= 520mm + def_p.z`!).
         let def_jockey_held = (self.state.prev_buttons[d_s_idx] & BTN_JOCKEY) != 0;
         for d_idx in 0..def_count {
@@ -2096,7 +3478,7 @@ impl MatchSimulation {
                 continue;
             }
             let dist_ball = def_p.pos.dist(ball_xy);
-            let intercept_r = Fp::from_milli(if def_jockey_held { 475 } else { 415 });
+            let intercept_r = Fp::from_milli(if def_jockey_held { 505 } else { 435 });
             if dist_ball > intercept_r {
                 continue;
             }
@@ -2124,7 +3506,6 @@ impl MatchSimulation {
             let carry_step = def_pos_ahead(def_p.pos, def_fwd, 340);
 
             self.state.player_stats[d_s_idx][d_idx].tackles_won += 1;
-            // Carrier stays on his feet with a realistic brief off-stride check (zero cartoon face-plant!)
             self.state.players[c_s_idx][carrier_idx].action =
                 PlayerActionState::Cooldown { ticks_left: 8 };
             self.state.ball.owner = Some((def_side, d_idx));
@@ -2140,6 +3521,7 @@ impl MatchSimulation {
             if d_idx != 0 {
                 self.state.controlled_idx[d_s_idx] = d_idx;
             }
+            self.state.manual_switch_lock = [0, 0];
             self.set_last_touch(def_side, d_idx);
             self.state.ball.pass_in_flight = None;
             self.state.ball.assist_candidate = None;
@@ -2153,7 +3535,7 @@ impl MatchSimulation {
             return;
         }
 
-        // Layer 2 & 3: Active Directional Standing Boot-Capsule Tackle & Sweeping Segment Slide Tackle
+        // Layer 2 & 3: Assisted Standing Boot-Capsule Tackle & Sweeping Segment Slide Tackle
         for d_idx in 0..def_count {
             let def_action = self.state.players[d_s_idx][d_idx].action;
             let def_pos = self.state.players[d_s_idx][d_idx].pos;
@@ -2163,13 +3545,13 @@ impl MatchSimulation {
             let def_fwd = Vec2::from_bam(def_facing, Fp::ONE);
 
             let (is_slide, contact_dist_ball, hit_man_before_ball, clipped_man) = match def_action {
-                PlayerActionState::Tackling { ticks_left } if ticks_left >= 5 => {
-                    // Directional Standing Tackle: extended tackling boot `540mm` ahead along `def_fwd`
-                    // within a strict forward `±68°` cone & hip/thigh vertical boot reach (`<= 680mm + def_z`)
+                PlayerActionState::Tackling { ticks_left } if ticks_left >= 4 => {
+                    // Assisted Standing Tackle: extended tackling boot `540mm` ahead along `def_fwd`
+                    // within a `±76°` forward cone & hip/thigh vertical boot reach (`<= 680mm + def_z`)
                     let to_ball_vec = ball_xy - def_pos;
                     let raw_dist_ball = to_ball_vec.len();
                     let dist_carrier = def_pos.dist(carrier_pos);
-                    if raw_dist_ball > Fp::from_milli(1_120) && dist_carrier > Fp::from_milli(640) {
+                    if raw_dist_ball > Fp::from_milli(1_220) && dist_carrier > Fp::from_milli(640) {
                         continue;
                     }
                     let ball_in_vert_reach = ball_z <= def_z + Fp::from_milli(680);
@@ -2179,7 +3561,7 @@ impl MatchSimulation {
                         } else {
                             Fp::ONE
                         };
-                        if cone_align >= Fp::from_milli(350) {
+                        if cone_align >= Fp::from_milli(240) {
                             let boot_pos = def_pos + def_fwd.scale(Fp::from_milli(540));
                             boot_pos.dist(ball_xy).min(raw_dist_ball)
                         } else {
@@ -2188,28 +3570,28 @@ impl MatchSimulation {
                     } else {
                         Fp::from_int(99)
                     };
-                    if boot_to_ball > Fp::from_milli(550) && dist_carrier > Fp::from_milli(620) {
+                    if boot_to_ball > Fp::from_milli(600) && dist_carrier > Fp::from_milli(620) {
                         continue;
                     }
                     let def_to_c = (carrier_pos - def_pos).normalize_or_zero();
                     let def_to_b = to_ball_vec.normalize_or_zero();
-                    let body_blocking = if !ball_in_vert_reach || boot_to_ball > Fp::from_milli(550) {
+                    let body_blocking = if !ball_in_vert_reach || boot_to_ball > Fp::from_milli(600) {
                         dist_carrier <= Fp::from_milli(620)
                             && def_fwd.dot(def_to_c) >= Fp::from_milli(350)
                     } else {
                         dist_carrier + Fp::from_milli(130) < raw_dist_ball
                             && def_to_c.dot(def_to_b) > Fp::from_milli(680)
                     };
-                    if boot_to_ball > Fp::from_milli(550) && !body_blocking {
+                    if boot_to_ball > Fp::from_milli(600) && !body_blocking {
                         continue;
                     }
                     (false, boot_to_ball, body_blocking, dist_carrier <= Fp::from_milli(720))
                 }
-                PlayerActionState::Sliding { ticks_left, dir } if ticks_left >= 6 => {
-                    // Sweeping Slide Segment from `-120mm` (hip) to `+1060mm` (lead studs) along `dir`
+                PlayerActionState::Sliding { ticks_left, dir } if ticks_left >= 5 => {
+                    // Sweeping Slide Segment from `-120mm` (hip) to `+1120mm` (lead studs) along `dir`
                     // gated by low turf-slide stud height (`ball_z <= 420mm`)!
                     let seg_a = def_pos - dir.scale(Fp::from_milli(120));
-                    let seg_b = def_pos + dir.scale(Fp::from_milli(1_060));
+                    let seg_b = def_pos + dir.scale(Fp::from_milli(1_120));
                     let (d_ball_xy, t_ball) = point_to_segment_dist_and_t(ball_xy, seg_a, seg_b);
                     let d_ball = if ball_z <= Fp::from_milli(420) {
                         d_ball_xy
@@ -2217,11 +3599,11 @@ impl MatchSimulation {
                         Fp::from_int(99)
                     };
                     let (d_man, t_man) = point_to_segment_dist_and_t(carrier_pos, seg_a, seg_b);
-                    if d_ball > Fp::from_milli(500) && d_man > Fp::from_milli(520) {
+                    if d_ball > Fp::from_milli(540) && d_man > Fp::from_milli(520) {
                         continue;
                     }
                     let man_first = d_man <= Fp::from_milli(520)
-                        && (d_ball > Fp::from_milli(480) || t_man + Fp::from_milli(160) < t_ball);
+                        && (d_ball > Fp::from_milli(510) || t_man + Fp::from_milli(160) < t_ball);
                     (true, d_ball, man_first, d_man <= Fp::from_milli(560))
                 }
                 _ => continue,
@@ -2277,26 +3659,32 @@ impl MatchSimulation {
                 continue;
             }
 
-            // If slide only clipped the man without foul and missed the ball (`contact_dist_ball > 500mm`), no magical steal!
-            if contact_dist_ball > Fp::from_milli(550) {
+            if contact_dist_ball > Fp::from_milli(600) {
                 continue;
             }
 
             // Clean Physical Dispossession!
             self.state.player_stats[d_s_idx][d_idx].tackles_won += 1;
             self.state.players[d_s_idx][d_idx].action = PlayerActionState::Cooldown {
-                ticks_left: if is_slide { 12 } else { 6 },
+                ticks_left: if is_slide { 11 } else { 6 },
             };
+            self.state.manual_switch_lock = [0, 0];
 
-            // Decide between Clean Controlled Hook vs Outstretched 50/50 Toe-Poke / Sweep!
-            let clean_hook = !is_slide
-                && contact_dist_ball <= Fp::from_milli(390)
+            // Assisted Clean Hook: cleanly hooks possession against non-sprinting carriers (`< 5.8 m/s`)
+            // across the full `<= 595mm` boot reach while preserving outstretched sprint toe-pokes (`>= 5.8 m/s`, `> 445mm`)!
+            let clean_hook = (!is_slide
                 && !hit_man_before_ball
-                && (carrier_speed < Fp::from_milli(6_100) || (tackle_skill as i64) >= carrier_drib - 4);
+                && ((contact_dist_ball <= Fp::from_milli(445)
+                    && (carrier_speed < Fp::from_milli(6_200)
+                        || (tackle_skill as i64) >= carrier_drib + 6))
+                    || (contact_dist_ball <= Fp::from_milli(595)
+                        && carrier_speed < Fp::from_milli(4_800))))
+                || (is_slide
+                    && contact_dist_ball <= Fp::from_milli(340)
+                    && !hit_man_before_ball
+                    && def_vel.len() < Fp::from_milli(5_600));
 
             if clean_hook {
-                // Controlled standing hook: ball cushions smoothly ahead of tackler's stride (NO teleport to 0,0!)
-                // and carrier stays on his feet with a brief off-stride check (`Cooldown`), only stumbling on high-speed crash!
                 let heavy_crash = clipped_man
                     && (def_vel - carrier_vel).len() > Fp::from_milli(6_800);
                 self.state.players[c_s_idx][carrier_idx].action = if heavy_crash {
@@ -2337,9 +3725,9 @@ impl MatchSimulation {
                 let poke_dir = (def_fwd.scale(Fp::from_milli(580)) + push_out.scale(Fp::from_milli(420)))
                     .normalize_or_zero();
                 let poke_spd = if is_slide {
-                    Fp::from_milli(6_400) + def_vel.len().mul(Fp::from_milli(320))
+                    Fp::from_milli(5_900) + def_vel.len().mul(Fp::from_milli(300))
                 } else {
-                    Fp::from_milli(5_100) + def_vel.len().mul(Fp::from_milli(280))
+                    Fp::from_milli(4_900) + def_vel.len().mul(Fp::from_milli(280))
                 };
                 let nudged = ball_xy + poke_dir.scale(Fp::from_milli(280));
                 self.state.ball.owner = None;
@@ -2349,7 +3737,7 @@ impl MatchSimulation {
                 self.state.ball.vel = Vec3::new(
                     poke_dir.x.mul(poke_spd),
                     poke_dir.y.mul(poke_spd),
-                    Fp::from_milli(if is_slide { 420 } else { 180 }),
+                    Fp::from_milli(if is_slide { 380 } else { 180 }),
                 );
                 self.state.ball.spin_top = Fp::from_milli(-420);
             }
@@ -2525,11 +3913,10 @@ impl MatchSimulation {
                 self.state.ball.vel = Vec3::new(p.vel.x, p.vel.y, Fp::ZERO);
                 self.state.ball.gk_hold_ticks -= 1;
                 if self.state.ball.gk_hold_ticks == 0 {
-                    // Auto-distribute upfield if human hasn't released yet
-                    let attack_sign = side.attack_sign(self.state.second_half_swapped());
-                    let aim = Vec2::new(Fp::from_int(attack_sign as i32), Fp::from_milli(200))
-                        .normalize_or_zero();
-                    self.execute_kick(side, 0, BTN_PASS, 15, false, aim);
+                    // Auto-distribute safely to an unmarked teammate (or lofted clearance if pressed!)
+                    let (gk_btn, gk_charge, gk_aim) =
+                        choose_safe_gk_distribution(&self.state, side);
+                    self.execute_kick(side, 0, gk_btn, gk_charge, false, gk_aim);
                 }
                 return;
             }
@@ -2835,12 +4222,14 @@ impl MatchSimulation {
             return;
         }
 
+        let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
         let ball_xy = self.state.ball.pos.xy();
+        let prev_ball_xy = ball_xy - self.state.ball.vel.xy().scale(dt);
         let ball_z = self.state.ball.pos.z;
         let ball_speed = self.state.ball.vel.xy().len();
         let half_len = self.state.format.half_length();
 
-        // Collect eligible candidates sorted deterministically by distance to ball
+        // Collect eligible candidates sorted deterministically by distance to ball (including swept GK glove segment!)
         let mut candidates: Vec<(i64, TeamSide, usize)> = Vec::new();
         for side in [TeamSide::Home, TeamSide::Away] {
             for (idx, p) in self.state.players[side.index()].iter().enumerate() {
@@ -2859,25 +4248,51 @@ impl MatchSimulation {
                     .pass_in_flight
                     .as_ref()
                     .is_some_and(|pf| pf.team == side && pf.intended_receiver_idx == idx);
+                let is_team_pass = self
+                    .state
+                    .ball
+                    .pass_in_flight
+                    .as_ref()
+                    .is_some_and(|pf| pf.team == side);
 
-                let (horiz_r, max_z) = if idx == 0 && in_own_box {
+                let (horiz_r, max_z, dist) = if idx == 0 && in_own_box {
                     let gk_bonus = (p.attributes.goalkeeping as i64) * 5;
-                    let dive_bonus = if matches!(p.action, PlayerActionState::Diving { .. }) {
-                        420
-                    } else {
-                        0
+                    let (dive_bonus, swept_d) = match p.action {
+                        PlayerActionState::Diving { dir, .. } => {
+                            let (d_body, _) =
+                                point_to_segment_dist_and_t(p.pos, prev_ball_xy, ball_xy);
+                            let glove_pt = p.pos + dir.scale(Fp::from_milli(720));
+                            let (d_glove, _) =
+                                point_to_segment_dist_and_t(glove_pt, prev_ball_xy, ball_xy);
+                            (520, d_body.min(d_glove))
+                        }
+                        _ => {
+                            let (d_seg, _) =
+                                point_to_segment_dist_and_t(p.pos, prev_ball_xy, ball_xy);
+                            (0, d_seg)
+                        }
                     };
                     (
-                        Fp::from_milli(820 + gk_bonus + dive_bonus),
-                        Fp::from_milli(2_250) + p.z,
+                        Fp::from_milli(880 + gk_bonus + dive_bonus),
+                        Fp::from_milli(2_320) + p.z,
+                        p.pos.dist(ball_xy).min(swept_d),
                     )
                 } else {
-                    // Regulation 110mm ball + anatomical leg/chest reach (~520mm, +65mm anticipation for intended receiver)
-                    let reach_mm = if is_intended_recv { 585 } else { 520 };
-                    (Fp::from_milli(reach_mm), Fp::from_milli(1_480) + p.z)
+                    // Generous assisted trap reach for intended teammate pass receivers (`680mm`)!
+                    let reach_mm = if is_intended_recv {
+                        680
+                    } else if is_team_pass {
+                        615
+                    } else {
+                        530
+                    };
+                    (
+                        Fp::from_milli(reach_mm),
+                        Fp::from_milli(1_480) + p.z,
+                        p.pos.dist(ball_xy),
+                    )
                 };
 
-                let dist = p.pos.dist(ball_xy);
                 if dist <= horiz_r && ball_z <= max_z {
                     candidates.push((dist.to_milli(), side, idx));
                 }
@@ -2926,8 +4341,9 @@ impl MatchSimulation {
             } else {
                 self.state.ball.vel.x
             };
-            let was_shot_threat = vel_toward_own_goal > Fp::from_milli(6_500);
-            let catch_limit = Fp::from_milli(14_500 + gk_attr * 60);
+            let was_shot_threat = vel_toward_own_goal > Fp::from_milli(5_400);
+            let catch_limit = Fp::from_milli(15_200 + gk_attr * 62);
+            self.state.manual_switch_lock = [0, 0];
 
             let gk_vz = self.state.players[s_idx][0].vz;
             // Crowded-box high aerial cross (`IMG_0365`): if an opposing attacker is contesting right on the GK,
@@ -2981,7 +4397,7 @@ impl MatchSimulation {
                 }
                 return;
             } else {
-                // Blistering shot -> Fingertip tip OVER the crossbar on high risers (`IMG_0356`) or parry wide (`IMG_0358`, `IMG_0364`)!
+                // Blistering shot -> Fingertip tip OVER the crossbar on high risers (`IMG_0356`) or smart parry wide away from strikers!
                 let goal_h = self.state.format.goal_height();
                 let goal_hw = self.state.format.goal_half_width();
                 let dist_from_line = (ball_xy.x - own_goal_x).abs();
@@ -2999,10 +4415,30 @@ impl MatchSimulation {
                     self.state.ball.spin_top = Fp::from_milli(-900);
                     format!("{player_name} tips it over the bar!")
                 } else {
-                    let parry_y_sign = if self.state.ball.pos.y >= Fp::ZERO {
-                        Fp::ONE
+                    // Choose safer flank away from poaching opposing forwards when shot is central!
+                    let parry_y_sign = if self.state.ball.pos.y.abs() >= Fp::from_milli(650) {
+                        if self.state.ball.pos.y >= Fp::ZERO {
+                            Fp::ONE
+                        } else {
+                            Fp::NEG_ONE
+                        }
                     } else {
-                        Fp::NEG_ONE
+                        let mut pos_y_clear = Fp::from_milli(15_000);
+                        let mut neg_y_clear = Fp::from_milli(15_000);
+                        let test_x = own_goal_x + Fp::from_milli(attack_sign * 4_500);
+                        for opp in self.state.players[side.opponent().index()].iter().skip(1) {
+                            if !opp.sent_off {
+                                pos_y_clear = pos_y_clear
+                                    .min(opp.pos.dist(Vec2::new(test_x, Fp::from_milli(5_500))));
+                                neg_y_clear = neg_y_clear
+                                    .min(opp.pos.dist(Vec2::new(test_x, Fp::from_milli(-5_500))));
+                            }
+                        }
+                        if pos_y_clear >= neg_y_clear {
+                            Fp::ONE
+                        } else {
+                            Fp::NEG_ONE
+                        }
                     };
                     let tip_behind_for_corner = was_shot_threat
                         && self.state.ball.pos.y.abs() > goal_hw - Fp::from_milli(680)
@@ -3014,8 +4450,8 @@ impl MatchSimulation {
                         )
                     } else {
                         (
-                            Fp::from_int(attack_sign as i32).mul(Fp::from_milli(5_400)),
-                            parry_y_sign.mul(Fp::from_milli(10_500)),
+                            Fp::from_int(attack_sign as i32).mul(Fp::from_milli(6_200)),
+                            parry_y_sign.mul(Fp::from_milli(11_800)),
                         )
                     };
                     self.state.ball.vel = Vec3::new(rebound_x, rebound_y, Fp::from_milli(1_800));
@@ -3070,6 +4506,7 @@ impl MatchSimulation {
             self.state.ball.pos.y = pushed_xy.y;
             self.state.ball.vel = Vec3::new(defl_xy.x, defl_xy.y, defl_vz);
             self.state.ball.spin_top = Fp::from_milli(-450);
+            self.state.manual_switch_lock = [0, 0];
             self.set_last_touch(side, idx);
             self.state.ball.pass_in_flight = None;
             self.state.ball.assist_candidate = None;
@@ -3078,6 +4515,7 @@ impl MatchSimulation {
         }
 
         // 4. Clean trap & possession (with substitution-safe pass & assist attribution)!
+        let mut was_intentional_team_pass = false;
         if let Some(pass) = self.state.ball.pass_in_flight.take() {
             let same_athlete = if !pass.passer_id.is_empty() {
                 pass.passer_id == player_id
@@ -3085,6 +4523,7 @@ impl MatchSimulation {
                 pass.passer_idx == idx
             };
             if pass.team == side && !same_athlete {
+                was_intentional_team_pass = true;
                 if !pass.passer_id.is_empty() {
                     if let Some(st) = self.state.player_stats_mut_by_id(side, &pass.passer_id) {
                         st.passes_completed += 1;
@@ -3127,17 +4566,22 @@ impl MatchSimulation {
             let dist_opp_goal = (self.state.players[s_idx][idx].pos.x - opp_goal_x).abs();
             if dist_opp_goal <= Fp::from_milli(if self.state.format.players_per_side <= 6 { 11_500 } else { 15_500 }) {
                 // Attacking downward bullet header toward goal mouth!
-                let corner_y = if self.state.players[s_idx][idx].pos.y >= Fp::ZERO {
+                let opp_gk_y = self.state.players[side.opponent().index()][0].pos.y;
+                let corner_y = if opp_gk_y.abs() > Fp::from_milli(250) {
+                    -Fp::from_int(opp_gk_y.signum_int())
+                        .mul(self.state.format.goal_half_width().mul(Fp::from_milli(580)))
+                } else if self.state.players[s_idx][idx].pos.y >= Fp::ZERO {
                     -self.state.format.goal_half_width().mul(Fp::from_milli(520))
                 } else {
                     self.state.format.goal_half_width().mul(Fp::from_milli(520))
                 };
                 let hdr_dir = (Vec2::new(opp_goal_x, corner_y) - self.state.players[s_idx][idx].pos)
                     .normalize_or_zero();
-                let hdr_spd = Fp::from_milli(14_200 + (self.state.players[s_idx][idx].attributes.shooting as i64) * 45);
+                let hdr_spd = Fp::from_milli(14_500 + (self.state.players[s_idx][idx].attributes.shooting as i64) * 48);
                 self.state.ball.owner = None;
                 self.state.ball.vel = Vec3::new(hdr_dir.x.mul(hdr_spd), hdr_dir.y.mul(hdr_spd), Fp::from_milli(-1_150));
                 self.state.ball.spin_top = Fp::from_milli(1_400);
+                self.state.manual_switch_lock = [0, 0];
                 self.set_last_touch(side, idx);
                 self.state.players[s_idx][idx].facing_bam = hdr_dir.to_bam();
                 self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
@@ -3169,6 +4613,7 @@ impl MatchSimulation {
                     Fp::from_milli(3_150),
                 );
                 self.state.ball.spin_top = Fp::from_milli(-700);
+                self.state.manual_switch_lock = [0, 0];
                 self.set_last_touch(side, idx);
                 self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
                 return;
@@ -3180,14 +4625,20 @@ impl MatchSimulation {
         let rel_vel = incoming_xy - recv_vel;
         let rel_speed = rel_vel.len();
 
-        // Visco-Elastic First-Touch Cushioning: bullet passes received on the back-turn or at full sprint
-        // pop slightly ahead into stride (`heavy touch`) instead of magnetically gluing in 0 ms!
+        // Visco-Elastic First-Touch Cushioning: intentional teammate passes (`was_intentional_team_pass`)
+        // get generous FIFA assisted boot cushioning (`+7.2 m/s`), while blind loose bullets hitting a player's back pop ahead!
         let heading = Vec2::from_bam(self.state.players[s_idx][idx].facing_bam, Fp::ONE);
         let pre_ball_xy = ball_xy - incoming_xy.scale(Fp::from_ratio(1, TICKS_PER_SECOND as i64));
         let to_ball_dir = (pre_ball_xy - self.state.players[s_idx][idx].pos).normalize_or_zero();
         let face_align = heading.dot(to_ball_dir); // +1 facing ball, -1 ball hitting back
+        let team_pass_bonus = if was_intentional_team_pass {
+            Fp::from_milli(7_200)
+        } else {
+            Fp::ZERO
+        };
         let soft_trap_limit = Fp::from_milli(10_800 + drib_attr * 52)
-            + face_align.mul(Fp::from_milli(2_200));
+            + face_align.mul(Fp::from_milli(2_200))
+            + team_pass_bonus;
         if idx != 0
             && self.state.input_buffer[s_idx].is_none()
             && rel_speed > soft_trap_limit
@@ -3241,6 +4692,7 @@ impl MatchSimulation {
         self.state.ball.dribble_touch_cd = 6;
         self.state.ball.pos.z = trapped_z;
         self.state.ball.vel = Vec3::new(cushioned_xy.x, cushioned_xy.y, trapped_vz);
+        self.state.manual_switch_lock = [0, 0];
         self.set_last_touch(side, idx);
 
         if idx != 0 {
@@ -5127,6 +6579,570 @@ mod tests {
         assert!(
             gk_leapt && punched_upfield,
             "GK must leap ({gk_leapt}) and punch a crowded fast aerial cross clear upfield ({punched_upfield})"
+        );
+    }
+
+    #[test]
+    fn assisted_auto_switching_follows_ball_and_respects_manual_override_and_modes() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2026_21);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).expect("valid 5v5 snapshot");
+        sim.state.phase = MatchPhase::OpenPlay;
+
+        // Place Away defenders: #1 far left (-12, -10), #2 right in front of Home ball carrier (-7.5, +6)
+        sim.state.controlled_idx = [4, 1];
+        sim.state.switch_cooldown = [0, 0];
+        sim.state.manual_switch_lock = [0, 0];
+        sim.state.players[1][1].pos = Vec2::from_milli(-12_000, -10_500);
+        sim.state.players[1][2].pos = Vec2::from_milli(-7_500, 6_000);
+        sim.state.players[1][3].pos = Vec2::from_milli(2_000, -8_000);
+        sim.state.players[1][4].pos = Vec2::from_milli(5_000, 8_000);
+
+        // Home #4 carries the ball at (-5.0, +6.0) right toward Away #2!
+        sim.state.players[0][4].pos = Vec2::from_milli(-5_000, 6_000);
+        sim.state.ball.owner = Some((TeamSide::Home, 4));
+        sim.state.ball.pos = Vec3::from_milli(-5_200, 6_000, 0);
+
+        // 1. In `Manual` mode, Away controlled player (#1) does NOT auto-switch even though #2 is right on the ball!
+        let mut away_manual = InputFrame::IDLE;
+        away_manual.reserved = InputFrame::encode_auto_switch_mode(crate::input::AutoSwitchMode::Manual);
+        sim.tick(&[InputFrame::IDLE, away_manual]);
+        assert_eq!(
+            sim.state().controlled_idx[1],
+            1,
+            "Manual auto-switch mode must not switch Away player without BTN_SWITCH"
+        );
+
+        // 2. In `AirAndLoose` mode, Away controlled player (#1) holds selection while opponent dribbles on ground,
+        //    then auto-switches immediately when an aerial cross is launched toward #2!
+        let mut away_air = InputFrame::IDLE;
+        away_air.reserved = InputFrame::encode_auto_switch_mode(crate::input::AutoSwitchMode::AirAndLoose);
+        sim.tick(&[InputFrame::IDLE, away_air]);
+        assert_eq!(
+            sim.state().controlled_idx[1],
+            1,
+            "AirAndLoose mode must not auto-switch while opponent carries ball on ground"
+        );
+
+        // Launch an aerial ball toward Away #2: `AirAndLoose` switches immediately!
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(-6_200, 6_000, 1_450);
+        sim.state.ball.vel = Vec3::from_milli(-3_000, 0, 1_200);
+        sim.tick(&[InputFrame::IDLE, away_air]);
+        assert_eq!(
+            sim.state().controlled_idx[1],
+            2,
+            "AirAndLoose mode must auto-switch to nearest defender on an aerial ball"
+        );
+
+        // 3. Default `AssistedBall` mode tracks the ball carrier automatically on defense!
+        sim.state.controlled_idx[1] = 1;
+        sim.state.switch_cooldown[1] = 0;
+        sim.state.manual_switch_lock[1] = 0;
+        sim.state.ball.owner = Some((TeamSide::Home, 4));
+        sim.state.ball.pos = Vec3::from_milli(-5_200, 6_000, 0);
+        sim.state.ball.vel = Vec3::ZERO;
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]); // default reserved=0 => AssistedBall
+        assert_eq!(
+            sim.state().controlled_idx[1],
+            2,
+            "AssistedBall mode must automatically switch active defender to follow the ball"
+        );
+
+        // 4. Manual `BTN_SWITCH` overrides to next best defender (`best_switch_target`) and holds `manual_switch_lock`!
+        let expected_next = sim
+            .best_switch_target(TeamSide::Away)
+            .expect("must expose next switch candidate");
+        assert_ne!(expected_next, 2);
+        sim.tick(&[
+            InputFrame::IDLE,
+            InputFrame {
+                buttons: BTN_SWITCH,
+                ..InputFrame::IDLE
+            },
+        ]);
+        assert_eq!(
+            sim.state().controlled_idx[1],
+            expected_next,
+            "BTN_SWITCH must switch to best_switch_target"
+        );
+        assert!(
+            sim.state().manual_switch_lock[1] >= 70,
+            "manual BTN_SWITCH must engage ~1.25s manual_switch_lock grace window"
+        );
+
+        // During the grace window, AssistedBall respects the human's manual choice (no instant snap-back!)
+        for _ in 0..30 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        }
+        assert_eq!(
+            sim.state().controlled_idx[1],
+            expected_next,
+            "AssistedBall must respect manual_switch_lock during grace window"
+        );
+
+        // Once the 75-tick manual grace lock expires and ball is still at (-5.2, +6.0) by #2, AssistedBall resumes!
+        for _ in 0..55 {
+            sim.state.players[0][4].pos = Vec2::from_milli(-5_000, 6_000);
+            sim.state.players[1][2].pos = Vec2::from_milli(-7_200, 6_000);
+            sim.state.ball.owner = Some((TeamSide::Home, 4));
+            sim.state.ball.pos = Vec3::from_milli(-5_200, 6_000, 0);
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        }
+        assert_eq!(
+            sim.state().controlled_idx[1],
+            2,
+            "AssistedBall must resume tracking the ball after manual_switch_lock expires"
+        );
+    }
+
+    #[test]
+    fn overhauled_throw_in_overhead_staging_infield_clamp_and_law11_no_offside() {
+        let mut snap = FixtureSnapshot::sample_eleven_a_side(2026_22);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).expect("valid 11v11 snapshot");
+
+        let half_wid = sim.state().format.half_width();
+        let spot = Vec2::new(Fp::from_milli(12_000), half_wid);
+        sim.setup_set_piece(RestartKind::ThrowIn, TeamSide::Home, spot);
+
+        let MatchPhase::SetPiece {
+            kind: RestartKind::ThrowIn,
+            team: TeamSide::Home,
+            ..
+        } = sim.state().phase
+        else {
+            panic!("expected ThrowIn SetPiece phase");
+        };
+        let taker_idx = sim.state().controlled_idx[0];
+        assert_eq!(
+            sim.state().ball.pos.z,
+            Fp::from_milli(1_820),
+            "throw-in taker must hold ball overhead at z = 1.82m"
+        );
+
+        // Verify at least 3 infield teammates checked within 18m of the throw-in spot!
+        let support_count = sim
+            .state()
+            .players[0]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(i, p)| *i != taker_idx && p.pos.dist(spot) <= Fp::from_milli(18_500))
+            .count();
+        assert!(
+            support_count >= 3,
+            "throw-in setup must stage at least 3 infield support options (got {support_count})"
+        );
+
+        // Hold `BTN_PASS` for 6 ticks while aiming dangerously along/toward the touchline (`move_x: 127, move_y: 50`),
+        // then release to execute the throw-in!
+        let hold_in = InputFrame {
+            move_x: 127,
+            move_y: 50,
+            aim_x: 127,
+            aim_y: 50,
+            buttons: BTN_PASS,
+            ..InputFrame::IDLE
+        };
+        for _ in 0..6 {
+            sim.tick(&[hold_in, InputFrame::IDLE]);
+        }
+        assert!(
+            matches!(
+                sim.state().players[0][taker_idx].action,
+                PlayerActionState::Charging { .. }
+            ),
+            "holding BTN_PASS during SetPiece must charge throw-in power"
+        );
+
+        // Release button to deliver!
+        sim.tick(&[
+            InputFrame {
+                move_x: 127,
+                move_y: 50,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert_eq!(
+            sim.state().phase,
+            MatchPhase::OpenPlay,
+            "releasing BTN_PASS must launch throw-in into OpenPlay"
+        );
+        let pif = sim
+            .state()
+            .ball
+            .pass_in_flight
+            .as_ref()
+            .expect("throw-in must create PassInFlight");
+        assert!(
+            !pif.receiver_was_offside,
+            "Law 11: a player cannot be offside directly from a throw-in"
+        );
+        assert!(
+            pif.target_pos.y <= half_wid - Fp::from_milli(1_850),
+            "throw-in target must clamp >= 1.85m inside the touchline (got {:?} vs {:?})",
+            pif.target_pos.y,
+            half_wid
+        );
+
+        // Step 65 ticks and verify the ball stays in bounds (no immediate opposite/same touchline turnover!) and reaches Home!
+        let mut home_received = false;
+        for _ in 0..65 {
+            let recv_idx = sim.state().controlled_idx[0];
+            let ball_xy = sim.state().ball.pos.xy();
+            let recv_pos = sim.state().players[0][recv_idx].pos;
+            let to_b = ball_xy - recv_pos;
+            let dir = to_b.normalize_or_zero();
+            let h_in = if to_b.len() > Fp::from_milli(250) {
+                InputFrame {
+                    move_x: (dir.x.to_milli() * 127 / 1_000).clamp(-127, 127) as i8,
+                    move_y: (dir.y.to_milli() * 127 / 1_000).clamp(-127, 127) as i8,
+                    ..InputFrame::IDLE
+                }
+            } else {
+                InputFrame::IDLE
+            };
+            sim.tick(&[h_in, InputFrame::IDLE]);
+            assert!(
+                !matches!(
+                    sim.state().phase,
+                    MatchPhase::SetPiece {
+                        kind: RestartKind::ThrowIn,
+                        ..
+                    }
+                ),
+                "clamped throw-in must never drift directly out of bounds for another throw-in"
+            );
+            if let Some((TeamSide::Home, idx)) = sim.state().ball.owner {
+                if idx != taker_idx {
+                    home_received = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            home_received,
+            "assisted overhead throw-in must be cleanly received by an infield Home teammate"
+        );
+    }
+
+    #[test]
+    fn overhauled_corner_kick_box_staging_short_option_and_whipped_aerial_header_delivery() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2026_23);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).expect("valid 5v5 snapshot");
+
+        let half_len = sim.state().format.half_length();
+        let half_wid = sim.state().format.half_width();
+        let corner_spot = Vec2::new(half_len - Fp::from_milli(250), half_wid - Fp::from_milli(250));
+
+        // 1. Verify box staging: attackers & defenders must stage in the attacking penalty area!
+        sim.setup_set_piece(RestartKind::CornerKick, TeamSide::Home, corner_spot);
+        let taker_idx = sim.state().controlled_idx[0];
+        let attackers_in_att_third = sim
+            .state()
+            .players[0]
+            .iter()
+            .enumerate()
+            .skip(1)
+            .filter(|(i, p)| *i != taker_idx && p.pos.x > half_len - Fp::from_milli(12_500))
+            .count();
+        let defenders_in_box = sim
+            .state()
+            .players[1]
+            .iter()
+            .skip(1)
+            .filter(|p| p.pos.x > half_len - Fp::from_milli(11_500))
+            .count();
+        assert!(
+            attackers_in_att_third >= 2 && defenders_in_box >= 3,
+            "corner kick must stage attackers ({attackers_in_att_third}) and defenders ({defenders_in_box}) inside the box"
+        );
+
+        // 2. Option A: Short Ground Corner (`BTN_PASS` hold + release) -> crisp ground ball to short support!
+        for _ in 0..5 {
+            sim.tick(&[
+                InputFrame {
+                    buttons: BTN_PASS,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert_eq!(sim.state().phase, MatchPhase::OpenPlay);
+        assert_eq!(
+            sim.state().ball.vel.z,
+            Fp::ZERO,
+            "BTN_PASS on corner must play a crisp ground short corner"
+        );
+        assert_ne!(
+            sim.state().controlled_idx[0],
+            taker_idx,
+            "short corner must switch control to the short-corner support receiver"
+        );
+
+        // 3. Option B: Whipped In-Swinging Aerial Corner (`BTN_LOB` hold + release) -> high header cross into box!
+        sim.setup_set_piece(RestartKind::CornerKick, TeamSide::Home, corner_spot);
+        let taker_idx2 = sim.state().controlled_idx[0];
+        for _ in 0..10 {
+            sim.tick(&[
+                InputFrame {
+                    buttons: BTN_LOB,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert_eq!(sim.state().phase, MatchPhase::OpenPlay);
+        let box_target_idx = sim.state().controlled_idx[0];
+        assert!(
+            box_target_idx != 0 && box_target_idx != taker_idx2,
+            "aerial corner must switch active control to the target header attacker in the box"
+        );
+        assert!(
+            sim.state().ball.spin_side.abs() >= Fp::from_milli(3_000),
+            "whipped aerial corner must impart strong in-swinging Magnus side-spin"
+        );
+
+        let mut peak_z = Fp::ZERO;
+        let mut entered_box = false;
+        for _ in 0..75 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            peak_z = peak_z.max(sim.state().ball.pos.z);
+            if sim.state().ball.pos.x > half_len - Fp::from_milli(9_500)
+                && sim.state().ball.pos.y.abs() < Fp::from_milli(6_500)
+            {
+                entered_box = true;
+            }
+        }
+        assert!(
+            peak_z > Fp::from_milli(1_650) && entered_box,
+            "whipped aerial corner must reach header height (peak_z={:?}) inside the penalty box ({entered_box})",
+            peak_z
+        );
+    }
+
+    #[test]
+    fn fifa_assisted_shooting_passing_tackling_and_upgraded_goalkeeper_work() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2026_24);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).expect("valid 5v5 snapshot");
+        sim.state.phase = MatchPhase::OpenPlay;
+
+        let half_len = sim.state().format.half_length().to_milli();
+        let goal_hw = sim.state().format.goal_half_width();
+
+        // Park extra players out of the way
+        for idx in 1..5 {
+            sim.state.players[0][idx].pos = Vec2::from_milli(-10_000, -12_000 + (idx as i64) * 2_000);
+            sim.state.players[0][idx].vel = Vec2::ZERO;
+            sim.state.players[1][idx].pos = Vec2::from_milli(-10_000, 12_000 - (idx as i64) * 2_000);
+            sim.state.players[1][idx].vel = Vec2::ZERO;
+        }
+
+        // 1. Assisted Diagonal 45° D-Pad Shot (`move_x: 90, move_y: -90` from 11m out):
+        //    Raw 45° ray would miss 11m wide, but FIFA goal-frame assist maps cleanly inside the post (`on_target`)!
+        sim.state.controlled_idx = [4, 1];
+        sim.state.players[0][4].pos = Vec2::from_milli(half_len - 11_000, 0);
+        sim.state.players[0][4].facing_bam = 0;
+        sim.state.players[0][4].action = PlayerActionState::Normal;
+        sim.state.players[1][0].pos = Vec2::from_milli(half_len - 600, 950); // GK shifted +Y
+        sim.state.ball.owner = Some((TeamSide::Home, 4));
+        sim.state.ball.pos = Vec3::from_milli(half_len - 10_650, 0, 0);
+        let shots_on_before = sim.state().player_stats[0][4].shots_on_target;
+
+        let diag_shoot = InputFrame {
+            move_x: 90,
+            move_y: -90,
+            aim_x: 90,
+            aim_y: -90,
+            buttons: BTN_SHOOT,
+            ..InputFrame::IDLE
+        };
+        for _ in 0..7 {
+            sim.tick(&[diag_shoot, InputFrame::IDLE]);
+        }
+        sim.tick(&[
+            InputFrame {
+                move_x: 90,
+                move_y: -90,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert_eq!(
+            sim.state().player_stats[0][4].shots_on_target,
+            shots_on_before + 1,
+            "45-degree diagonal D-pad shot must map inside goal_half_w ({:?}) as an on-target corner strike",
+            goal_hw
+        );
+        assert!(
+            sim.state().ball.vel.y < Fp::ZERO,
+            "aiming -Y must steer shot toward the -Y post"
+        );
+
+        // 2. Neutral Forward Aim (`move_x: 127, move_y: 0`) vs Off-Center GK (`y = +1.15m`):
+        //    Assisted finishing automatically biases away from the GK toward the open `-Y` side!
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.players[0][4].pos = Vec2::from_milli(half_len - 9_500, 0);
+        sim.state.players[0][4].vel = Vec2::ZERO;
+        sim.state.players[0][4].facing_bam = 0;
+        sim.state.players[0][4].action = PlayerActionState::Normal;
+        sim.state.players[1][0].pos = Vec2::from_milli(half_len - 600, 1_150);
+        sim.state.ball.owner = Some((TeamSide::Home, 4));
+        sim.state.ball.pos = Vec3::from_milli(half_len - 9_150, 0, 0);
+        for _ in 0..6 {
+            sim.tick(&[
+                InputFrame {
+                    move_x: 127,
+                    aim_x: 127,
+                    buttons: BTN_SHOOT,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        sim.tick(&[
+            InputFrame {
+                move_x: 127,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert!(
+            sim.state().ball.vel.y < Fp::from_milli(-300),
+            "neutral forward shot against +Y-shifted GK must bias into open -Y side (got vy={:?})",
+            sim.state().ball.vel.y
+        );
+
+        // 3. Blocker-Avoiding Assisted Pass + Curl + Cushioned Teammate First Touch:
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.controlled_idx = [1, 2];
+        sim.state.players[0][1].pos = Vec2::from_milli(-6_000, 0);
+        sim.state.players[0][1].vel = Vec2::ZERO;
+        sim.state.players[0][1].facing_bam = 0;
+        sim.state.players[0][1].action = PlayerActionState::Normal;
+        // Receiver #2 at (+4.0, +3.5), and an Away blocker #1 standing near the direct passing lane at (-1.0, +1.5)!
+        sim.state.players[0][2].pos = Vec2::from_milli(4_000, 3_500);
+        sim.state.players[0][2].vel = Vec2::ZERO;
+        sim.state.players[1][1].pos = Vec2::from_milli(-1_000, 1_500);
+        sim.state.players[1][1].vel = Vec2::ZERO;
+        sim.state.ball.owner = Some((TeamSide::Home, 1));
+        sim.state.ball.pos = Vec3::from_milli(-5_650, 0, 0);
+
+        for _ in 0..6 {
+            sim.tick(&[
+                InputFrame {
+                    move_x: 90,
+                    move_y: 90,
+                    aim_x: 90,
+                    aim_y: 90,
+                    buttons: BTN_PASS,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        sim.tick(&[
+            InputFrame {
+                move_x: 90,
+                move_y: 90,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert!(
+            sim.state().ball.spin_side.abs() > Fp::ZERO,
+            "assisted pass bending around a lane blocker must apply non-zero side-spin curl"
+        );
+        let mut completed_to_2 = false;
+        for _ in 0..55 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().ball.owner == Some((TeamSide::Home, 2)) {
+                completed_to_2 = true;
+                break;
+            }
+        }
+        assert!(
+            completed_to_2,
+            "blocker-avoiding assisted pass must curve around defender and cushion cleanly onto receiver #2"
+        );
+
+        // 4. Assisted Homing Standing Tackle within `1.65m` while holding lateral stick:
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.controlled_idx = [2, 1];
+        sim.state.players[0][2].pos = Vec2::from_milli(0, 0);
+        sim.state.players[0][2].vel = Vec2::ZERO;
+        sim.state.players[0][2].facing_bam = 0;
+        sim.state.players[0][2].action = PlayerActionState::Normal;
+        sim.state.ball.owner = Some((TeamSide::Home, 2));
+        sim.state.ball.pos = Vec3::from_milli(320, 0, 0);
+
+        // Away #1 is 1.25m away at `(1.57, -0.35)` holding lateral stick `(0, 90)` + `BTN_TACKLE`:
+        sim.state.players[1][1].pos = Vec2::from_milli(1_570, -350);
+        sim.state.players[1][1].vel = Vec2::ZERO;
+        sim.state.players[1][1].facing_bam = 32_768;
+        sim.state.players[1][1].action = PlayerActionState::Normal;
+        sim.state.prev_buttons = [0, 0];
+
+        sim.tick(&[
+            InputFrame::IDLE,
+            InputFrame {
+                move_x: -20,
+                move_y: 90,
+                buttons: BTN_TACKLE,
+                ..InputFrame::IDLE
+            },
+        ]);
+        for _ in 0..8 {
+            if sim.state().ball.owner == Some((TeamSide::Away, 1)) {
+                break;
+            }
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        }
+        assert_eq!(
+            sim.state().ball.owner,
+            Some((TeamSide::Away, 1)),
+            "assisted standing tackle must home onto nearby ball inside cone and win clean possession"
+        );
+
+        // 5. Swept High-Speed GK Save + Safe GK Distribution Avoiding Pressing Striker:
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.players[1][0].pos = Vec2::from_milli(half_len - 900, 0);
+        sim.state.players[1][0].vel = Vec2::ZERO;
+        sim.state.players[1][0].z = Fp::ZERO;
+        sim.state.players[1][0].action = PlayerActionState::Normal;
+        sim.set_last_touch(TeamSide::Home, 4);
+        sim.state.ball.owner = None;
+        // Place blistering `28 m/s` shot `220mm` in front of GK so in 1 tick (`466mm` step) it crosses GK plane!
+        sim.state.ball.pos = Vec3::from_milli(half_len - 1_120, 180, 650);
+        sim.state.ball.vel = Vec3::from_milli(28_000, 0, 100);
+        let saves_before = sim.state().player_stats[1][0].saves;
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert!(
+            sim.state().player_stats[1][0].saves > saves_before && sim.state().score[0] == 0,
+            "continuous swept segment-to-GK-glove check must save a 28 m/s shot without tunneling"
+        );
+
+        // Safe GK Distribution: put Away #1 blocked by Home striker #4, while Away #2 is wide open on the flank!
+        sim.state.players[1][0].pos = Vec2::from_milli(half_len - 1_200, 0);
+        sim.state.players[1][1].pos = Vec2::from_milli(half_len - 8_000, 0);
+        sim.state.players[0][4].pos = Vec2::from_milli(half_len - 5_500, 0); // Striker camping right in lane to #1!
+        sim.state.players[1][2].pos = Vec2::from_milli(half_len - 9_000, 9_500); // Wide open on +Y wing!
+        let (_btn, _chg, safe_dir) =
+            crate::ai::choose_safe_gk_distribution(sim.state(), TeamSide::Away);
+        assert!(
+            safe_dir.y > Fp::from_milli(450),
+            "safe GK distribution must steer toward wide-open flank teammate #2 (+Y) instead of blocked central lane (got {:?})",
+            safe_dir
         );
     }
 }

@@ -74,6 +74,12 @@ const DIFF_OPTIONS = [
   { code: 2, name: "Normal", label: "PROFESSIONAL" },
   { code: 3, name: "Hard", label: "WORLD CLASS" },
 ];
+const AUTO_SWITCH_STORAGE_KEY = "psfc_auto_switch_mode_v1";
+const AUTO_SWITCH_OPTIONS = [
+  { code: 0, short: "BALL", label: "ASSISTED (BALL)" },
+  { code: 1, short: "AIR", label: "AIR & LOOSE" },
+  { code: 2, short: "MANUAL", label: "MANUAL ONLY" },
+];
 
 // Normalized (x%, y%) coordinates on the vertical 2D tactical pitch board (bottom = own goal, top = opponent goal)
 const FORMATION_COORDS_5V5 = {
@@ -374,6 +380,13 @@ let pmSideIdx = 0; // 0 = P1 Home vs CPU, 1 = CPU vs P1 Away, 2 = 2P Couch, 3 = 
 let pmFmtIdx = 0; // 0 = 5v5, 1 = 11v11
 let pmDurIdx = 1; // 2 min default
 let pmDiffIdx = 1; // Professional (Normal)
+let autoSwitchIdx = (() => {
+  try {
+    const raw = parseInt(localStorage.getItem(AUTO_SWITCH_STORAGE_KEY) || "0", 10);
+    if (Number.isInteger(raw) && raw >= 0 && raw < AUTO_SWITCH_OPTIONS.length) return raw;
+  } catch (_e) {}
+  return 0; // Default: ASSISTED (BALL)
+})();
 let pendingOfficialFixture = null; // Set when entering Pre-Match from an Official Parallel Fixture!
 
 // Live match & deterministic substitution state
@@ -1470,6 +1483,7 @@ function stepFocusedPreMatchRow(dir) {
     ["pm-diff-prev", "pm-diff-next"],
     ["pm-cam-prev", "pm-cam-next"],
     ["pm-wx-prev", "pm-wx-next"],
+    ["pm-sw-prev", "pm-sw-next"],
   ];
   const pair = pairs[pmFocusedRowIdx];
   if (!pair) return;
@@ -2375,17 +2389,37 @@ function renderPreMatchScreen() {
   document.getElementById("pm-diff-val").textContent = DIFF_OPTIONS[pmDiffIdx].label;
   document.getElementById("pm-cam-val").textContent = CAMERA_LABELS[engine3d.cameraMode];
   syncWeatherLabels();
+  syncAutoSwitchLabels();
 
   engine3d.updatePreMatchShowcase(hRoster, aRoster);
 }
 
-// --- Match HUD, Weather, Live Substitutions, Radar, Pause & Instant Replay ---
+// --- Match HUD, Weather, Auto-Switch, Live Substitutions, Radar, Pause & Instant Replay ---
 
 function showGoalBroadcastBanner(title, sub, ticks = 150) {
   document.getElementById("goal-banner-title").textContent = title;
   document.getElementById("goal-banner-sub").textContent = sub;
   document.getElementById("goal-banner").hidden = false;
   goalBannerTicks = ticks;
+}
+
+function syncAutoSwitchLabels() {
+  const opt = AUTO_SWITCH_OPTIONS[autoSwitchIdx] || AUTO_SWITCH_OPTIONS[0];
+  const pmEl = document.getElementById("pm-sw-val");
+  if (pmEl) pmEl.textContent = opt.label;
+  const hudEl = document.getElementById("btn-hud-sw");
+  if (hudEl) hudEl.textContent = `SW: ${opt.short}`;
+  const pauseEl = document.getElementById("btn-pause-sw");
+  if (pauseEl) pauseEl.textContent = `AUTO-SWITCH: ${opt.label}`;
+}
+
+function stepAutoSwitch(dir = 1) {
+  autoSwitchIdx = (autoSwitchIdx + dir + AUTO_SWITCH_OPTIONS.length) % AUTO_SWITCH_OPTIONS.length;
+  try {
+    localStorage.setItem(AUTO_SWITCH_STORAGE_KEY, String(autoSwitchIdx));
+  } catch (_e) {}
+  syncAutoSwitchLabels();
+  GameAudio.uiTick(590);
 }
 
 function syncWeatherLabels() {
@@ -2962,10 +2996,13 @@ function mainLoop(nowMs) {
           hIn = samplePrimaryHumanInput(true);
         }
 
+        const swBits = ((AUTO_SWITCH_OPTIONS[autoSwitchIdx]?.code ?? 0) & 0x3) << 12;
         for (let s = 0; s < steps; s++) {
           if (currSimPacked) prevSimPacked = currSimPacked;
-          const hBtns = ((hIn.btns & 0xffff) | ((queuedSubReserved[0] & 0xffff) << 16)) >>> 0;
-          const aBtns = ((aIn.btns & 0xffff) | ((queuedSubReserved[1] & 0xffff) << 16)) >>> 0;
+          const hReserved = (queuedSubReserved[0] | swBits) & 0xffff;
+          const aReserved = (queuedSubReserved[1] | swBits) & 0xffff;
+          const hBtns = ((hIn.btns & 0xffff) | (hReserved << 16)) >>> 0;
+          const aBtns = ((aIn.btns & 0xffff) | (aReserved << 16)) >>> 0;
           queuedSubReserved[0] = 0;
           queuedSubReserved[1] = 0;
 
@@ -3740,6 +3777,12 @@ document.getElementById("pm-wx-prev").addEventListener("click", () => {
 document.getElementById("pm-wx-next").addEventListener("click", () => {
   cycleMatchWeather();
 });
+document.getElementById("pm-sw-prev").addEventListener("click", () => {
+  stepAutoSwitch(-1);
+});
+document.getElementById("pm-sw-next").addEventListener("click", () => {
+  stepAutoSwitch(1);
+});
 
 document.getElementById("btn-pm-back").addEventListener("click", () => {
   GameAudio.uiTick(380);
@@ -4042,6 +4085,7 @@ document.getElementById("btn-hud-zoom-in").addEventListener("click", () => {
   engine3d.adjustZoom(-0.09);
   GameAudio.uiTick(560);
 });
+document.getElementById("btn-hud-sw").addEventListener("click", () => stepAutoSwitch(1));
 document.getElementById("btn-hud-wx").addEventListener("click", cycleMatchWeather);
 document.getElementById("btn-hud-cam").addEventListener("click", cycleMatchCamera);
 document.getElementById("btn-hud-replay").addEventListener("click", toggleInstantReplay);
@@ -4050,6 +4094,7 @@ document.getElementById("btn-hud-pause").addEventListener("click", togglePauseMo
 document.getElementById("btn-pause-resume").addEventListener("click", togglePauseModal);
 document.getElementById("btn-pause-subs-toggle").addEventListener("click", () => togglePauseSubsDrawer());
 document.getElementById("btn-pause-replay").addEventListener("click", toggleInstantReplay);
+document.getElementById("btn-pause-sw").addEventListener("click", () => stepAutoSwitch(1));
 document.getElementById("btn-pause-cam").addEventListener("click", cycleMatchCamera);
 document.getElementById("btn-pause-wx").addEventListener("click", cycleMatchWeather);
 document.getElementById("btn-subs-home").addEventListener("click", () => {
@@ -4099,6 +4144,7 @@ document.getElementById("btn-ft-hub").addEventListener("click", () => {
 // --- Boot Sequence ---
 
 async function bootGame() {
+  syncAutoSwitchLabels();
   updateGamepadBadges();
   await refreshWorldOverview();
 

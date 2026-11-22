@@ -217,6 +217,15 @@
               <button class="step-arrow" id="pm-wx-next" type="button">▶</button>
             </div>
           </div>
+
+          <div class="pm-setting-row">
+            <span class="pm-s-label">AUTO-SWITCH</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-sw-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-sw-val">ASSISTED (BALL)</span>
+              <button class="step-arrow" id="pm-sw-next" type="button">▶</button>
+            </div>
+          </div>
         </div>
       </div>
 
@@ -560,13 +569,13 @@
             </ul>
           </div>
           <div class="ctrl-map-box">
-            <h3>OFF THE BALL (DEFENDING &amp; MENUS)</h3>
+            <h3>OFF THE BALL (ASSISTED DEFENDING)</h3>
             <ul>
-              <li><span>Switch Defender + Jockey</span> <strong>SNES L / LB / L1 / Q / F</strong></li>
-              <li><span>Aimed Standing Tackle</span> <strong>SNES B (Bottom) / Cross / E</strong></li>
-              <li><span>Aimed Sweeping Slide</span> <strong>SNES Y (Left) / Square / C</strong></li>
+              <li><span>Auto-Switch (Follows Ball) + Manual</span> <strong>SNES L / LB / L1 / Q</strong></li>
+              <li><span>Assisted Goal-Side Jockey</span> <strong>SNES L / LT / L2 / F</strong></li>
+              <li><span>Assisted Standing Tackle</span> <strong>SNES B (Bottom) / Cross / E</strong></li>
+              <li><span>Assisted Sweeping Slide</span> <strong>SNES Y (Left) / Square / C</strong></li>
               <li><span>Team Press / GK Rush</span> <strong>SNES X (Top) / RB / R1 / R</strong></li>
-              <li><span>Sprint Track-Back</span> <strong>SNES R / RT / Shift</strong></li>
               <li><span>Start / Pause / Replay</span> <strong>START / SELECT / Esc / Tab</strong></li>
             </ul>
           </div>
@@ -639,6 +648,7 @@
     <div class="match-top-right">
       <button class="hud-mini-btn" id="btn-hud-zoom-out" type="button" title="Zoom Out (- or Scroll Down)">ZOOM −</button>
       <button class="hud-mini-btn" id="btn-hud-zoom-in" type="button" title="Zoom In (+ or Scroll Up)">ZOOM +</button>
+      <button class="hud-mini-btn" id="btn-hud-sw" type="button" title="Cycle Player Auto-Switching Mode">SW: BALL</button>
       <button class="hud-mini-btn" id="btn-hud-wx" type="button" title="Cycle Weather &amp; Lighting (M)">WX: NIGHT</button>
       <button class="hud-mini-btn" id="btn-hud-cam" type="button" title="Cycle Broadcast Camera (V)">CAM: TELE</button>
       <button class="hud-mini-btn" id="btn-hud-replay" type="button" title="Instant Replay (Tab)">REPLAY</button>
@@ -708,6 +718,7 @@
               <button class="console-btn console-btn-primary" id="btn-pause-resume" type="button">RESUME MATCH</button>
               <button class="console-btn console-btn-gold" id="btn-pause-subs-toggle" type="button">LIVE SUBSTITUTIONS (BENCH)</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-replay" type="button">INSTANT REPLAY THEATER</button>
+              <button class="console-btn console-btn-secondary" id="btn-pause-sw" type="button">AUTO-SWITCH: ASSISTED (BALL)</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-cam" type="button">CAMERA ANGLE: TELE BROADCAST</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-wx" type="button">WEATHER: FLOODLIT NIGHT</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-sim" type="button">FAST-FORWARD TO FULL-TIME</button>
