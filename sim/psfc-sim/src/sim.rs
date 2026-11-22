@@ -2858,7 +2858,7 @@ impl MatchSimulation {
         self.state.ball.owner = None;
         self.state.ball.gk_hold_ticks = 0;
         self.state.ball.dribble_touch_cd = 0;
-        self.state.manual_switch_lock = [0, 0];
+        self.state.manual_switch_lock[s_idx] = 0;
         self.set_last_touch(side, kicker_idx);
         self.state.players[s_idx][kicker_idx].action = PlayerActionState::Cooldown {
             ticks_left: if is_5v5 { 7 } else { 10 },
@@ -3521,7 +3521,7 @@ impl MatchSimulation {
             if d_idx != 0 {
                 self.state.controlled_idx[d_s_idx] = d_idx;
             }
-            self.state.manual_switch_lock = [0, 0];
+            self.state.manual_switch_lock[d_s_idx] = 0;
             self.set_last_touch(def_side, d_idx);
             self.state.ball.pass_in_flight = None;
             self.state.ball.assist_candidate = None;
@@ -3668,7 +3668,7 @@ impl MatchSimulation {
             self.state.players[d_s_idx][d_idx].action = PlayerActionState::Cooldown {
                 ticks_left: if is_slide { 11 } else { 6 },
             };
-            self.state.manual_switch_lock = [0, 0];
+            self.state.manual_switch_lock[d_s_idx] = 0;
 
             // Assisted Clean Hook: cleanly hooks possession against non-sprinting carriers (`< 5.8 m/s`)
             // across the full `<= 595mm` boot reach while preserving outstretched sprint toe-pokes (`>= 5.8 m/s`, `> 445mm`)!
@@ -4343,7 +4343,7 @@ impl MatchSimulation {
             };
             let was_shot_threat = vel_toward_own_goal > Fp::from_milli(5_400);
             let catch_limit = Fp::from_milli(15_200 + gk_attr * 62);
-            self.state.manual_switch_lock = [0, 0];
+            self.state.manual_switch_lock[s_idx] = 0;
 
             let gk_vz = self.state.players[s_idx][0].vz;
             // Crowded-box high aerial cross (`IMG_0365`): if an opposing attacker is contesting right on the GK,
@@ -4506,7 +4506,7 @@ impl MatchSimulation {
             self.state.ball.pos.y = pushed_xy.y;
             self.state.ball.vel = Vec3::new(defl_xy.x, defl_xy.y, defl_vz);
             self.state.ball.spin_top = Fp::from_milli(-450);
-            self.state.manual_switch_lock = [0, 0];
+            self.state.manual_switch_lock[s_idx] = 0;
             self.set_last_touch(side, idx);
             self.state.ball.pass_in_flight = None;
             self.state.ball.assist_candidate = None;
@@ -4581,7 +4581,7 @@ impl MatchSimulation {
                 self.state.ball.owner = None;
                 self.state.ball.vel = Vec3::new(hdr_dir.x.mul(hdr_spd), hdr_dir.y.mul(hdr_spd), Fp::from_milli(-1_150));
                 self.state.ball.spin_top = Fp::from_milli(1_400);
-                self.state.manual_switch_lock = [0, 0];
+                self.state.manual_switch_lock[s_idx] = 0;
                 self.set_last_touch(side, idx);
                 self.state.players[s_idx][idx].facing_bam = hdr_dir.to_bam();
                 self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
@@ -4613,7 +4613,7 @@ impl MatchSimulation {
                     Fp::from_milli(3_150),
                 );
                 self.state.ball.spin_top = Fp::from_milli(-700);
-                self.state.manual_switch_lock = [0, 0];
+                self.state.manual_switch_lock[s_idx] = 0;
                 self.set_last_touch(side, idx);
                 self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
                 return;
@@ -4692,7 +4692,7 @@ impl MatchSimulation {
         self.state.ball.dribble_touch_cd = 6;
         self.state.ball.pos.z = trapped_z;
         self.state.ball.vel = Vec3::new(cushioned_xy.x, cushioned_xy.y, trapped_vz);
-        self.state.manual_switch_lock = [0, 0];
+        self.state.manual_switch_lock[s_idx] = 0;
         self.set_last_touch(side, idx);
 
         if idx != 0 {
@@ -6672,22 +6672,46 @@ mod tests {
             "manual BTN_SWITCH must engage ~1.25s manual_switch_lock grace window"
         );
 
-        // During the grace window, AssistedBall respects the human's manual choice (no instant snap-back!)
+        // During the grace window, even if the opponent launches AND completes a pass (`execute_kick` + `resolve_ball_contacts`),
+        // Away's manual_switch_lock MUST stay intact past `switch_cooldown` (Codex PR #16 regression check)!
+        sim.state.players[0][3].pos = Vec2::from_milli(-5_000, 1_200);
+        for _ in 0..3 {
+            sim.tick(&[
+                InputFrame {
+                    move_y: -127,
+                    aim_y: -127,
+                    buttons: BTN_PASS,
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]); // Home #4 releases pass!
         for _ in 0..30 {
             sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
         }
         assert_eq!(
+            sim.state().ball.owner,
+            Some((TeamSide::Home, 3)),
+            "Home #3 must have received the pass during Away's manual grace window"
+        );
+        assert!(
+            sim.state().manual_switch_lock[1] > 0,
+            "opponent pass launch & completion must not clear defending team's manual_switch_lock"
+        );
+        assert_eq!(
             sim.state().controlled_idx[1],
             expected_next,
-            "AssistedBall must respect manual_switch_lock during grace window"
+            "AssistedBall must respect manual_switch_lock during grace window even across opponent passes"
         );
 
-        // Once the 75-tick manual grace lock expires and ball is still at (-5.2, +6.0) by #2, AssistedBall resumes!
+        // Once the 75-tick manual grace lock expires and ball is back at (-5.2, +6.0) by #2, AssistedBall resumes!
         for _ in 0..55 {
             sim.state.players[0][4].pos = Vec2::from_milli(-5_000, 6_000);
             sim.state.players[1][2].pos = Vec2::from_milli(-7_200, 6_000);
             sim.state.ball.owner = Some((TeamSide::Home, 4));
             sim.state.ball.pos = Vec3::from_milli(-5_200, 6_000, 0);
+            sim.state.ball.pass_in_flight = None;
             sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
         }
         assert_eq!(
