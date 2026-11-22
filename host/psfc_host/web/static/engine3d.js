@@ -1337,37 +1337,79 @@ function bodyToWorldSpace(bx, by, bz, actor, outVec) {
   return outVec;
 }
 
-/**
- * Solves Hinge-Constrained Orthonormal Two-Bone Leg IK:
- * - Constructs exact `SO(3)` thigh basis `[x1, y1, z1]` so `hipBone` carries full 3-DOF swing +
- *   internal/external axial thigh twist aligned with the kneecap pole vector.
- * - Constrains `kneeBone` to a pure anatomical 1-DOF `+X` flexion hinge (`[0.04, 2.48] rad`) —
- *   eliminating sideways valgus/varus knee distortion completely!
- * - Clamps both ankle and knee above the turf plane so cleats/knees never clip underground.
- */
-function solveAndDampLegIK(
-  hipsBone,
-  hipBone,
-  kneeBone,
-  ankleBone,
-  hipSocketLocal,
-  targetPos,
-  poleDir,
-  footPitchRad,
-  smoothTime,
-  dt,
-  footYawRad = 0,
-  footRollRad = 0,
-  minAnkleFloorY = SOLE_HEIGHT,
-  minKneeFloorY = 0.056
-) {
-  _vHipPos.copy(hipSocketLocal).applyQuaternion(hipsBone.quaternion).add(hipsBone.position);
+const _vFloorWorldTmp = new THREE.Vector3();
 
-  _vTargetClamp.set(targetPos.x, Math.max(minAnkleFloorY, targetPos.y), targetPos.z);
-  _vTargetOff.subVectors(_vTargetClamp, _vHipPos);
-  const rawDist = _vTargetOff.length();
+/**
+ * Computes the minimum `bodyScaleGroup` local `Y` at local lateral offset `bx` such that
+ * the resulting 3D world-space `Y` is at least `minWorldY` under `bodyScaleGroup.rotation.z`
+ * (bank roll), `bodyScaleGroup.scale`, `bodyScaleGroup.position.y` (`smoothJumpY`), and `root.position.y`.
+ */
+function minBodyYForWorldFloor(bx, minWorldY, actor) {
+  if (!actor) return minWorldY;
+  const sc = actor.bodyScaleGroup.scale;
+  const sx = Math.max(0.5, sc.x);
+  const sy = Math.max(0.5, sc.y);
+  const roll = actor.bodyScaleGroup.rotation.z;
+  const cr = Math.max(0.25, Math.cos(roll));
+  const sr = Math.sin(roll);
+  return (
+    (minWorldY - actor.root.position.y - actor.bodyScaleGroup.position.y - bx * sx * sr) /
+    (sy * cr)
+  );
+}
+
+/**
+ * Clamps a `bodyScaleGroup` coordinate `posBS` against the 3D world-space floor plane `minWorldY`,
+ * lifting only along world `+Y` (preserving exact world `(X, Z)` turf contact under bank roll).
+ */
+function clampBodyPointWorldFloor(posBS, minWorldY, actor) {
+  if (!actor) {
+    if (posBS.y < minWorldY) posBS.y = minWorldY;
+    return posBS;
+  }
+  bodyToWorldSpace(posBS.x, posBS.y, posBS.z, actor, _vFloorWorldTmp);
+  if (_vFloorWorldTmp.y < minWorldY) {
+    worldToBodySpace(_vFloorWorldTmp.x, minWorldY, _vFloorWorldTmp.z, actor, posBS);
+  }
+  return posBS;
+}
+
+const _vDampPole = new THREE.Vector3();
+
+function computeExactLegIKQuats(
+  hipsBone,
+  targetPos,
+  basePoleDir,
+  footYawTwistRad,
+  minAnkleWorldY,
+  minKneeWorldY,
+  actor
+) {
+  _vTargetClamp.copy(targetPos);
+  clampBodyPointWorldFloor(_vTargetClamp, minAnkleWorldY, actor);
+
+  const minReach = 0.282; // Matches anatomical max knee flexion (2.48 rad, calf-on-hamstring)
   const maxReach = UPPER_LEG_LEN + LOWER_LEG_LEN - 0.003;
-  const clampedDist = Math.max(0.22, Math.min(rawDist, maxReach));
+
+  _vTargetOff.subVectors(_vTargetClamp, _vHipPos);
+  let rawDist = _vTargetOff.length();
+  if (rawDist < minReach) {
+    // Expand horizontally before re-clamping to turf so low slide/tumble hips never push ankles underground
+    const dy = _vTargetOff.y;
+    const minHoriz = Math.sqrt(Math.max(0.0004, minReach * minReach - dy * dy));
+    const curHoriz = Math.hypot(_vTargetOff.x, _vTargetOff.z);
+    if (curHoriz > 1e-4) {
+      const scaleH = minHoriz / curHoriz;
+      _vTargetClamp.x = _vHipPos.x + _vTargetOff.x * scaleH;
+      _vTargetClamp.z = _vHipPos.z + _vTargetOff.z * scaleH;
+    } else {
+      _vTargetClamp.z = _vHipPos.z - minHoriz;
+    }
+    clampBodyPointWorldFloor(_vTargetClamp, minAnkleWorldY, actor);
+    _vTargetOff.subVectors(_vTargetClamp, _vHipPos);
+    rawDist = _vTargetOff.length();
+  }
+  const clampedDist = Math.max(minReach, Math.min(rawDist, maxReach));
 
   if (rawDist > 1e-5) {
     _vToTarget.copy(_vTargetOff).divideScalar(rawDist);
@@ -1375,10 +1417,9 @@ function solveAndDampLegIK(
     _vToTarget.set(0, -1, 0);
   }
 
-  // Twist knee pole partially with foot yaw so hip rotation turns the kneecap & thigh naturally!
-  _vPole.copy(poleDir);
-  if (Math.abs(footYawRad) > 0.005) {
-    _vPole.applyAxisAngle(_vAxisY, footYawRad * 0.62);
+  _vPole.copy(basePoleDir);
+  if (Math.abs(footYawTwistRad) > 0.005) {
+    _vPole.applyAxisAngle(_vAxisY, footYawTwistRad * 0.62);
   }
   _vPole.addScaledVector(_vToTarget, -_vPole.dot(_vToTarget));
   if (_vPole.lengthSq() < 1e-6) {
@@ -1401,16 +1442,14 @@ function solveAndDampLegIK(
     .copy(_vHipPos)
     .addScaledVector(_vToTarget, UPPER_LEG_LEN * cosAlpha)
     .addScaledVector(_vPole, UPPER_LEG_LEN * sinAlpha);
-  if (_vKneePos.y < minKneeFloorY) {
-    _vKneePos.y = minKneeFloorY;
-  }
+  clampBodyPointWorldFloor(_vKneePos, minKneeWorldY, actor);
   _vEffTarget.copy(_vHipPos).addScaledVector(_vToTarget, clampedDist);
 
   // Build exact right-handed hip orthonormal basis: +Y = knee->hip, +X = pole x toTarget, +Z = kneecap forward
   _vBasisY.subVectors(_vHipPos, _vKneePos).normalize();
   _vBasisX.crossVectors(_vPole, _vToTarget);
   if (_vBasisX.lengthSq() < 1e-6) _vBasisX.set(1, 0, 0);
-  // Re-orthogonalize X against Y in case turf knee-clamp nudged _vKneePos.y
+  // Re-orthogonalize X against Y in case turf knee-clamp nudged _vKneePos
   _vBasisX.addScaledVector(_vBasisY, -_vBasisX.dot(_vBasisY)).normalize();
   _vBasisZ.crossVectors(_vBasisX, _vBasisY).normalize();
 
@@ -1430,6 +1469,45 @@ function solveAndDampLegIK(
   );
   const thetaKnee = Math.max(0.04, Math.min(2.48, Math.PI - Math.acos(cosInterior)));
   _qKneeGoal.setFromAxisAngle(_vAxisX, thetaKnee);
+}
+
+/**
+ * Solves Hinge-Constrained Orthonormal Two-Bone Leg IK:
+ * - Constructs exact `SO(3)` thigh basis `[x1, y1, z1]` so `hipBone` carries full 3-DOF swing +
+ *   internal/external axial thigh twist aligned with the kneecap pole vector.
+ * - Constrains `kneeBone` to a pure anatomical 1-DOF `+X` flexion hinge (`[0.04, 2.48] rad`) —
+ *   eliminating sideways valgus/varus knee distortion completely!
+ * - Clamps both ankle and knee in true 3D world space (accounting for `bodyScaleGroup.rotation.z`
+ *   bank roll, scale, jump height, and quaternion slerp pendulum sag) so cleats/knees never dip below turf.
+ */
+function solveAndDampLegIK(
+  hipsBone,
+  hipBone,
+  kneeBone,
+  ankleBone,
+  hipSocketLocal,
+  targetPos,
+  poleDir,
+  footPitchRad,
+  smoothTime,
+  dt,
+  footYawRad = 0,
+  footRollRad = 0,
+  minAnkleWorldY = SOLE_HEIGHT,
+  minKneeWorldY = 0.056,
+  actor = null
+) {
+  _vHipPos.copy(hipSocketLocal).applyQuaternion(hipsBone.quaternion).add(hipsBone.position);
+
+  computeExactLegIKQuats(
+    hipsBone,
+    targetPos,
+    poleDir,
+    footYawRad,
+    minAnkleWorldY,
+    minKneeWorldY,
+    actor
+  );
 
   // Anatomical YXZ ankle orientation (heading yaw -> plantar/dorsi pitch -> inversion/eversion roll)
   _eulerYXZ.set(footPitchRad, footYawRad, footRollRad);
@@ -1445,40 +1523,66 @@ function solveAndDampLegIK(
     dampQ(hipBone.quaternion, _qHipGoal, smoothTime, dt);
     dampQ(kneeBone.quaternion, _qKneeGoal, smoothTime, dt);
     dampQ(ankleBone.quaternion, _qAnkleGoal, smoothTime, dt);
+
+    // Project damped FK ankle vertically onto world turf if pendulum arc or bank-roll slerp dipped below floor
+    if (actor) {
+      _qHipWorld.multiplyQuaternions(hipsBone.quaternion, hipBone.quaternion);
+      _vKneePos.set(0, -UPPER_LEG_LEN, 0).applyQuaternion(_qHipWorld).add(_vHipPos);
+      _qShinWorldInv.multiplyQuaternions(_qHipWorld, kneeBone.quaternion);
+      _vEffTarget.set(0, -LOWER_LEG_LEN, 0).applyQuaternion(_qShinWorldInv).add(_vKneePos);
+      bodyToWorldSpace(_vEffTarget.x, _vEffTarget.y, _vEffTarget.z, actor, _vFloorWorldTmp);
+      if (_vFloorWorldTmp.y < minAnkleWorldY) {
+        _qFootWorld.multiplyQuaternions(_qShinWorldInv, ankleBone.quaternion);
+        _vDampPole.set(0, 0, 1).applyQuaternion(_qHipWorld);
+        worldToBodySpace(_vFloorWorldTmp.x, minAnkleWorldY, _vFloorWorldTmp.z, actor, _vEffTarget);
+        computeExactLegIKQuats(
+          hipsBone,
+          _vEffTarget,
+          _vDampPole,
+          0,
+          minAnkleWorldY,
+          minKneeWorldY,
+          actor
+        );
+        hipBone.quaternion.copy(_qHipGoal);
+        kneeBone.quaternion.copy(_qKneeGoal);
+        _qShinWorldInv.multiplyQuaternions(_qHipWorld, _qKneeGoal).invert();
+        ankleBone.quaternion.multiplyQuaternions(_qShinWorldInv, _qFootWorld);
+      }
+    }
   }
 }
 
-/**
- * Solves Hinge-Constrained Orthonormal Two-Bone Arm + 3-DOF Wrist IK:
- * - `shBone` carries full 3-DOF glenohumeral swing + humeral twist in `B_CHEST` space.
- * - `elBone` is constrained to a pure anatomical 1-DOF `-X` flexion hinge (`[-2.48, -0.05] rad`).
- * - `wristBone` aligns the semi-pronated palm normal (`-sideSign * X`) and finger ray (`-Y`)
- *   to target world/body vectors (GK shot-stopping palms, caught-ball cradle, overhead throw-in,
- *   shoulder shielding, or turf brace), clamped to physiological human wrist/forearm ROM.
- */
-function solveAndDampArmIK(
+function computeExactArmIKQuats(
   chestWorldQuat,
-  chestPosBS,
-  shBone,
-  elBone,
-  wristBone,
-  shSocketLocal,
   targetWristPos,
   elbowPoleDir,
   sideSign,
-  smoothTime,
-  dt,
-  palmNormalBS = null,
-  fingerDirBS = null,
-  minWristFloorY = 0.045
+  minWristWorldY,
+  actor
 ) {
-  _vHipPos.copy(shSocketLocal).applyQuaternion(chestWorldQuat).add(chestPosBS);
-
-  _vTargetClamp.set(targetWristPos.x, Math.max(minWristFloorY, targetWristPos.y), targetWristPos.z);
+  _vTargetClamp.copy(targetWristPos);
+  clampBodyPointWorldFloor(_vTargetClamp, minWristWorldY, actor);
   _vTargetOff.subVectors(_vTargetClamp, _vHipPos);
-  const rawDist = _vTargetOff.length();
+  let rawDist = _vTargetOff.length();
+  const minReach = 0.162;
   const maxReach = UPPER_ARM_LEN + LOWER_ARM_LEN - 0.003;
-  const clampedDist = Math.max(0.13, Math.min(rawDist, maxReach));
+  if (rawDist < minReach) {
+    const dy = _vTargetOff.y;
+    const minHoriz = Math.sqrt(Math.max(0.0004, minReach * minReach - dy * dy));
+    const curHoriz = Math.hypot(_vTargetOff.x, _vTargetOff.z);
+    if (curHoriz > 1e-4) {
+      const scaleH = minHoriz / curHoriz;
+      _vTargetClamp.x = _vHipPos.x + _vTargetOff.x * scaleH;
+      _vTargetClamp.z = _vHipPos.z + _vTargetOff.z * scaleH;
+    } else {
+      _vTargetClamp.x = _vHipPos.x + sideSign * minHoriz;
+    }
+    clampBodyPointWorldFloor(_vTargetClamp, minWristWorldY, actor);
+    _vTargetOff.subVectors(_vTargetClamp, _vHipPos);
+    rawDist = _vTargetOff.length();
+  }
+  const clampedDist = Math.max(minReach, Math.min(rawDist, maxReach));
 
   if (rawDist > 1e-5) {
     _vToTarget.copy(_vTargetOff).divideScalar(rawDist);
@@ -1508,9 +1612,7 @@ function solveAndDampArmIK(
     .copy(_vHipPos)
     .addScaledVector(_vToTarget, UPPER_ARM_LEN * cosAlpha)
     .addScaledVector(_vPole, UPPER_ARM_LEN * sinAlpha);
-  if (_vKneePos.y < minWristFloorY + 0.012) {
-    _vKneePos.y = minWristFloorY + 0.012;
-  }
+  clampBodyPointWorldFloor(_vKneePos, minWristWorldY + 0.012, actor);
 
   // Right-handed humerus basis: +Y = elbow->shoulder, +X = toTarget x elbowPole, +Z = bicep anterior
   _vBasisY.subVectors(_vHipPos, _vKneePos).normalize();
@@ -1535,6 +1637,44 @@ function solveAndDampArmIK(
   );
   const thetaElbow = Math.max(0.05, Math.min(2.48, Math.PI - Math.acos(cosInterior)));
   _qElGoal.setFromAxisAngle(_vAxisX, -thetaElbow);
+  return clampedDist;
+}
+
+/**
+ * Solves Hinge-Constrained Orthonormal Two-Bone Arm + 3-DOF Wrist IK:
+ * - `shBone` carries full 3-DOF glenohumeral swing + humeral twist in `B_CHEST` space.
+ * - `elBone` is constrained to a pure anatomical 1-DOF `-X` flexion hinge (`[-2.48, -0.05] rad`).
+ * - `wristBone` aligns the semi-pronated palm normal (`-sideSign * X`) and finger ray (`-Y`)
+ *   to target world/body vectors (GK shot-stopping palms, caught-ball cradle, overhead throw-in,
+ *   shoulder shielding, or turf brace), clamped to physiological human wrist/forearm ROM.
+ */
+function solveAndDampArmIK(
+  chestWorldQuat,
+  chestPosBS,
+  shBone,
+  elBone,
+  wristBone,
+  shSocketLocal,
+  targetWristPos,
+  elbowPoleDir,
+  sideSign,
+  smoothTime,
+  dt,
+  palmNormalBS = null,
+  fingerDirBS = null,
+  minWristWorldY = 0.046,
+  actor = null
+) {
+  _vHipPos.copy(shSocketLocal).applyQuaternion(chestWorldQuat).add(chestPosBS);
+
+  const clampedDist = computeExactArmIKQuats(
+    chestWorldQuat,
+    targetWristPos,
+    elbowPoleDir,
+    sideSign,
+    minWristWorldY,
+    actor
+  );
 
   _qForearmWorld.multiplyQuaternions(_qShWorld, _qElGoal);
 
@@ -1578,6 +1718,37 @@ function solveAndDampArmIK(
     dampQ(shBone.quaternion, _qShGoal, smoothTime, dt);
     dampQ(elBone.quaternion, _qElGoal, smoothTime, dt);
     dampQ(wristBone.quaternion, _qWristGoal, smoothTime, dt);
+
+    if (actor) {
+      _qShWorld.multiplyQuaternions(chestWorldQuat, shBone.quaternion);
+      _vKneePos.set(0, -UPPER_ARM_LEN, 0).applyQuaternion(_qShWorld).add(_vHipPos);
+      _qForearmWorld.multiplyQuaternions(_qShWorld, elBone.quaternion);
+      _vEffTarget.set(0, -LOWER_ARM_LEN, 0).applyQuaternion(_qForearmWorld).add(_vKneePos);
+      bodyToWorldSpace(_vEffTarget.x, _vEffTarget.y, _vEffTarget.z, actor, _vFloorWorldTmp);
+      if (_vFloorWorldTmp.y < minWristWorldY) {
+        _qWristWorld.multiplyQuaternions(_qForearmWorld, wristBone.quaternion);
+        _vDampPole.set(0, 0, -1).applyQuaternion(_qShWorld);
+        worldToBodySpace(_vFloorWorldTmp.x, minWristWorldY, _vFloorWorldTmp.z, actor, _vEffTarget);
+        computeExactArmIKQuats(
+          chestWorldQuat,
+          _vEffTarget,
+          _vDampPole,
+          sideSign,
+          minWristWorldY,
+          actor
+        );
+        shBone.quaternion.copy(_qShGoal);
+        elBone.quaternion.copy(_qElGoal);
+        _qShinWorldInv.multiplyQuaternions(_qShWorld, _qElGoal).invert();
+        wristBone.quaternion.multiplyQuaternions(_qShinWorldInv, _qWristWorld);
+        const dotId = Math.abs(_qIdentity.dot(wristBone.quaternion));
+        const wrAngle = 2.0 * Math.acos(Math.min(1.0, dotId));
+        if (wrAngle > 1.62) {
+          _qTmp.copy(_qIdentity).slerp(wristBone.quaternion, 1.62 / wrAngle);
+          wristBone.quaternion.copy(_qTmp);
+        }
+      }
+    }
   }
 }
 
@@ -4044,7 +4215,14 @@ function evaluateDirectionalFootTarget(
  * (`0.05*PI .. 0.80*PI`), eliminating turf ice-skating on accelerations, cuts, and jockeys,
  * and smoothly releasing on toe-off or large pivot stretches.
  */
-function applyWorldFootPin(pin, phase, allowPin, actor, targetFootBS) {
+function applyWorldFootPin(
+  pin,
+  phase,
+  allowPin,
+  actor,
+  targetFootBS,
+  ankleWorldFloorY = SOLE_HEIGHT
+) {
   if (!allowPin) {
     pin.active = false;
     return;
@@ -4057,14 +4235,21 @@ function applyWorldFootPin(pin, phase, allowPin, actor, targetFootBS) {
     return;
   }
 
+  const floorBSY = minBodyYForWorldFloor(targetFootBS.x, ankleWorldFloorY, actor);
   if (!pin.active) {
-    bodyToWorldSpace(targetFootBS.x, SOLE_HEIGHT, targetFootBS.z, actor, _pinWorldTmp);
+    bodyToWorldSpace(
+      targetFootBS.x,
+      Math.max(floorBSY, targetFootBS.y),
+      targetFootBS.z,
+      actor,
+      _pinWorldTmp
+    );
     pin.wx = _pinWorldTmp.x;
     pin.wz = _pinWorldTmp.z;
     pin.active = true;
   }
 
-  worldToBodySpace(pin.wx, SOLE_HEIGHT, pin.wz, actor, _pinLocalTmp);
+  worldToBodySpace(pin.wx, ankleWorldFloorY, pin.wz, actor, _pinLocalTmp);
   const drift = Math.hypot(_pinLocalTmp.x - targetFootBS.x, _pinLocalTmp.z - targetFootBS.z);
   if (drift > 0.56) {
     // Exceeded physiological stride stretch -> release & re-step cleanly
@@ -4078,8 +4263,9 @@ function applyWorldFootPin(pin, phase, allowPin, actor, targetFootBS) {
   const w = pinEnvelope * stretchFade;
 
   targetFootBS.x += (_pinLocalTmp.x - targetFootBS.x) * w;
+  targetFootBS.y += (_pinLocalTmp.y - targetFootBS.y) * w;
   targetFootBS.z += (_pinLocalTmp.z - targetFootBS.z) * w;
-  targetFootBS.y = Math.min(targetFootBS.y, SOLE_HEIGHT + 0.015 * (1 - w));
+  clampBodyPointWorldFloor(targetFootBS, ankleWorldFloorY, actor);
 }
 
 function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
@@ -4622,10 +4808,16 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   // ==========================================================================
   // STEP C: TURF FLOOR CONSTRAINTS & FULL-STATE TWO-BONE LEG IK
   // ==========================================================================
-  const scaleY = Math.max(0.5, actor.bodyScaleGroup.scale.y);
-  const minAnkleFloorY = (SOLE_HEIGHT - actor.smoothJumpY) / scaleY;
-  const minKneeFloorY = (0.056 - actor.smoothJumpY) / scaleY;
-  const minWristFloorY = (0.046 - actor.smoothJumpY) / scaleY;
+  const sc = actor.bodyScaleGroup.scale;
+  const scaleX = Math.max(0.5, sc.x);
+  const scaleY = Math.max(0.5, sc.y);
+  const groundY = actor.root.position.y;
+  // Account for lateral cleat soleplate half-width (~0.028m) under residual world roll
+  const soleRollClear = Math.abs(Math.sin(actor.smoothBankRoll)) * 0.016 * scaleX;
+  const ankleWorldFloorY = groundY + SOLE_HEIGHT * scaleY + soleRollClear;
+  const kneeWorldFloorY = groundY + 0.056 * scaleY;
+  const wristWorldFloorY = groundY + 0.046 * scaleY;
+  const groundedContactBlend = 1.0 - smoothstep(0.005, 0.035, actor.smoothJumpY);
 
   _dynPoleL.copy(_poleL);
   _dynPoleR.copy(_poleR);
@@ -4641,10 +4833,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     // Turf-Clamped Slide Tackle: sweeping extended right cleat + tucked underneath left knee!
     actor.footPinL.active = false;
     actor.footPinR.active = false;
-    _tmpFootR.set(-0.04, minAnkleFloorY + 0.018, 0.76);
+    _tmpFootR.set(-0.04, minBodyYForWorldFloor(-0.04, ankleWorldFloorY, actor) + 0.018, 0.76);
     pitchR = 0.36;
     yawR = 0.18;
-    _tmpFootL.set(0.16, minAnkleFloorY + 0.015, 0.08);
+    _tmpFootL.set(0.20, minBodyYForWorldFloor(0.20, ankleWorldFloorY, actor) + 0.018, -0.06);
     pitchL = 0.42;
     yawL = -0.28;
     _dynPoleL.set(0.55, 0.35, 0.75).normalize();
@@ -4653,8 +4845,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     // Turf Tumble Recovery Knees
     actor.footPinL.active = false;
     actor.footPinR.active = false;
-    _tmpFootL.set(0.13, minAnkleFloorY + 0.03, -0.34);
-    _tmpFootR.set(-0.12, minAnkleFloorY + 0.02, -0.14);
+    _tmpFootL.set(0.13, minBodyYForWorldFloor(0.13, ankleWorldFloorY, actor) + 0.03, -0.34);
+    _tmpFootR.set(-0.12, minBodyYForWorldFloor(-0.12, ankleWorldFloorY, actor) + 0.02, -0.14);
     pitchL = 0.48;
     pitchR = 0.34;
     legSmoothTime = 0.042;
@@ -4665,16 +4857,36 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     const extX = -diveLatDir * (0.46 + highDiveBlend * 0.30);
     if (diveLatDir > 0) {
       // Diving Left (+X): Left leg is bottom/lead, Right leg is top/trail push-off
-      _tmpFootL.set(extX + 0.04, minAnkleFloorY + highDiveBlend * 0.12, -0.05);
-      _tmpFootR.set(extX - 0.10, minAnkleFloorY + 0.04 + highDiveBlend * 0.24, 0.04);
+      const lx = extX + 0.04;
+      const rx = extX - 0.10;
+      _tmpFootL.set(
+        lx,
+        minBodyYForWorldFloor(lx, ankleWorldFloorY, actor) + highDiveBlend * 0.12,
+        -0.05
+      );
+      _tmpFootR.set(
+        rx,
+        minBodyYForWorldFloor(rx, ankleWorldFloorY, actor) + 0.04 + highDiveBlend * 0.24,
+        0.04
+      );
       pitchL = 0.24 + highDiveBlend * 0.24;
       pitchR = 0.30 + highDiveBlend * 0.22;
       _dynPoleL.set(0.25, 0.30, 0.92).normalize();
       _dynPoleR.set(0.15, 0.45, 0.88).normalize();
     } else {
       // Diving Right (-X): Right leg is bottom/lead, Left leg is top/trail push-off
-      _tmpFootR.set(extX - 0.04, minAnkleFloorY + highDiveBlend * 0.12, -0.05);
-      _tmpFootL.set(extX + 0.10, minAnkleFloorY + 0.04 + highDiveBlend * 0.24, 0.04);
+      const rx = extX - 0.04;
+      const lx = extX + 0.10;
+      _tmpFootR.set(
+        rx,
+        minBodyYForWorldFloor(rx, ankleWorldFloorY, actor) + highDiveBlend * 0.12,
+        -0.05
+      );
+      _tmpFootL.set(
+        lx,
+        minBodyYForWorldFloor(lx, ankleWorldFloorY, actor) + 0.04 + highDiveBlend * 0.24,
+        0.04
+      );
       pitchR = 0.24 + highDiveBlend * 0.24;
       pitchL = 0.30 + highDiveBlend * 0.22;
       _dynPoleR.set(-0.25, 0.30, 0.92).normalize();
@@ -4686,14 +4898,30 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     actor.footPinR.active = false;
     if (actor.isGk) {
       // Towering GK Cross Claim (`IMG_0365` Oblak: protective high right knee + extended left takeoff leg!)
-      _tmpFootL.set(0.10, Math.max(minAnkleFloorY, 0.06), -0.08);
+      _tmpFootL.set(
+        0.10,
+        Math.max(minBodyYForWorldFloor(0.10, ankleWorldFloorY, actor), 0.06),
+        -0.08
+      );
       pitchL = 0.42;
-      _tmpFootR.set(-0.10, Math.max(minAnkleFloorY, 0.48), 0.26);
+      _tmpFootR.set(
+        -0.10,
+        Math.max(minBodyYForWorldFloor(-0.10, ankleWorldFloorY, actor), 0.48),
+        0.26
+      );
       pitchR = 0.36;
     } else {
       // Outfield Aerial Header Leap (athletic hamstring tuck!)
-      _tmpFootL.set(0.10, Math.max(minAnkleFloorY, 0.22), -0.24);
-      _tmpFootR.set(-0.10, Math.max(minAnkleFloorY, 0.27), -0.28);
+      _tmpFootL.set(
+        0.10,
+        Math.max(minBodyYForWorldFloor(0.10, ankleWorldFloorY, actor), 0.22),
+        -0.24
+      );
+      _tmpFootR.set(
+        -0.10,
+        Math.max(minBodyYForWorldFloor(-0.10, ankleWorldFloorY, actor), 0.27),
+        -0.28
+      );
       pitchL = 0.44;
       pitchR = 0.48;
     }
@@ -4725,6 +4953,19 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       _tmpFootR
     );
 
+    // Map gait foot targets onto the banked world turf plane before foot-pinning & overrides
+    const liftL = Math.max(0, _tmpFootL.y - SOLE_HEIGHT);
+    const bankedFloorL = minBodyYForWorldFloor(_tmpFootL.x, ankleWorldFloorY, actor) + liftL;
+    _tmpFootL.y =
+      bankedFloorL * groundedContactBlend +
+      Math.max(bankedFloorL, _tmpFootL.y) * (1.0 - groundedContactBlend);
+
+    const liftR = Math.max(0, _tmpFootR.y - SOLE_HEIGHT);
+    const bankedFloorR = minBodyYForWorldFloor(_tmpFootR.x, ankleWorldFloorY, actor) + liftR;
+    _tmpFootR.y =
+      bankedFloorR * groundedContactBlend +
+      Math.max(bankedFloorR, _tmpFootR.y) * (1.0 - groundedContactBlend);
+
     // Outward athletic knee pole flare during lateral shuffles & GK ready crouch
     const kneeFlare = strafeRatio * 0.24 + gkAlert * 0.18;
     _dynPoleL.set(0.05 + kneeFlare, 0.18, 1.0).normalize();
@@ -4743,14 +4984,16 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       actor.stridePhase,
       !specialStance && (locoWeight > 0.02 || pivotWeight > 0.02),
       actor,
-      _tmpFootL
+      _tmpFootL,
+      ankleWorldFloorY
     );
     applyWorldFootPin(
       actor.footPinR,
       actor.stridePhase + Math.PI,
       !specialStance && (locoWeight > 0.02 || pivotWeight > 0.02),
       actor,
-      _tmpFootR
+      _tmpFootR,
+      ankleWorldFloorY
     );
 
     const touchWindow =
@@ -4762,45 +5005,49 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
 
     if (isThrowInTaker) {
       // Law 15 planted split-step touchline stance
-      _tmpFootL.set(0.118, SOLE_HEIGHT, 0.15);
-      _tmpFootR.set(-0.118, SOLE_HEIGHT, -0.16 - throwCoil * 0.08);
+      _tmpFootL.set(0.118, minBodyYForWorldFloor(0.118, ankleWorldFloorY, actor), 0.15);
+      _tmpFootR.set(
+        -0.118,
+        minBodyYForWorldFloor(-0.118, ankleWorldFloorY, actor),
+        -0.16 - throwCoil * 0.08
+      );
       pitchL = -0.04;
       pitchR = 0.14;
     } else if (inWall && speed < 0.3) {
-      _tmpFootL.set(0.090, SOLE_HEIGHT, 0.01);
-      _tmpFootR.set(-0.090, SOLE_HEIGHT, -0.01);
+      _tmpFootL.set(0.090, minBodyYForWorldFloor(0.090, ankleWorldFloorY, actor), 0.01);
+      _tmpFootR.set(-0.090, minBodyYForWorldFloor(-0.090, ankleWorldFloorY, actor), -0.01);
       pitchL = 0.02;
       pitchR = 0.02;
     } else if (gkSpreadSave) {
       // 1v1 Goalkeeper K-Block Spread (`IMG_0366` Čech: wide low split leg barrier!)
       const blockSign = ballLocalX >= 0 ? 1 : -1;
       if (blockSign > 0) {
-        _tmpFootL.set(0.52, SOLE_HEIGHT + 0.02, 0.22);
+        _tmpFootL.set(0.52, minBodyYForWorldFloor(0.52, ankleWorldFloorY, actor) + 0.02, 0.22);
         yawL = -0.35;
         pitchL = -0.18;
-        _tmpFootR.set(-0.18, SOLE_HEIGHT + 0.02, -0.22);
+        _tmpFootR.set(-0.18, minBodyYForWorldFloor(-0.18, ankleWorldFloorY, actor) + 0.02, -0.22);
         pitchR = 0.48;
       } else {
-        _tmpFootR.set(-0.52, SOLE_HEIGHT + 0.02, 0.22);
+        _tmpFootR.set(-0.52, minBodyYForWorldFloor(-0.52, ankleWorldFloorY, actor) + 0.02, 0.22);
         yawR = 0.35;
         pitchR = -0.18;
-        _tmpFootL.set(0.18, SOLE_HEIGHT + 0.02, -0.22);
+        _tmpFootL.set(0.18, minBodyYForWorldFloor(0.18, ankleWorldFloorY, actor) + 0.02, -0.22);
         pitchL = 0.48;
       }
     } else if (action === 2) {
       // Deep split-leg standing tackle lunge (`IMG_0363.jpeg` Valencia defender!)
       const lungeLeft = ballLocalX > 0.08;
       if (lungeLeft) {
-        _tmpFootL.set(0.08, SOLE_HEIGHT + 0.015, 0.68);
+        _tmpFootL.set(0.08, minBodyYForWorldFloor(0.08, ankleWorldFloorY, actor) + 0.015, 0.68);
         pitchL = -0.26;
         yawL = -0.34;
-        _tmpFootR.set(-0.13, SOLE_HEIGHT + 0.03, -0.50);
+        _tmpFootR.set(-0.13, minBodyYForWorldFloor(-0.13, ankleWorldFloorY, actor) + 0.03, -0.50);
         pitchR = 0.56;
       } else {
-        _tmpFootR.set(-0.08, SOLE_HEIGHT + 0.015, 0.68);
+        _tmpFootR.set(-0.08, minBodyYForWorldFloor(-0.08, ankleWorldFloorY, actor) + 0.015, 0.68);
         pitchR = -0.26;
         yawR = 0.34;
-        _tmpFootL.set(0.13, SOLE_HEIGHT + 0.03, -0.50);
+        _tmpFootL.set(0.13, minBodyYForWorldFloor(0.13, ankleWorldFloorY, actor) + 0.03, -0.50);
         pitchL = 0.56;
       }
     } else if (chargeCockBlend > 0.01) {
@@ -4809,9 +5056,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       const isPower = actor.lastKickKind >= 3;
       const sDirX = Math.sin(actor.lastKickRelYaw * 0.65);
       const sDirZ = Math.cos(actor.lastKickRelYaw * 0.65);
+      const cockX = kSign * 0.11 - sDirX * 0.22 * chargeCockBlend;
       const cockFoot = _auxVecA.set(
-        kSign * 0.11 - sDirX * 0.22 * chargeCockBlend,
-        SOLE_HEIGHT + (isPower ? 0.38 : 0.22) * chargeCockBlend,
+        cockX,
+        minBodyYForWorldFloor(cockX, ankleWorldFloorY, actor) +
+          (isPower ? 0.38 : 0.22) * chargeCockBlend,
         -(isPower ? 0.40 : 0.26) * sDirZ * chargeCockBlend
       );
       const cockPitch = (isPower ? 0.68 : 0.34) * chargeCockBlend;
@@ -4824,7 +5073,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
         yawL = cockYaw;
         if (stationaryFactor > 0.25) {
           _tmpFootR.lerp(
-            _auxVecB.set(-0.145, SOLE_HEIGHT, Math.max(-0.04, Math.min(0.22, ballLocalZ - 0.04))),
+            _auxVecB.set(
+              -0.145,
+              minBodyYForWorldFloor(-0.145, ankleWorldFloorY, actor),
+              Math.max(-0.04, Math.min(0.22, ballLocalZ - 0.04))
+            ),
             chargeCockBlend * 0.85
           );
           pitchR = -0.05 * chargeCockBlend;
@@ -4835,7 +5088,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
         yawR = cockYaw;
         if (stationaryFactor > 0.25) {
           _tmpFootL.lerp(
-            _auxVecB.set(0.145, SOLE_HEIGHT, Math.max(-0.04, Math.min(0.22, ballLocalZ - 0.04))),
+            _auxVecB.set(
+              0.145,
+              minBodyYForWorldFloor(0.145, ankleWorldFloorY, actor),
+              Math.max(-0.04, Math.min(0.22, ballLocalZ - 0.04))
+            ),
             chargeCockBlend * 0.85
           );
           pitchL = -0.05 * chargeCockBlend;
@@ -4853,9 +5110,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       const followSpan = isInsidePass ? 0.44 : 0.62;
       const crossBodyX = isInsidePass ? -kSign * 0.04 : -kSign * 0.13;
 
+      const strikeX = kSign * 0.09 * (1 - whipArc) + (sDirX * followSpan * 0.55 + crossBodyX) * whipArc;
       const strikeFoot = _auxVecA.set(
-        kSign * 0.09 * (1 - whipArc) + (sDirX * followSpan * 0.55 + crossBodyX) * whipArc,
-        SOLE_HEIGHT + followLift * whipArc,
+        strikeX,
+        minBodyYForWorldFloor(strikeX, ankleWorldFloorY, actor) + followLift * whipArc,
         -0.10 * (1 - whipArc) + sDirZ * followSpan * whipArc
       );
       const blendW = Math.min(1, whipArc * 1.35);
@@ -4872,18 +5130,20 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       // Stride-Synced Active Dribble Cushion Touch (`IMG_0347.jpeg`)
       const reachZ = Math.max(0.08, Math.min(0.44, ballLocalZ - 0.11));
       if (ballLocalX >= 0.02) {
+        const tx = Math.max(0.05, Math.min(0.22, ballLocalX));
         _auxVecA.set(
-          Math.max(0.05, Math.min(0.22, ballLocalX)),
-          SOLE_HEIGHT + 0.032 * touchProx,
+          tx,
+          minBodyYForWorldFloor(tx, ankleWorldFloorY, actor) + 0.032 * touchProx,
           reachZ
         );
         _tmpFootL.lerp(_auxVecA, touchProx * 0.52);
         yawL = -0.38 * touchProx;
         pitchL = pitchL * (1 - touchProx * 0.5) - 0.08 * touchProx;
       } else {
+        const tx = Math.min(-0.05, Math.max(-0.22, ballLocalX));
         _auxVecA.set(
-          Math.min(-0.05, Math.max(-0.22, ballLocalX)),
-          SOLE_HEIGHT + 0.032 * touchProx,
+          tx,
+          minBodyYForWorldFloor(tx, ankleWorldFloorY, actor) + 0.032 * touchProx,
           reachZ
         );
         _tmpFootR.lerp(_auxVecA, touchProx * 0.52);
@@ -4893,6 +5153,18 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     }
   }
 
+  clampBodyPointWorldFloor(_tmpFootL, ankleWorldFloorY, actor);
+  clampBodyPointWorldFloor(_tmpFootR, ankleWorldFloorY, actor);
+
+  // Subtalar ankle counter-roll keeps planted cleat soleplates flush with the grass during banked cuts
+  bodyToWorldSpace(_tmpFootL.x, _tmpFootL.y, _tmpFootL.z, actor, _vFloorWorldTmp);
+  const plantBlendL = 1.0 - smoothstep(0.012, 0.09, _vFloorWorldTmp.y - ankleWorldFloorY);
+  rollL = -actor.smoothBankRoll * (0.35 + 0.50 * plantBlendL) * Math.cos(yawL);
+
+  bodyToWorldSpace(_tmpFootR.x, _tmpFootR.y, _tmpFootR.z, actor, _vFloorWorldTmp);
+  const plantBlendR = 1.0 - smoothstep(0.012, 0.09, _vFloorWorldTmp.y - ankleWorldFloorY);
+  rollR = -actor.smoothBankRoll * (0.35 + 0.50 * plantBlendR) * Math.cos(yawR);
+
   if (discontinuousMove) {
     actor.footGoalL.copy(_tmpFootL);
     actor.footGoalR.copy(_tmpFootR);
@@ -4900,6 +5172,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     damp3(actor.footGoalL, _tmpFootL, 0.020, dt);
     damp3(actor.footGoalR, _tmpFootR, 0.020, dt);
   }
+  clampBodyPointWorldFloor(actor.footGoalL, ankleWorldFloorY, actor);
+  clampBodyPointWorldFloor(actor.footGoalR, ankleWorldFloorY, actor);
 
   solveAndDampLegIK(
     bones[B_HIPS],
@@ -4914,8 +5188,9 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     dt,
     yawL,
     rollL,
-    minAnkleFloorY,
-    minKneeFloorY
+    ankleWorldFloorY,
+    kneeWorldFloorY,
+    actor
   );
   solveAndDampLegIK(
     bones[B_HIPS],
@@ -4930,8 +5205,9 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     dt,
     yawR,
     rollR,
-    minAnkleFloorY,
-    minKneeFloorY
+    ankleWorldFloorY,
+    kneeWorldFloorY,
+    actor
   );
 
   // ==========================================================================
@@ -4971,7 +5247,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
         worldToBodySpace(predWorldX, predWorldY + 0.19, predWorldZ, actor, _tmpHandR);
       } else {
         // Low turf lunge counter-balance trail glove (`IMG_0358`)!
-        _tmpHandR.set(-0.26, Math.max(minWristFloorY + 0.28, 0.66), 0.24);
+        _tmpHandR.set(
+          -0.26,
+          Math.max(minBodyYForWorldFloor(-0.26, wristWorldFloorY, actor) + 0.28, 0.66),
+          0.24
+        );
       }
       _elPoleL.set(0.35, -0.35, -0.86).normalize();
       _elPoleR.set(-0.55, 0.25, -0.80).normalize();
@@ -4980,7 +5260,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       if (highDiveBlend > 0.34) {
         worldToBodySpace(predWorldX, predWorldY + 0.19, predWorldZ, actor, _tmpHandL);
       } else {
-        _tmpHandL.set(0.26, Math.max(minWristFloorY + 0.28, 0.66), 0.24);
+        _tmpHandL.set(
+          0.26,
+          Math.max(minBodyYForWorldFloor(0.26, wristWorldFloorY, actor) + 0.28, 0.66),
+          0.24
+        );
       }
       _elPoleR.set(-0.35, -0.35, -0.86).normalize();
       _elPoleL.set(0.55, 0.25, -0.80).normalize();
@@ -5042,14 +5326,18 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     usePalmR = true;
   } else if (action === 3) {
     // Slide Tackle: Tucked left hand braces just above grass + right arm counter-balances high!
-    _tmpHandL.set(0.32, minWristFloorY + 0.025, -0.06);
-    _tmpHandR.set(-0.36, Math.max(minWristFloorY + 0.36, 0.62), 0.16);
+    _tmpHandL.set(0.32, minBodyYForWorldFloor(0.32, wristWorldFloorY, actor) + 0.025, -0.06);
+    _tmpHandR.set(
+      -0.36,
+      Math.max(minBodyYForWorldFloor(-0.36, wristWorldFloorY, actor) + 0.36, 0.62),
+      0.16
+    );
     _palmNormL.set(0, -1, 0.15).normalize();
     usePalmL = true;
   } else if (action === 5) {
     // Turf Tumble: Both palms pronate downward toward grass to cushion the fall!
-    _tmpHandL.set(0.24, minWristFloorY + 0.030, 0.42);
-    _tmpHandR.set(-0.24, minWristFloorY + 0.035, 0.36);
+    _tmpHandL.set(0.24, minBodyYForWorldFloor(0.24, wristWorldFloorY, actor) + 0.030, 0.42);
+    _tmpHandR.set(-0.24, minBodyYForWorldFloor(-0.24, wristWorldFloorY, actor) + 0.035, 0.36);
     _palmNormL.set(0, -0.95, 0.30).normalize();
     _palmNormR.set(0, -0.95, 0.30).normalize();
     usePalmL = true;
@@ -5241,6 +5529,9 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     }
   }
 
+  clampBodyPointWorldFloor(_tmpHandL, wristWorldFloorY, actor);
+  clampBodyPointWorldFloor(_tmpHandR, wristWorldFloorY, actor);
+
   if (discontinuousMove) {
     actor.handGoalL.copy(_tmpHandL);
     actor.handGoalR.copy(_tmpHandR);
@@ -5248,6 +5539,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     damp3(actor.handGoalL, _tmpHandL, 0.018, dt);
     damp3(actor.handGoalR, _tmpHandR, 0.018, dt);
   }
+  clampBodyPointWorldFloor(actor.handGoalL, wristWorldFloorY, actor);
+  clampBodyPointWorldFloor(actor.handGoalR, wristWorldFloorY, actor);
 
   solveAndDampArmIK(
     _qChestBS,
@@ -5263,7 +5556,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     dt,
     usePalmL ? _palmNormL : null,
     useFingerL ? _fingerDirL : null,
-    minWristFloorY
+    wristWorldFloorY,
+    actor
   );
   solveAndDampArmIK(
     _qChestBS,
@@ -5279,7 +5573,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     dt,
     usePalmR ? _palmNormR : null,
     useFingerR ? _fingerDirR : null,
-    minWristFloorY
+    wristWorldFloorY,
+    actor
   );
 }
 
@@ -6996,18 +7291,27 @@ export class ClassicFifa3DEngine {
             .add(bones[B_HIPS].position);
           _pChestBS.set(0, 0.20, 0).applyQuaternion(_qSpineBS).add(_pSpineBS);
 
+          const capScaleY = Math.max(0.5, cap.bodyScaleGroup.scale.y);
+          const capAnkleWorldY = cap.root.position.y + SOLE_HEIGHT * capScaleY;
+          const capKneeWorldY = cap.root.position.y + 0.056 * capScaleY;
+          const capWristWorldY = cap.root.position.y + 0.046 * capScaleY;
+
           solveAndDampLegIK(
             bones[B_HIPS],
             bones[B_HIP_L],
             bones[B_KNEE_L],
             bones[B_ANKLE_L],
             HIP_SOCKET_L,
-            _tmpFootL.set(0.116, SOLE_HEIGHT, 0.048 * sgn),
+            _tmpFootL.set(0.116, minBodyYForWorldFloor(0.116, capAnkleWorldY, cap), 0.048 * sgn),
             _poleL,
             0.0,
             0.06,
             dt,
-            -0.06
+            -0.06,
+            0,
+            capAnkleWorldY,
+            capKneeWorldY,
+            cap
           );
           solveAndDampLegIK(
             bones[B_HIPS],
@@ -7015,12 +7319,16 @@ export class ClassicFifa3DEngine {
             bones[B_KNEE_R],
             bones[B_ANKLE_R],
             HIP_SOCKET_R,
-            _tmpFootR.set(-0.116, SOLE_HEIGHT, -0.042 * sgn),
+            _tmpFootR.set(-0.116, minBodyYForWorldFloor(-0.116, capAnkleWorldY, cap), -0.042 * sgn),
             _poleR,
             0.0,
             0.06,
             dt,
-            0.06
+            0.06,
+            0,
+            capAnkleWorldY,
+            capKneeWorldY,
+            cap
           );
 
           _elPoleL.set(0.45, -0.25, -0.86).normalize();
@@ -7036,7 +7344,11 @@ export class ClassicFifa3DEngine {
             _elPoleL,
             1,
             0.07,
-            dt
+            dt,
+            null,
+            null,
+            capWristWorldY,
+            cap
           );
           solveAndDampArmIK(
             _qChestBS,
@@ -7049,7 +7361,11 @@ export class ClassicFifa3DEngine {
             _elPoleR,
             -1,
             0.07,
-            dt
+            dt,
+            null,
+            null,
+            capWristWorldY,
+            cap
           );
           dampBoneEuler(
             bones[B_HEAD],
