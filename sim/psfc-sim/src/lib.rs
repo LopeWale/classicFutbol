@@ -18,7 +18,7 @@ pub mod state;
 
 pub use config::{CpuDifficulty, MatchFormat, RuleSet, SideController, TeamSide, TICKS_PER_SECOND};
 pub use events::{MatchEvent, MatchEventType, PlayerMatchStats};
-pub use input::{InputFrame, BTN_SKILL};
+pub use input::{AutoSwitchMode, InputFrame, BTN_SKILL};
 pub use math::{Fp, Vec2, Vec3};
 pub use sim::{MatchSimulation, SimError};
 pub use snapshot::{

@@ -2151,6 +2151,8 @@ const SHARED_GEO = (() => {
   // Sleek FIFA 10–12 Proportioned Pitch Indicators (`IMG_0350.webp`)
   const ring = retainGpu(new THREE.RingGeometry(0.35, 0.45, 36));
   ring.rotateX(-Math.PI * 0.5);
+  const nextRing = retainGpu(new THREE.RingGeometry(0.38, 0.435, 28));
+  nextRing.rotateX(-Math.PI * 0.5);
   const chargeArc = retainGpu(new THREE.RingGeometry(0.47, 0.56, 32));
   chargeArc.rotateX(-Math.PI * 0.5);
   const aimArrow = retainGpu(new THREE.ConeGeometry(0.095, 0.20, 4));
@@ -2159,6 +2161,12 @@ const SHARED_GEO = (() => {
   cursorCone.rotateX(Math.PI);
   const shadowDisc = retainGpu(new THREE.CircleGeometry(0.36, 20));
   shadowDisc.rotateX(-Math.PI * 0.5);
+  const setPieceTargetRing = retainGpu(new THREE.RingGeometry(0.62, 0.78, 36));
+  setPieceTargetRing.rotateX(-Math.PI * 0.5);
+  const setPieceTargetDisc = retainGpu(new THREE.CircleGeometry(0.60, 28));
+  setPieceTargetDisc.rotateX(-Math.PI * 0.5);
+  const setPieceDash = retainGpu(new THREE.PlaneGeometry(0.13, 0.62));
+  setPieceDash.rotateX(-Math.PI * 0.5);
   const grassTuft = retainGpu(createGrassTuftGeometry());
 
   return {
@@ -2189,10 +2197,14 @@ const SHARED_GEO = (() => {
     gkHeadgear,
     sNumPlane,
     ring,
+    nextRing,
     chargeArc,
     aimArrow,
     cursorCone,
     shadowDisc,
+    setPieceTargetRing,
+    setPieceTargetDisc,
+    setPieceDash,
     grassTuft,
   };
 })();
@@ -3480,6 +3492,18 @@ function createFootballerActor(spec) {
   ctrlRing.visible = false;
   root.add(ctrlRing);
 
+  const nextRingMat = new THREE.MeshBasicMaterial({
+    color: ringColor,
+    transparent: true,
+    opacity: 0.36,
+    side: THREE.DoubleSide,
+    depthWrite: false,
+  });
+  const nextSwitchRing = new THREE.Mesh(SHARED_GEO.nextRing, nextRingMat);
+  nextSwitchRing.position.y = 0.020;
+  nextSwitchRing.visible = false;
+  root.add(nextSwitchRing);
+
   const aimWedge = new THREE.Mesh(SHARED_GEO.aimArrow, ringMat);
   aimWedge.position.set(0, 0.025, 0.53);
   aimWedge.visible = false;
@@ -3527,6 +3551,7 @@ function createFootballerActor(spec) {
     dirtLevel: 0,
     sweatLevel: 0,
     ctrlRing,
+    nextSwitchRing,
     aimWedge,
     chargeRing,
     chargeRingMat,
@@ -3630,8 +3655,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     charge,
     jumpZ = 0,
     inWall = false,
+    isThrowInTaker = false,
     refSignal = 0,
     isControlled,
+    isNextSwitch = false,
     ballX,
     ballY,
     ballZ = 0,
@@ -3732,15 +3759,23 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     actor.kickSwingTimer = Math.max(0, actor.kickSwingTimer - dt);
   }
 
-  // Clean EA FIFA 10–12 Pitch Indicators (`IMG_0350.webp` — zero giant floating black billboards!)
+  // Clean EA FIFA 10–12 Pitch Indicators + FIFA Second-Man Next-Switch Ring (`IMG_0350.webp`)
   actor.ctrlRing.visible = Boolean(isControlled);
   actor.aimWedge.visible = Boolean(isControlled);
   actor.overheadCursor.visible = Boolean(isControlled);
+  if (actor.nextSwitchRing) {
+    const showNext = Boolean(isNextSwitch && !isControlled);
+    actor.nextSwitchRing.visible = showNext;
+    if (showNext) {
+      const pulse = 0.96 + Math.sin(nowSec * 5.2) * 0.04;
+      actor.nextSwitchRing.scale.set(pulse, 1, pulse);
+    }
+  }
   if (isControlled) {
     actor.overheadCursor.position.y = 2.02 + actor.smoothJumpY + Math.sin(nowSec * 7.0) * 0.035;
     actor.overheadCursor.rotation.y = nowSec * 3.0;
     const relAimYaw =
-      aimRad !== null && charge > 0.02
+      aimRad !== null
         ? wrapAngleRad(Math.PI * 0.5 - aimRad - actor.root.rotation.y)
         : 0;
     const rAim = 0.53 + (charge > 0.02 ? charge * 0.18 : 0);
@@ -3975,7 +4010,13 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       ? 1.0 - smoothstep(0.32, 0.86, ballDistHoriz)
       : 0;
 
-  if (inWall && speed < 0.3) {
+  if (isThrowInTaker) {
+    // Planted split-step touchline throw-in stance (Law 15 both feet grounded behind/on touchline!)
+    _tmpFootL.set(0.115, SOLE_HEIGHT, 0.14);
+    _tmpFootR.set(-0.115, SOLE_HEIGHT, -0.15 - chargeCockBlend * 0.08);
+    pitchL = -0.05;
+    pitchR = 0.12;
+  } else if (inWall && speed < 0.3) {
     _tmpFootL.set(0.088, SOLE_HEIGHT, 0.01);
     _tmpFootR.set(-0.088, SOLE_HEIGHT, -0.01);
     pitchL = 0;
@@ -4062,7 +4103,16 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   );
 
   // Continuous Quaternion-Damped Upper-Limb Angular-Momentum Counter-Balance & Shielding (`IMG_0347`, `IMG_0363`!)
-  if (inWall && speed < 0.35) {
+  if (isThrowInTaker) {
+    // Authentic Two-Handed Overhead Throw-In Pose (`z = 1.82m` ball cradle + thoracic coil!)
+    const coil = chargeCockBlend;
+    dampBoneEuler(bones[B_SPINE], -0.10 - coil * 0.16, 0, 0, 0.055, dt);
+    dampBoneEuler(bones[B_CHEST], -0.12 - coil * 0.18, 0, 0, 0.055, dt);
+    dampBoneEuler(bones[B_SH_L], -2.84 - coil * 0.24, 0.18, -0.22, 0.05, dt);
+    dampBoneEuler(bones[B_SH_R], -2.84 - coil * 0.24, -0.18, 0.22, 0.05, dt);
+    dampBoneEuler(bones[B_EL_L], -0.62 - coil * 0.28, 0, -0.18, 0.05, dt);
+    dampBoneEuler(bones[B_EL_R], -0.62 - coil * 0.28, 0, 0.18, 0.05, dt);
+  } else if (inWall && speed < 0.35) {
     // Classic FIFA Free-Kick Defensive Wall Shield Pose (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
     dampBoneEuler(bones[B_SH_L], -0.34, 0.36, -0.22, 0.06, dt);
     dampBoneEuler(bones[B_SH_R], -0.34, -0.36, 0.22, 0.06, dt);
@@ -5362,6 +5412,51 @@ export class ClassicFifa3DEngine {
     this.scene.add(this.showcaseGroup);
     this.showcaseCaptains = null;
 
+    // 3D FIFA Set-Piece Aiming Trajectory & Landing Target Ring (Throw-Ins, Corners, Goal Kicks, Free Kicks)
+    this.setPieceGuide = new THREE.Group();
+    this.setPieceGuide.visible = false;
+    this.spRingMat = retainGpu(
+      new THREE.MeshBasicMaterial({
+        color: "#fbbf24",
+        transparent: true,
+        opacity: 0.85,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    this.spDiscMat = retainGpu(
+      new THREE.MeshBasicMaterial({
+        color: "#fbbf24",
+        transparent: true,
+        opacity: 0.18,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    this.spDashMat = retainGpu(
+      new THREE.MeshBasicMaterial({
+        color: "#f8fafc",
+        transparent: true,
+        opacity: 0.58,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+      })
+    );
+    this.spTargetRing = new THREE.Mesh(SHARED_GEO.setPieceTargetRing, this.spRingMat);
+    this.spTargetRing.position.y = 0.026;
+    this.spTargetDisc = new THREE.Mesh(SHARED_GEO.setPieceTargetDisc, this.spDiscMat);
+    this.spTargetDisc.position.y = 0.022;
+    this.setPieceGuide.add(this.spTargetRing);
+    this.setPieceGuide.add(this.spTargetDisc);
+    this.spDashes = [];
+    for (let i = 0; i < 7; i++) {
+      const dash = new THREE.Mesh(SHARED_GEO.setPieceDash, this.spDashMat);
+      dash.position.y = 0.024;
+      this.setPieceGuide.add(dash);
+      this.spDashes.push(dash);
+    }
+    this.scene.add(this.setPieceGuide);
+
     this.netRipple = [0, 0];
     this.netImpact = [
       { strength: 0, z: 0, y: 1.2 },
@@ -5483,7 +5578,7 @@ export class ClassicFifa3DEngine {
       }
       if (pitchMat) {
         pitchMat.roughness = m === "rain" ? 0.38 : m === "day" ? 0.86 : 0.82;
-        pitchMat.metalness = m === "rain" ? 0.08 : 0.01;
+        pitchMat.metalness = m === "rain" ? 0.08 : m === "day" ? 0.01 : 0.01;
       }
       if (grassField && grassField.mesh && grassField.mesh.material) {
         grassField.mesh.material.roughness = m === "rain" ? 0.36 : 0.76;
@@ -5502,6 +5597,9 @@ export class ClassicFifa3DEngine {
     }
     if (this.refereeActor) {
       this.refereeActor.root.visible = showMatchActors;
+    }
+    if (this.setPieceGuide && mode === "showcase") {
+      this.setPieceGuide.visible = false;
     }
     this.ballMesh.visible = true;
     this.ballShadow.visible = true;
@@ -5939,6 +6037,9 @@ export class ClassicFifa3DEngine {
       const hasAimWords = currPacked.length >= spinBase + 4;
       const homeAimBam = hasAimWords ? currPacked[spinBase + 2] : -1;
       const awayAimBam = hasAimWords ? currPacked[spinBase + 3] : -1;
+      const hasNextSwitchWords = currPacked.length >= spinBase + 6;
+      const homeNextSwitch = hasNextSwitchWords ? currPacked[spinBase + 4] : -1;
+      const awayNextSwitch = hasNextSwitchWords ? currPacked[spinBase + 5] : -1;
 
       this.ballMesh.position.set(ballX, this.ballRadius + Math.max(0, ballZ), ballY);
       const bSpeed = Math.hypot(ballVx, ballVy);
@@ -5968,6 +6069,7 @@ export class ClassicFifa3DEngine {
 
       const showHudIndicators = this.viewMode === "match" && !(replayOpts && replayOpts.active);
       const wallTargetDist = pitchLen > 80 ? 9.15 : 4.6;
+      let spTakerCharge = 0;
 
       const actorCount = Math.min(pps * 2, this.actors.length);
       for (let n = 0; n < actorCount; n++) {
@@ -6032,10 +6134,20 @@ export class ClassicFifa3DEngine {
           }
         }
 
-        const isControlled = showHudIndicators && (side === 0 ? idx === homeCtrl : idx === awayCtrl);
+        const isSideCtrl = side === 0 ? idx === homeCtrl : idx === awayCtrl;
+        const isControlled = showHudIndicators && isSideCtrl;
+        const isNextSwitch =
+          showHudIndicators &&
+          !isControlled &&
+          ownerSide !== side &&
+          (side === 0 ? idx === homeNextSwitch : idx === awayNextSwitch);
         const rawAimBam = side === 0 ? homeAimBam : awayAimBam;
         const aimRad = isControlled && rawAimBam >= 0 ? (rawAimBam * Math.PI * 2) / 65536 : null;
         const isBallCarrier = showHudIndicators && ownerSide === side && ownerIdx === idx;
+        const isThrowInTaker = phase === 2 && ownerSide === side && isSideCtrl;
+        if (phase >= 2 && phase <= 6 && ownerSide === side && isSideCtrl) {
+          spTakerCharge = charge;
+        }
         const celebrating = phase === 10 && ownerSide === side;
         const inWall =
           phase === 5 &&
@@ -6059,7 +6171,9 @@ export class ClassicFifa3DEngine {
             charge,
             jumpZ,
             inWall,
+            isThrowInTaker,
             isControlled,
+            isNextSwitch,
             isBallCarrier,
             ballX,
             ballY,
@@ -6075,6 +6189,76 @@ export class ClassicFifa3DEngine {
         );
         if (phase === 3 || phase === 5 || phase === 6) {
           actor.nameplate.visible = false;
+        }
+      }
+
+      // Update 3D Set-Piece Aiming Trajectory & Landing Target Ring (Throw-Ins, Corners, Goal/Free/Penalty Kicks)
+      if (this.setPieceGuide) {
+        const spAimBam = ownerSide === 0 ? homeAimBam : ownerSide === 1 ? awayAimBam : -1;
+        if (showHudIndicators && phase >= 2 && phase <= 6 && spAimBam >= 0) {
+          this.setPieceGuide.visible = true;
+          const spColorHex = ownerSide === 0 ? 0xfbbf24 : 0x38bdf8;
+          this.spRingMat.color.setHex(spTakerCharge > 0.78 ? 0xef4444 : spColorHex);
+          this.spDiscMat.color.setHex(spColorHex);
+
+          const spRad = (spAimBam * Math.PI * 2) / 65536;
+          const dirX = Math.cos(spRad);
+          const dirY = Math.sin(spRad);
+          const is11Sp = pitchLen > 80;
+          const attSign = ownerSide === 0 ? Math.sign(gk1X || 1) : Math.sign(gk0X || -1);
+
+          let landX = ballX + dirX * 9.0;
+          let landY = ballY + dirY * 9.0;
+          if (phase === 2) {
+            // Throw-In landing zone (`5.5m..17.5m` infield along clamped aim, >= 1.85m inside touchline!)
+            const dThrow = (is11Sp ? 7.2 : 5.8) + spTakerCharge * (is11Sp ? 11.5 : 8.8);
+            landX = Math.max(-(halfL - 1.5), Math.min(halfL - 1.5, ballX + dirX * dThrow));
+            landY = Math.max(-(halfW - 1.85), Math.min(halfW - 1.85, ballY + dirY * dThrow));
+          } else if (phase === 3) {
+            // Corner Kick box target zone (Near Post -> Penalty Corridor -> Far Post as charge rises!)
+            const ySign = ballY >= 0 ? 1 : -1;
+            const baseDepth = is11Sp ? 7.8 : 5.4;
+            const goalHW = leftGoal.goalHW || 2.0;
+            const ySpan = goalHW * (is11Sp ? 1.35 : 1.15);
+            const zoneY =
+              spTakerCharge < 0.04
+                ? ySign * ySpan * 0.25
+                : spTakerCharge < 0.36
+                  ? ySign * ySpan * 0.78
+                  : spTakerCharge <= 0.72
+                    ? -ySign * ySpan * 0.12
+                    : -ySign * ySpan * 0.88;
+            const depthNudge = Math.max(-1.6, Math.min(2.0, (-dirX * attSign - 0.35) * 3.6));
+            landX = attSign * halfL - attSign * (baseDepth + depthNudge);
+            landY = Math.max(-(halfW - 1.8), Math.min(halfW - 1.8, zoneY));
+          } else {
+            const dKick = (is11Sp ? 12.0 : 8.5) + spTakerCharge * (is11Sp ? 14.0 : 9.5);
+            landX = Math.max(-(halfL + 0.5), Math.min(halfL + 0.5, ballX + dirX * dKick));
+            landY = Math.max(-(halfW - 1.2), Math.min(halfW - 1.2, ballY + dirY * dKick));
+          }
+
+          const ringPulse = 1.0 + Math.sin(nowSec * 6.0) * 0.06 + spTakerCharge * 0.18;
+          this.spTargetRing.position.set(landX, 0.026, landY);
+          this.spTargetRing.scale.set(ringPulse, 1, ringPulse);
+          this.spTargetDisc.position.set(landX, 0.022, landY);
+          this.spTargetDisc.scale.set(ringPulse, 1, ringPulse);
+
+          const dx = landX - ballX;
+          const dy = landY - ballY;
+          const chordYaw = Math.atan2(dx, dy);
+          // Lateral in-swinging arc bow on Corner Kicks (`phase === 3`)
+          const bowX = phase === 3 ? -attSign * (is11Sp ? 1.85 : 1.15) : 0;
+          for (let i = 0; i < this.spDashes.length; i++) {
+            const u = (i + 1) / (this.spDashes.length + 1);
+            const arcWeight = 4 * u * (1 - u);
+            const px = ballX + dx * u + bowX * arcWeight;
+            const py = ballY + dy * u;
+            const dash = this.spDashes[i];
+            dash.position.set(px, 0.024, py);
+            dash.rotation.y = chordYaw;
+          }
+        } else {
+          this.setPieceGuide.visible = false;
         }
       }
 
@@ -6236,8 +6420,24 @@ export class ClassicFifa3DEngine {
       const targetGoalX = targetGoalSign * halfL;
       const distToAttGoal = Math.hypot(targetGoalX - ballX, ballY);
 
-      if (phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
-        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg`!)
+      if (phase === 2 && Math.abs(ballY) > halfW * 0.65) {
+        // Authentic Sideline Throw-In Camera framing full overhead thrower above radar + 3 infield options!
+        setPieceCamKey = 2;
+        const ySign = ballY >= 0 ? 1 : -1;
+        desiredFov = 33.5;
+        camSmoothTime = 0.16;
+        targetPos = [
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - targetGoalSign * 4.4)),
+          4.15 * zScale,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY + ySign * 5.3 * zScale)),
+        ];
+        targetLook = [
+          Math.max(-(halfL - 2.0), Math.min(halfL - 2.0, ballX + targetGoalSign * 2.8)),
+          0.52,
+          ballY - ySign * (is11 ? 5.2 : 4.0),
+        ];
+      } else if (phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
+        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg` — taker framed cleanly above radar!)
         setPieceCamKey = 3;
         const penSpotX = Math.sign(ballX) * (halfL - (is11 ? 11.0 : 6.2));
         const dx = penSpotX - ballX;
@@ -6245,14 +6445,16 @@ export class ClassicFifa3DEngine {
         const inv = 1.0 / Math.max(0.1, Math.hypot(dx, dz));
         const ux = dx * inv;
         const uz = dz * inv;
-        desiredFov = 34;
+        const px = -uz;
+        const pz = ux;
+        desiredFov = 35;
         camSmoothTime = 0.14;
         targetPos = [
-          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * 6.2 * zScale)),
-          3.35 * zScale,
-          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 6.2 * zScale)),
+          Math.max(-maxBowlX, Math.min(maxBowlX, ballX - ux * 5.2 * zScale + px * 0.95)),
+          3.05 * zScale,
+          Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 5.2 * zScale + pz * 0.95)),
         ];
-        targetLook = [ballX + ux * 11.5, 1.05, ballY + uz * 11.5];
+        targetLook = [ballX + ux * 7.6, 0.55, ballY + uz * 7.6];
       } else if (phase === 6 || (phase === 5 && distToAttGoal < halfL * 0.92)) {
         // Authentic Behind-the-Free-Kick / Penalty-Taker Camera (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
         setPieceCamKey = phase;
