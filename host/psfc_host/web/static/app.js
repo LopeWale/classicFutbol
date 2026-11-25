@@ -648,6 +648,7 @@ let goalBannerTicks = 0;
 let lastShootoutScore = null;
 let homePossTicks = 1;
 let awayPossTicks = 1;
+let lastKnownOwnerSide = -1;
 let matchEventsLog = [];
 let queuedReservedQueue = [[], []]; // Queued 16-bit `reserved` commands (settings sync 0x4000 or subs 0x8000) per side
 let subsUsedCount = [0, 0];
@@ -1794,7 +1795,7 @@ function samplePhysicalGamepad(logicalSlot) {
  * `buttons` bitmask + 7-bit analog sprint pressure so the Rust `PossessionContext` state machine
  * resolves Attacking / Defending / LooseBall deterministically on every 60 Hz tick.
  */
-function mapPhysicalToSimInput(phys, prof = controlProfile) {
+function mapPhysicalToSimInput(phys, prof = controlProfile, isAttacking = true) {
   const p = phys.buttons;
   const pressed = (key) => Boolean(key && p[key]);
   const triggerDepth = (key) => {
@@ -1823,8 +1824,9 @@ function mapPhysicalToSimInput(phys, prof = controlProfile) {
   if (pressed(prof.defense.jockey)) buttons |= BTN_JOCKEY;
   if (pressed(prof.defense.switchPlayer)) buttons |= BTN_SWITCH;
 
-  // --- Sprint (Analog or Digital past 0.10 deadzone) ---
-  const sprintDepth = Math.max(triggerDepth(prof.attack.sprint), triggerDepth(prof.defense.sprint));
+  // --- Sprint (Analog or Digital past 0.10 deadzone), resolved strictly from active context ---
+  const activeSprintKey = isAttacking ? prof.attack.sprint : prof.defense.sprint;
+  const sprintDepth = triggerDepth(activeSprintKey);
   let sprintAnalog = 0;
   if (sprintDepth > 0.10) {
     buttons |= BTN_SPRINT;
@@ -1876,10 +1878,10 @@ function mapPhysicalToSimInput(phys, prof = controlProfile) {
   };
 }
 
-function sampleRawGamepad(logicalSlot) {
+function sampleRawGamepad(logicalSlot, isAttacking = true) {
   const phys = samplePhysicalGamepad(logicalSlot);
   if (!phys) return null;
-  return mapPhysicalToSimInput(phys, controlProfile);
+  return mapPhysicalToSimInput(phys, controlProfile, isAttacking);
 }
 
 function isPadInputActive(gp) {
@@ -1935,30 +1937,30 @@ function samplePhysicalKeyboardP1(allowArrows) {
   };
 }
 
-function samplePrimaryHumanInput(allowArrows) {
+function samplePrimaryHumanInput(allowArrows, isAttacking = true) {
   // In 1P modes (`allowArrows === true`), respond to WHICHEVER connected controller is being used!
   if (allowArrows) {
     const pads = getConnectedPads();
     for (let i = 0; i < pads.length; i++) {
-      const gpAny = sampleRawGamepad(i);
+      const gpAny = sampleRawGamepad(i, isAttacking);
       if (isPadInputActive(gpAny)) return gpAny;
     }
   } else {
-    const gp = sampleRawGamepad(0);
+    const gp = sampleRawGamepad(0, isAttacking);
     if (isPadInputActive(gp)) return gp;
   }
 
   // Route P1 keyboard through Layer 2 ControlProfile so Classic / Alternate / Two-Button / Custom
   // presets immediately govern keyboard controls too!
-  const mapped = mapPhysicalToSimInput(samplePhysicalKeyboardP1(allowArrows), controlProfile);
+  const mapped = mapPhysicalToSimInput(samplePhysicalKeyboardP1(allowArrows), controlProfile, isAttacking);
   // Preserve optional direct keyboard convenience keys without interfering with preset bindings
   if (keysDown.has("KeyC")) mapped.btns |= BTN_SLIDE;
   if (keysDown.has("KeyR")) mapped.btns |= BTN_TEAMMATE_CONTAIN | BTN_CALL_RUN;
   return mapped;
 }
 
-function sampleSecondaryHumanInput() {
-  const gp2 = sampleRawGamepad(1);
+function sampleSecondaryHumanInput(isAttacking = true) {
+  const gp2 = sampleRawGamepad(1, isAttacking);
   if (isPadInputActive(gp2)) return gp2;
 
   let lx = 0;
@@ -1997,7 +1999,7 @@ function sampleSecondaryHumanInput() {
     id: "keyboard-p2",
     rawPad: null,
   };
-  return mapPhysicalToSimInput(phys2, controlProfile);
+  return mapPhysicalToSimInput(phys2, controlProfile, isAttacking);
 }
 
 function rebindControlProfileAction(context, actionKey, newPhys) {
@@ -2772,6 +2774,7 @@ function setupLiveMatchHud(snapshot, contextLabel) {
   lastShootoutScore = null;
   homePossTicks = 1;
   awayPossTicks = 1;
+  lastKnownOwnerSide = -1;
   matchEventsLog = [];
   queuedReservedQueue = [[], []];
   enqueueControlSettingsSync();
@@ -3865,27 +3868,36 @@ function mainLoop(nowMs) {
     } else {
       if (!paused && currentScreen === "match" && steps > 0) {
         const sideMode = SIDE_MODES[pmSideIdx].id;
+        const ownerNow = currSimPacked ? currSimPacked[15] : -1;
+        const effOwner = ownerNow === 0 || ownerNow === 1 ? ownerNow : lastKnownOwnerSide;
+        const homeAttacking = effOwner === 0;
+        const awayAttacking = effOwner === 1;
         let hIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
         let aIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
 
         if (sideMode === "local_2p") {
-          hIn = samplePrimaryHumanInput(false);
-          aIn = sampleSecondaryHumanInput();
+          hIn = samplePrimaryHumanInput(false, homeAttacking);
+          aIn = sampleSecondaryHumanInput(awayAttacking);
         } else if (sideMode === "away_vs_cpu") {
-          aIn = samplePrimaryHumanInput(true);
+          aIn = samplePrimaryHumanInput(true, awayAttacking);
         } else if (sideMode === "home_vs_cpu") {
-          hIn = samplePrimaryHumanInput(true);
+          hIn = samplePrimaryHumanInput(true, homeAttacking);
         }
 
         const swBits = ((AUTO_SWITCH_OPTIONS[autoSwitchIdx]?.code ?? 0) & 0x3) << 12;
+        const dualMapBit = 0x0800;
         const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
         const aSprintBits = (aIn.sprintAnalog || 0) & 0x7f;
         for (let s = 0; s < steps; s++) {
           if (currSimPacked) prevSimPacked = currSimPacked;
           const hQueued = queuedReservedQueue[0].length > 0 ? queuedReservedQueue[0].shift() : 0;
           const aQueued = queuedReservedQueue[1].length > 0 ? queuedReservedQueue[1].shift() : 0;
-          const hReserved = (hQueued !== 0 ? hQueued | ((hQueued & 0x8000) !== 0 ? swBits : 0) : swBits | hSprintBits) & 0xffff;
-          const aReserved = (aQueued !== 0 ? aQueued | ((aQueued & 0x8000) !== 0 ? swBits : 0) : swBits | aSprintBits) & 0xffff;
+          const hReserved =
+            (hQueued !== 0 ? hQueued | ((hQueued & 0x8000) !== 0 ? swBits : 0) : swBits | dualMapBit | hSprintBits) &
+            0xffff;
+          const aReserved =
+            (aQueued !== 0 ? aQueued | ((aQueued & 0x8000) !== 0 ? swBits : 0) : swBits | dualMapBit | aSprintBits) &
+            0xffff;
           const hBtns = ((hIn.btns & 0xffff) | (hReserved << 16)) >>> 0;
           const aBtns = ((aIn.btns & 0xffff) | (aReserved << 16)) >>> 0;
 
@@ -3900,8 +3912,13 @@ function mainLoop(nowMs) {
           if (subPacked && subPacked[3] !== 12) {
             if (replayBuffer.length >= REPLAY_CAPACITY) replayBuffer.shift();
             replayBuffer.push(new Int32Array(subPacked));
-            if (subPacked[15] === 0) homePossTicks++;
-            else if (subPacked[15] === 1) awayPossTicks++;
+            if (subPacked[15] === 0) {
+              homePossTicks++;
+              lastKnownOwnerSide = 0;
+            } else if (subPacked[15] === 1) {
+              awayPossTicks++;
+              lastKnownOwnerSide = 1;
+            }
           }
           if (subPacked && subPacked[17] > 0) {
             drainLiveMatchEvents(subPacked);

@@ -27,6 +27,9 @@ pub const BTN_PACE_CONTROL: u16 = 1 << 15;
 
 pub const RESERVED_SUB_FLAG: u16 = 0x8000;
 pub const RESERVED_SETTINGS_FLAG: u16 = 0x4000;
+/// Normal gameplay `reserved` bit `11` (`0x0800`): client emits context-separated Attack/Defense maps
+/// (`BTN_FINESSE` / `BTN_PACE_CONTROL` explicitly separated from defensive `BTN_JOCKEY`).
+pub const RESERVED_DUAL_MAP_FLAG: u16 = 0x0800;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InputFrame {
@@ -250,12 +253,18 @@ impl InputFrame {
         ((mode as u16) & 0x3) << 12
     }
 
-    /// Encodes normal gameplay `reserved` carrying `AutoSwitchMode` (bits `12..=13`)
-    /// and 7-bit analog sprint throttle `0..=127` (bits `0..=6`).
+    /// Encodes normal gameplay `reserved` carrying `AutoSwitchMode` (bits `12..=13`),
+    /// `RESERVED_DUAL_MAP_FLAG` (bit `11`), and 7-bit analog sprint throttle `0..=127` (bits `0..=6`).
     #[inline]
     pub const fn encode_gameplay_reserved(mode: AutoSwitchMode, sprint_analog: u8) -> u16 {
         let clamped = if sprint_analog > 127 { 127 } else { sprint_analog };
-        (((mode as u16) & 0x3) << 12) | ((clamped as u16) & 0x7F)
+        (((mode as u16) & 0x3) << 12) | RESERVED_DUAL_MAP_FLAG | ((clamped as u16) & 0x7F)
+    }
+
+    #[inline]
+    pub const fn is_dual_map_frame(self) -> bool {
+        (self.reserved & (RESERVED_SUB_FLAG | RESERVED_SETTINGS_FLAG)) == 0
+            && (self.reserved & RESERVED_DUAL_MAP_FLAG) != 0
     }
 
     #[inline]

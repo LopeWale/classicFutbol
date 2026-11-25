@@ -131,6 +131,7 @@ impl MatchSimulation {
                 switch_cooldown: [0, 0],
                 manual_switch_lock: [0, 0],
                 control_settings: [ControlSettings::default(), ControlSettings::default()],
+                dual_map_controls: [false, false],
                 switch_move_assist_ticks: [0, 0],
                 switch_move_assist_dir: [Vec2::ZERO, Vec2::ZERO],
                 prev_rstick_active: [false, false],
@@ -233,9 +234,13 @@ impl MatchSimulation {
                 self.apply_substitution(side, pitch_slot, bench_idx);
             } else if let Some(cfg) = ext.decode_settings() {
                 self.state.control_settings[s_idx] = cfg;
+                self.state.dual_map_controls[s_idx] = true;
             } else if (ext.reserved & (RESERVED_SUB_FLAG | RESERVED_SETTINGS_FLAG)) == 0 {
                 // Keep backward compatibility with callers that only encode AutoSwitchMode in bits 12..13
                 self.state.control_settings[s_idx].auto_switch_mode = ext.auto_switch_mode();
+                if ext.is_dual_map_frame() {
+                    self.state.dual_map_controls[s_idx] = true;
+                }
             }
         }
 
@@ -264,6 +269,7 @@ impl MatchSimulation {
         // Advance pre-contact Input Buffer & live Power Bar charging!
         for s_idx in 0..2 {
             let side_in = inputs[s_idx];
+            let dual_map = self.state.dual_map_controls[s_idx];
             if let Some(mut buf) = self.state.input_buffer[s_idx] {
                 if buf.charging {
                     let primary_btn = if (buf.button & BTN_SHOOT) != 0 {
@@ -277,7 +283,7 @@ impl MatchSimulation {
                     {
                         buf.button |= BTN_LOB;
                     }
-                    if is_finesse_pressed(side_in) {
+                    if is_finesse_pressed(side_in, dual_map) {
                         buf.finesse = true;
                     }
                     let is_cpu = match s_idx {
@@ -451,7 +457,8 @@ impl MatchSimulation {
                         };
                         let still_held = (side_in.buttons & primary_btn) != 0;
                         let next_ticks = ticks + 1;
-                        let next_finesse = finesse || is_finesse_pressed(side_in);
+                        let next_finesse =
+                            finesse || is_finesse_pressed(side_in, self.state.dual_map_controls[t_s_idx]);
                         let eff_aim = if user_steering {
                             live_aim
                         } else if prev_aim.len() > Fp::from_milli(120) {
@@ -488,7 +495,10 @@ impl MatchSimulation {
                             self.state.players[t_s_idx][taker_idx].action = PlayerActionState::Charging {
                                 button: single_btn,
                                 ticks: 1,
-                                finesse: is_finesse_pressed(side_in),
+                                finesse: is_finesse_pressed(
+                                    side_in,
+                                    self.state.dual_map_controls[t_s_idx],
+                                ),
                                 aim: live_aim,
                             };
                         } else if wait_ticks >= timeout_ticks {
@@ -2376,6 +2386,8 @@ impl MatchSimulation {
             let side_input = inputs[s_idx];
             let prev_btns = self.state.prev_buttons[s_idx];
             let ctrl_cfg = self.state.control_settings[s_idx];
+            let side_dual_map = self.state.dual_map_controls[s_idx];
+            let side_has_buffer = self.state.input_buffer[s_idx].is_some();
             let side_is_cpu = match side {
                 TeamSide::Home => self.state.rules.home_controller.is_cpu(),
                 TeamSide::Away => self.state.rules.away_controller.is_cpu(),
@@ -2607,7 +2619,8 @@ impl MatchSimulation {
                                     Vec2::from_bam(p.facing_bam, Fp::ONE)
                                 };
                                 let aim = resolve_kick_aim(side_input, side_is_cpu, fallback_aim);
-                                let next_finesse = finesse || is_finesse_pressed(side_input);
+                                let next_finesse =
+                                    finesse || is_finesse_pressed(side_input, side_dual_map);
                                 if !still_held || next_ticks >= MAX_CHARGE_TICKS {
                                     p.action = PlayerActionState::Cooldown { ticks_left: 6 };
                                     kick_to_execute = Some((next_button, next_ticks, next_finesse, aim));
@@ -2675,13 +2688,13 @@ impl MatchSimulation {
                                         p.action = PlayerActionState::Charging {
                                             button: single_btn,
                                             ticks: 1,
-                                            finesse: is_finesse_pressed(side_input),
+                                            finesse: is_finesse_pressed(side_input, side_dual_map),
                                             aim: init_aim,
                                         };
                                     } else if !is_gk
                                         && rstick_flick_rising
                                         && side_input.pressed(BTN_SPRINT)
-                                        && !is_pace_control_pressed(side_input)
+                                        && !is_pace_control_pressed(side_input, side_dual_map)
                                     {
                                         // FIFA 10–12 Right-Stick Sprint Knock-On: burst touch into open space!
                                         let ko_dir = rstick_vec.normalize_or_zero();
@@ -2756,7 +2769,7 @@ impl MatchSimulation {
                                         new_buffered = Some(BufferedAction {
                                             button: single_btn,
                                             aim: init_aim,
-                                            finesse: is_finesse_pressed(side_input),
+                                            finesse: is_finesse_pressed(side_input, side_dual_map),
                                             charge_ticks: 1,
                                             charging: true,
                                             ttl_ticks: INPUT_BUFFER_TTL_TICKS,
@@ -2882,15 +2895,18 @@ impl MatchSimulation {
 
                     let is_5v5 = self.state.format.players_per_side <= 6;
 
-                    // Determine desired 360° movement vector, analog sprint throttle (`0..=1000`), jockey, contain & pace-control
+                    // Determine desired 360° movement vector, analog sprint throttle (`0..=1000`), jockey, contain & pace-control.
+                    // Suppress defensive Contain/Jockey while receiving a teammate's pass or holding a buffered attacking kick!
+                    let attacking_receive_or_buffer =
+                        own_team_receiving || new_buffered.is_some() || side_has_buffer;
                     let (mut move_dir, sprint_throttle, mut jockey, contain_held, pace_control) =
                         if is_controlled {
                             (
                                 side_input.move_vec(),
                                 side_input.sprint_throttle_permille(ctrl_cfg.analog_sprint),
-                                !has_ball && side_input.pressed(BTN_JOCKEY),
-                                !has_ball && side_input.pressed(BTN_CONTAIN),
-                                has_ball && is_pace_control_pressed(side_input),
+                                !has_ball && !attacking_receive_or_buffer && side_input.pressed(BTN_JOCKEY),
+                                !has_ball && !attacking_receive_or_buffer && side_input.pressed(BTN_CONTAIN),
+                                has_ball && is_pace_control_pressed(side_input, side_dual_map),
                             )
                         } else if let Some(intent) = ai_intent {
                             (
@@ -4030,8 +4046,10 @@ impl MatchSimulation {
         let carrier_speed = carrier_vel.len();
         let carrier_facing = self.state.players[c_s_idx][carrier_idx].facing_bam;
         let carrier_forward = Vec2::from_bam(carrier_facing, Fp::ONE);
-        let carrier_shielding =
-            (self.state.prev_buttons[c_s_idx] & (BTN_PACE_CONTROL | BTN_JOCKEY)) != 0;
+        let carrier_shielding = is_pace_control_bits(
+            self.state.prev_buttons[c_s_idx],
+            self.state.dual_map_controls[c_s_idx],
+        );
         let carrier_drib = self.state.players[c_s_idx][carrier_idx].attributes.dribbling as i64;
         let ball_xy = self.state.ball.pos.xy();
         let ball_z = self.state.ball.pos.z;
@@ -4523,7 +4541,8 @@ impl MatchSimulation {
                 facing_dir
             };
 
-            let pace_control = is_pace_control_pressed(inp);
+            let pace_control =
+                is_pace_control_pressed(inp, self.state.dual_map_controls[side.index()]);
             let sprint_throttle =
                 inp.sprint_throttle_permille(self.state.control_settings[side.index()].analog_sprint);
             let tight_lead = (445 - (drib_skill - 75) * 2).clamp(385, 480);
@@ -5335,11 +5354,25 @@ impl MatchSimulation {
                     };
                     let overlap = min_sep - dist;
 
-                    // Physical mass + low-center-of-gravity shielding brace (`LT / L2` Pace Control / Jockey)
-                    let a_shield =
-                        (self.state.prev_buttons[sa] & (BTN_PACE_CONTROL | BTN_JOCKEY)) != 0;
-                    let b_shield =
-                        (self.state.prev_buttons[sb] & (BTN_PACE_CONTROL | BTN_JOCKEY)) != 0;
+                    // Physical mass + low-center-of-gravity shielding brace (Attack: Pace Control; Defense: Jockey)
+                    let a_owns = self.state.ball.owner.map(|(s, _)| s.index()) == Some(sa);
+                    let b_owns = self.state.ball.owner.map(|(s, _)| s.index()) == Some(sb);
+                    let a_shield = if a_owns {
+                        is_pace_control_bits(
+                            self.state.prev_buttons[sa],
+                            self.state.dual_map_controls[sa],
+                        )
+                    } else {
+                        (self.state.prev_buttons[sa] & BTN_JOCKEY) != 0
+                    };
+                    let b_shield = if b_owns {
+                        is_pace_control_bits(
+                            self.state.prev_buttons[sb],
+                            self.state.dual_map_controls[sb],
+                        )
+                    } else {
+                        (self.state.prev_buttons[sb] & BTN_JOCKEY) != 0
+                    };
                     let mass_a = (68 + (self.state.players[sa][ia].attributes.strength as i64) * 3 / 10)
                         + if a_shield { 16 } else { 0 };
                     let mass_b = (68 + (self.state.players[sb][ib].attributes.strength as i64) * 3 / 10)
@@ -5873,17 +5906,32 @@ fn point_to_segment_dist_and_t(p: Vec2, a: Vec2, b: Vec2) -> (Fp, Fp) {
     (p.dist(closest), t)
 }
 
-/// Returns true when Finesse / Driven modifier is active (`RB / R1` `BTN_FINESSE`, or legacy `BTN_JOCKEY`
-/// without `BTN_PACE_CONTROL` for SNES single-shoulder & existing unit tests).
+/// Returns true when Finesse / Driven modifier is active (`RB / R1` `BTN_FINESSE`).
+/// Legacy single-map frames (`!dual_map`) preserve `BTN_JOCKEY` without `BTN_PACE_CONTROL`;
+/// dual-map (`ControlProfile`) frames never leak defensive `BTN_JOCKEY` into attacking Finesse.
 #[inline]
-const fn is_finesse_pressed(inp: InputFrame) -> bool {
-    inp.pressed(BTN_FINESSE) || (inp.pressed(BTN_JOCKEY) && !inp.pressed(BTN_PACE_CONTROL))
+const fn is_finesse_pressed(inp: InputFrame, dual_map: bool) -> bool {
+    if dual_map {
+        inp.pressed(BTN_FINESSE)
+    } else {
+        inp.pressed(BTN_FINESSE) || (inp.pressed(BTN_JOCKEY) && !inp.pressed(BTN_PACE_CONTROL))
+    }
 }
 
-/// Returns true when Pace Control / Close Shielding / Skill Modifier is active (`LT / L2` `BTN_PACE_CONTROL` or legacy `BTN_JOCKEY`).
+/// Returns true when Pace Control / Close Shielding / Skill Modifier is active (`LT / L2` `BTN_PACE_CONTROL`).
+/// Legacy single-map frames (`!dual_map`) preserve `BTN_JOCKEY`; dual-map frames keep defensive `BTN_JOCKEY` separate.
 #[inline]
-const fn is_pace_control_pressed(inp: InputFrame) -> bool {
-    inp.pressed(BTN_PACE_CONTROL) || inp.pressed(BTN_JOCKEY)
+const fn is_pace_control_bits(buttons: u16, dual_map: bool) -> bool {
+    if dual_map {
+        (buttons & BTN_PACE_CONTROL) != 0
+    } else {
+        (buttons & (BTN_PACE_CONTROL | BTN_JOCKEY)) != 0
+    }
+}
+
+#[inline]
+const fn is_pace_control_pressed(inp: InputFrame, dual_map: bool) -> bool {
+    is_pace_control_bits(inp.buttons, dual_map)
 }
 
 /// Solves initial horizontal ground pass velocity `v0 = sqrt(v_arr^2 + 2 * a_eff * d)` matching `step_ball`'s
@@ -8477,6 +8525,131 @@ mod tests {
             matches!(sk.state().players[0][1].action, PlayerActionState::Normal),
             "continuously holding Right Stick past 14 ticks must NOT re-trigger/loop another Skill Move, got {:?}",
             sk.state().players[0][1].action
+        );
+    }
+
+    #[test]
+    fn codex_review_dual_map_isolation_and_pass_buffer_no_contain() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(7706);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+
+        // 1. Codex P2 #1: Holding A/Cross (`BTN_PASS | BTN_CONTAIN`) to buffer a teammate's incoming pass
+        //    MUST NOT activate defensive Containment or pull the receiver goal-side (-X)!
+        let mut sim = MatchSimulation::new(&snap).unwrap();
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.controlled_idx = [1, 1];
+        sim.state.players[0][1].pos = Vec2::from_milli(0, 0);
+        sim.state.players[0][1].vel = Vec2::ZERO;
+        sim.state.ball.owner = None;
+        // Ball passed by Home teammate #2 rolling across in front of #1 (`own_team_receiving = true`)
+        sim.state.ball.pos = Vec3::from_milli(3_500, 0, 0);
+        sim.state.ball.vel = Vec3::from_milli(-4_000, 0, 0);
+        sim.state.ball.last_touch_team = Some(TeamSide::Home);
+        sim.state.ball.last_touch_player = Some((TeamSide::Home, 2));
+        for _ in 0..5 {
+            sim.tick(&[
+                InputFrame {
+                    move_x: 127, // Receiver running forward +X toward incoming pass!
+                    buttons: BTN_PASS | BTN_CONTAIN,
+                    reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::AssistedBall, 0),
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        assert!(
+            sim.state().players[0][1].vel.x > Fp::from_milli(2_500),
+            "receiver buffering teammate pass with BTN_PASS|BTN_CONTAIN must run forward +X, NOT be pulled back by defensive contain (vel={:?})",
+            sim.state().players[0][1].vel
+        );
+
+        // 2. Codex P2 #3: Under dual-map controls (`0x4000` / `0x0800`), remapping defensive Jockey to East
+        //    (`BTN_SHOOT | BTN_JOCKEY`) must NOT trigger Finesse Shot and `BTN_JOCKEY` while carrying must NOT trigger Pace Control!
+        let mut dm = MatchSimulation::new(&snap).unwrap();
+        dm.state.phase = MatchPhase::OpenPlay;
+        dm.state.controlled_idx = [1, 1];
+        dm.state.players[0][1].pos = Vec2::from_milli(14_000, 2_000);
+        dm.state.players[0][1].vel = Vec2::ZERO;
+        dm.state.players[0][1].facing_bam = 0;
+        dm.state.ball.owner = Some((TeamSide::Home, 1));
+        dm.state.ball.pos = Vec3::from_milli(14_400, 2_000, 0);
+        // Sync ControlSettings (enables dual_map_controls[0] = true)
+        let settings_res = InputFrame::encode_settings(ControlSettings::default());
+        dm.tick(&[
+            InputFrame {
+                move_x: 127,
+                buttons: BTN_JOCKEY, // Remapped defensive Jockey held while running with ball
+                reserved: settings_res,
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        // Compare carrier running speed with `BTN_JOCKEY` vs `BTN_PACE_CONTROL` under dual-map:
+        let measure_dual_map_carry_speed = |extra_btn: u16| -> Fp {
+            let mut s = MatchSimulation::new(&snap).unwrap();
+            s.state.phase = MatchPhase::OpenPlay;
+            s.state.controlled_idx = [1, 1];
+            s.state.dual_map_controls[0] = true;
+            s.state.players[0][1].pos = Vec2::from_milli(0, 0);
+            s.state.players[0][1].vel = Vec2::ZERO;
+            s.state.players[0][1].facing_bam = 0;
+            for opp in &mut s.state.players[1] {
+                opp.pos = Vec2::from_milli(24_000, -14_000);
+            }
+            s.state.ball.owner = Some((TeamSide::Home, 1));
+            s.state.ball.pos = Vec3::from_milli(400, 0, 0);
+            for _ in 0..24 {
+                s.tick(&[
+                    InputFrame {
+                        move_x: 127,
+                        buttons: extra_btn,
+                        reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::AssistedBall, 0),
+                        ..InputFrame::IDLE
+                    },
+                    InputFrame::IDLE,
+                ]);
+            }
+            s.state().players[0][1].vel.len()
+        };
+        let spd_def_jockey = measure_dual_map_carry_speed(BTN_JOCKEY);
+        let spd_pace_ctrl = measure_dual_map_carry_speed(BTN_PACE_CONTROL);
+        assert!(
+            spd_def_jockey > spd_pace_ctrl + Fp::from_milli(800),
+            "under dual-map controls, defensive BTN_JOCKEY must NOT slow carrier like attacking BTN_PACE_CONTROL (jockey={spd_def_jockey:?}, pace={spd_pace_ctrl:?})"
+        );
+
+        // Now shoot with `BTN_SHOOT | BTN_JOCKEY` (without `BTN_FINESSE`) under dual-map -> MUST NOT curl as Finesse!
+        for _ in 0..10 {
+            dm.tick(&[
+                InputFrame {
+                    move_x: 127,
+                    buttons: BTN_SHOOT | BTN_JOCKEY,
+                    reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::AssistedBall, 0),
+                    ..InputFrame::IDLE
+                },
+                InputFrame::IDLE,
+            ]);
+        }
+        dm.tick(&[
+            InputFrame {
+                move_x: 127,
+                reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::AssistedBall, 0),
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert!(
+            dm.state().ball.spin_side.abs() < Fp::from_milli(2_500),
+            "dual-map shot with remapped defensive BTN_JOCKEY must NOT turn into a Finesse Curler (spin_side={:?})",
+            dm.state().ball.spin_side
+        );
+        assert!(
+            !dm.state()
+                .recorded_events
+                .iter()
+                .any(|e| e.detail.contains("curls")),
+            "dual-map shot without BTN_FINESSE must not report a finesse curl"
         );
     }
 }

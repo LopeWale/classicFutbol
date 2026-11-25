@@ -21,7 +21,7 @@
       "minimum": 0,
       "maximum": 65535,
       "default": 0,
-      "description": "Bit15=1: Substitution; Bit15=0&Bit14=1: 14-bit ControlSettings sync; Bit15=0&Bit14=0: bits12..13=AutoSwitchMode, bits0..6=AnalogSprint(0..127)"
+      "description": "Bit15=1: Substitution; Bit15=0&Bit14=1: 14-bit ControlSettings sync; Bit15=0&Bit14=0: bits12..13=AutoSwitchMode, bit11=DualMapControls, bits0..6=AnalogSprint(0..127)"
     }
   },
   "additionalProperties": false

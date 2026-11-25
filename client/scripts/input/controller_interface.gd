@@ -198,7 +198,8 @@ func _pack_buttons_with_reserved(side: int, low_buttons: int, sprint_analog: int
 		reserved = encode_control_settings_reserved()
 		pending_settings_sync[side] = false
 	else:
-		reserved = ((_auto_switch_code() & 0x3) << 12) | (clampi(sprint_analog, 0, 127) & 0x7F)
+		# Bit 11 (0x0800) tags dual-map ControlProfile frames so psfc-sim disables legacy BTN_JOCKEY attacking aliases.
+		reserved = ((_auto_switch_code() & 0x3) << 12) | 0x0800 | (clampi(sprint_analog, 0, 127) & 0x7F)
 	return (low_buttons & 0xFFFF) | ((reserved & 0xFFFF) << 16)
 
 func _auto_bind_connected_pads() -> void:
@@ -227,12 +228,12 @@ func _on_joy_connection_changed(device_id: int, connected: bool) -> void:
 		if bound_guid_by_side[side] == guid:
 			active_device_by_side[side] = device_id if connected else -1
 
-func sample_input_frame(side: int) -> Dictionary:
+func sample_input_frame(side: int, is_attacking: bool = false) -> Dictionary:
 	var dev_id: int = active_device_by_side.get(side, -1)
 	if dev_id >= 0:
-		return _sample_joypad(side, dev_id, bound_guid_by_side[side])
+		return _sample_joypad(side, dev_id, bound_guid_by_side[side], is_attacking)
 	if side == 0:
-		return _sample_keyboard_p1(side)
+		return _sample_keyboard_p1(side, is_attacking)
 	return {
 		"move_x": 0,
 		"move_y": 0,
@@ -257,7 +258,7 @@ func detect_controller_profile(dev_id: int) -> String:
 		return "Xbox XInput Controller"
 	return "Standard USB/BT Gamepad"
 
-func _sample_joypad(side: int, dev_id: int, guid: String) -> Dictionary:
+func _sample_joypad(side: int, dev_id: int, guid: String, is_attacking: bool = false) -> Dictionary:
 	var cal: DeviceCalibration = calibration_by_guid.get(guid, DeviceCalibration.new())
 	var lvec := _apply_circular_deadzone(
 		Vector2(Input.get_joy_axis(dev_id, JOY_AXIS_LEFT_X), Input.get_joy_axis(dev_id, JOY_AXIS_LEFT_Y)),
@@ -312,7 +313,7 @@ func _sample_joypad(side: int, dev_id: int, guid: String) -> Dictionary:
 	}
 
 	var extra_skill := Input.is_joy_button_pressed(dev_id, JOY_BUTTON_RIGHT_STICK) or Input.is_joy_button_pressed(dev_id, JOY_BUTTON_LEFT_STICK)
-	return _map_physical_to_frame(side, lvec, rvec, lt_val, rt_val, phys, extra_skill)
+	return _map_physical_to_frame(side, lvec, rvec, lt_val, rt_val, phys, extra_skill, is_attacking)
 
 func _map_physical_to_frame(
 	side: int,
@@ -321,7 +322,8 @@ func _map_physical_to_frame(
 	lt_val: float,
 	rt_val: float,
 	phys: Dictionary,
-	extra_skill: bool = false
+	extra_skill: bool = false,
+	is_attacking: bool = false
 ) -> Dictionary:
 	var att: Dictionary = control_profile.get("attack", CONTROL_PRESETS["classic"]["attack"])
 	var def: Dictionary = control_profile.get("defense", CONTROL_PRESETS["classic"]["defense"])
@@ -359,16 +361,15 @@ func _map_physical_to_frame(
 	if phys.get(def.get("switch_player", "lb"), false):
 		btns |= BTN_SWITCH
 
-	# Analog or Digital Sprint (> 0.10 deadzone)
-	var sprint_key_att: String = str(att.get("sprint", "rt"))
-	var sprint_key_def: String = str(def.get("sprint", "rt"))
-	var depth_of := func(k: String) -> float:
-		if k == "rt":
-			return rt_val
-		if k == "lt":
-			return lt_val
-		return 1.0 if phys.get(k, false) else 0.0
-	var sprint_depth: float = maxf(depth_of.call(sprint_key_att), depth_of.call(sprint_key_def))
+	# Analog or Digital Sprint (> 0.10 deadzone), resolved strictly from active Attack/Defense context
+	var active_sprint_key: String = str(att.get("sprint", "rt")) if is_attacking else str(def.get("sprint", "rt"))
+	var sprint_depth: float = 0.0
+	if active_sprint_key == "rt":
+		sprint_depth = rt_val
+	elif active_sprint_key == "lt":
+		sprint_depth = lt_val
+	else:
+		sprint_depth = 1.0 if phys.get(active_sprint_key, false) else 0.0
 	var sprint_analog: int = 0
 	if sprint_depth > 0.10:
 		btns |= BTN_SPRINT
@@ -396,7 +397,7 @@ func _map_physical_to_frame(
 		"buttons": _pack_buttons_with_reserved(side, btns, sprint_analog),
 	}
 
-func _sample_keyboard_p1(side: int) -> Dictionary:
+func _sample_keyboard_p1(side: int, is_attacking: bool = false) -> Dictionary:
 	var mx := 0.0
 	var my := 0.0
 	if Input.is_key_pressed(KEY_D) or Input.is_key_pressed(KEY_RIGHT):
@@ -424,7 +425,7 @@ func _sample_keyboard_p1(side: int) -> Dictionary:
 		"rt": sprinting,
 		"select": Input.is_key_pressed(KEY_Z),
 	}
-	return _map_physical_to_frame(side, v, Vector2.ZERO, 1.0 if lt_held else 0.0, 1.0 if sprinting else 0.0, phys, false)
+	return _map_physical_to_frame(side, v, Vector2.ZERO, 1.0 if lt_held else 0.0, 1.0 if sprinting else 0.0, phys, false, is_attacking)
 
 func _apply_circular_deadzone(raw: Vector2, dz: float) -> Vector2:
 	var mag := raw.length()

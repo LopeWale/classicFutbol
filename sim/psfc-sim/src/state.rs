@@ -274,6 +274,10 @@ pub struct MatchState {
     /// Per-side FIFA control assistance & defending mode settings (deterministically synced via `InputFrame.reserved`).
     #[serde(default)]
     pub control_settings: [ControlSettings; 2],
+    /// True once a side emits dual-map (`ControlProfile`) inputs (`0x4000` settings sync or `0x0800` flag),
+    /// disabling legacy single-map `BTN_JOCKEY` attacking modifier aliases so remapped defensive Jockey never leaks into Attack.
+    #[serde(default)]
+    pub dual_map_controls: [bool; 2],
     /// Remaining Auto-Switching Move Assistance ticks carrying prior run direction after a player switch.
     #[serde(default)]
     pub switch_move_assist_ticks: [u8; 2],
@@ -400,6 +404,8 @@ impl MatchState {
         h.u8(self.manual_switch_lock[1]);
         h.u16(self.control_settings[0].encode_reserved());
         h.u16(self.control_settings[1].encode_reserved());
+        h.u8(u8::from(self.dual_map_controls[0]));
+        h.u8(u8::from(self.dual_map_controls[1]));
         h.u8(self.switch_move_assist_ticks[0]);
         h.u8(self.switch_move_assist_ticks[1]);
         h.i64(self.switch_move_assist_dir[0].x.raw());
