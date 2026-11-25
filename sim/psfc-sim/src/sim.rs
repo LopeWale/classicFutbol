@@ -229,17 +229,23 @@ impl MatchSimulation {
         // Execute any deterministic substitution or FIFA ControlSettings sync encoded in `external_inputs[s].reserved`
         for side in [TeamSide::Home, TeamSide::Away] {
             let s_idx = side.index();
+            let is_human = match side {
+                TeamSide::Home => !self.state.rules.home_controller.is_cpu(),
+                TeamSide::Away => !self.state.rules.away_controller.is_cpu(),
+            };
             let ext = external_inputs[s_idx];
             if let Some((pitch_slot, bench_idx)) = ext.decode_substitution() {
                 self.apply_substitution(side, pitch_slot, bench_idx);
-            } else if let Some(cfg) = ext.decode_settings() {
-                self.state.control_settings[s_idx] = cfg;
-                self.state.dual_map_controls[s_idx] = true;
-            } else if (ext.reserved & (RESERVED_SUB_FLAG | RESERVED_SETTINGS_FLAG)) == 0 {
-                // Keep backward compatibility with callers that only encode AutoSwitchMode in bits 12..13
-                self.state.control_settings[s_idx].auto_switch_mode = ext.auto_switch_mode();
-                if ext.is_dual_map_frame() {
+            } else if is_human {
+                if let Some(cfg) = ext.decode_settings() {
+                    self.state.control_settings[s_idx] = cfg;
                     self.state.dual_map_controls[s_idx] = true;
+                } else if (ext.reserved & (RESERVED_SUB_FLAG | RESERVED_SETTINGS_FLAG)) == 0 {
+                    // Keep backward compatibility with callers that only encode AutoSwitchMode in bits 12..13
+                    self.state.control_settings[s_idx].auto_switch_mode = ext.auto_switch_mode();
+                    if ext.is_dual_map_frame() {
+                        self.state.dual_map_controls[s_idx] = true;
+                    }
                 }
             }
         }
@@ -3759,10 +3765,12 @@ impl MatchSimulation {
                     if !is_lob && !in_attacking_wing {
                         let rel = opp.pos - kicker_pos;
                         let along = rel.dot(lane_dir);
-                        if along > Fp::from_milli(1_000) && along < dist - Fp::from_milli(750) {
+                        if along > Fp::from_milli(150) && along < dist - Fp::from_milli(650) {
                             let lat_d = (rel - lane_dir.scale(along)).len();
-                            if lat_d < Fp::from_milli(1_150) {
-                                lane_blocked_pen = Fp::from_milli(2_600);
+                            if along < Fp::from_milli(1_600) && lat_d < Fp::from_milli(980) {
+                                lane_blocked_pen = lane_blocked_pen.max(Fp::from_milli(6_200));
+                            } else if lat_d < Fp::from_milli(1_150) {
+                                lane_blocked_pen = lane_blocked_pen.max(Fp::from_milli(2_600));
                             }
                         }
                     }
@@ -3826,7 +3834,7 @@ impl MatchSimulation {
                 }
                 let rel = opp.pos - kicker_pos;
                 let along = rel.dot(init_dir);
-                if along > Fp::from_milli(1_100) && along < init_dist - Fp::from_milli(850) {
+                if along > Fp::from_milli(150) && along < init_dist - Fp::from_milli(750) {
                     let lat = rel.dot(perp);
                     if lat.abs() < Fp::from_milli(1_950) {
                         let open_sign = if lat >= Fp::ZERO { Fp::NEG_ONE } else { Fp::ONE };
@@ -3835,6 +3843,18 @@ impl MatchSimulation {
                         let aim_arc = (needed_clear.mul(Fp::from_milli(1_450)))
                             .clamp(Fp::from_milli(1_250), Fp::from_milli(2_550));
                         target_pos += perp.scale(open_sign.mul(aim_arc));
+                        // If presser is point-blank (< 2.0m), step ball onto the passer's outside boot so it clears shins!
+                        if along < Fp::from_milli(2_000) && lat.abs() < Fp::from_milli(1_150) {
+                            let step_out = perp.scale(open_sign.mul(Fp::from_milli(260)));
+                            self.state.ball.pos.x = (self.state.ball.pos.x + step_out.x).clamp(
+                                -(half_len - Fp::from_milli(400)),
+                                half_len - Fp::from_milli(400),
+                            );
+                            self.state.ball.pos.y = (self.state.ball.pos.y + step_out.y).clamp(
+                                -(half_wid - Fp::from_milli(400)),
+                                half_wid - Fp::from_milli(400),
+                            );
+                        }
                         lane_avoid_spin = (-open_sign).mul(Fp::from_milli(bend_mag));
                         bypassing_blocker = true;
                         break;
@@ -4093,20 +4113,36 @@ impl MatchSimulation {
 
             let def_id = def_p.footballer_id.clone();
             let def_name = def_p.name.clone();
+            let def_pos_now = def_p.pos;
             let def_vel = def_p.vel;
-            let carry_step = def_pos_ahead(def_p.pos, def_fwd, 340);
+            let away_from_carrier = {
+                let sep = def_pos_now - carrier_pos;
+                if sep.len() > Fp::from_milli(40) {
+                    sep.normalize_or_zero()
+                } else {
+                    def_fwd
+                }
+            };
+            let escape_dir = (def_fwd.scale(Fp::from_milli(650))
+                + away_from_carrier.scale(Fp::from_milli(350)))
+            .normalize_or_zero();
+            let carry_step = def_pos_ahead(def_pos_now, escape_dir, 400);
 
             self.state.player_stats[d_s_idx][d_idx].tackles_won += 1;
             self.state.players[c_s_idx][carrier_idx].action =
-                PlayerActionState::Cooldown { ticks_left: 8 };
+                PlayerActionState::Cooldown { ticks_left: 22 };
+            self.state.players[c_s_idx][carrier_idx].vel =
+                carrier_vel.scale(Fp::from_milli(420));
+            self.state.players[d_s_idx][d_idx].run_boost_ticks =
+                self.state.players[d_s_idx][d_idx].run_boost_ticks.max(14);
             self.state.ball.owner = Some((def_side, d_idx));
             self.state.ball.dribble_touch_cd = 6;
             self.state.ball.pos.x = carry_step.x;
             self.state.ball.pos.y = carry_step.y;
             self.state.ball.pos.z = Fp::ZERO;
             self.state.ball.vel = Vec3::new(
-                def_vel.x.mul(Fp::from_milli(780)) + def_fwd.x.mul(Fp::from_milli(1_450)),
-                def_vel.y.mul(Fp::from_milli(780)) + def_fwd.y.mul(Fp::from_milli(1_450)),
+                def_vel.x.mul(Fp::from_milli(780)) + escape_dir.x.mul(Fp::from_milli(1_850)),
+                def_vel.y.mul(Fp::from_milli(780)) + escape_dir.y.mul(Fp::from_milli(1_850)),
                 Fp::ZERO,
             );
             if d_idx != 0 {
@@ -4246,7 +4282,7 @@ impl MatchSimulation {
             // the tackler's leg cannot phase through the carrier's pelvis to poke the ball!
             if !is_slide && hit_man_before_ball && (carrier_shielding || from_behind) {
                 self.state.players[d_s_idx][d_idx].action =
-                    PlayerActionState::Cooldown { ticks_left: 11 };
+                    PlayerActionState::Cooldown { ticks_left: 14 };
                 continue;
             }
 
@@ -4256,9 +4292,6 @@ impl MatchSimulation {
 
             // Clean Physical Dispossession!
             self.state.player_stats[d_s_idx][d_idx].tackles_won += 1;
-            self.state.players[d_s_idx][d_idx].action = PlayerActionState::Cooldown {
-                ticks_left: if is_slide { 11 } else { 6 },
-            };
             self.state.manual_switch_lock[d_s_idx] = 0;
 
             // Assisted Clean Hook: cleanly hooks possession against non-sprinting carriers (`< 5.8 m/s`)
@@ -4276,19 +4309,38 @@ impl MatchSimulation {
                     && def_vel.len() < Fp::from_milli(5_600));
 
             if clean_hook {
+                // Keep clean-hook winner immediately responsive (`ticks_left: 2`) while giving the
+                // dispossessed carrier realistic upright off-balance recovery (`ticks_left: 24`)!
+                self.state.players[d_s_idx][d_idx].action = PlayerActionState::Cooldown {
+                    ticks_left: if is_slide { 8 } else { 2 },
+                };
+                self.state.players[d_s_idx][d_idx].run_boost_ticks =
+                    self.state.players[d_s_idx][d_idx].run_boost_ticks.max(16);
+
                 let heavy_crash = clipped_man
                     && (def_vel - carrier_vel).len() > Fp::from_milli(6_800);
                 self.state.players[c_s_idx][carrier_idx].action = if heavy_crash {
-                    PlayerActionState::Stumbled { ticks_left: 14 }
+                    PlayerActionState::Stumbled { ticks_left: 18 }
                 } else {
-                    PlayerActionState::Cooldown { ticks_left: 10 }
+                    PlayerActionState::Cooldown { ticks_left: 24 }
                 };
                 self.state.players[c_s_idx][carrier_idx].vel =
-                    carrier_vel.scale(Fp::from_milli(580));
+                    carrier_vel.scale(Fp::from_milli(400));
 
-                let hook_xy = def_pos_ahead(def_pos, def_fwd, 380);
+                let away_from_carrier = {
+                    let sep = def_pos - carrier_pos;
+                    if sep.len() > Fp::from_milli(40) {
+                        sep.normalize_or_zero()
+                    } else {
+                        def_fwd
+                    }
+                };
+                let escape_dir = (def_fwd.scale(Fp::from_milli(650))
+                    + away_from_carrier.scale(Fp::from_milli(350)))
+                .normalize_or_zero();
+                let hook_xy = def_pos_ahead(def_pos, escape_dir, 420);
                 let hook_vel = def_vel.scale(Fp::from_milli(760))
-                    + def_fwd.scale(Fp::from_milli(1_850));
+                    + escape_dir.scale(Fp::from_milli(2_150));
                 self.state.ball.owner = Some((def_side, d_idx));
                 self.state.ball.dribble_touch_cd = 6;
                 self.state.ball.pos.x = hook_xy.x;
@@ -4300,10 +4352,13 @@ impl MatchSimulation {
                 }
             } else {
                 // Outstretched Standing Toe-Poke or Sweeping Slide Tackle -> pokes ball loose into space!
+                self.state.players[d_s_idx][d_idx].action = PlayerActionState::Cooldown {
+                    ticks_left: if is_slide { 14 } else { 9 },
+                };
                 self.state.players[c_s_idx][carrier_idx].action = if is_slide && clipped_man {
                     PlayerActionState::Stumbled { ticks_left: 18 }
                 } else {
-                    PlayerActionState::Cooldown { ticks_left: 9 }
+                    PlayerActionState::Cooldown { ticks_left: 18 }
                 };
                 let push_out = {
                     let d = ball_xy - def_pos;
@@ -4316,11 +4371,11 @@ impl MatchSimulation {
                 let poke_dir = (def_fwd.scale(Fp::from_milli(580)) + push_out.scale(Fp::from_milli(420)))
                     .normalize_or_zero();
                 let poke_spd = if is_slide {
-                    Fp::from_milli(5_900) + def_vel.len().mul(Fp::from_milli(300))
+                    Fp::from_milli(6_100) + def_vel.len().mul(Fp::from_milli(300))
                 } else {
-                    Fp::from_milli(4_900) + def_vel.len().mul(Fp::from_milli(280))
+                    Fp::from_milli(5_400) + def_vel.len().mul(Fp::from_milli(280))
                 };
-                let nudged = ball_xy + poke_dir.scale(Fp::from_milli(280));
+                let nudged = ball_xy + poke_dir.scale(Fp::from_milli(320));
                 self.state.ball.owner = None;
                 self.state.ball.pos.x = nudged.x;
                 self.state.ball.pos.y = nudged.y;
@@ -8650,6 +8705,77 @@ mod tests {
                 .iter()
                 .any(|e| e.detail.contains("curls")),
             "dual-map shot without BTN_FINESSE must not report a finesse curl"
+        );
+    }
+
+    #[test]
+    fn world_class_cpu_vs_cpu_never_locks_in_midfield_duel_loop() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2);
+        snap.rules.half_duration_ticks = 3_600;
+        snap.rules.home_controller = SideController::Cpu(crate::CpuDifficulty::Hard);
+        snap.rules.away_controller = SideController::Cpu(crate::CpuDifficulty::Hard);
+
+        let mut sim = MatchSimulation::new(&snap).unwrap();
+        // Verify spectator Manual/MoveAssist ControlSettings on external_inputs NEVER overwrite CPU sides
+        let manual_spec = InputFrame {
+            reserved: InputFrame::encode_settings(ControlSettings {
+                pass_assist: AssistLevel::Manual,
+                through_assist: AssistLevel::Manual,
+                shot_assist: AssistLevel::Manual,
+                cross_assist: AssistLevel::Manual,
+                defending_mode: DefendingMode::Legacy,
+                auto_switch_mode: AutoSwitchMode::Manual,
+                auto_switch_move_assist: crate::AutoSwitchMoveAssist::High,
+                analog_sprint: false,
+            }),
+            ..InputFrame::IDLE
+        };
+        sim.tick(&[manual_spec, manual_spec]);
+        assert_eq!(sim.state().control_settings[0].pass_assist, AssistLevel::Assisted);
+        assert_eq!(sim.state().control_settings[1].pass_assist, AssistLevel::Assisted);
+        assert!(!sim.state().dual_map_controls[0] && !sim.state().dual_map_controls[1]);
+
+        let mut anchor_tick = 1_u32;
+        let mut anchor_pos = sim.state().ball.pos.xy();
+        let mut flips_in_zone = 0_u32;
+        let mut prev_owner: Option<TeamSide> = None;
+        let mut max_stall_ticks = 0_u32;
+        let mut max_zone_flips = 0_u32;
+
+        for _ in 1..3_800 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            let st = sim.state();
+            if matches!(st.phase, MatchPhase::FullTime) {
+                break;
+            }
+            if !matches!(st.phase, MatchPhase::OpenPlay) || st.ball.gk_hold_ticks > 0 {
+                anchor_tick = st.tick;
+                anchor_pos = st.ball.pos.xy();
+                flips_in_zone = 0;
+                prev_owner = st.ball.owner.map(|(s, _)| s);
+                continue;
+            }
+            if let Some((cur_side, _)) = st.ball.owner {
+                if let Some(prev_side) = prev_owner {
+                    if prev_side != cur_side {
+                        flips_in_zone += 1;
+                    }
+                }
+                prev_owner = Some(cur_side);
+            }
+            if st.ball.pos.xy().dist(anchor_pos) > Fp::from_milli(3_200) {
+                anchor_tick = st.tick;
+                anchor_pos = st.ball.pos.xy();
+                flips_in_zone = 0;
+            } else {
+                max_stall_ticks = max_stall_ticks.max(st.tick.saturating_sub(anchor_tick));
+                max_zone_flips = max_zone_flips.max(flips_in_zone);
+            }
+        }
+
+        assert!(
+            max_stall_ticks <= 165 && max_zone_flips <= 5,
+            "World Class CPU vs CPU must never lock into a repetitive duel loop (max_stall_ticks={max_stall_ticks}, max_zone_flips={max_zone_flips})"
         );
     }
 }

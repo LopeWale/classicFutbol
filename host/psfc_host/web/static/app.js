@@ -665,10 +665,17 @@ function saveControlProfile() {
 
 function enqueueControlSettingsSync() {
   const word = encodeControlSettingsReserved(controlProfile);
-  // Coalesce any pending older settings sync in queue while preserving substitutions
+  const sideMode = SIDE_MODES[pmSideIdx]?.id || "home_vs_cpu";
+  const humanSides = [
+    sideMode === "home_vs_cpu" || sideMode === "local_2p",
+    sideMode === "away_vs_cpu" || sideMode === "local_2p",
+  ];
+  // Coalesce any pending older settings sync in queue while preserving substitutions (Human sides only!)
   for (let s = 0; s < 2; s++) {
     queuedReservedQueue[s] = queuedReservedQueue[s].filter((w) => (w & 0xc000) !== 0x4000);
-    queuedReservedQueue[s].push(word);
+    if (humanSides[s]) {
+      queuedReservedQueue[s].push(word);
+    }
   }
 }
 
@@ -3884,6 +3891,8 @@ function mainLoop(nowMs) {
           hIn = samplePrimaryHumanInput(true, homeAttacking);
         }
 
+        const homeHuman = sideMode === "home_vs_cpu" || sideMode === "local_2p";
+        const awayHuman = sideMode === "away_vs_cpu" || sideMode === "local_2p";
         const swBits = ((AUTO_SWITCH_OPTIONS[autoSwitchIdx]?.code ?? 0) & 0x3) << 12;
         const dualMapBit = 0x0800;
         const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
@@ -3893,11 +3902,17 @@ function mainLoop(nowMs) {
           const hQueued = queuedReservedQueue[0].length > 0 ? queuedReservedQueue[0].shift() : 0;
           const aQueued = queuedReservedQueue[1].length > 0 ? queuedReservedQueue[1].shift() : 0;
           const hReserved =
-            (hQueued !== 0 ? hQueued | ((hQueued & 0x8000) !== 0 ? swBits : 0) : swBits | dualMapBit | hSprintBits) &
-            0xffff;
+            (hQueued !== 0
+              ? hQueued | ((hQueued & 0x8000) !== 0 && homeHuman ? swBits : 0)
+              : homeHuman
+                ? swBits | dualMapBit | hSprintBits
+                : 0) & 0xffff;
           const aReserved =
-            (aQueued !== 0 ? aQueued | ((aQueued & 0x8000) !== 0 ? swBits : 0) : swBits | dualMapBit | aSprintBits) &
-            0xffff;
+            (aQueued !== 0
+              ? aQueued | ((aQueued & 0x8000) !== 0 && awayHuman ? swBits : 0)
+              : awayHuman
+                ? swBits | dualMapBit | aSprintBits
+                : 0) & 0xffff;
           const hBtns = ((hIn.btns & 0xffff) | (hReserved << 16)) >>> 0;
           const aBtns = ((aIn.btns & 0xffff) | (aReserved << 16)) >>> 0;
 

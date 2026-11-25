@@ -2,8 +2,8 @@
 
 use crate::config::{CpuDifficulty, TeamSide};
 use crate::input::{
-    InputFrame, BTN_JOCKEY, BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_SPRINT, BTN_SWITCH, BTN_TACKLE,
-    BTN_THROUGH,
+    InputFrame, BTN_JOCKEY, BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_SKILL, BTN_SPRINT, BTN_SWITCH,
+    BTN_TACKLE, BTN_THROUGH,
 };
 use crate::math::{Fp, Vec2};
 use crate::snapshot::PlayerRole;
@@ -961,14 +961,63 @@ pub fn generate_cpu_input(
         return vec_and_buttons_to_input(gk_aim, gk_aim, gk_btn);
     }
 
-    // Reaction cadence by difficulty
+    // Reaction cadence by difficulty (staggered per side so Home & Away CPU never phase-lock on identical ticks!)
     let decision_cadence: u32 = match difficulty {
         CpuDifficulty::Easy => 18,
         CpuDifficulty::Normal => 10,
-        CpuDifficulty::Hard => 5,
+        CpuDifficulty::Hard => 6,
+    };
+    let cadence_tick = state.tick.wrapping_add((side_idx as u32) * 7);
+    let half_wid = state.format.half_width();
+
+    // Nearest opponent distance & vector (used for both quick-release charging and dribbling/passing)
+    let mut nearest_opp_dist = Fp::from_int(999);
+    let mut nearest_opp_vec = Vec2::ZERO;
+    for opp in &state.players[side.opponent().index()] {
+        if opp.sent_off {
+            continue;
+        }
+        let d = me.pos.dist(opp.pos);
+        if d < nearest_opp_dist {
+            nearest_opp_dist = d;
+            nearest_opp_vec = opp.pos - me.pos;
+        }
+    }
+
+    // Helper: compute lateral sidestep away from a close presser while keeping pitch bounds in mind
+    let evade_stride = |desired: Vec2| -> Vec2 {
+        if nearest_opp_dist < Fp::from_milli(3_800) && nearest_opp_vec.len() > Fp::from_milli(80) {
+            let opp_dir = nearest_opp_vec.normalize_or_zero();
+            let perp_a = Vec2::new(-opp_dir.y, opp_dir.x);
+            let perp_b = Vec2::new(opp_dir.y, -opp_dir.x);
+            let score_side = |cand: Vec2| -> Fp {
+                let next_y = me.pos.y + cand.y.mul(Fp::from_milli(2_500));
+                let wall_margin = (half_wid - next_y.abs()).clamp(Fp::from_milli(-3_000), Fp::from_milli(6_000));
+                cand.dot(desired).mul(Fp::from_milli(1_400)) + wall_margin.mul(Fp::from_milli(220))
+            };
+            let lateral = if score_side(perp_a) >= score_side(perp_b) {
+                perp_a
+            } else {
+                perp_b
+            };
+            let head_on = opp_dir.dot(desired);
+            if head_on > Fp::from_milli(250) {
+                let lat_w = if nearest_opp_dist < Fp::from_milli(1_850) {
+                    Fp::from_milli(760)
+                } else {
+                    Fp::from_milli(560)
+                };
+                (desired.scale(Fp::ONE - lat_w) + lateral.scale(lat_w) - opp_dir.scale(Fp::from_milli(220)))
+                    .normalize_or_zero()
+            } else {
+                (desired - opp_dir.scale(Fp::from_milli(360))).normalize_or_zero()
+            }
+        } else {
+            desired
+        }
     };
 
-    // If already charging a pass/shot, preserve diagonal aim & stride glide until release!
+    // If already charging a pass/shot, release briskly under close pressure so tacklers never catch windup!
     if let PlayerActionState::Charging {
         button,
         ticks,
@@ -976,17 +1025,25 @@ pub fn generate_cpu_input(
         ..
     } = me.action
     {
-        let target_charge: u16 = if (button & BTN_SHOOT) != 0 { 12 } else { 8 };
+        let tight_press = nearest_opp_dist < Fp::from_milli(2_050);
+        let target_charge: u16 = if (button & BTN_SHOOT) != 0 {
+            if tight_press { 11 } else { 15 }
+        } else if tight_press {
+            4
+        } else {
+            8
+        };
         let hold_aim = if stored_aim.len() > Fp::from_milli(120) {
             stored_aim.normalize_or_zero()
         } else {
             Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO)
         };
-        let glide_dir = if me.vel.len() > Fp::from_milli(450) {
+        let base_glide = if me.vel.len() > Fp::from_milli(450) {
             me.vel.normalize_or_zero()
         } else {
             hold_aim
         };
+        let glide_dir = evade_stride(base_glide);
         if ticks >= target_charge {
             return vec_and_buttons_to_input(glide_dir, hold_aim, 0);
         } else {
@@ -1005,84 +1062,169 @@ pub fn generate_cpu_input(
         let shot_target = Vec2::new(opp_goal_x, corner_y);
         let dist_to_goal = me.pos.dist(Vec2::new(opp_goal_x, Fp::ZERO));
         let max_shoot_dist = if state.format.players_per_side <= 6 {
-            Fp::from_milli(14_500)
+            Fp::from_milli(15_800)
         } else {
-            Fp::from_milli(21_000)
+            Fp::from_milli(22_200)
         };
 
-        // Nearest opponent distance
-        let mut nearest_opp_dist = Fp::from_int(999);
-        let mut nearest_opp_vec = Vec2::ZERO;
-        for opp in &state.players[side.opponent().index()] {
-            if opp.sent_off {
-                continue;
-            }
-            let d = me.pos.dist(opp.pos);
-            if d < nearest_opp_dist {
-                nearest_opp_dist = d;
-                nearest_opp_vec = opp.pos - me.pos;
-            }
-        }
-
         // 1. Shoot when in shooting range!
-        if dist_to_goal <= max_shoot_dist && state.tick.is_multiple_of(decision_cadence) {
+        let urgent_press = difficulty != CpuDifficulty::Easy
+            && nearest_opp_dist < Fp::from_milli(1_650)
+            && cadence_tick.is_multiple_of(3);
+        if dist_to_goal <= max_shoot_dist
+            && (cadence_tick.is_multiple_of(decision_cadence) || urgent_press)
+        {
             let aim = (shot_target - me.pos).normalize_or_zero();
             return vec_and_buttons_to_input(aim, aim, BTN_SHOOT);
         }
 
-        // 2. Pass or through-ball if pressured or if a teammate is in a much better forward spot!
-        if state.tick.is_multiple_of(decision_cadence) {
-            let mut best_mate: Option<(usize, Vec2, Fp, bool)> = None;
+        // 2. Pass, through-ball, or lob over presser when pressured or when a teammate is in a better spot!
+        if cadence_tick.is_multiple_of(decision_cadence) || urgent_press {
+            let in_own_half = me.pos.x.mul(Fp::from_int(attack_sign as i32)) < Fp::ZERO;
+            let recent_passer_id = state
+                .ball
+                .assist_candidate
+                .as_ref()
+                .filter(|ac| ac.team == side && state.tick.saturating_sub(ac.completed_tick) < 110)
+                .map(|ac| ac.passer_id.as_str());
+            let mut best_mate: Option<(usize, Vec2, Fp, u16)> = None;
             for (m_idx, mate) in state.players[side_idx].iter().enumerate() {
-                if m_idx == ctrl_idx || m_idx == 0 || mate.sent_off {
+                if m_idx == ctrl_idx || mate.sent_off {
                     continue;
                 }
                 let dist = me.pos.dist(mate.pos);
-                if dist < Fp::from_milli(3_000) || dist > Fp::from_milli(28_000) {
+                if m_idx == 0 {
+                    // Only recycle to GK when in own half under heavy pressure and at safe pass distance
+                    if !in_own_half
+                        || nearest_opp_dist > Fp::from_milli(1_850)
+                        || dist < Fp::from_milli(5_200)
+                        || dist > Fp::from_milli(22_000)
+                    {
+                        continue;
+                    }
+                } else if dist < Fp::from_milli(2_200) || dist > Fp::from_milli(29_000) {
                     continue;
                 }
-                // Check openness
+
+                let lane_vec = mate.pos - me.pos;
+                let lane_dir = lane_vec.normalize_or_zero();
                 let mut mate_clearance = Fp::from_int(50);
+                let mut lane_min_dist = Fp::from_int(50);
+                let mut point_blank_blocked = false;
                 for opp in &state.players[side.opponent().index()] {
+                    if opp.sent_off {
+                        continue;
+                    }
                     mate_clearance = mate_clearance.min(mate.pos.dist(opp.pos));
+                    let rel = opp.pos - me.pos;
+                    let proj = rel.dot(lane_dir);
+                    if proj > Fp::from_milli(120) && proj < dist - Fp::from_milli(450) {
+                        let perp_d = (rel - lane_dir.scale(proj)).len();
+                        lane_min_dist = lane_min_dist.min(perp_d);
+                        if proj < Fp::from_milli(1_450) && perp_d < Fp::from_milli(950) {
+                            point_blank_blocked = true;
+                        }
+                    }
                 }
+
+                if m_idx == 0 && (lane_min_dist < Fp::from_milli(2_200) || point_blank_blocked) {
+                    continue;
+                }
+
                 let forward_gain = (mate.pos.x - me.pos.x).mul(Fp::from_int(attack_sign as i32));
-                let score = forward_gain + mate_clearance.mul(Fp::from_milli(800));
-                let should_through = mate.role == PlayerRole::Forward
-                    && forward_gain > Fp::from_milli(3_500)
-                    && mate_clearance > Fp::from_milli(3_000);
+                let ground_blocked = point_blank_blocked || lane_min_dist < Fp::from_milli(1_350);
+                let can_chip_over = ground_blocked
+                    && difficulty != CpuDifficulty::Easy
+                    && m_idx != 0
+                    && dist > Fp::from_milli(7_200)
+                    && mate_clearance > Fp::from_milli(2_500);
+                let lane_penalty = if ground_blocked && !can_chip_over {
+                    Fp::from_milli(9_500)
+                } else if lane_min_dist < Fp::from_milli(2_100) {
+                    Fp::from_milli(2_200)
+                } else {
+                    Fp::ZERO
+                };
+                let gk_back_penalty = if m_idx == 0 {
+                    Fp::from_milli(4_200)
+                } else {
+                    Fp::ZERO
+                };
+                // Avoid sterile A -> B -> A return ping-pong unless B has made a genuine forward run!
+                let return_ping_penalty = if recent_passer_id == Some(mate.footballer_id.as_str())
+                    && forward_gain < Fp::from_milli(2_500)
+                {
+                    Fp::from_milli(3_800)
+                } else {
+                    Fp::ZERO
+                };
+                let score = forward_gain + mate_clearance.mul(Fp::from_milli(850))
+                    - lane_penalty
+                    - gk_back_penalty
+                    - return_ping_penalty;
+
+                let pass_btn = if can_chip_over {
+                    BTN_LOB
+                } else if m_idx != 0
+                    && mate.role == PlayerRole::Forward
+                    && forward_gain > Fp::from_milli(3_200)
+                    && mate_clearance > Fp::from_milli(2_600)
+                    && !ground_blocked
+                    && difficulty != CpuDifficulty::Easy
+                {
+                    BTN_THROUGH
+                } else {
+                    BTN_PASS
+                };
+
                 if best_mate.is_none_or(|(_, _, best_s, _)| score > best_s) {
-                    best_mate = Some((m_idx, mate.pos, score, should_through));
+                    best_mate = Some((m_idx, mate.pos, score, pass_btn));
                 }
             }
 
-            if let Some((_, mate_pos, score, should_through)) = best_mate {
-                let under_pressure = nearest_opp_dist < Fp::from_milli(2_700);
-                let great_forward_option = score > Fp::from_milli(7_500);
-                if under_pressure || great_forward_option {
+            let tight_pressure = nearest_opp_dist < Fp::from_milli(1_650);
+            let moderate_pressure = nearest_opp_dist < Fp::from_milli(2_650);
+            if let Some((_, mate_pos, score, btn)) = best_mate {
+                let great_forward_option = score > Fp::from_milli(6_800);
+                let progressive_outlet = moderate_pressure && score > Fp::from_milli(2_600);
+                let tight_escape = tight_pressure && score > Fp::from_milli(-3_500);
+                if great_forward_option || progressive_outlet || tight_escape {
                     let aim = (mate_pos - me.pos).normalize_or_zero();
-                    let btn = if should_through && difficulty != CpuDifficulty::Easy {
-                        BTN_THROUGH
-                    } else {
-                        BTN_PASS
-                    };
                     return vec_and_buttons_to_input(aim, aim, btn);
                 }
             }
+
+            // Deep defensive-third safety valve: hoist clearance upfield if swarmed with all lanes shut!
+            if me.pos.x.mul(Fp::from_int(attack_sign as i32)) < -half_len.mul(Fp::from_milli(520))
+                && nearest_opp_dist < Fp::from_milli(1_650)
+            {
+                let clear_y = if me.pos.y >= Fp::ZERO {
+                    Fp::from_milli(380)
+                } else {
+                    Fp::from_milli(-380)
+                };
+                let clear_aim = Vec2::new(Fp::from_int(attack_sign as i32), clear_y).normalize_or_zero();
+                return vec_and_buttons_to_input(clear_aim, clear_aim, BTN_LOB);
+            }
         }
 
-        // 3. Dribble progressively toward opponent goal, angling slightly away from nearest tackler
-        let mut drive = (shot_target - me.pos).normalize_or_zero();
-        if nearest_opp_dist < Fp::from_milli(4_000) && nearest_opp_vec.len() > Fp::from_milli(100) {
-            let evade = nearest_opp_vec.normalize_or_zero().scale(Fp::from_milli(550));
-            drive = (drive - evade).normalize_or_zero();
-        }
-        let sprint = nearest_opp_dist > Fp::from_milli(2_800) && difficulty != CpuDifficulty::Easy;
-        return vec_and_buttons_to_input(
-            drive,
-            Vec2::ZERO,
-            if sprint { BTN_SPRINT } else { 0 },
-        );
+        // 3. Dribble progressively with genuine 360° lateral cuts around pressers (+ 1v1 skill move on Hard/Normal)
+        let goal_drive = (shot_target - me.pos).normalize_or_zero();
+        let drive = evade_stride(goal_drive);
+        let try_skill = difficulty != CpuDifficulty::Easy
+            && nearest_opp_dist >= Fp::from_milli(1_150)
+            && nearest_opp_dist <= Fp::from_milli(2_050)
+            && nearest_opp_vec.normalize_or_zero().dot(goal_drive) > Fp::from_milli(420)
+            && cadence_tick.is_multiple_of(19);
+        let sprint = nearest_opp_dist > Fp::from_milli(2_600) && difficulty != CpuDifficulty::Easy;
+        let btns = if try_skill {
+            BTN_SKILL
+        } else if sprint {
+            BTN_SPRINT
+        } else {
+            0
+        };
+        return vec_and_buttons_to_input(drive, Vec2::ZERO, btns);
     }
 
     // CPU does NOT own ball on `ctrl_idx`: defend or intercept loose ball!
@@ -1091,7 +1233,7 @@ pub fn generate_cpu_input(
     let (my_intercept, my_ticks) = best_ball_intercept_for_player(state, side, ctrl_idx);
 
     // Switch to a faster-intercepting outfield defender if needed
-    if state.switch_cooldown[side_idx] == 0 && state.tick.is_multiple_of(decision_cadence) {
+    if state.switch_cooldown[side_idx] == 0 && cadence_tick.is_multiple_of(decision_cadence) {
         for (idx, mate) in state.players[side_idx].iter().enumerate() {
             if idx == 0 || idx == ctrl_idx || mate.sent_off {
                 continue;
@@ -1120,10 +1262,24 @@ pub fn generate_cpu_input(
     } else {
         buttons |= BTN_JOCKEY;
     }
-    if state.ball.owner.is_some()
-        && state.ball.owner.map(|(s, _)| s) != Some(side)
-        && my_dist <= Fp::from_milli(1_250)
-        && state.tick.is_multiple_of(decision_cadence)
+
+    let tackle_cadence: u32 = match difficulty {
+        CpuDifficulty::Easy => 24,
+        CpuDifficulty::Normal => 17,
+        CpuDifficulty::Hard => 13,
+    };
+    let clean_tackle_angle = match state.ball.owner {
+        Some((o_side, o_idx)) if o_side != side => {
+            let carrier = &state.players[o_side.index()][o_idx];
+            let c_fwd = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
+            let def_to_c = (carrier.pos - me.pos).normalize_or_zero();
+            def_to_c.dot(c_fwd) < Fp::from_milli(550)
+        }
+        _ => false,
+    };
+    if clean_tackle_angle
+        && my_dist <= Fp::from_milli(1_180)
+        && cadence_tick.is_multiple_of(tackle_cadence)
     {
         buttons |= BTN_TACKLE;
     }
