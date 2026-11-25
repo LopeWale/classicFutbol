@@ -367,6 +367,22 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                 st.pending_events.len() as i32,
             ]);
 
+            let classify_kick_kind = |button: u16| -> i32 {
+                if (button & BTN_SHOOT) != 0 && (button & BTN_LOB) != 0 {
+                    5 // Chip shot (LB/L1 + Shoot)
+                } else if (button & BTN_SHOOT) != 0 {
+                    4
+                } else if (button & BTN_LOB) != 0 {
+                    3
+                } else if (button & BTN_THROUGH) != 0 {
+                    2
+                } else if (button & BTN_PASS) != 0 {
+                    1
+                } else {
+                    0
+                }
+            };
+
             for (s, side_players) in st.players.iter().enumerate() {
                 for p in side_players {
                     let action_code: i32 = match p.action {
@@ -380,7 +396,13 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                         PlayerActionState::SkillMove { .. } => 7,
                     };
                     let stamina = p.stamina_permille.clamp(0, 1000);
-                    let charge = (p.charge_ratio_permille() as i32).clamp(0, 1000);
+                    let mut charge = (p.charge_ratio_permille() as i32).clamp(0, 1000);
+                    // Surface live pre-contact input buffer charge on the HUD power bar.
+                    if charge == 0 && p.index == st.controlled_idx[s] {
+                        if let Some(buf) = st.input_buffer[s] {
+                            charge = (buf.charge_ratio_permille() as i32).clamp(0, 1000);
+                        }
+                    }
                     let has_yellow = i32::from(p.yellow_cards > 0);
                     let jump_step = ((p.z.to_milli().clamp(0, 900)) / 60) as i32;
                     let packed = (action_code & 0xF)
@@ -410,6 +432,12 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                     if let PlayerActionState::Charging { aim, .. } = cp.action {
                         if aim.len() > Fp::from_milli(100) {
                             return aim.to_bam() as i32;
+                        }
+                        return cp.facing_bam as i32;
+                    }
+                    if let Some(buf) = st.input_buffer[side_idx] {
+                        if buf.aim.len() > Fp::from_milli(100) {
+                            return buf.aim.to_bam() as i32;
                         }
                         return cp.facing_bam as i32;
                     }
@@ -444,7 +472,7 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                     .unwrap_or(-1),
                 ball_hold_and_touch,
             ]);
-            for side_players in &st.players {
+            for (s, side_players) in st.players.iter().enumerate() {
                 for p in side_players {
                     let (kick_kind, finesse, action_ticks, dir_bam, has_dir): (
                         i32,
@@ -459,17 +487,7 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                             finesse,
                             aim,
                         } => {
-                            let kind = if (button & BTN_SHOOT) != 0 {
-                                4
-                            } else if (button & BTN_LOB) != 0 {
-                                3
-                            } else if (button & BTN_THROUGH) != 0 {
-                                2
-                            } else if (button & BTN_PASS) != 0 {
-                                1
-                            } else {
-                                0
-                            };
+                            let kind = classify_kick_kind(button);
                             let (bam, hd) = if aim.len() > Fp::from_milli(100) {
                                 (aim.to_bam() as i32, 1)
                             } else {
@@ -516,7 +534,29 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                             };
                             (0, 0, i32::from(ticks_left), bam, hd)
                         }
-                        PlayerActionState::Normal => (0, 0, 0, p.facing_bam as i32, 0),
+                        PlayerActionState::Normal => {
+                            if p.index == st.controlled_idx[s] {
+                                if let Some(buf) = st.input_buffer[s] {
+                                    let kind = classify_kick_kind(buf.button);
+                                    let (bam, hd) = if buf.aim.len() > Fp::from_milli(100) {
+                                        (buf.aim.to_bam() as i32, 1)
+                                    } else {
+                                        (p.facing_bam as i32, 0)
+                                    };
+                                    (
+                                        kind,
+                                        i32::from(buf.finesse),
+                                        (buf.charge_ticks.min(255)) as i32,
+                                        bam,
+                                        hd,
+                                    )
+                                } else {
+                                    (0, 0, 0, p.facing_bam as i32, 0)
+                                }
+                            } else {
+                                (0, 0, 0, p.facing_bam as i32, 0)
+                            }
+                        }
                     };
                     let cue = (kick_kind & 0x7)
                         | ((finesse & 0x1) << 3)

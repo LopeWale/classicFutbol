@@ -2421,6 +2421,220 @@ kbd {
   margin-top: 14px;
 }
 
+/* =========================================================================
+   FIFA 10–12 CONTROL SETTINGS, INTERACTIVE REMAPPING & 4-BAR POWER HUD
+   ========================================================================= */
+
+.ctrl-right-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-height: 0;
+  overflow-y: auto;
+}
+
+.ctrl-cartridge-compact .cart-slot-graphic {
+  padding: 8px 12px;
+}
+
+.ctrl-settings-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.ctrl-settings-compact {
+  gap: 7px;
+  max-height: 315px;
+  overflow-y: auto;
+  padding-right: 4px;
+}
+
+.cset-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(12, 20, 36, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.cset-row label {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+}
+
+.cset-select {
+  min-width: 175px;
+  padding: 4px 8px !important;
+  font-size: 12px !important;
+}
+
+.vis-trigger {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 3px;
+  min-width: 60px;
+}
+
+.vis-trig-bar {
+  width: 46px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.16);
+  overflow: hidden;
+  display: block;
+}
+
+.vis-trig-bar > i {
+  display: block;
+  height: 100%;
+  width: 0%;
+  background: var(--turf-bright);
+}
+
+.ctrl-map-hdr {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.ctrl-map-hdr h3 {
+  margin: 0 !important;
+}
+
+.ctrl-map-hint {
+  font-family: var(--font-display);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.07em;
+  color: var(--text-muted);
+}
+
+.ctrl-map-box li {
+  align-items: center;
+  gap: 8px;
+  padding: 2px 0;
+}
+
+.rebind-pill {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 11.5px;
+  letter-spacing: 0.05em;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(148, 163, 184, 0.45);
+  background: rgba(30, 41, 59, 0.92);
+  color: #f8fafc;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: border-color 0.12s ease, background 0.12s ease;
+}
+
+.rebind-pill:hover {
+  border-color: var(--gold-champ);
+  background: rgba(250, 204, 21, 0.18);
+}
+
+.rebind-pill.listening {
+  background: var(--gold-champ);
+  color: #090f1c;
+  border-color: #ffffff;
+  box-shadow: 0 0 10px rgba(250, 204, 21, 0.65);
+}
+
+.rebind-pill.static-pill {
+  cursor: default;
+  border-color: rgba(255, 255, 255, 0.16);
+  background: rgba(15, 23, 42, 0.72);
+  color: var(--text-secondary);
+}
+
+.rebind-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 12px;
+  border-radius: 5px;
+  background: rgba(56, 189, 248, 0.18);
+  border: 1px solid rgba(56, 189, 248, 0.75);
+  color: #e0f2fe;
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 13px;
+  letter-spacing: 0.06em;
+}
+
+/* 4-Segment FIFA Power Bar HUD + Live Action Tag */
+.fph-power-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.fph-power-row .fph-power-track {
+  flex: 1;
+  position: relative;
+  height: 9px;
+}
+
+.fph-seg-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image: linear-gradient(
+    90deg,
+    transparent 24.4%,
+    rgba(6, 11, 20, 0.88) 24.4%,
+    rgba(6, 11, 20, 0.88) 25.6%,
+    transparent 25.6%,
+    transparent 49.4%,
+    rgba(6, 11, 20, 0.88) 49.4%,
+    rgba(6, 11, 20, 0.88) 50.6%,
+    transparent 50.6%,
+    transparent 74.4%,
+    rgba(6, 11, 20, 0.88) 74.4%,
+    rgba(6, 11, 20, 0.88) 75.6%,
+    transparent 75.6%
+  );
+}
+
+.fph-kick-badge {
+  font-family: var(--font-display);
+  font-weight: 900;
+  font-size: 10.5px;
+  letter-spacing: 0.08em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--gold-champ);
+  color: #090f1c;
+  white-space: nowrap;
+}
+
+.fph-kick-badge.badge-finesse {
+  background: #38bdf8;
+  color: #061322;
+}
+
+.fph-kick-badge.badge-chip {
+  background: #c084fc;
+  color: #160926;
+}
+
+.match-modal-card.mm-pause-card.ctrl-open {
+  max-width: 920px;
+}
+
 /* Responsive Adjustments */
 @media (max-width: 1100px) {
   .hub-layout,

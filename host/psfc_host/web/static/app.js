@@ -17,6 +17,250 @@ const BTN_TACKLE = 1 << 7;
 const BTN_SLIDE = 1 << 8;
 const BTN_CALL_RUN = 1 << 9;
 const BTN_SKILL = 1 << 10;
+const BTN_FINESSE = 1 << 11;
+const BTN_CONTAIN = 1 << 12;
+const BTN_TEAMMATE_CONTAIN = 1 << 13;
+const BTN_GK_RUSH = 1 << 14;
+const BTN_PACE_CONTROL = 1 << 15;
+
+// =========================================================================
+// ACTION-BASED INPUT ABSTRACTION LAYER (FIFA 10–12 PRESETS & SERIALIZATION)
+// =========================================================================
+
+const CONTROL_PROFILE_STORAGE_KEY = "psfc_control_profile_v2";
+const PHYSICAL_BINDABLE_INPUTS = ["south", "east", "west", "north", "rt", "rb", "lt", "lb", "select"];
+
+const CONTROL_PRESETS = {
+  classic: {
+    label: "CLASSIC (FIFA)",
+    attack: {
+      pass: "south",         // A / Cross -> Ground Pass / Header
+      shoot: "east",         // B / Circle -> Shoot / Volley / Clear
+      cross: "west",         // X / Square -> Lob Pass / Cross / Clear
+      throughBall: "north",  // Y / Triangle -> Through Ball
+      sprint: "rt",          // RT / R2 -> Sprint (Analog or Digital)
+      finesse: "rb",         // RB / R1 -> Finesse Shot Modifier
+      paceControl: "lt",     // LT / L2 -> Pace Control / Skill Modifier
+      chipRun: "lb",         // LB / L1 -> Chip Shot Modifier / Trigger Run
+    },
+    defense: {
+      contain: "south",          // A / Cross -> Contain (Hold)
+      standingTackle: "east",    // B / Circle -> Standing Tackle / Push-Pull (FIFA 12)
+      slidingTackle: "west",     // X / Square -> Sliding Tackle
+      rushGk: "north",           // Y / Triangle -> Rush Goalkeeper (Hold)
+      sprint: "rt",              // RT / R2 -> Sprint
+      teammateContain: "rb",     // RB / R1 -> Teammate Contain (Hold)
+      jockey: "lt",              // LT / L2 -> Jockey / Strafe
+      switchPlayer: "lb",        // LB / L1 -> Switch Player (Auto/Nearest)
+    },
+  },
+  alternate: {
+    label: "ALTERNATE (SWAP X-B)",
+    attack: {
+      pass: "south",
+      shoot: "west",         // PES / Alternate: X / Square shoots
+      cross: "east",         // PES / Alternate: B / Circle crosses
+      throughBall: "north",
+      sprint: "rt",
+      finesse: "rb",
+      paceControl: "lt",
+      chipRun: "lb",
+    },
+    defense: {
+      contain: "south",
+      standingTackle: "east",
+      slidingTackle: "west",
+      rushGk: "north",
+      sprint: "rt",
+      teammateContain: "rb",
+      jockey: "lt",
+      switchPlayer: "lb",
+    },
+  },
+  two_button: {
+    label: "TWO-BUTTON",
+    attack: {
+      pass: "south",
+      shoot: "east",
+      cross: "west",
+      throughBall: "north",
+      sprint: "rt",
+      finesse: "rb",
+      paceControl: "lt",
+      chipRun: "lb",
+    },
+    defense: {
+      contain: "south",
+      standingTackle: "east",
+      slidingTackle: "west",
+      rushGk: "north",
+      sprint: "rt",
+      teammateContain: "rb",
+      jockey: "lt",
+      switchPlayer: "south",
+    },
+  },
+};
+
+const ATTACK_ACTION_META = [
+  { key: "pass", label: "Ground Pass / Header", kb: "Space / J" },
+  { key: "shoot", label: "Shoot / Volley / Clear", kb: "L / Enter" },
+  { key: "cross", label: "Lob Pass / Cross / Clear", kb: "U" },
+  { key: "throughBall", label: "Through Ball", kb: "K" },
+  { key: "sprint", label: "Sprint (Analog / Digital)", kb: "Shift" },
+  { key: "finesse", label: "Finesse Shot Modifier", kb: "E" },
+  { key: "paceControl", label: "Pace Control / Skill Modifier", kb: "F" },
+  { key: "chipRun", label: "Chip Modifier / Trigger Run", kb: "Q" },
+];
+
+const DEFENSE_ACTION_META = [
+  { key: "contain", label: "Contain (Hold)", kb: "Space / J" },
+  { key: "standingTackle", label: "Standing Tackle / Push-Pull", kb: "L / E" },
+  { key: "slidingTackle", label: "Sliding Tackle", kb: "U / C" },
+  { key: "rushGk", label: "Rush Goalkeeper (Hold)", kb: "K" },
+  { key: "sprint", label: "Sprint", kb: "Shift" },
+  { key: "teammateContain", label: "Teammate Contain (Hold)", kb: "R" },
+  { key: "jockey", label: "Jockey / Strafe", kb: "F" },
+  { key: "switchPlayer", label: "Switch Player (Auto / Nearest)", kb: "Q" },
+];
+
+function createDefaultControlProfile(presetName = "classic") {
+  const base = CONTROL_PRESETS[presetName] || CONTROL_PRESETS.classic;
+  return {
+    version: 2,
+    preset: CONTROL_PRESETS[presetName] ? presetName : "classic",
+    autoSwitch: "auto",              // "auto" | "air_balls" | "manual"
+    autoSwitchMoveAssist: "low",     // "none" | "low" | "high"
+    passAssist: "assisted",          // "assisted" | "semi" | "manual"
+    throughAssist: "assisted",
+    shotAssist: "assisted",
+    crossAssist: "assisted",
+    defendingMode: "tactical",       // "tactical" | "legacy"
+    analogSprint: true,
+    attack: { ...base.attack },
+    defense: { ...base.defense },
+  };
+}
+
+function sanitizeControlProfile(raw) {
+  const def = createDefaultControlProfile("classic");
+  if (!raw || typeof raw !== "object") return def;
+  const preset = ["classic", "alternate", "two_button", "custom"].includes(raw.preset) ? raw.preset : "classic";
+  const validAssist = (v) => (["assisted", "semi", "manual"].includes(v) ? v : "assisted");
+  const validMove = (v) => (["none", "low", "high"].includes(v) ? v : "low");
+  const validSw = (v) => (["auto", "air_balls", "manual"].includes(v) ? v : "auto");
+  const validPhys = (v, fb) => (PHYSICAL_BINDABLE_INPUTS.includes(v) ? v : fb);
+  const presetBase = CONTROL_PRESETS[preset] || CONTROL_PRESETS.classic;
+  const attack = {};
+  for (const k of Object.keys(presetBase.attack)) {
+    attack[k] = validPhys(raw.attack && raw.attack[k], presetBase.attack[k]);
+  }
+  const defense = {};
+  for (const k of Object.keys(presetBase.defense)) {
+    defense[k] = validPhys(raw.defense && raw.defense[k], presetBase.defense[k]);
+  }
+  return {
+    version: 2,
+    preset,
+    autoSwitch: validSw(raw.autoSwitch),
+    autoSwitchMoveAssist: validMove(raw.autoSwitchMoveAssist),
+    passAssist: validAssist(raw.passAssist),
+    throughAssist: validAssist(raw.throughAssist),
+    shotAssist: validAssist(raw.shotAssist),
+    crossAssist: validAssist(raw.crossAssist),
+    defendingMode: raw.defendingMode === "legacy" ? "legacy" : "tactical",
+    analogSprint: typeof raw.analogSprint === "boolean" ? raw.analogSprint : true,
+    attack,
+    defense,
+  };
+}
+
+function encodeControlSettingsReserved(prof) {
+  const assistCode = (v) => (v === "semi" ? 1 : v === "manual" ? 2 : 0);
+  const moveAssistCode = (v) => (v === "low" ? 1 : v === "high" ? 2 : 0);
+  const swCode = (v) => (v === "air_balls" ? 1 : v === "manual" ? 2 : 0);
+  const defBit = prof.defendingMode === "legacy" ? 1 : 0;
+  const analogBit = prof.analogSprint ? 1 : 0;
+  return (
+    (0x4000 |
+      (assistCode(prof.passAssist) & 0x3) |
+      ((assistCode(prof.throughAssist) & 0x3) << 2) |
+      ((assistCode(prof.shotAssist) & 0x3) << 4) |
+      ((assistCode(prof.crossAssist) & 0x3) << 6) |
+      ((defBit & 0x1) << 8) |
+      ((moveAssistCode(prof.autoSwitchMoveAssist) & 0x3) << 9) |
+      ((analogBit & 0x1) << 11) |
+      ((swCode(prof.autoSwitch) & 0x3) << 12)) &
+    0xffff
+  );
+}
+
+function autoSwitchCodeFromName(name) {
+  return name === "air_balls" ? 1 : name === "manual" ? 2 : 0;
+}
+
+function formatPhysicalGlyph(physKey, style = "modern") {
+  const tables = {
+    modern: {
+      south: "A / ✕",
+      east: "B / ○",
+      west: "X / □",
+      north: "Y / △",
+      rt: "RT / R2",
+      rb: "RB / R1",
+      lt: "LT / L2",
+      lb: "LB / L1",
+      select: "VIEW / SHARE",
+    },
+    ps: {
+      south: "✕ Cross",
+      east: "○ Circle",
+      west: "□ Square",
+      north: "△ Triangle",
+      rt: "R2",
+      rb: "R1",
+      lt: "L2",
+      lb: "L1",
+      select: "SHARE",
+    },
+    xbox: {
+      south: "A",
+      east: "B",
+      west: "X",
+      north: "Y",
+      rt: "RT",
+      rb: "RB",
+      lt: "LT",
+      lb: "LB",
+      select: "VIEW",
+    },
+    snes: {
+      south: "SNES B (Bottom)",
+      east: "SNES A (Right)",
+      west: "SNES Y (Left)",
+      north: "SNES X (Top)",
+      rt: "SNES R",
+      rb: "SNES R",
+      lt: "SNES L",
+      lb: "SNES L",
+      select: "SELECT",
+    },
+  };
+  const tbl = tables[style] || tables.modern;
+  return tbl[physKey] || String(physKey || "?").toUpperCase();
+}
+
+const PHYSICAL_KEYBOARD_LABELS = {
+  south: "Space / J",
+  east: "L / Enter",
+  west: "U",
+  north: "K",
+  rt: "Shift",
+  rb: "E",
+  lt: "F",
+  lb: "Q",
+  select: "Z",
+};
 
 const PHASE_LABELS = {
   0: "KICK OFF",
@@ -76,9 +320,9 @@ const DIFF_OPTIONS = [
 ];
 const AUTO_SWITCH_STORAGE_KEY = "psfc_auto_switch_mode_v1";
 const AUTO_SWITCH_OPTIONS = [
-  { code: 0, short: "BALL", label: "ASSISTED (BALL)" },
-  { code: 1, short: "AIR", label: "AIR & LOOSE" },
-  { code: 2, short: "MANUAL", label: "MANUAL ONLY" },
+  { code: 0, name: "auto", short: "AUTO", label: "AUTO (ALL BALLS)" },
+  { code: 1, name: "air_balls", short: "AIR", label: "AIR BALLS" },
+  { code: 2, name: "manual", short: "MANUAL", label: "MANUAL" },
 ];
 
 // Normalized (x%, y%) coordinates on the vertical 2D tactical pitch board (bottom = own goal, top = opponent goal)
@@ -380,16 +624,23 @@ let pmSideIdx = 0; // 0 = P1 Home vs CPU, 1 = CPU vs P1 Away, 2 = 2P Couch, 3 = 
 let pmFmtIdx = 0; // 0 = 5v5, 1 = 11v11
 let pmDurIdx = 1; // 2 min default
 let pmDiffIdx = 1; // Professional (Normal)
-let autoSwitchIdx = (() => {
+let controlProfile = (() => {
   try {
-    const raw = parseInt(localStorage.getItem(AUTO_SWITCH_STORAGE_KEY) || "0", 10);
-    if (Number.isInteger(raw) && raw >= 0 && raw < AUTO_SWITCH_OPTIONS.length) return raw;
+    const raw = localStorage.getItem(CONTROL_PROFILE_STORAGE_KEY);
+    if (raw) return sanitizeControlProfile(JSON.parse(raw));
   } catch (_e) {}
-  return 0; // Default: ASSISTED (BALL)
+  const def = createDefaultControlProfile("classic");
+  try {
+    const legacySw = parseInt(localStorage.getItem(AUTO_SWITCH_STORAGE_KEY) || "0", 10);
+    if (legacySw === 1) def.autoSwitch = "air_balls";
+    else if (legacySw === 2) def.autoSwitch = "manual";
+  } catch (_e) {}
+  return def;
 })();
+let autoSwitchIdx = autoSwitchCodeFromName(controlProfile.autoSwitch);
 let pendingOfficialFixture = null; // Set when entering Pre-Match from an Official Parallel Fixture!
 
-// Live match & deterministic substitution state
+// Live match & deterministic command/substitution queue state (`InputFrame.reserved` FIFO per side)
 let activeOfficialSession = null;
 let paused = false;
 let fulltimeShown = false;
@@ -398,10 +649,27 @@ let lastShootoutScore = null;
 let homePossTicks = 1;
 let awayPossTicks = 1;
 let matchEventsLog = [];
-let queuedSubReserved = [0, 0]; // 16-bit encoded substitution per side for next sim_tick!
+let queuedReservedQueue = [[], []]; // Queued 16-bit `reserved` commands (settings sync 0x4000 or subs 0x8000) per side
 let subsUsedCount = [0, 0];
 let subsSide = 0;
 let subsArmedSlot = null;
+let rebindState = null; // { context: "attack"|"defense", actionKey, label, waitingRelease }
+
+function saveControlProfile() {
+  try {
+    localStorage.setItem(CONTROL_PROFILE_STORAGE_KEY, JSON.stringify(controlProfile));
+    localStorage.setItem(AUTO_SWITCH_STORAGE_KEY, String(autoSwitchCodeFromName(controlProfile.autoSwitch)));
+  } catch (_e) {}
+}
+
+function enqueueControlSettingsSync() {
+  const word = encodeControlSettingsReserved(controlProfile);
+  // Coalesce any pending older settings sync in queue while preserving substitutions
+  for (let s = 0; s < 2; s++) {
+    queuedReservedQueue[s] = queuedReservedQueue[s].filter((w) => (w & 0xc000) !== 0x4000);
+    queuedReservedQueue[s].push(word);
+  }
+}
 
 // Instant Replay Theater
 let replayBuffer = [];
@@ -1003,6 +1271,7 @@ function updateGamepadBadges() {
       if (currentScreen === "prematch") renderPreMatchScreen();
     }
   }
+  renderControlBindingLists();
 }
 
 function syncGamepadConnectionState() {
@@ -1235,7 +1504,41 @@ function startPadCalibration() {
   advanceOrFinishCalibration();
 }
 
-function sampleRawGamepad(logicalSlot) {
+function applyCircularDeadzone(rawX, rawY, deadzone = 0.12) {
+  const mag = Math.hypot(rawX, rawY);
+  if (mag <= deadzone) return [0, 0];
+  const clamped = Math.min(1.0, mag);
+  const scaled = (clamped - deadzone) / (1.0 - deadzone);
+  return [(rawX / mag) * scaled, (rawY / mag) * scaled];
+}
+
+function detectConnectedPromptStyle() {
+  const pads = getConnectedPads();
+  if (!pads.length) return "modern";
+  const p = pads[0];
+  const idLc = String(p.id || "").toLowerCase();
+  const btnCount = p.buttons ? p.buttons.length : 16;
+  const profSel = document.getElementById("pad-profile-select");
+  const hwProf = profSel ? profSel.value : "auto";
+  if (hwProf === "snes_usb" || hwProf === "snes_std" || (hwProf === "auto" && isSnesSignature(idLc, btnCount))) {
+    return "snes";
+  }
+  if (idLc.includes("054c") || idLc.includes("dualsense") || idLc.includes("dualshock") || idLc.includes("wireless controller")) {
+    return "ps";
+  }
+  if (idLc.includes("045e") || idLc.includes("xbox") || idLc.includes("xinput")) {
+    return "xbox";
+  }
+  return "modern";
+}
+
+/**
+ * Layer 1 (Hardware -> Canonical Physical Gamepad):
+ * Normalizes Xbox, PlayStation, Switch Pro, DirectInput, 2.4GHz/USB/BT SNES, WebHID, and
+ * Calibrated Custom pads into a single device-independent physical snapshot with true 360°
+ * radial deadzones and 0.0–1.0 analog trigger pressure.
+ */
+function samplePhysicalGamepad(logicalSlot) {
   const pads = getConnectedPads();
   const pad = pads[logicalSlot];
   if (!pad) return null;
@@ -1268,7 +1571,7 @@ function sampleRawGamepad(logicalSlot) {
       !idLc.includes("dualsense") &&
       !idLc.includes("dualshock"));
 
-  const cleanAxis = (idx, deadzone = 0.22) => {
+  const readAxisRaw = (idx) => {
     if (!pad.axes || idx >= pad.axes.length) return 0;
     const raw = Number(pad.axes[idx] || 0);
     const st = axisStates && idx < axisStates.length ? axisStates[idx] : null;
@@ -1276,11 +1579,17 @@ function sampleRawGamepad(logicalSlot) {
     if (idx >= 2 && idx <= 5 && st && !st.sawCenter && Math.abs(st.initial) > 0.80 && Math.abs(raw - st.initial) < 0.25) {
       return 0;
     }
-    return Math.abs(raw) < deadzone ? 0 : Math.max(-1, Math.min(1, raw));
+    return Math.max(-1, Math.min(1, raw));
   };
 
   const b = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.42));
-  const trig = (i) => Boolean(pad.buttons[i] && (pad.buttons[i].pressed || pad.buttons[i].value > 0.24));
+  const trigVal = (i) => {
+    const bt = pad.buttons[i];
+    if (!bt) return 0;
+    const v = typeof bt.value === "number" ? Math.max(0, Math.min(1, bt.value)) : 0;
+    if (v > 0.02) return v;
+    return bt.pressed ? 1.0 : 0;
+  };
 
   let lx = 0;
   let ly = 0;
@@ -1290,12 +1599,14 @@ function sampleRawGamepad(logicalSlot) {
   let east = false;
   let west = false;
   let north = false;
-  let l1 = false;
-  let r1 = false;
-  let l2 = false;
-  let r2 = false;
+  let lb = false;
+  let rb = false;
+  let ltValue = 0;
+  let rtValue = 0;
   let selectBtn = false;
   let startBtn = false;
+  let l3 = false;
+  let r3 = false;
 
   if (useCustom) {
     if (evalCustomBinding(pad, customPadMap.left, axisStates)) lx -= 1;
@@ -1303,27 +1614,26 @@ function sampleRawGamepad(logicalSlot) {
     if (evalCustomBinding(pad, customPadMap.up, axisStates)) ly -= 1;
     if (evalCustomBinding(pad, customPadMap.down, axisStates)) ly += 1;
     if (lx === 0 && ly === 0) {
-      lx = cleanAxis(0, 0.25);
-      ly = cleanAxis(1, 0.25);
+      [lx, ly] = applyCircularDeadzone(readAxisRaw(0), readAxisRaw(1), 0.14);
     }
     south = evalCustomBinding(pad, customPadMap.south, axisStates);
     east = evalCustomBinding(pad, customPadMap.east, axisStates);
     west = evalCustomBinding(pad, customPadMap.west, axisStates);
     north = evalCustomBinding(pad, customPadMap.north, axisStates);
-    l1 = evalCustomBinding(pad, customPadMap.l1, axisStates);
-    r1 = evalCustomBinding(pad, customPadMap.r1, axisStates);
+    lb = evalCustomBinding(pad, customPadMap.l1, axisStates);
+    rb = evalCustomBinding(pad, customPadMap.r1, axisStates);
     selectBtn = evalCustomBinding(pad, customPadMap.select, axisStates);
     startBtn = evalCustomBinding(pad, customPadMap.start, axisStates);
   } else {
-    lx = cleanAxis(0, 0.24);
-    ly = cleanAxis(1, 0.24);
+    // True 360-degree radial circular deadzone (no 8-way axis snapping!)
+    [lx, ly] = applyCircularDeadzone(readAxisRaw(0), readAxisRaw(1), isSnesMode ? 0.25 : 0.12);
     if (!isSnesMode) {
-      rx = cleanAxis(2, 0.22);
+      const rawRx = readAxisRaw(2);
       const rawRy =
-        isDirectInput && pad.axes && pad.axes.length >= 6 && Math.abs(cleanAxis(3, 0.05)) < 0.05
-          ? cleanAxis(5, 0.22)
-          : cleanAxis(3, 0.22);
-      ry = rawRy;
+        isDirectInput && pad.axes && pad.axes.length >= 6 && Math.abs(readAxisRaw(3)) < 0.05
+          ? readAxisRaw(5)
+          : readAxisRaw(3);
+      [rx, ry] = applyCircularDeadzone(rawRx, rawRy, 0.16);
     }
 
     let dpadX = 0;
@@ -1341,11 +1651,11 @@ function sampleRawGamepad(logicalSlot) {
         [2, 3],
       ]) {
         if (isSnesMode || axI >= 4) {
-          const sx = cleanAxis(axI, 0.45);
-          const sy = cleanAxis(ayI, 0.45);
-          if (sx !== 0 || sy !== 0) {
-            dpadX = Math.sign(sx);
-            dpadY = Math.sign(sy);
+          const sx = readAxisRaw(axI);
+          const sy = readAxisRaw(ayI);
+          if (Math.abs(sx) > 0.45 || Math.abs(sy) > 0.45) {
+            dpadX = Math.abs(sx) > 0.45 ? Math.sign(sx) : 0;
+            dpadY = Math.abs(sy) > 0.45 ? Math.sign(sy) : 0;
             break;
           }
         }
@@ -1370,114 +1680,206 @@ function sampleRawGamepad(logicalSlot) {
       east = b(1);
       south = b(2);
       west = b(3);
-      l1 = b(4);
-      r1 = b(5);
-      l2 = btnCount >= 10 && b(6);
-      r2 = btnCount >= 10 && b(7);
+      lb = b(4);
+      rb = b(5);
+      ltValue = btnCount >= 10 && b(6) ? 1.0 : 0.0;
+      rtValue = btnCount >= 10 && b(7) ? 1.0 : 0.0;
       selectBtn = b(8) || (btnCount <= 9 && b(6));
       startBtn = b(9) || (btnCount <= 9 && b(7));
     } else if (isSnesStd) {
-      // W3C Standard-Mapped Bluetooth SNES (`057e:2017` / SN30): Positional Bottom `B` = Pass (`b(0)`), Right `A` = Shoot (`b(1)`), Left `Y` = Lob (`b(2)`), Top `X` = Through (`b(3)`)
       south = b(0);
       east = b(1);
       west = b(2);
       north = b(3);
-      l1 = b(4);
-      r1 = b(5);
-      l2 = false;
-      r2 = false;
+      lb = b(4);
+      rb = b(5);
       selectBtn = b(8) || (btnCount <= 9 && b(6));
       startBtn = b(9) || (btnCount <= 9 && b(7));
     } else if (isSwitchSwap) {
-      // Explicit Nintendo Switch Pro ("Swap A-B / X-Y"): swap 0<->1 and 2<->3
       south = b(1);
       east = b(0);
       west = b(3);
       north = b(2);
-      l1 = b(4);
-      r1 = b(5);
-      l2 = trig(6);
-      r2 = trig(7);
+      lb = b(4);
+      rb = b(5);
+      ltValue = trigVal(6);
+      rtValue = trigVal(7);
       selectBtn = b(8);
       startBtn = b(9);
+      l3 = b(10);
+      r3 = b(11);
     } else if (isDirectInput) {
       south = b(1);
       east = b(2);
       west = b(0);
       north = b(3);
-      l1 = b(4);
-      r1 = b(5);
-      l2 = btnCount > 9 && trig(6);
-      r2 = btnCount > 9 && trig(7);
+      lb = b(4);
+      rb = b(5);
+      ltValue = btnCount > 9 ? trigVal(6) : 0;
+      rtValue = btnCount > 9 ? trigVal(7) : 0;
       selectBtn = b(8) || (btnCount <= 9 && b(6));
       startBtn = b(9) || (btnCount <= 9 && b(7));
+      l3 = b(10);
+      r3 = b(11);
     } else {
+      // Standard W3C Xbox / PlayStation / 8BitDo XInput layout
       south = b(0);
       east = b(1);
       west = b(2);
       north = b(3);
-      l1 = b(4);
-      r1 = b(5);
-      l2 = trig(6);
-      r2 = trig(7);
+      lb = b(4);
+      rb = b(5);
+      ltValue = trigVal(6);
+      rtValue = trigVal(7);
       selectBtn = b(8);
       startBtn = b(9);
+      l3 = b(10);
+      r3 = b(11);
     }
   }
 
-  // Normalize diagonal D-Pad vectors so 8-way SNES movement has true unit magnitude
+  // Normalize diagonal D-Pad vectors so 8-way SNES/D-Pad movement stays unit length
   const magL = Math.hypot(lx, ly);
   if (magL > 1.0) {
     lx /= magL;
     ly /= magL;
   }
 
-  let buttons = 0;
-  if (south) buttons |= BTN_PASS | BTN_TACKLE;
-  if (east) buttons |= BTN_SHOOT;
-  if (west) buttons |= BTN_LOB | BTN_SLIDE;
-  if (north) buttons |= isSnesMode ? BTN_THROUGH | BTN_CALL_RUN : BTN_THROUGH;
-
-  if (isSnesMode || useCustom) {
-    // 6-Action SNES Football Layout: R = Sprint, L = Switch Defender + Finesse/Driven/Jockey, SELECT = Skill Move!
-    if (r1 || r2) buttons |= BTN_SPRINT;
-    if (l1 || l2) buttons |= BTN_SWITCH | BTN_JOCKEY;
-    if (selectBtn) buttons |= BTN_SKILL;
-  } else {
-    if (r2) buttons |= BTN_SPRINT;
-    if (l2) buttons |= BTN_JOCKEY;
-    if (l1) buttons |= BTN_SWITCH;
-    if (r1) buttons |= BTN_CALL_RUN | BTN_TACKLE;
-    if (b(11) || b(10) || selectBtn) buttons |= BTN_SKILL;
+  // Retro 6-button SNES pad synthesis: single L/R shoulders act as LB+LT and RT cleanly through Layer 2!
+  const snesTwoShoulder = isSnesMode || useCustom;
+  let lt = ltValue > 0.10;
+  let rt = rtValue > 0.10;
+  if (snesTwoShoulder) {
+    if (rb || rt) {
+      rt = true;
+      rtValue = 1.0;
+    }
+    if (lb || lt) {
+      lb = true;
+      lt = true;
+      ltValue = 1.0;
+    }
   }
 
-  const mx = Math.max(-127, Math.min(127, Math.round(lx * 127)));
-  const my = Math.max(-127, Math.min(127, Math.round(ly * 127)));
-  const rStickX = Math.max(-127, Math.min(127, Math.round(rx * 127)));
-  const rStickY = Math.max(-127, Math.min(127, Math.round(ry * 127)));
-  const aimingKick = (buttons & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
-
   return {
-    mx,
-    my,
-    ax: aimingKick ? mx : rStickX,
-    ay: aimingKick ? my : rStickY,
-    btns: buttons,
-    south,
-    east,
-    west,
-    north,
-    l1: l1 || l2,
-    r1: r1 || r2,
-    select: selectBtn,
-    start: startBtn,
     lx,
     ly,
     rx,
     ry,
+    ltValue,
+    rtValue,
+    isSnesMode: snesTwoShoulder,
+    buttons: {
+      south,
+      east,
+      west,
+      north,
+      lb,
+      rb: snesTwoShoulder ? false : rb,
+      lt,
+      rt,
+      select: selectBtn,
+      start: startBtn,
+      l3,
+      r3,
+    },
     id: pad.id,
     rawPad: pad,
   };
+}
+
+/**
+ * Layer 2 (ControlProfile Attack & Defense Binding Maps -> Deterministic Sim InputFrame):
+ * Evaluates both context-separated maps (`profile.attack` & `profile.defense`) into the 16-bit
+ * `buttons` bitmask + 7-bit analog sprint pressure so the Rust `PossessionContext` state machine
+ * resolves Attacking / Defending / LooseBall deterministically on every 60 Hz tick.
+ */
+function mapPhysicalToSimInput(phys, prof = controlProfile) {
+  const p = phys.buttons;
+  const pressed = (key) => Boolean(key && p[key]);
+  const triggerDepth = (key) => {
+    if (key === "rt") return phys.rtValue;
+    if (key === "lt") return phys.ltValue;
+    return pressed(key) ? 1.0 : 0.0;
+  };
+
+  let buttons = 0;
+
+  // --- In Possession (Attacking) Map ---
+  if (pressed(prof.attack.pass)) buttons |= BTN_PASS;
+  if (pressed(prof.attack.shoot)) buttons |= BTN_SHOOT;
+  if (pressed(prof.attack.cross)) buttons |= BTN_LOB;
+  if (pressed(prof.attack.throughBall)) buttons |= BTN_THROUGH;
+  if (pressed(prof.attack.finesse)) buttons |= BTN_FINESSE;
+  if (pressed(prof.attack.paceControl)) buttons |= BTN_PACE_CONTROL;
+  if (pressed(prof.attack.chipRun)) buttons |= BTN_CALL_RUN;
+
+  // --- Out of Possession (Defending) Map ---
+  if (pressed(prof.defense.contain)) buttons |= BTN_CONTAIN;
+  if (pressed(prof.defense.standingTackle)) buttons |= BTN_TACKLE;
+  if (pressed(prof.defense.slidingTackle)) buttons |= BTN_SLIDE;
+  if (pressed(prof.defense.rushGk)) buttons |= BTN_GK_RUSH;
+  if (pressed(prof.defense.teammateContain)) buttons |= BTN_TEAMMATE_CONTAIN;
+  if (pressed(prof.defense.jockey)) buttons |= BTN_JOCKEY;
+  if (pressed(prof.defense.switchPlayer)) buttons |= BTN_SWITCH;
+
+  // --- Sprint (Analog or Digital past 0.10 deadzone) ---
+  const sprintDepth = Math.max(triggerDepth(prof.attack.sprint), triggerDepth(prof.defense.sprint));
+  let sprintAnalog = 0;
+  if (sprintDepth > 0.10) {
+    buttons |= BTN_SPRINT;
+    sprintAnalog = prof.analogSprint ? Math.max(1, Math.min(127, Math.round(sprintDepth * 127))) : 127;
+  }
+
+  // --- Skill Move Button (Select / L3 / R3; Right Stick also triggers directional skills/knock-on) ---
+  if (p.select || p.l3 || p.r3) buttons |= BTN_SKILL;
+
+  // SNES retro pad convenience: L also allows Finesse when shooting since SNES lacks separate RB
+  if (phys.isSnesMode && p.lb) {
+    buttons |= BTN_FINESSE;
+  }
+
+  const mx = Math.max(-127, Math.min(127, Math.round(phys.lx * 127)));
+  const my = Math.max(-127, Math.min(127, Math.round(phys.ly * 127)));
+  // Always keep Left Stick in (mx, my) and pure Right Stick in (ax, ay) so Human kick aiming
+  // uses Left Stick in psfc-sim while Right Stick stays cleanly independent for directional switching
+  // (even while holding Contain/Jockey) and Skill Moves / Knock-On!
+  const ax = Math.max(-127, Math.min(127, Math.round(phys.rx * 127)));
+  const ay = Math.max(-127, Math.min(127, Math.round(phys.ry * 127)));
+
+  return {
+    mx,
+    my,
+    ax,
+    ay,
+    btns: buttons,
+    sprintAnalog,
+    south: p.south,
+    east: p.east,
+    west: p.west,
+    north: p.north,
+    l1: p.lb,
+    r1: p.rb,
+    l2: p.lt,
+    r2: p.rt,
+    ltValue: phys.ltValue,
+    rtValue: phys.rtValue,
+    select: p.select,
+    start: p.start,
+    lx: phys.lx,
+    ly: phys.ly,
+    rx: phys.rx,
+    ry: phys.ry,
+    phys,
+    id: phys.id,
+    rawPad: phys.rawPad,
+  };
+}
+
+function sampleRawGamepad(logicalSlot) {
+  const phys = samplePhysicalGamepad(logicalSlot);
+  if (!phys) return null;
+  return mapPhysicalToSimInput(phys, controlProfile);
 }
 
 function isPadInputActive(gp) {
@@ -1493,6 +1895,46 @@ function isPadInputActive(gp) {
   );
 }
 
+function samplePhysicalKeyboardP1(allowArrows) {
+  let lx = 0;
+  let ly = 0;
+  if (keysDown.has("KeyA") || (allowArrows && keysDown.has("ArrowLeft"))) lx -= 1;
+  if (keysDown.has("KeyD") || (allowArrows && keysDown.has("ArrowRight"))) lx += 1;
+  if (keysDown.has("KeyW") || (allowArrows && keysDown.has("ArrowUp"))) ly -= 1;
+  if (keysDown.has("KeyS") || (allowArrows && keysDown.has("ArrowDown"))) ly += 1;
+  if (lx !== 0 && ly !== 0) {
+    lx *= Math.SQRT1_2;
+    ly *= Math.SQRT1_2;
+  }
+  const rt = keysDown.has("ShiftLeft") || keysDown.has("ShiftRight");
+  const lt = keysDown.has("KeyF");
+  return {
+    lx,
+    ly,
+    rx: 0,
+    ry: 0,
+    ltValue: lt ? 1.0 : 0.0,
+    rtValue: rt ? 1.0 : 0.0,
+    isSnesMode: false,
+    buttons: {
+      south: keysDown.has("Space") || keysDown.has("KeyJ"),
+      east: keysDown.has("KeyL") || keysDown.has("Enter"),
+      west: keysDown.has("KeyU"),
+      north: keysDown.has("KeyK"),
+      lb: keysDown.has("KeyQ"),
+      rb: keysDown.has("KeyE"),
+      lt,
+      rt,
+      select: keysDown.has("KeyZ"),
+      start: false,
+      l3: false,
+      r3: false,
+    },
+    id: "keyboard-p1",
+    rawPad: null,
+  };
+}
+
 function samplePrimaryHumanInput(allowArrows) {
   // In 1P modes (`allowArrows === true`), respond to WHICHEVER connected controller is being used!
   if (allowArrows) {
@@ -1506,70 +1948,117 @@ function samplePrimaryHumanInput(allowArrows) {
     if (isPadInputActive(gp)) return gp;
   }
 
-  let dx = 0;
-  let dy = 0;
-  if (keysDown.has("KeyA") || (allowArrows && keysDown.has("ArrowLeft"))) dx -= 1;
-  if (keysDown.has("KeyD") || (allowArrows && keysDown.has("ArrowRight"))) dx += 1;
-  if (keysDown.has("KeyW") || (allowArrows && keysDown.has("ArrowUp"))) dy -= 1;
-  if (keysDown.has("KeyS") || (allowArrows && keysDown.has("ArrowDown"))) dy += 1;
-  if (dx !== 0 && dy !== 0) {
-    dx *= Math.SQRT1_2;
-    dy *= Math.SQRT1_2;
-  }
-
-  let btns = 0;
-  if (keysDown.has("Space") || keysDown.has("KeyJ")) btns |= BTN_PASS | BTN_TACKLE;
-  if (keysDown.has("KeyK")) btns |= BTN_THROUGH;
-  if (keysDown.has("KeyU")) btns |= BTN_LOB | BTN_SLIDE;
-  if (keysDown.has("KeyL") || keysDown.has("Enter")) btns |= BTN_SHOOT;
-  if (keysDown.has("ShiftLeft") || keysDown.has("ShiftRight")) btns |= BTN_SPRINT;
-  if (keysDown.has("KeyQ")) btns |= BTN_SWITCH;
-  if (keysDown.has("KeyF")) btns |= BTN_JOCKEY;
-  if (keysDown.has("KeyE")) btns |= BTN_TACKLE;
-  if (keysDown.has("KeyC")) btns |= BTN_SLIDE;
-  if (keysDown.has("KeyR")) btns |= BTN_CALL_RUN;
-  if (keysDown.has("KeyZ")) btns |= BTN_SKILL;
-
-  const mx = Math.round(dx * 127);
-  const my = Math.round(dy * 127);
-  const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
-  return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
+  // Route P1 keyboard through Layer 2 ControlProfile so Classic / Alternate / Two-Button / Custom
+  // presets immediately govern keyboard controls too!
+  const mapped = mapPhysicalToSimInput(samplePhysicalKeyboardP1(allowArrows), controlProfile);
+  // Preserve optional direct keyboard convenience keys without interfering with preset bindings
+  if (keysDown.has("KeyC")) mapped.btns |= BTN_SLIDE;
+  if (keysDown.has("KeyR")) mapped.btns |= BTN_TEAMMATE_CONTAIN | BTN_CALL_RUN;
+  return mapped;
 }
 
 function sampleSecondaryHumanInput() {
   const gp2 = sampleRawGamepad(1);
   if (isPadInputActive(gp2)) return gp2;
 
-  let dx = 0;
-  let dy = 0;
-  if (keysDown.has("ArrowLeft")) dx -= 1;
-  if (keysDown.has("ArrowRight")) dx += 1;
-  if (keysDown.has("ArrowUp")) dy -= 1;
-  if (keysDown.has("ArrowDown")) dy += 1;
-  if (dx !== 0 && dy !== 0) {
-    dx *= Math.SQRT1_2;
-    dy *= Math.SQRT1_2;
+  let lx = 0;
+  let ly = 0;
+  if (keysDown.has("ArrowLeft")) lx -= 1;
+  if (keysDown.has("ArrowRight")) lx += 1;
+  if (keysDown.has("ArrowUp")) ly -= 1;
+  if (keysDown.has("ArrowDown")) ly += 1;
+  if (lx !== 0 && ly !== 0) {
+    lx *= Math.SQRT1_2;
+    ly *= Math.SQRT1_2;
   }
-
-  let btns = 0;
-  if (keysDown.has("Numpad1") || keysDown.has("Period")) btns |= BTN_PASS | BTN_TACKLE;
-  if (keysDown.has("Numpad2") || keysDown.has("Slash")) btns |= BTN_SHOOT;
-  if (keysDown.has("Numpad3")) btns |= BTN_THROUGH;
-  if (keysDown.has("Numpad0")) btns |= BTN_SKILL;
-  if (keysDown.has("ControlRight") || keysDown.has("RightControl")) btns |= BTN_SPRINT;
-  if (keysDown.has("Comma")) btns |= BTN_SWITCH | BTN_TACKLE;
-
-  const mx = Math.round(dx * 127);
-  const my = Math.round(dy * 127);
-  const aiming = (btns & (BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT)) !== 0;
-  return { mx, my, ax: aiming ? mx : 0, ay: aiming ? my : 0, btns };
+  const rt = keysDown.has("ControlRight") || keysDown.has("RightControl");
+  const phys2 = {
+    lx,
+    ly,
+    rx: 0,
+    ry: 0,
+    ltValue: 0.0,
+    rtValue: rt ? 1.0 : 0.0,
+    isSnesMode: false,
+    buttons: {
+      south: keysDown.has("Numpad1") || keysDown.has("Period"),
+      east: keysDown.has("Numpad2") || keysDown.has("Slash"),
+      west: keysDown.has("Numpad4"),
+      north: keysDown.has("Numpad3"),
+      lb: keysDown.has("Comma"),
+      rb: false,
+      lt: false,
+      rt,
+      select: keysDown.has("Numpad0"),
+      start: false,
+      l3: false,
+      r3: false,
+    },
+    id: "keyboard-p2",
+    rawPad: null,
+  };
+  return mapPhysicalToSimInput(phys2, controlProfile);
 }
 
-// Update live Controller Visualizer when on SCREEN_CONTROLLERS (merges P1 & P2 so testing either SNES pad lights immediately!)
+function rebindControlProfileAction(context, actionKey, newPhys) {
+  if ((context !== "attack" && context !== "defense") || !controlProfile[context]) return;
+  const map = controlProfile[context];
+  const prevPhys = map[actionKey];
+  if (prevPhys === newPhys) return;
+  // Auto-swap colliding bindings inside the same context so two actions never accidentally double-fire
+  // (e.g., rebinding Shoot -> West swaps Cross -> East instead of firing Chip Shot on every press).
+  for (const otherKey of Object.keys(map)) {
+    if (otherKey !== actionKey && map[otherKey] === newPhys) {
+      map[otherKey] = prevPhys;
+      break;
+    }
+  }
+  map[actionKey] = newPhys;
+  controlProfile.preset = "custom";
+  saveControlProfile();
+  enqueueControlSettingsSync();
+}
+
+function stepInteractiveRebindCapture() {
+  if (!rebindState) return;
+  const pads = getConnectedPads();
+  if (!pads.length) return;
+
+  let anyHeld = false;
+  let capturedKey = null;
+  for (let i = 0; i < pads.length; i++) {
+    const phys = samplePhysicalGamepad(i);
+    if (!phys) continue;
+    for (const key of PHYSICAL_BINDABLE_INPUTS) {
+      if (phys.buttons[key]) {
+        anyHeld = true;
+        if (!capturedKey) capturedKey = key;
+      }
+    }
+  }
+
+  if (rebindState.waitingRelease) {
+    if (!anyHeld) rebindState.waitingRelease = false;
+    return;
+  }
+
+  if (capturedKey) {
+    rebindControlProfileAction(rebindState.context, rebindState.actionKey, capturedKey);
+    rebindState = null;
+    const banner = document.getElementById("rebind-capture-banner");
+    if (banner) banner.hidden = true;
+    syncControlSettingsUi();
+    GameAudio.uiConfirm();
+  }
+}
+
+// Update live Controller Visualizer when on SCREEN_CONTROLLERS (merges P1 & P2 so testing either pad lights immediately!)
 function updateControllerVisualizer() {
   if (currentScreen !== "controllers") return;
   if (calibState) {
     stepPadCalibrationWizard();
+  } else if (rebindState) {
+    stepInteractiveRebindCapture();
   }
 
   const pads = getConnectedPads();
@@ -1601,10 +2090,20 @@ function updateControllerVisualizer() {
 
   const l1El = document.getElementById("vis-btn-l1");
   const r1El = document.getElementById("vis-btn-r1");
+  const l2El = document.getElementById("vis-btn-l2");
+  const r2El = document.getElementById("vis-btn-r2");
+  const ltFill = document.getElementById("vis-trig-lt-fill");
+  const rtFill = document.getElementById("vis-trig-rt-fill");
   const selEl = document.getElementById("vis-btn-select");
   const stEl = document.getElementById("vis-btn-start");
-  if (l1El) l1El.classList.toggle("lit", Boolean((activeGp && activeGp.l1) || keysDown.has("KeyQ") || keysDown.has("KeyF")));
-  if (r1El) r1El.classList.toggle("lit", Boolean((activeGp && activeGp.r1) || keysDown.has("ShiftLeft") || keysDown.has("ShiftRight")));
+  const ltPct = Math.round(((activeGp && activeGp.ltValue) || (keysDown.has("KeyF") ? 1 : 0)) * 100);
+  const rtPct = Math.round(((activeGp && activeGp.rtValue) || (keysDown.has("ShiftLeft") || keysDown.has("ShiftRight") ? 1 : 0)) * 100);
+  if (l1El) l1El.classList.toggle("lit", Boolean((activeGp && activeGp.l1) || keysDown.has("KeyQ")));
+  if (r1El) r1El.classList.toggle("lit", Boolean((activeGp && activeGp.r1) || keysDown.has("KeyE") || keysDown.has("KeyR")));
+  if (l2El) l2El.classList.toggle("lit", ltPct > 10);
+  if (r2El) r2El.classList.toggle("lit", rtPct > 10);
+  if (ltFill) ltFill.style.width = `${ltPct}%`;
+  if (rtFill) rtFill.style.width = `${rtPct}%`;
   if (selEl) selEl.classList.toggle("lit", Boolean((activeGp && activeGp.select) || keysDown.has("KeyZ")));
   if (stEl) stEl.classList.toggle("lit", Boolean(activeGp && activeGp.start));
 
@@ -1617,14 +2116,15 @@ function updateControllerVisualizer() {
         if (p.buttons[i] && (p.buttons[i].pressed || p.buttons[i].value > 0.4)) pressedBtns.push(`B${i}`);
       }
       const mvStr =
-        activeGp.mx !== 0 || activeGp.my !== 0 ? `MV(${activeGp.mx},${activeGp.my}) ` : "";
+        activeGp.mx !== 0 || activeGp.my !== 0 ? `LS(${activeGp.mx},${activeGp.my}) ` : "";
+      const trigStr = rtPct > 10 ? `RT:${rtPct}% ` : "";
       const axStr =
         p.axes && p.axes.length >= 2
           ? `AX(${Number(p.axes[0] || 0).toFixed(1)},${Number(p.axes[1] || 0).toFixed(1)})`
           : "";
       rawEl.textContent = pressedBtns.length
-        ? `PRESSED: ${pressedBtns.join("+")} ${mvStr}${axStr}`.trim()
-        : `READY · ${mvStr}${axStr || "IDLE"}`.trim();
+        ? `PRESSED: ${pressedBtns.join("+")} ${trigStr}${mvStr}${axStr}`.trim()
+        : `READY · ${trigStr}${mvStr}${axStr || "IDLE"}`.trim();
     } else {
       rawEl.textContent = "RAW: IDLE";
     }
@@ -1657,6 +2157,8 @@ function stepFocusedPreMatchRow(dir) {
     ["pm-cam-prev", "pm-cam-next"],
     ["pm-wx-prev", "pm-wx-next"],
     ["pm-sw-prev", "pm-sw-next"],
+    ["pm-preset-prev", "pm-preset-next"],
+    ["pm-def-prev", "pm-def-next"],
   ];
   const pair = pairs[pmFocusedRowIdx];
   if (!pair) return;
@@ -1829,7 +2331,7 @@ function sampleAnyMenuGamepad() {
 }
 
 function pollGamepadMenuActions(nowMs) {
-  if (calibState && currentScreen === "controllers") return; // Don't navigate screens while calibrating buttons!
+  if ((calibState || rebindState) && currentScreen === "controllers") return; // Don't navigate screens while calibrating or rebinding buttons!
   const gp = sampleAnyMenuGamepad();
   if (!gp) {
     prevStartBtn = false;
@@ -2271,14 +2773,17 @@ function setupLiveMatchHud(snapshot, contextLabel) {
   homePossTicks = 1;
   awayPossTicks = 1;
   matchEventsLog = [];
-  queuedSubReserved = [0, 0];
+  queuedReservedQueue = [[], []];
+  enqueueControlSettingsSync();
   subsUsedCount = [0, 0];
   subsArmedSlot = null;
   subsSide = SIDE_MODES[pmSideIdx].id === "away_vs_cpu" ? 1 : 0;
 
   document.getElementById("pause-modal").hidden = true;
   document.getElementById("pause-subs-panel").hidden = true;
-  document.getElementById("pause-modal-card").classList.remove("subs-open");
+  const ctrlPanel = document.getElementById("pause-ctrl-panel");
+  if (ctrlPanel) ctrlPanel.hidden = true;
+  document.getElementById("pause-modal-card").classList.remove("subs-open", "ctrl-open");
   document.getElementById("fulltime-modal").hidden = true;
   document.getElementById("replay-bar").hidden = true;
   document.getElementById("radar-wrap").hidden = false;
@@ -2286,7 +2791,12 @@ function setupLiveMatchHud(snapshot, contextLabel) {
   document.getElementById("verify-banner").hidden = true;
   document.getElementById("hud-home-card").hidden = true;
   document.getElementById("hud-away-card").hidden = true;
+  const hKick = document.getElementById("hud-home-kick");
+  const aKick = document.getElementById("hud-away-kick");
+  if (hKick) hKick.hidden = true;
+  if (aKick) aKick.hidden = true;
   syncWeatherLabels();
+  syncControlSettingsUi();
 
   const kits = resolveMatchKits(
     snapshot.home.club_id,
@@ -2562,18 +3072,166 @@ function renderPreMatchScreen() {
   document.getElementById("pm-diff-val").textContent = DIFF_OPTIONS[pmDiffIdx].label;
   document.getElementById("pm-cam-val").textContent = CAMERA_LABELS[engine3d.cameraMode];
   syncWeatherLabels();
-  syncAutoSwitchLabels();
+  syncControlSettingsUi();
 
   engine3d.updatePreMatchShowcase(hRoster, aRoster);
 }
 
-// --- Match HUD, Weather, Auto-Switch, Live Substitutions, Radar, Pause & Instant Replay ---
+// --- Match HUD, Control Settings UI, Weather, Auto-Switch, Live Substitutions, Radar, Pause & Replay ---
 
 function showGoalBroadcastBanner(title, sub, ticks = 150) {
   document.getElementById("goal-banner-title").textContent = title;
   document.getElementById("goal-banner-sub").textContent = sub;
   document.getElementById("goal-banner").hidden = false;
   goalBannerTicks = ticks;
+}
+
+function startActionRebind(context, actionKey, label) {
+  rebindState = { context, actionKey, label, waitingRelease: true };
+  const banner = document.getElementById("rebind-capture-banner");
+  const promptEl = document.getElementById("rebind-capture-prompt");
+  if (banner) banner.hidden = false;
+  if (promptEl) {
+    promptEl.textContent = `REBIND [${context.toUpperCase()}] ${label} — Press any controller button (or click again to cycle)`;
+  }
+  renderControlBindingLists();
+  GameAudio.uiTick(560);
+}
+
+function renderControlBindingLists() {
+  const attUl = document.getElementById("ctrl-attack-bindings-list");
+  const defUl = document.getElementById("ctrl-defense-bindings-list");
+  if (!attUl || !defUl) return;
+  const style = detectConnectedPromptStyle();
+
+  const buildList = (ul, context, metaList, stickRows) => {
+    ul.innerHTML = "";
+    for (const [lbl, glyph] of stickRows) {
+      const li = document.createElement("li");
+      li.innerHTML = `<span>${lbl}</span><span class="rebind-pill static-pill">${glyph}</span>`;
+      ul.appendChild(li);
+    }
+    for (const item of metaList) {
+      const boundPhys = controlProfile[context][item.key];
+      const isListening = Boolean(
+        rebindState && rebindState.context === context && rebindState.actionKey === item.key
+      );
+      const glyph = formatPhysicalGlyph(boundPhys, style);
+      const kbLabel = PHYSICAL_KEYBOARD_LABELS[boundPhys] || item.kb;
+      const li = document.createElement("li");
+      const labelSpan = document.createElement("span");
+      labelSpan.textContent = item.label;
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = `rebind-pill${isListening ? " listening" : ""}`;
+      btn.title = `Keyboard: ${kbLabel} · Click to rebind with controller or click again to cycle`;
+      btn.textContent = isListening ? "PRESS BUTTON..." : `${glyph} · ${kbLabel}`;
+      btn.addEventListener("click", () => {
+        if (isListening) {
+          // Clicking while listening cycles through canonical physical inputs with collision auto-swap!
+          const curIdx = PHYSICAL_BINDABLE_INPUTS.indexOf(boundPhys);
+          const nextPhys = PHYSICAL_BINDABLE_INPUTS[(curIdx + 1) % PHYSICAL_BINDABLE_INPUTS.length];
+          rebindControlProfileAction(context, item.key, nextPhys);
+          rebindState = null;
+          const banner = document.getElementById("rebind-capture-banner");
+          if (banner) banner.hidden = true;
+          syncControlSettingsUi();
+          GameAudio.uiConfirm();
+        } else {
+          startActionRebind(context, item.key, item.label);
+        }
+      });
+      li.appendChild(labelSpan);
+      li.appendChild(btn);
+      ul.appendChild(li);
+    }
+  };
+
+  buildList(attUl, "attack", ATTACK_ACTION_META, [
+    ["360° Dribble & Aim", "L-Stick / WASD"],
+    ["Skill Moves / Knock-On", "R-Stick / Z"],
+  ]);
+  buildList(defUl, "defense", DEFENSE_ACTION_META, [
+    ["Player Movement", "L-Stick / WASD"],
+    ["Manual Player Switch (Dir)", "R-Stick"],
+  ]);
+
+  const defBadge = document.getElementById("ctrl-def-mode-badge");
+  if (defBadge) {
+    defBadge.textContent =
+      controlProfile.defendingMode === "legacy"
+        ? "LEGACY (AUTO-TACKLE)"
+        : "TACTICAL (FIFA 12)";
+  }
+}
+
+function syncControlSettingsUi() {
+  autoSwitchIdx = autoSwitchCodeFromName(controlProfile.autoSwitch);
+  syncAutoSwitchLabels();
+
+  // Keep every settings dropdown on Screen 5 AND Pause Modal synced to controlProfile
+  document.querySelectorAll("select[data-cset]").forEach((sel) => {
+    const key = sel.getAttribute("data-cset");
+    if (!key) return;
+    if (key === "analogSprint") {
+      sel.value = controlProfile.analogSprint ? "on" : "off";
+    } else if (controlProfile[key] !== undefined) {
+      sel.value = String(controlProfile[key]);
+    }
+  });
+
+  // Update Pre-Match quick steppers
+  const pmPreset = document.getElementById("pm-preset-val");
+  if (pmPreset) {
+    const presetMeta = CONTROL_PRESETS[controlProfile.preset];
+    pmPreset.textContent = presetMeta ? presetMeta.label : "CUSTOM";
+  }
+  const pmDef = document.getElementById("pm-def-val");
+  if (pmDef) {
+    pmDef.textContent = controlProfile.defendingMode === "legacy" ? "LEGACY" : "TACTICAL";
+  }
+
+  renderControlBindingLists();
+}
+
+function applyControlSettingChange(key, value) {
+  if (key === "preset") {
+    if (CONTROL_PRESETS[value]) {
+      controlProfile.preset = value;
+      controlProfile.attack = { ...CONTROL_PRESETS[value].attack };
+      controlProfile.defense = { ...CONTROL_PRESETS[value].defense };
+    } else if (value === "custom") {
+      controlProfile.preset = "custom";
+    }
+  } else if (key === "analogSprint") {
+    controlProfile.analogSprint = value === "on" || value === true;
+  } else if (key === "autoSwitch") {
+    controlProfile.autoSwitch = ["auto", "air_balls", "manual"].includes(value) ? value : "auto";
+  } else if (key === "autoSwitchMoveAssist") {
+    controlProfile.autoSwitchMoveAssist = ["none", "low", "high"].includes(value) ? value : "low";
+  } else if (key === "defendingMode") {
+    controlProfile.defendingMode = value === "legacy" ? "legacy" : "tactical";
+  } else if (["passAssist", "throughAssist", "shotAssist", "crossAssist"].includes(key)) {
+    controlProfile[key] = ["assisted", "semi", "manual"].includes(value) ? value : "assisted";
+  }
+  saveControlProfile();
+  enqueueControlSettingsSync();
+  syncControlSettingsUi();
+  GameAudio.uiTick(580);
+}
+
+function stepControlPreset(dir = 1) {
+  const order = ["classic", "alternate", "two_button"];
+  const idx = order.indexOf(controlProfile.preset);
+  const next = order[((idx < 0 ? 0 : idx) + dir + order.length) % order.length];
+  applyControlSettingChange("preset", next);
+}
+
+function toggleDefendingMode() {
+  applyControlSettingChange(
+    "defendingMode",
+    controlProfile.defendingMode === "tactical" ? "legacy" : "tactical"
+  );
 }
 
 function syncAutoSwitchLabels() {
@@ -2587,12 +3245,9 @@ function syncAutoSwitchLabels() {
 }
 
 function stepAutoSwitch(dir = 1) {
-  autoSwitchIdx = (autoSwitchIdx + dir + AUTO_SWITCH_OPTIONS.length) % AUTO_SWITCH_OPTIONS.length;
-  try {
-    localStorage.setItem(AUTO_SWITCH_STORAGE_KEY, String(autoSwitchIdx));
-  } catch (_e) {}
-  syncAutoSwitchLabels();
-  GameAudio.uiTick(590);
+  const nextIdx = (autoSwitchIdx + dir + AUTO_SWITCH_OPTIONS.length) % AUTO_SWITCH_OPTIONS.length;
+  const opt = AUTO_SWITCH_OPTIONS[nextIdx] || AUTO_SWITCH_OPTIONS[0];
+  applyControlSettingChange("autoSwitch", opt.name);
 }
 
 function syncWeatherLabels() {
@@ -2630,14 +3285,20 @@ function togglePauseModal() {
     if (!document.getElementById("pause-subs-panel").hidden) {
       renderPauseSubsPanel();
     }
+    syncControlSettingsUi();
   }
   GameAudio.uiTick(paused ? 420 : 620);
 }
 
 function togglePauseSubsDrawer(forceOpen = null) {
   const panel = document.getElementById("pause-subs-panel");
+  const ctrlPanel = document.getElementById("pause-ctrl-panel");
   const card = document.getElementById("pause-modal-card");
   const nextOpen = forceOpen !== null ? forceOpen : panel.hidden;
+  if (nextOpen && ctrlPanel) {
+    ctrlPanel.hidden = true;
+    card.classList.remove("ctrl-open");
+  }
   panel.hidden = !nextOpen;
   card.classList.toggle("subs-open", nextOpen);
   if (nextOpen) {
@@ -2645,6 +3306,24 @@ function togglePauseSubsDrawer(forceOpen = null) {
     renderPauseSubsPanel();
   }
   GameAudio.uiTick(540);
+}
+
+function togglePauseCtrlDrawer(forceOpen = null) {
+  const ctrlPanel = document.getElementById("pause-ctrl-panel");
+  const subsPanel = document.getElementById("pause-subs-panel");
+  const card = document.getElementById("pause-modal-card");
+  if (!ctrlPanel) return;
+  const nextOpen = forceOpen !== null ? forceOpen : ctrlPanel.hidden;
+  if (nextOpen && subsPanel) {
+    subsPanel.hidden = true;
+    card.classList.remove("subs-open");
+  }
+  ctrlPanel.hidden = !nextOpen;
+  card.classList.toggle("ctrl-open", nextOpen);
+  if (nextOpen) {
+    syncControlSettingsUi();
+  }
+  GameAudio.uiTick(560);
 }
 
 function renderPauseSubsPanel() {
@@ -2799,7 +3478,9 @@ function renderPauseSubsPanel() {
             }
           }
         }
-        queuedSubReserved[subsSide] = 0x8000 | ((targetSlot & 0x1f) << 5) | (benchIdx & 0x1f);
+        queuedReservedQueue[subsSide].push(
+          0x8000 | ((targetSlot & 0x1f) << 5) | (benchIdx & 0x1f)
+        );
         subsArmedSlot = null;
         GameAudio.uiConfirm();
         togglePauseModal(); // Unpauses immediately so next 60Hz tick applies the substitution!
@@ -2949,6 +3630,16 @@ function updatePlayerCornerHuds(packed) {
   const pps = packed[6];
   const homeCtrl = packed[7];
   const awayCtrl = packed[8];
+  const cueBase = 18 + pps * 20 + 7;
+  const hasCueWords = packed.length >= cueBase + pps * 2;
+
+  const KICK_BADGE_LABELS = {
+    1: "PASS",
+    2: "THROUGH",
+    3: "CROSS",
+    4: "SHOT",
+    5: "CHIP",
+  };
 
   const updateCorner = (side, ctrlIdx, prefix) => {
     const n = side * pps + ctrlIdx;
@@ -2960,6 +3651,9 @@ function updatePlayerCornerHuds(packed) {
     const charge = ((flags >>> 15) & 0x7ff) / 1000;
     const sentOff = ((flags >>> 26) & 1) === 1;
     const hasYellow = ((flags >>> 27) & 1) === 1;
+    const cueWord = hasCueWords ? packed[cueBase + n] >>> 0 : 0;
+    const kickKind = cueWord & 0x7;
+    const kickFinesse = ((cueWord >>> 3) & 1) === 1;
 
     const team = side === 0 ? currentSnapshot.home : currentSnapshot.away;
     const member = team.starters && team.starters[ctrlIdx];
@@ -2976,6 +3670,20 @@ function updatePlayerCornerHuds(packed) {
     stamEl.style.width = `${Math.round(stamina * 100)}%`;
     stamEl.style.background = stamina < 0.3 ? "#ef4444" : stamina < 0.55 ? "#facc15" : "#22c55e";
     document.getElementById(`hud-${prefix}-pow`).style.width = `${Math.round(charge * 100)}%`;
+
+    const kickEl = document.getElementById(`hud-${prefix}-kick`);
+    if (kickEl) {
+      if (charge > 0.01 && kickKind > 0) {
+        const isChip = kickKind === 5;
+        const isFinesse = !isChip && kickFinesse && kickKind === 4;
+        kickEl.textContent = isFinesse ? "FINESSE" : KICK_BADGE_LABELS[kickKind] || "KICK";
+        kickEl.classList.toggle("badge-finesse", isFinesse);
+        kickEl.classList.toggle("badge-chip", isChip);
+        kickEl.hidden = false;
+      } else {
+        kickEl.hidden = true;
+      }
+    }
   };
 
   updateCorner(0, homeCtrl, "home");
@@ -3170,14 +3878,16 @@ function mainLoop(nowMs) {
         }
 
         const swBits = ((AUTO_SWITCH_OPTIONS[autoSwitchIdx]?.code ?? 0) & 0x3) << 12;
+        const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
+        const aSprintBits = (aIn.sprintAnalog || 0) & 0x7f;
         for (let s = 0; s < steps; s++) {
           if (currSimPacked) prevSimPacked = currSimPacked;
-          const hReserved = (queuedSubReserved[0] | swBits) & 0xffff;
-          const aReserved = (queuedSubReserved[1] | swBits) & 0xffff;
+          const hQueued = queuedReservedQueue[0].length > 0 ? queuedReservedQueue[0].shift() : 0;
+          const aQueued = queuedReservedQueue[1].length > 0 ? queuedReservedQueue[1].shift() : 0;
+          const hReserved = (hQueued !== 0 ? hQueued | ((hQueued & 0x8000) !== 0 ? swBits : 0) : swBits | hSprintBits) & 0xffff;
+          const aReserved = (aQueued !== 0 ? aQueued | ((aQueued & 0x8000) !== 0 ? swBits : 0) : swBits | aSprintBits) & 0xffff;
           const hBtns = ((hIn.btns & 0xffff) | (hReserved << 16)) >>> 0;
           const aBtns = ((aIn.btns & 0xffff) | (aReserved << 16)) >>> 0;
-          queuedSubReserved[0] = 0;
-          queuedSubReserved[1] = 0;
 
           wasm.sim_tick(hIn.mx, hIn.my, hIn.ax, hIn.ay, hBtns, aIn.mx, aIn.my, aIn.ax, aIn.ay, aBtns);
           const subPacked = readPackedState();
@@ -3215,8 +3925,9 @@ function mainLoop(nowMs) {
           const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
           const ss = String(totalSec % 60).padStart(2, "0");
           document.getElementById("sb-time").textContent = `${mm}:${ss}`;
+          const passGlyph = formatPhysicalGlyph(controlProfile.attack.pass, detectConnectedPromptStyle());
           document.getElementById("sb-phase").textContent =
-            phase === 0 ? "KICK OFF · PRESS PASS [SPACE / A]" : PHASE_LABELS[phase] || "OPEN PLAY";
+            phase === 0 ? `KICK OFF · PRESS PASS [SPACE / ${passGlyph}]` : PHASE_LABELS[phase] || "OPEN PLAY";
 
           updatePlayerCornerHuds(packed);
           drawPitchRadar(packed);
@@ -3956,6 +4667,18 @@ document.getElementById("pm-sw-prev").addEventListener("click", () => {
 document.getElementById("pm-sw-next").addEventListener("click", () => {
   stepAutoSwitch(1);
 });
+document.getElementById("pm-preset-prev").addEventListener("click", () => {
+  stepControlPreset(-1);
+});
+document.getElementById("pm-preset-next").addEventListener("click", () => {
+  stepControlPreset(1);
+});
+document.getElementById("pm-def-prev").addEventListener("click", () => {
+  toggleDefendingMode();
+});
+document.getElementById("pm-def-next").addEventListener("click", () => {
+  toggleDefendingMode();
+});
 
 document.getElementById("btn-pm-back").addEventListener("click", () => {
   GameAudio.uiTick(380);
@@ -4141,6 +4864,7 @@ document.getElementById("btn-season-back").addEventListener("click", () => {
       try {
         localStorage.setItem(PAD_PROFILE_STORAGE_KEY, profSel.value);
       } catch (_e) {}
+      renderControlBindingLists();
       GameAudio.uiTick(500);
     });
   }
@@ -4179,6 +4903,85 @@ document.getElementById("btn-season-back").addEventListener("click", () => {
       GameAudio.uiTick(360);
     });
   }
+
+  // FIFA 10-12 Control Settings Panel (Screen 5 + Pause Drawer shared `data-cset` selects!)
+  document.querySelectorAll("select[data-cset]").forEach((sel) => {
+    sel.addEventListener("change", () => {
+      const key = sel.getAttribute("data-cset");
+      if (key) applyControlSettingChange(key, sel.value);
+    });
+  });
+
+  const rebindCancel = document.getElementById("btn-rebind-cancel");
+  if (rebindCancel) {
+    rebindCancel.addEventListener("click", () => {
+      rebindState = null;
+      const banner = document.getElementById("rebind-capture-banner");
+      if (banner) banner.hidden = true;
+      renderControlBindingLists();
+      GameAudio.uiTick(360);
+    });
+  }
+
+  const showProfileToast = (text) => {
+    const t = document.getElementById("ctrl-profile-toast");
+    if (!t) return;
+    t.textContent = text;
+    t.hidden = false;
+  };
+
+  const exportBtn = document.getElementById("btn-ctrl-export-json");
+  if (exportBtn) {
+    exportBtn.addEventListener("click", () => {
+      const blob = new Blob([JSON.stringify(controlProfile, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `psfc-controls-${controlProfile.preset}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      showProfileToast(`Exported control profile JSON (${controlProfile.preset.toUpperCase()}).`);
+      GameAudio.uiConfirm();
+    });
+  }
+
+  const importBtn = document.getElementById("btn-ctrl-import-json");
+  const importInput = document.getElementById("input-ctrl-import-file");
+  if (importBtn && importInput) {
+    importBtn.addEventListener("click", () => importInput.click());
+    importInput.addEventListener("change", async () => {
+      const file = importInput.files && importInput.files[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        controlProfile = sanitizeControlProfile(JSON.parse(text));
+        saveControlProfile();
+        enqueueControlSettingsSync();
+        syncControlSettingsUi();
+        showProfileToast(`Imported control profile JSON (${controlProfile.preset.toUpperCase()}).`);
+        GameAudio.uiConfirm();
+      } catch (_err) {
+        showProfileToast("Invalid control profile JSON file.");
+      } finally {
+        importInput.value = "";
+      }
+    });
+  }
+
+  const resetBtn = document.getElementById("btn-ctrl-reset-defaults");
+  if (resetBtn) {
+    resetBtn.addEventListener("click", () => {
+      controlProfile = createDefaultControlProfile("classic");
+      rebindState = null;
+      const banner = document.getElementById("rebind-capture-banner");
+      if (banner) banner.hidden = true;
+      saveControlProfile();
+      enqueueControlSettingsSync();
+      syncControlSettingsUi();
+      showProfileToast("Reset to FIFA 10–12 Classic defaults (Tactical Defending, Analog Sprint ON).");
+      GameAudio.uiConfirm();
+    });
+  }
 })();
 
 document.getElementById("cart-device-select").addEventListener("change", (ev) => {
@@ -4201,6 +5004,7 @@ document.getElementById("btn-sync-cartridge").addEventListener("click", async ()
       controller_profile: {
         layout: profSel ? profSel.value : "auto",
         custom_map: customPadMap || null,
+        fifa_profile: controlProfile,
       },
     }),
   });
@@ -4245,6 +5049,9 @@ document.getElementById("btn-download-cartridge").addEventListener("click", () =
 });
 
 document.getElementById("btn-ctrl-back").addEventListener("click", () => {
+  rebindState = null;
+  const banner = document.getElementById("rebind-capture-banner");
+  if (banner) banner.hidden = true;
   GameAudio.uiTick(380);
   navigateTo("menu");
 });
@@ -4266,6 +5073,10 @@ document.getElementById("btn-hud-pause").addEventListener("click", togglePauseMo
 
 document.getElementById("btn-pause-resume").addEventListener("click", togglePauseModal);
 document.getElementById("btn-pause-subs-toggle").addEventListener("click", () => togglePauseSubsDrawer());
+const pauseCtrlToggleBtn = document.getElementById("btn-pause-ctrl-toggle");
+if (pauseCtrlToggleBtn) {
+  pauseCtrlToggleBtn.addEventListener("click", () => togglePauseCtrlDrawer());
+}
 document.getElementById("btn-pause-replay").addEventListener("click", toggleInstantReplay);
 document.getElementById("btn-pause-sw").addEventListener("click", () => stepAutoSwitch(1));
 document.getElementById("btn-pause-cam").addEventListener("click", cycleMatchCamera);
@@ -4317,7 +5128,7 @@ document.getElementById("btn-ft-hub").addEventListener("click", () => {
 // --- Boot Sequence ---
 
 async function bootGame() {
-  syncAutoSwitchLabels();
+  syncControlSettingsUi();
   updateGamepadBadges();
   await refreshWorldOverview();
 

@@ -222,8 +222,26 @@
             <span class="pm-s-label">AUTO-SWITCH</span>
             <div class="pm-stepper">
               <button class="step-arrow" id="pm-sw-prev" type="button">◀</button>
-              <span class="pm-s-val" id="pm-sw-val">ASSISTED (BALL)</span>
+              <span class="pm-s-val" id="pm-sw-val">AUTO (ALL BALLS)</span>
               <button class="step-arrow" id="pm-sw-next" type="button">▶</button>
+            </div>
+          </div>
+
+          <div class="pm-setting-row">
+            <span class="pm-s-label">CONTROLS</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-preset-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-preset-val">CLASSIC (FIFA)</span>
+              <button class="step-arrow" id="pm-preset-next" type="button">▶</button>
+            </div>
+          </div>
+
+          <div class="pm-setting-row">
+            <span class="pm-s-label">DEFENDING</span>
+            <div class="pm-stepper">
+              <button class="step-arrow" id="pm-def-prev" type="button">◀</button>
+              <span class="pm-s-val" id="pm-def-val">TACTICAL</span>
+              <button class="step-arrow" id="pm-def-next" type="button">▶</button>
             </div>
           </div>
         </div>
@@ -528,18 +546,22 @@
         <div class="pad-visualizer">
           <div class="pad-stick-box">
             <div class="vis-shoulder-row">
-              <span class="vis-btn vis-bumper" id="vis-btn-l1">L · SWITCH / FINESSE</span>
+              <span class="vis-btn vis-bumper" id="vis-btn-l1">LB / L1</span>
+              <span class="vis-btn vis-bumper vis-trigger" id="vis-btn-l2">
+                <span>LT / L2</span>
+                <span class="vis-trig-bar"><i id="vis-trig-lt-fill"></i></span>
+              </span>
             </div>
             <div class="stick-well"><div class="stick-dot" id="vis-lstick"></div></div>
-            <span>D-PAD / LEFT STICK</span>
+            <span>360° LEFT STICK / D-PAD</span>
           </div>
           <div class="pad-buttons-cluster">
-            <span class="vis-btn vis-snes-x" id="vis-btn-north">X (TOP) / △</span>
+            <span class="vis-btn vis-snes-x" id="vis-btn-north">Y / △</span>
             <div class="vis-mid-row">
-              <span class="vis-btn vis-snes-y" id="vis-btn-west">Y (LEFT) / □</span>
-              <span class="vis-btn vis-snes-a" id="vis-btn-east">A (RIGHT) / ○</span>
+              <span class="vis-btn vis-snes-y" id="vis-btn-west">X / □</span>
+              <span class="vis-btn vis-snes-a" id="vis-btn-east">B / ○</span>
             </div>
-            <span class="vis-btn vis-snes-b" id="vis-btn-south">B (BOTTOM) / ✕</span>
+            <span class="vis-btn vis-snes-b" id="vis-btn-south">A / ✕</span>
             <div class="vis-meta-row">
               <span class="vis-btn vis-mini" id="vis-btn-select">SELECT</span>
               <span class="vis-btn vis-mini" id="vis-btn-start">START</span>
@@ -547,67 +569,155 @@
           </div>
           <div class="pad-stick-box">
             <div class="vis-shoulder-row">
-              <span class="vis-btn vis-bumper" id="vis-btn-r1">R · SPRINT</span>
+              <span class="vis-btn vis-bumper" id="vis-btn-r1">RB / R1</span>
+              <span class="vis-btn vis-bumper vis-trigger" id="vis-btn-r2">
+                <span>RT / R2</span>
+                <span class="vis-trig-bar"><i id="vis-trig-rt-fill"></i></span>
+              </span>
             </div>
             <div class="stick-well"><div class="stick-dot" id="vis-rstick"></div></div>
             <span id="vis-raw-readout">RAW: IDLE</span>
           </div>
         </div>
 
+        <div class="rebind-banner" id="rebind-capture-banner" hidden>
+          <span id="rebind-capture-prompt">Press any gamepad button to bind action...</span>
+          <button class="console-btn console-btn-ghost btn-compact" id="btn-rebind-cancel" type="button">CANCEL</button>
+        </div>
+
         <div class="controls-two-col">
           <div class="ctrl-map-box">
-            <h3>ON THE BALL (SNES / MODERN PAD)</h3>
-            <ul>
-              <li><span>Move &amp; Pass/Shot Aim</span> <strong>D-Pad / L-Stick / WASD</strong></li>
-              <li><span>Ground Pass (Hold Force)</span> <strong>SNES B (Bottom) / Cross / Space</strong></li>
-              <li><span>Shoot (Tap Low / Hold Power)</span> <strong>SNES A (Right) / Circle / L</strong></li>
-              <li><span>Lob Switch / Wing Cross</span> <strong>SNES Y (Left) / Square / U</strong></li>
-              <li><span>Through Ball (Hold Lead)</span> <strong>SNES X (Top) / Triangle / K</strong></li>
-              <li><span>Sprint / Knock-On</span> <strong>SNES R / RT / Shift</strong></li>
-              <li><span>Finesse / Driven / Shield</span> <strong>SNES L / LT / L2 / F</strong></li>
-              <li><span>Skill Move / Chip Shot</span> <strong>SELECT / R-Stick · L+R+Shoot</strong></li>
-            </ul>
+            <div class="ctrl-map-hdr">
+              <h3>ATTACKING (IN POSSESSION)</h3>
+              <span class="ctrl-map-hint">Click any button pill to remap</span>
+            </div>
+            <ul id="ctrl-attack-bindings-list"></ul>
           </div>
           <div class="ctrl-map-box">
-            <h3>OFF THE BALL (ASSISTED DEFENDING)</h3>
-            <ul>
-              <li><span>Auto-Switch (Follows Ball) + Manual</span> <strong>SNES L / LB / L1 / Q</strong></li>
-              <li><span>Assisted Goal-Side Jockey</span> <strong>SNES L / LT / L2 / F</strong></li>
-              <li><span>Assisted Standing Tackle</span> <strong>SNES B (Bottom) / Cross / E</strong></li>
-              <li><span>Assisted Sweeping Slide</span> <strong>SNES Y (Left) / Square / C</strong></li>
-              <li><span>Team Press / GK Rush</span> <strong>SNES X (Top) / RB / R1 / R</strong></li>
-              <li><span>Start / Pause / Replay</span> <strong>START / SELECT / Esc / Tab</strong></li>
-            </ul>
+            <div class="ctrl-map-hdr">
+              <h3>DEFENDING (OUT OF POSSESSION)</h3>
+              <span class="ctrl-map-hint" id="ctrl-def-mode-badge">TACTICAL DEFENDING</span>
+            </div>
+            <ul id="ctrl-defense-bindings-list"></ul>
           </div>
         </div>
       </div>
 
-      <div class="ctrl-card">
-        <h2>PROFILE CARTRIDGE SLOT (PSFC-CART-V1)</h2>
-        <p class="pane-sub">Portable signed profile envelope storing your club representation, camera preference &amp; world sequence checkpoint.</p>
-
-        <div class="cart-slot-graphic">
-          <div class="cart-shell">
-            <div class="cart-grip"></div>
-            <div class="cart-label">
-              <span class="cart-tag">PARALLEL SEASON FC</span>
-              <strong id="cart-title-display">ALEX · MANCHESTER UNITED</strong>
-              <span id="cart-rev-display">READY TO SYNC</span>
+      <div class="ctrl-right-stack">
+        <!-- FIFA 10-12 CONTROLLER & ASSISTANCE SETTINGS PANEL -->
+        <div class="ctrl-card ctrl-settings-card">
+          <div class="ctrl-card-hdr">
+            <h2>FIFA 10–12 CONTROL SETTINGS</h2>
+            <div class="ctrl-hdr-actions">
+              <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-export-json" type="button" title="Download Control Profile JSON">EXPORT</button>
+              <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-import-json" type="button" title="Import Control Profile JSON">IMPORT</button>
+              <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-reset-defaults" type="button">RESET</button>
+              <input type="file" id="input-ctrl-import-file" accept=".json,application/json" hidden />
             </div>
           </div>
+          <div class="ctrl-settings-list" id="ctrl-settings-panel">
+            <div class="cset-row">
+              <label for="cset-preset">Control Preset</label>
+              <select id="cset-preset" class="console-select cset-select" data-cset="preset">
+                <option value="classic">Classic (FIFA 10–12)</option>
+                <option value="alternate">Alternate (Swap Shoot/Cross)</option>
+                <option value="two_button">Two-Button (Arcade)</option>
+                <option value="custom">Custom (Remapped)</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-auto-switch">Auto Switching</label>
+              <select id="cset-auto-switch" class="console-select cset-select" data-cset="autoSwitch">
+                <option value="auto">Auto</option>
+                <option value="air_balls">Air Balls</option>
+                <option value="manual">Manual</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-move-assist">Auto Switching Move Assistance</label>
+              <select id="cset-move-assist" class="console-select cset-select" data-cset="autoSwitchMoveAssist">
+                <option value="none">None</option>
+                <option value="low">Low</option>
+                <option value="high">High</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-pass-assist">Pass Assistance</label>
+              <select id="cset-pass-assist" class="console-select cset-select" data-cset="passAssist">
+                <option value="assisted">Assisted</option>
+                <option value="semi">Semi</option>
+                <option value="manual">Manual</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-through-assist">Through Ball Assistance</label>
+              <select id="cset-through-assist" class="console-select cset-select" data-cset="throughAssist">
+                <option value="assisted">Assisted</option>
+                <option value="semi">Semi</option>
+                <option value="manual">Manual</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-shot-assist">Shot Assistance</label>
+              <select id="cset-shot-assist" class="console-select cset-select" data-cset="shotAssist">
+                <option value="assisted">Assisted</option>
+                <option value="semi">Semi</option>
+                <option value="manual">Manual</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-cross-assist">Cross Assistance</label>
+              <select id="cset-cross-assist" class="console-select cset-select" data-cset="crossAssist">
+                <option value="assisted">Assisted</option>
+                <option value="semi">Semi</option>
+                <option value="manual">Manual</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-defending">Defending</label>
+              <select id="cset-defending" class="console-select cset-select" data-cset="defendingMode">
+                <option value="tactical">Tactical (FIFA 12)</option>
+                <option value="legacy">Legacy (Auto-Tackle)</option>
+              </select>
+            </div>
+            <div class="cset-row">
+              <label for="cset-analog-sprint">Analog Sprint</label>
+              <select id="cset-analog-sprint" class="console-select cset-select" data-cset="analogSprint">
+                <option value="on">On (Trigger Pressure)</option>
+                <option value="off">Off (Digital &gt; 10%)</option>
+              </select>
+            </div>
+          </div>
+          <div id="ctrl-profile-toast" class="console-toast" hidden></div>
         </div>
 
-        <div class="cart-controls-stack">
-          <select id="cart-device-select" class="console-select">
-            <option value="part-alex|dev-alex-01">Alex's Cartridge (dev-alex-01 · MUN)</option>
-            <option value="part-sam|dev-sam-02">Sam's Cartridge (dev-sam-02 · ARS)</option>
-          </select>
-          <div class="comm-btn-row">
-            <button class="console-btn console-btn-primary" id="btn-sync-cartridge" type="button">SYNC CARTRIDGE</button>
-            <button class="console-btn console-btn-secondary" id="btn-verify-cartridge" type="button" disabled>VERIFY</button>
-            <button class="console-btn console-btn-secondary" id="btn-download-cartridge" type="button" disabled>EXPORT .JSON</button>
+        <div class="ctrl-card ctrl-cartridge-compact">
+          <h2>PROFILE CARTRIDGE SLOT (PSFC-CART-V1)</h2>
+          <p class="pane-sub">Portable signed profile envelope storing your club representation, FIFA control profile &amp; world sequence checkpoint.</p>
+
+          <div class="cart-slot-graphic">
+            <div class="cart-shell">
+              <div class="cart-grip"></div>
+              <div class="cart-label">
+                <span class="cart-tag">PARALLEL SEASON FC</span>
+                <strong id="cart-title-display">ALEX · MANCHESTER UNITED</strong>
+                <span id="cart-rev-display">READY TO SYNC</span>
+              </div>
+            </div>
           </div>
-          <div id="cartridge-msg" class="console-toast" hidden></div>
+
+          <div class="cart-controls-stack">
+            <select id="cart-device-select" class="console-select">
+              <option value="part-alex|dev-alex-01">Alex's Cartridge (dev-alex-01 · MUN)</option>
+              <option value="part-sam|dev-sam-02">Sam's Cartridge (dev-sam-02 · ARS)</option>
+            </select>
+            <div class="comm-btn-row">
+              <button class="console-btn console-btn-primary" id="btn-sync-cartridge" type="button">SYNC CARTRIDGE</button>
+              <button class="console-btn console-btn-secondary" id="btn-verify-cartridge" type="button" disabled>VERIFY</button>
+              <button class="console-btn console-btn-secondary" id="btn-download-cartridge" type="button" disabled>EXPORT .JSON</button>
+            </div>
+            <div id="cartridge-msg" class="console-toast" hidden></div>
+          </div>
         </div>
       </div>
     </div>
@@ -648,11 +758,11 @@
     <div class="match-top-right">
       <button class="hud-mini-btn" id="btn-hud-zoom-out" type="button" title="Zoom Out (- or Scroll Down)">ZOOM −</button>
       <button class="hud-mini-btn" id="btn-hud-zoom-in" type="button" title="Zoom In (+ or Scroll Up)">ZOOM +</button>
-      <button class="hud-mini-btn" id="btn-hud-sw" type="button" title="Cycle Player Auto-Switching Mode">SW: BALL</button>
+      <button class="hud-mini-btn" id="btn-hud-sw" type="button" title="Cycle Player Auto-Switching Mode">SW: AUTO</button>
       <button class="hud-mini-btn" id="btn-hud-wx" type="button" title="Cycle Weather &amp; Lighting (M)">WX: NIGHT</button>
       <button class="hud-mini-btn" id="btn-hud-cam" type="button" title="Cycle Broadcast Camera (V)">CAM: TELE</button>
       <button class="hud-mini-btn" id="btn-hud-replay" type="button" title="Instant Replay (Tab)">REPLAY</button>
-      <button class="hud-mini-btn" id="btn-hud-pause" type="button" title="Pause &amp; Substitutions (Esc / Start)">PAUSE</button>
+      <button class="hud-mini-btn" id="btn-hud-pause" type="button" title="Pause, Subs &amp; Controls (Esc / Start)">PAUSE</button>
     </div>
 
     <!-- GOAL / EVENT BROADCAST LOWER-THIRD WIPE -->
@@ -664,7 +774,7 @@
       </div>
     </div>
 
-    <!-- BOTTOM-LEFT HOME PLAYER FIFA NAMEPLATE + STAMINA + SHOT POWER BAR -->
+    <!-- BOTTOM-LEFT HOME PLAYER FIFA NAMEPLATE + STAMINA + 4-SEGMENT POWER BAR -->
     <div class="fifa-player-hud fifa-hud-left">
       <div class="fph-top">
         <span class="fph-num" id="hud-home-num">10</span>
@@ -675,7 +785,13 @@
       </div>
       <div class="fph-bars">
         <div class="fph-bar-track" title="Stamina"><div class="fph-stamina-fill" id="hud-home-stam"></div></div>
-        <div class="fph-bar-track fph-power-track" title="Shot / Pass Power"><div class="fph-power-fill" id="hud-home-pow"></div></div>
+        <div class="fph-power-row">
+          <div class="fph-bar-track fph-power-track" title="Shot / Pass Power (4-Bar Charge)">
+            <div class="fph-power-fill" id="hud-home-pow"></div>
+            <span class="fph-seg-ticks" aria-hidden="true"></span>
+          </div>
+          <span class="fph-kick-badge" id="hud-home-kick" hidden>SHOT</span>
+        </div>
       </div>
     </div>
 
@@ -695,7 +811,13 @@
       </div>
       <div class="fph-bars">
         <div class="fph-bar-track" title="Stamina"><div class="fph-stamina-fill" id="hud-away-stam"></div></div>
-        <div class="fph-bar-track fph-power-track" title="Shot / Pass Power"><div class="fph-power-fill" id="hud-away-pow"></div></div>
+        <div class="fph-power-row">
+          <span class="fph-kick-badge" id="hud-away-kick" hidden>SHOT</span>
+          <div class="fph-bar-track fph-power-track" title="Shot / Pass Power (4-Bar Charge)">
+            <div class="fph-power-fill" id="hud-away-pow"></div>
+            <span class="fph-seg-ticks" aria-hidden="true"></span>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -707,7 +829,7 @@
       <button class="hud-mini-btn" id="btn-replay-exit" type="button">EXIT REPLAY [TAB]</button>
     </div>
 
-    <!-- PAUSE MENU & LIVE SUBSTITUTIONS OVERLAY -->
+    <!-- PAUSE MENU, LIVE SUBSTITUTIONS & CONTROLLER SETTINGS OVERLAY -->
     <div class="match-modal-backdrop" id="pause-modal" hidden>
       <div class="match-modal-card mm-pause-card" id="pause-modal-card">
         <div class="mm-pause-layout">
@@ -717,8 +839,9 @@
             <div class="mm-menu-stack">
               <button class="console-btn console-btn-primary" id="btn-pause-resume" type="button">RESUME MATCH</button>
               <button class="console-btn console-btn-gold" id="btn-pause-subs-toggle" type="button">LIVE SUBSTITUTIONS (BENCH)</button>
+              <button class="console-btn console-btn-secondary" id="btn-pause-ctrl-toggle" type="button">CONTROLLER SETTINGS (FIFA 10–12)</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-replay" type="button">INSTANT REPLAY THEATER</button>
-              <button class="console-btn console-btn-secondary" id="btn-pause-sw" type="button">AUTO-SWITCH: ASSISTED (BALL)</button>
+              <button class="console-btn console-btn-secondary" id="btn-pause-sw" type="button">AUTO-SWITCH: AUTO</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-cam" type="button">CAMERA ANGLE: TELE BROADCAST</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-wx" type="button">WEATHER: FLOODLIT NIGHT</button>
               <button class="console-btn console-btn-secondary" id="btn-pause-sim" type="button">FAST-FORWARD TO FULL-TIME</button>
@@ -746,6 +869,90 @@
                 <div class="subs-col-title">OFFICIAL BENCH RESERVES</div>
                 <div class="subs-list" id="subs-bench-list"></div>
               </div>
+            </div>
+          </div>
+
+          <!-- IN-MATCH CONTROLLER SETTINGS DRAWER -->
+          <div class="mm-subs-drawer mm-ctrl-drawer" id="pause-ctrl-panel" hidden>
+            <div class="subs-hdr-row">
+              <span class="subs-col-title">FIFA 10–12 CONTROLLER SETTINGS</span>
+              <span class="ct-chip" id="pause-ctrl-sync-pill">SYNCED TO 60HZ SIM</span>
+            </div>
+            <div class="ctrl-settings-list ctrl-settings-compact">
+              <div class="cset-row">
+                <label for="pcset-preset">Control Preset</label>
+                <select id="pcset-preset" class="console-select cset-select" data-cset="preset">
+                  <option value="classic">Classic (FIFA 10–12)</option>
+                  <option value="alternate">Alternate (Swap Shoot/Cross)</option>
+                  <option value="two_button">Two-Button (Arcade)</option>
+                  <option value="custom">Custom (Remapped)</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-auto-switch">Auto Switching</label>
+                <select id="pcset-auto-switch" class="console-select cset-select" data-cset="autoSwitch">
+                  <option value="auto">Auto</option>
+                  <option value="air_balls">Air Balls</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-move-assist">Auto Switching Move Assist</label>
+                <select id="pcset-move-assist" class="console-select cset-select" data-cset="autoSwitchMoveAssist">
+                  <option value="none">None</option>
+                  <option value="low">Low</option>
+                  <option value="high">High</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-pass-assist">Pass Assistance</label>
+                <select id="pcset-pass-assist" class="console-select cset-select" data-cset="passAssist">
+                  <option value="assisted">Assisted</option>
+                  <option value="semi">Semi</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-through-assist">Through Ball Assistance</label>
+                <select id="pcset-through-assist" class="console-select cset-select" data-cset="throughAssist">
+                  <option value="assisted">Assisted</option>
+                  <option value="semi">Semi</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-shot-assist">Shot Assistance</label>
+                <select id="pcset-shot-assist" class="console-select cset-select" data-cset="shotAssist">
+                  <option value="assisted">Assisted</option>
+                  <option value="semi">Semi</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-cross-assist">Cross Assistance</label>
+                <select id="pcset-cross-assist" class="console-select cset-select" data-cset="crossAssist">
+                  <option value="assisted">Assisted</option>
+                  <option value="semi">Semi</option>
+                  <option value="manual">Manual</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-defending">Defending</label>
+                <select id="pcset-defending" class="console-select cset-select" data-cset="defendingMode">
+                  <option value="tactical">Tactical (FIFA 12)</option>
+                  <option value="legacy">Legacy (Auto-Tackle)</option>
+                </select>
+              </div>
+              <div class="cset-row">
+                <label for="pcset-analog-sprint">Analog Sprint</label>
+                <select id="pcset-analog-sprint" class="console-select cset-select" data-cset="analogSprint">
+                  <option value="on">On (Trigger Pressure)</option>
+                  <option value="off">Off (Digital &gt; 10%)</option>
+                </select>
+              </div>
+            </div>
+            <div class="subs-hint" id="pause-ctrl-summary-hint">
+              Changes apply immediately on the next 60 Hz deterministic tick and are recorded in the replay log.
             </div>
           </div>
         </div>

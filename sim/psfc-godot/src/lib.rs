@@ -136,7 +136,7 @@ impl PsfcMatchSim {
             aim_x: home_aim_x.clamp(-127, 127) as i8,
             aim_y: home_aim_y.clamp(-127, 127) as i8,
             buttons: (home_buttons & 0xFFFF) as u16,
-            reserved: 0,
+            reserved: (((home_buttons as u32) >> 16) & 0xFFFF) as u16,
         };
         let away = InputFrame {
             move_x: away_move_x.clamp(-127, 127) as i8,
@@ -144,7 +144,7 @@ impl PsfcMatchSim {
             aim_x: away_aim_x.clamp(-127, 127) as i8,
             aim_y: away_aim_y.clamp(-127, 127) as i8,
             buttons: (away_buttons & 0xFFFF) as u16,
-            reserved: 0,
+            reserved: (((away_buttons as u32) >> 16) & 0xFFFF) as u16,
         };
         if !sim.is_finished() {
             let pair = [home, away];
