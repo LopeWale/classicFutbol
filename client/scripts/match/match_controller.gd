@@ -213,8 +213,10 @@ func _physics_process(delta: float) -> void:
 		_render_instant_replay_step(delta)
 		return
 
-	var h := controller_input.sample_input_frame(0)
-	var a := controller_input.sample_input_frame(1)
+	var h_att: bool = bool(sim.call("is_side_attacking", 0))
+	var a_att: bool = bool(sim.call("is_side_attacking", 1))
+	var h := controller_input.sample_input_frame(0, h_att)
+	var a := controller_input.sample_input_frame(1, a_att)
 	sim.call(
 		"tick",
 		h["move_x"], h["move_y"], h["aim_x"], h["aim_y"], h["buttons"],

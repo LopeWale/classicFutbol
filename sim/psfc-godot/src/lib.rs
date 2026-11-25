@@ -136,7 +136,7 @@ impl PsfcMatchSim {
             aim_x: home_aim_x.clamp(-127, 127) as i8,
             aim_y: home_aim_y.clamp(-127, 127) as i8,
             buttons: (home_buttons & 0xFFFF) as u16,
-            reserved: 0,
+            reserved: (((home_buttons as u32) >> 16) & 0xFFFF) as u16,
         };
         let away = InputFrame {
             move_x: away_move_x.clamp(-127, 127) as i8,
@@ -144,7 +144,7 @@ impl PsfcMatchSim {
             aim_x: away_aim_x.clamp(-127, 127) as i8,
             aim_y: away_aim_y.clamp(-127, 127) as i8,
             buttons: (away_buttons & 0xFFFF) as u16,
-            reserved: 0,
+            reserved: (((away_buttons as u32) >> 16) & 0xFFFF) as u16,
         };
         if !sim.is_finished() {
             let pair = [home, away];
@@ -240,6 +240,30 @@ impl PsfcMatchSim {
         };
         let c = sim.state().controlled_idx;
         Vector2i::new(c[0] as i32, c[1] as i32)
+    }
+
+    /// Returns true when `side` (`0 = Home`, `1 = Away`) currently possesses the ball or is receiving its own pass.
+    #[func]
+    pub fn is_side_attacking(&self, side: i32) -> bool {
+        let Some(ref sim) = self.sim else {
+            return false;
+        };
+        let target = if side == 0 {
+            psfc_sim::TeamSide::Home
+        } else {
+            psfc_sim::TeamSide::Away
+        };
+        let st = sim.state();
+        match st.ball.owner {
+            Some((owner_side, _)) => owner_side == target,
+            None => {
+                st.ball
+                    .pass_in_flight
+                    .as_ref()
+                    .is_some_and(|pf| pf.team == target)
+                    || st.ball.last_touch_team == Some(target)
+            }
+        }
     }
 
     #[func]

@@ -4034,6 +4034,8 @@ function createFootballerActor(spec) {
     prevAction: 0,
     prevCharge: 0,
     prevJumpY: 0,
+    jumpLeadLeg: 1,
+    headerSnapTimer: 0,
     prevBallSpeed: 0,
     prevWx: 0,
     prevWy: 0,
@@ -4051,6 +4053,7 @@ function createFootballerActor(spec) {
     smoothBankRoll: 0,
     smoothHipY: isGk ? 0.83 : 0.885,
     smoothJumpY: 0,
+    smoothJumpVel: 0,
     hipBobSpring: { x: 0, v: 0 },
     torsoPitchSpring: { x: 0, v: 0 },
     torsoRollSpring: { x: 0, v: 0 },
@@ -4281,6 +4284,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     action,
     charge,
     jumpZ = 0,
+    jumpVel = 0,
     inWall = false,
     isThrowInTaker = false,
     refSignal = 0,
@@ -4358,12 +4362,24 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const oppLocalFwd = oppWorldDx * fwdX + oppWorldDy * fwdZ;
   const oppSideSign = oppLocalLeft >= 0 ? 1 : -1;
 
-  // Landing & Braking 2nd-Order Spring Impulses (eccentric knee squat + upper-limb momentum!)
+  // Jump takeoff lead-leg selection + Landing 2nd-Order Spring Impulses!
+  if (discontinuousMove) {
+    actor.smoothJumpVel = 0;
+  }
+  if (!discontinuousMove && actor.prevJumpY <= 0.025 && jumpZ > 0.025) {
+    actor.jumpLeadLeg = Math.sin(actor.stridePhase) >= 0 ? 1 : -1;
+    actor.headerSnapTimer = 0;
+  }
+  if (actor.headerSnapTimer > 0) {
+    actor.headerSnapTimer = Math.max(0, actor.headerSnapTimer - dt);
+  }
   if (!discontinuousMove && actor.prevJumpY > 0.055 && jumpZ <= 0.022) {
     const landImpulse = Math.min(1.75, 0.55 + actor.prevJumpY * 2.2);
     actor.hipBobSpring.v -= landImpulse;
     actor.armImpulseL.v += landImpulse * 1.15;
     actor.armImpulseR.v += landImpulse * 1.15;
+    actor.headerSnapTimer = 0;
+    actor.smoothJumpVel = 0;
   }
   actor.prevJumpY = jumpZ;
 
@@ -4568,7 +4584,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
 
   const stationaryFactor = 1.0 - smoothstep(0.25, 2.4, speed);
   const chargeCockBlend =
-    !isThrowInTaker && (action === 1 || charge > 0.02)
+    !isThrowInTaker && (action === 1 || (charge > 0.02 && ballDistHoriz < 1.75))
       ? Math.min(1, smoothstep(0.02, 0.74, charge) * (0.56 + 0.44 * stationaryFactor))
       : 0;
   const throwCoil = isThrowInTaker ? smoothstep(0.0, 0.85, charge) : 0;
@@ -4641,8 +4657,32 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   }
 
   damp(actor, "smoothJumpY", targetJumpLift, 0.040, dt);
+  damp(actor, "smoothJumpVel", jumpVel, 0.065, dt);
   actor.bodyScaleGroup.position.y = actor.smoothJumpY;
   const airborneBlend = action === 4 ? 0 : smoothstep(0.05, 0.30, actor.smoothJumpY);
+  const jumpAscent = airborneBlend > 0.02 ? smoothstep(0.25, 1.85, actor.smoothJumpVel) : 0;
+  const jumpDescent = airborneBlend > 0.02 ? smoothstep(-0.25, -1.85, actor.smoothJumpVel) : 0;
+  if (
+    !actor.isGk &&
+    airborneBlend > 0.15 &&
+    ballDistHoriz < 1.35 &&
+    ballZ > 1.25 &&
+    (actor.smoothJumpVel < 1.15 || ballDistHoriz < 0.78)
+  ) {
+    actor.headerSnapTimer = Math.max(actor.headerSnapTimer, 0.20);
+  }
+  const headerSnapWeight = !actor.isGk
+    ? Math.max(
+        smoothstep(0.0, 0.12, actor.headerSnapTimer),
+        airborneBlend > 0.15 && ballDistHoriz < 1.15 && ballZ > 1.35 && actor.smoothJumpVel < 1.25 ? 0.85 : 0
+      )
+    : 0;
+  // Strict convex partition of aerial phases (`jumpSnapW + jumpAscW + jumpDescW + jumpApexW === 1.0`)
+  const jumpSnapW = headerSnapWeight;
+  const jumpRemW = Math.max(0, 1.0 - jumpSnapW);
+  const jumpAscW = jumpAscent * jumpRemW;
+  const jumpDescW = jumpDescent * jumpRemW;
+  const jumpApexW = Math.max(0, 1.0 - jumpSnapW - jumpAscW - jumpDescW);
 
   if (action === 3) {
     // Grounded Turf Slide Tackle (`IMG_0366`)
@@ -4725,8 +4765,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
 
     hipsRx =
       (action === 2 ? 0.20 : springPitch * 0.38 + (actor.isGk ? 0.06 * gkAlert : 0)) *
-        (1 - airborneBlend) -
-      0.10 * airborneBlend;
+      (1 - airborneBlend);
     hipsRy = pelvisYaw * (1 - airborneBlend);
     hipsRz = (springRoll * 0.62 + pelvisHipDrop + kickBank) * (1 - airborneBlend);
 
@@ -4737,10 +4776,23 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     spineRz = -pelvisHipDrop * 0.45 + kickBank * 0.5;
 
     if (airborneBlend > 0.05) {
-      // Aerial header / cross leap thoracic arch (`IMG_0365`, `IMG_0358`)
-      const headerSnap = !actor.isGk && ballDistHoriz < 1.2 && ballZ > 1.1 ? 0.22 : -0.11;
-      spineRx = spineRx * (1 - airborneBlend) + (actor.isGk ? -0.09 : headerSnap) * airborneBlend;
-      spineRy *= 1 - airborneBlend;
+      // 3-phase athletic aerial leap / forehead header (NEVER arch backward thrusting chest out!)
+      if (actor.isGk) {
+        hipsRx += 0.02 * airborneBlend;
+        spineRx = spineRx * (1 - airborneBlend) + 0.03 * airborneBlend;
+        spineRy *= 1 - airborneBlend;
+      } else {
+        const lead = actor.jumpLeadLeg || 1;
+        const jumpHipsRx =
+          0.04 * jumpAscW + 0.08 * jumpSnapW + 0.09 * jumpDescW + 0.05 * jumpApexW;
+        const jumpSpineRx =
+          0.02 * jumpAscW + 0.17 * jumpSnapW + 0.10 * jumpDescW + 0.06 * jumpApexW;
+        const jumpSpineRy = lead * (0.14 * jumpAscW - 0.12 * jumpSnapW);
+        hipsRx += jumpHipsRx * airborneBlend;
+        hipsRy += -lead * 0.10 * jumpAscW * airborneBlend;
+        spineRx = spineRx * (1 - airborneBlend) + jumpSpineRx * airborneBlend;
+        spineRy = spineRy * (1 - airborneBlend) + jumpSpineRy * airborneBlend;
+      }
     } else if (isThrowInTaker) {
       spineRx = -0.08 - throwCoil * 0.18;
       spineRy = 0;
@@ -4755,13 +4807,16 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       spineRz = -0.10;
     } else if (chargeCockBlend > 0.01) {
       spineRy += actor.activeKickFoot * 0.22 * chargeCockBlend;
-      spineRx += (actor.lastKickKind === 3 ? -0.06 : 0.04) * chargeCockBlend;
+      spineRx += (actor.lastKickKind === 3 || actor.lastKickKind === 5 ? -0.06 : 0.04) * chargeCockBlend;
     } else if (whipArc > 0.01) {
       spineRx -= (actor.lastKickKind >= 3 ? 0.13 : 0.06) * whipArc;
       spineRy -= actor.activeKickFoot * 0.20 * whipArc;
     }
 
-    chestRx = spineRx * 0.96;
+    chestRx =
+      airborneBlend > 0.05 && !actor.isGk
+        ? spineRx * 0.96 + 0.04 * headerSnapWeight * airborneBlend
+        : spineRx * 0.96;
     chestRy = spineRy * 1.16;
     chestRz = spineRz * 0.65;
   }
@@ -4800,7 +4855,12 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const rawHeadPitch = headHoriz > 1e-3 ? -Math.atan2(_auxVecA.y, headHoriz) : 0;
   const idleNoise = seededNoise2D(nowSec * 0.55, actor.phaseSeed * 3.1) * 0.04 * (1 - locoWeight);
   const clampedHeadYaw = Math.max(-0.76, Math.min(0.76, rawHeadYaw * 0.72 + yawRate * 0.035)) + idleNoise;
-  const clampedHeadPitch = Math.max(-0.56, Math.min(0.44, rawHeadPitch * 0.60));
+  const headPitchMin = !actor.isGk && airborneBlend > 0.05 ? -0.18 : -0.56;
+  const headerNod = !actor.isGk ? 0.26 * headerSnapWeight * airborneBlend : 0;
+  const clampedHeadPitch = Math.max(
+    headPitchMin,
+    Math.min(0.48, rawHeadPitch * 0.60 * (1 - headerSnapWeight * 0.55) + headerNod)
+  );
 
   dampBoneEuler(bones[B_NECK], clampedHeadPitch * 0.32, clampedHeadYaw * 0.30, 0, 0.065, dt);
   dampBoneEuler(bones[B_HEAD], clampedHeadPitch * 0.68, clampedHeadYaw * 0.70, 0, 0.065, dt);
@@ -4911,19 +4971,28 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       );
       pitchR = 0.36;
     } else {
-      // Outfield Aerial Header Leap (athletic hamstring tuck!)
+      // Athletic Single-Leg Takeoff -> Header Snap -> Staggered Landing Reach!
+      const lead = actor.jumpLeadLeg || 1;
+      const driveY = 0.38 * (1 - jumpDescent * 0.72) - headerSnapWeight * 0.10;
+      const driveZ = 0.18 * (1 - jumpDescent * 0.55) - headerSnapWeight * 0.16;
+      const plantY = 0.08 + 0.04 * (1 - jumpDescent);
+      const plantZ = -0.10 + jumpDescent * 0.14;
+      const leftY = lead > 0 ? driveY : plantY;
+      const leftZ = lead > 0 ? driveZ : plantZ;
+      const rightY = lead > 0 ? plantY : driveY;
+      const rightZ = lead > 0 ? plantZ : driveZ;
       _tmpFootL.set(
         0.10,
-        Math.max(minBodyYForWorldFloor(0.10, ankleWorldFloorY, actor), 0.22),
-        -0.24
+        Math.max(minBodyYForWorldFloor(0.10, ankleWorldFloorY, actor), leftY),
+        leftZ
       );
       _tmpFootR.set(
         -0.10,
-        Math.max(minBodyYForWorldFloor(-0.10, ankleWorldFloorY, actor), 0.27),
-        -0.28
+        Math.max(minBodyYForWorldFloor(-0.10, ankleWorldFloorY, actor), rightY),
+        rightZ
       );
-      pitchL = 0.44;
-      pitchR = 0.48;
+      pitchL = lead > 0 ? 0.24 : 0.36;
+      pitchR = lead > 0 ? 0.36 : 0.24;
     }
     legSmoothTime = 0.038;
   } else {
@@ -5454,9 +5523,31 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     );
 
     if (airborneBlend > 0.05) {
-      // Aerial header balance elbows flared wide!
-      _auxVecA.set(0.38, 1.32, 0.16);
-      _auxVecB.set(-0.38, 1.32, 0.16);
+      if (actor.isGk) {
+        // High cross claim: arms drive upward toward the aerial ball!
+        _auxVecA.set(0.22, 1.60, 0.28);
+        _auxVecB.set(-0.22, 1.60, 0.28);
+      } else {
+        // Athletic single-leg jump drive -> elbows pull back & down during forehead header snap!
+        const lead = actor.jumpLeadLeg || 1;
+        const driveArmY =
+          1.15 * jumpAscW + 1.00 * jumpSnapW + 1.02 * jumpDescW + 1.06 * jumpApexW;
+        const driveArmZ =
+          0.17 * jumpAscW - 0.16 * jumpSnapW + 0.05 * jumpDescW + 0.04 * jumpApexW;
+        const balArmY =
+          0.90 * jumpAscW + 0.99 * jumpSnapW + 1.01 * jumpDescW + 1.02 * jumpApexW;
+        const balArmZ =
+          -0.05 * jumpAscW - 0.15 * jumpSnapW + 0.05 * jumpDescW - 0.02 * jumpApexW;
+        const armX = 0.28 + 0.04 * jumpSnapW;
+        // Opposite arm drives up with the lifted takeoff knee (running jump coordination)
+        if (lead > 0) {
+          _auxVecA.set(armX, balArmY, balArmZ);
+          _auxVecB.set(-armX, driveArmY, driveArmZ);
+        } else {
+          _auxVecA.set(armX, driveArmY, driveArmZ);
+          _auxVecB.set(-armX, balArmY, balArmZ);
+        }
+      }
       _tmpHandL.lerp(_auxVecA, airborneBlend);
       _tmpHandR.lerp(_auxVecB, airborneBlend);
     } else if (action === 2) {
@@ -7548,6 +7639,7 @@ export class ClassicFifa3DEngine {
         const jz0 = ((flags0 >>> 28) & 0xf) * 0.06;
         const jz1 = ((flags >>> 28) & 0xf) * 0.06;
         const jumpZ = teleported ? jz1 : jz0 + (jz1 - jz0) * tInterp;
+        const jumpVel = teleported ? 0 : (jz1 - jz0) * 60;
 
         const cueWord = hasPlayerCueWords ? currPacked[cueBase + n] >>> 0 : 0;
         const kickKind = cueWord & 0x7;
@@ -7617,6 +7709,7 @@ export class ClassicFifa3DEngine {
             action,
             charge,
             jumpZ,
+            jumpVel,
             inWall,
             isThrowInTaker,
             isControlled,

@@ -14,9 +14,15 @@
       "type": "integer",
       "minimum": 0,
       "maximum": 65535,
-      "description": "Bitmask: 0=PASS, 1=THROUGH, 2=LOB, 3=SHOOT, 4=SPRINT, 5=SWITCH, 6=JOCKEY, 7=TACKLE, 8=SLIDE, 9=CALL_RUN"
+      "description": "Bitmask: 0=PASS, 1=THROUGH, 2=LOB, 3=SHOOT, 4=SPRINT, 5=SWITCH, 6=JOCKEY, 7=TACKLE, 8=SLIDE, 9=CALL_RUN, 10=SKILL, 11=FINESSE, 12=CONTAIN, 13=TEAMMATE_CONTAIN, 14=GK_RUSH, 15=PACE_CONTROL"
     },
-    "reserved": { "type": "integer", "minimum": 0, "maximum": 65535, "default": 0 }
+    "reserved": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 65535,
+      "default": 0,
+      "description": "Bit15=1: Substitution; Bit15=0&Bit14=1: 14-bit ControlSettings sync; Bit15=0&Bit14=0: bits12..13=AutoSwitchMode, bit11=DualMapControls, bits0..6=AnalogSprint(0..127)"
+    }
   },
   "additionalProperties": false
 }

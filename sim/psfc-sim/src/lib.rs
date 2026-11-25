@@ -18,11 +18,17 @@ pub mod state;
 
 pub use config::{CpuDifficulty, MatchFormat, RuleSet, SideController, TeamSide, TICKS_PER_SECOND};
 pub use events::{MatchEvent, MatchEventType, PlayerMatchStats};
-pub use input::{AutoSwitchMode, InputFrame, BTN_SKILL};
+pub use input::{
+    AssistLevel, AutoSwitchMode, AutoSwitchMoveAssist, ControlSettings, DefendingMode, InputFrame,
+    BTN_CONTAIN, BTN_FINESSE, BTN_GK_RUSH, BTN_PACE_CONTROL, BTN_SKILL, BTN_TEAMMATE_CONTAIN,
+};
 pub use math::{Fp, Vec2, Vec3};
 pub use sim::{MatchSimulation, SimError};
 pub use snapshot::{
     sample_arsenal, sample_manchester_united, FixtureSnapshot, PlayerAttributes, PlayerRole,
     PlayerSnapshot, TeamSnapshot, GAMEPLAY_VERSION,
 };
-pub use state::{BallState, MatchPhase, MatchState, PlayerActionState, PlayerState, RestartKind};
+pub use state::{
+    BallState, MatchPhase, MatchState, PlayerActionState, PlayerState, PossessionContext,
+    RestartKind,
+};

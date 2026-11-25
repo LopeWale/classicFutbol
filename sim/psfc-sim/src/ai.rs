@@ -613,6 +613,33 @@ pub fn compute_outfield_ai_intent(
         };
     }
 
+    // 2b. FIFA 12 Teammate Contain / Second-Man Press (`RB / R1` held by human on defense):
+    // Assigned AI defender sprints directly onto the ball carrier's goal-side shoulder to shadow/press
+    // while the human player covers passing lanes manually.
+    if state.teammate_contain_idx[side.index()] == Some(idx)
+        && state.ball.owner.map(|(s, _)| s) != Some(side)
+    {
+        let own_goal = Vec2::new(Fp::from_milli(-attack_sign * half_len.to_milli()), Fp::ZERO);
+        let pred_ball = predict_ball_xy_at_ticks(state, 5);
+        let is_legacy = state.control_settings[side.index()].defending_mode
+            == crate::input::DefendingMode::Legacy;
+        let hold_gap = Fp::from_milli(if is_legacy { 650 } else { 1_250 });
+        let contain_pt =
+            pred_ball + (own_goal - pred_ball).normalize_or_zero().scale(hold_gap);
+        let delta = contain_pt - p.pos;
+        let dist = delta.len();
+        return AiMoveIntent {
+            move_dir: if dist > Fp::from_milli(140) {
+                delta.normalize_or_zero()
+            } else {
+                Vec2::ZERO
+            },
+            sprint: dist > Fp::from_milli(1_450),
+            jockey: dist <= Fp::from_milli(1_750),
+            trigger_dive: None,
+        };
+    }
+
     // 3. Loose ball pursuit using Two-Phase Time-To-Ball Intercept (not raw static distance!)
     if state.ball.owner.is_none() {
         let controlled = state.controlled_idx[side.index()];

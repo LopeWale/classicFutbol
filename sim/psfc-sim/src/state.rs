@@ -2,6 +2,7 @@
 
 use crate::config::{MatchFormat, RuleSet, TeamSide};
 use crate::events::{MatchEvent, PlayerMatchStats};
+use crate::input::ControlSettings;
 use crate::math::{Fp, Vec2, Vec3};
 use crate::rng::DeterministicRng;
 use crate::snapshot::{PlayerAttributes, PlayerRole, TeamSnapshot};
@@ -213,12 +214,36 @@ impl MatchPhase {
     }
 }
 
+/// Context-sensitive gameplay state for a team's input state machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PossessionContext {
+    /// Team currently owns/carries the ball (attacking controls active).
+    Attacking,
+    /// Opponent currently owns/carries the ball (defending controls active).
+    Defending,
+    /// Ball is free/unowned in play (contested loose ball, aerial duel, or pass in flight).
+    LooseBall,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BufferedAction {
     pub button: u16,
     pub aim: Vec2,
     pub finesse: bool,
+    /// Accumulated charge ticks (`1..=28`) recorded while holding the kick button pre-contact.
+    #[serde(default)]
+    pub charge_ticks: u16,
+    /// True while the player is still holding the kick button down pre-contact.
+    #[serde(default)]
+    pub charging: bool,
     pub ttl_ticks: u8,
+}
+
+impl BufferedAction {
+    #[inline]
+    pub fn charge_ratio_permille(&self) -> u16 {
+        ((self.charge_ticks as u32 * 1000) / 28).min(1000) as u16
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,7 +271,29 @@ pub struct MatchState {
     /// Grace window ticks (`~1.2s`) preserving a manual `BTN_SWITCH` selection before auto-switching resumes.
     #[serde(default)]
     pub manual_switch_lock: [u8; 2],
-    /// Pre-contact `~233ms` (`14`-tick) input lookahead buffer per team for crisp one-touch play.
+    /// Per-side FIFA control assistance & defending mode settings (deterministically synced via `InputFrame.reserved`).
+    #[serde(default)]
+    pub control_settings: [ControlSettings; 2],
+    /// True once a side emits dual-map (`ControlProfile`) inputs (`0x4000` settings sync or `0x0800` flag),
+    /// disabling legacy single-map `BTN_JOCKEY` attacking modifier aliases so remapped defensive Jockey never leaks into Attack.
+    #[serde(default)]
+    pub dual_map_controls: [bool; 2],
+    /// Remaining Auto-Switching Move Assistance ticks carrying prior run direction after a player switch.
+    #[serde(default)]
+    pub switch_move_assist_ticks: [u8; 2],
+    /// Normalized previous movement direction preserved during `switch_move_assist_ticks`.
+    #[serde(default)]
+    pub switch_move_assist_dir: [Vec2; 2],
+    /// Rising-edge latch for Right Stick directional player switching & knock-on flicks.
+    #[serde(default)]
+    pub prev_rstick_active: [bool; 2],
+    /// Active AI teammate currently assigned to `BTN_TEAMMATE_CONTAIN` (Second-Man Press) per side.
+    #[serde(default)]
+    pub teammate_contain_idx: [Option<usize>; 2],
+    /// Remaining ticks of FIFA 12 Push-Pull shoulder-jostle momentum slowdown per team's ball carrier.
+    #[serde(default)]
+    pub push_pull_slow_ticks: [u8; 2],
+    /// Pre-contact `~250ms` (`15`-tick) input lookahead & power-bar buffer per team for crisp one-touch play.
     #[serde(default)]
     pub input_buffer: [Option<BufferedAction>; 2],
     #[serde(default)]
@@ -271,6 +318,16 @@ impl MatchState {
     #[inline]
     pub const fn second_half_swapped(&self) -> bool {
         self.half.is_multiple_of(2)
+    }
+
+    /// Authoritative context-sensitive possession state for `side`.
+    #[inline]
+    pub fn possession_context(&self, side: TeamSide) -> PossessionContext {
+        match self.ball.owner {
+            Some((owner_side, _)) if owner_side == side => PossessionContext::Attacking,
+            Some(_) => PossessionContext::Defending,
+            None => PossessionContext::LooseBall,
+        }
     }
 
     /// Returns stats for all starters and substitutes who appeared for `side`.
@@ -345,6 +402,29 @@ impl MatchState {
         h.u8(self.switch_cooldown[1]);
         h.u8(self.manual_switch_lock[0]);
         h.u8(self.manual_switch_lock[1]);
+        h.u16(self.control_settings[0].encode_reserved());
+        h.u16(self.control_settings[1].encode_reserved());
+        h.u8(u8::from(self.dual_map_controls[0]));
+        h.u8(u8::from(self.dual_map_controls[1]));
+        h.u8(self.switch_move_assist_ticks[0]);
+        h.u8(self.switch_move_assist_ticks[1]);
+        h.i64(self.switch_move_assist_dir[0].x.raw());
+        h.i64(self.switch_move_assist_dir[0].y.raw());
+        h.i64(self.switch_move_assist_dir[1].x.raw());
+        h.i64(self.switch_move_assist_dir[1].y.raw());
+        h.u8(u8::from(self.prev_rstick_active[0]));
+        h.u8(u8::from(self.prev_rstick_active[1]));
+        for tc in &self.teammate_contain_idx {
+            match tc {
+                Some(idx) => {
+                    h.u8(1);
+                    h.u32(*idx as u32);
+                }
+                None => h.u8(0),
+            }
+        }
+        h.u8(self.push_pull_slow_ticks[0]);
+        h.u8(self.push_pull_slow_ticks[1]);
         h.u8(self.subs_used[0]);
         h.u8(self.subs_used[1]);
         for slot in &self.input_buffer {
@@ -355,6 +435,8 @@ impl MatchState {
                     h.i64(buf.aim.x.raw());
                     h.i64(buf.aim.y.raw());
                     h.u8(u8::from(buf.finesse));
+                    h.u16(buf.charge_ticks);
+                    h.u8(u8::from(buf.charging));
                     h.u8(buf.ttl_ticks);
                 }
                 None => h.u8(0),
