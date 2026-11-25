@@ -3877,8 +3877,13 @@ function mainLoop(nowMs) {
         const sideMode = SIDE_MODES[pmSideIdx].id;
         const ownerNow = currSimPacked ? currSimPacked[15] : -1;
         const effOwner = ownerNow === 0 || ownerNow === 1 ? ownerNow : lastKnownOwnerSide;
-        const homeAttacking = effOwner === 0;
-        const awayAttacking = effOwner === 1;
+        const ppsNow = currSimPacked ? currSimPacked[6] : 0;
+        const holdWordIdx = 18 + ppsNow * 20 + 6;
+        const holdWord =
+          currSimPacked && currSimPacked.length > holdWordIdx ? currSimPacked[holdWordIdx] >>> 0 : 0;
+        const hasAuthoritativeCtx = (holdWord & 0x04000000) !== 0;
+        const homeAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 24)) !== 0 : effOwner === 0;
+        const awayAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 25)) !== 0 : effOwner === 1;
         let hIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
         let aIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
 

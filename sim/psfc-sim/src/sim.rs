@@ -274,6 +274,15 @@ impl MatchSimulation {
         }
         // Advance pre-contact Input Buffer & live Power Bar charging!
         for s_idx in 0..2 {
+            if self
+                .state
+                .ball
+                .owner
+                .is_some_and(|(o_side, _)| o_side.index() != s_idx)
+            {
+                self.state.input_buffer[s_idx] = None;
+                continue;
+            }
             let side_in = inputs[s_idx];
             let dual_map = self.state.dual_map_controls[s_idx];
             if let Some(mut buf) = self.state.input_buffer[s_idx] {
@@ -642,20 +651,13 @@ impl MatchSimulation {
                 TeamSide::Away => self.state.rules.away_controller,
             };
 
-            let switch_rising = inp.pressed(BTN_SWITCH) && (prev & BTN_SWITCH) == 0;
+            let in_attack_ctx = self.side_in_attack_or_buffer(side, inp, prev);
+            let switch_rising = inp.pressed(BTN_SWITCH) && (prev & BTN_SWITCH) == 0 && !in_attack_ctx;
             // FIFA 10–12 Manual Right-Stick Directional Player Switch works cleanly on Defense even while holding
             // Contain/Jockey/GK Rush, without hijacking a LooseBall first-time pass/shot buffer!
-            let own_team_receiving = self.state.ball.owner.is_none()
-                && (self
-                    .state
-                    .ball
-                    .pass_in_flight
-                    .as_ref()
-                    .is_some_and(|pf| pf.team == side)
-                    || self.state.ball.last_touch_team == Some(side));
             let loose_attack_kick = matches!(ctx, PossessionContext::LooseBall)
                 && (inp.buttons & CHARGE_MASK) != 0
-                && (own_team_receiving
+                && (in_attack_ctx
                     || (inp.buttons & (BTN_CONTAIN | BTN_JOCKEY | BTN_TEAMMATE_CONTAIN)) == 0);
             let rstick_len = inp.aim_vec().len();
             let rstick_now = rstick_len > Fp::from_milli(RSTICK_FLICK_THRESH_MM);
@@ -666,7 +668,7 @@ impl MatchSimulation {
                 && self.state.input_buffer[s_idx].is_none()
                 && !side_ctrl.is_cpu();
 
-            if !matches!(ctx, PossessionContext::Attacking) && (switch_rising || rstick_switch_rising) {
+            if switch_rising || rstick_switch_rising {
                 let sw_dir = if rstick_switch_rising {
                     inp.aim_vec()
                 } else {
@@ -685,15 +687,15 @@ impl MatchSimulation {
             }
 
             // FIFA 12 Teammate Contain (`RB / R1` hold off the ball): pick closest non-controlled AI defender!
-            if !matches!(ctx, PossessionContext::Attacking) && inp.pressed(BTN_TEAMMATE_CONTAIN) {
+            if !in_attack_ctx && inp.pressed(BTN_TEAMMATE_CONTAIN) {
                 self.state.teammate_contain_idx[s_idx] = self.best_switch_target(side);
             } else {
                 self.state.teammate_contain_idx[s_idx] = None;
             }
 
-            // Teammate run trigger when team owns ball (`LB / L1` `BTN_CALL_RUN` rising edge)
+            // Teammate run trigger when team owns or is receiving ball (`LB / L1` `BTN_CALL_RUN` rising edge)
             let run_rising = inp.pressed(BTN_CALL_RUN) && (prev & BTN_CALL_RUN) == 0;
-            if run_rising && matches!(ctx, PossessionContext::Attacking) {
+            if run_rising && in_attack_ctx {
                 self.trigger_teammate_run(side);
             }
         }
@@ -2304,6 +2306,13 @@ impl MatchSimulation {
         }
 
         let current = self.state.controlled_idx[s_idx];
+        // Never yank control away from a player actively charging/holding an attacking input buffer!
+        if self.state.input_buffer[s_idx].is_some()
+            && current != 0
+            && !self.state.players[s_idx][current].sent_off
+        {
+            return;
+        }
         // While our own pass is cleanly in flight toward `intended_receiver_idx`, keep that receiver active!
         if let Some(ref pf) = self.state.ball.pass_in_flight {
             if pf.team == side
@@ -2357,6 +2366,43 @@ impl MatchSimulation {
         }
     }
 
+    /// True when `side` is in the Attacking control context (`is_attacking_context`) OR is
+    /// initiating a valid pre-contact first-time attacking kick buffer on this tick.
+    fn side_in_attack_or_buffer(&self, side: TeamSide, inp: InputFrame, prev_btns: u16) -> bool {
+        if self.state.is_attacking_context(side) {
+            return true;
+        }
+        if self.state.ball.owner.is_some() || !matches!(self.state.phase, MatchPhase::OpenPlay) {
+            return false;
+        }
+        let s_idx = side.index();
+        let c_idx = self.state.controlled_idx[s_idx];
+        if c_idx == 0 || c_idx >= self.state.players[s_idx].len() {
+            return false;
+        }
+        let pressed_kick = inp.buttons & CHARGE_MASK;
+        let kick_rising = pressed_kick != 0 && (prev_btns & CHARGE_MASK) == 0;
+        if !kick_rising {
+            return false;
+        }
+        let p_ctrl = &self.state.players[s_idx][c_idx];
+        if p_ctrl.sent_off || !matches!(p_ctrl.action, PlayerActionState::Normal) {
+            return false;
+        }
+        let ball_xy = self.state.ball.pos.xy();
+        let dist = p_ctrl.pos.dist(ball_xy);
+        if dist > Fp::from_milli(8_500) {
+            return false;
+        }
+        let ball_z = self.state.ball.pos.z;
+        let aerial_contest = ball_z >= Fp::from_milli(1_150) && dist <= Fp::from_milli(2_400);
+        let attack_sign = side.attack_sign(self.state.second_half_swapped());
+        let in_attacking_half = p_ctrl.pos.x.mul(Fp::from_int(attack_sign as i32)) > Fp::ZERO;
+        aerial_contest
+            || (pressed_kick & BTN_THROUGH) != 0
+            || ((pressed_kick & BTN_SHOOT) != 0 && in_attacking_half)
+    }
+
     fn trigger_teammate_run(&mut self, side: TeamSide) {
         let s_idx = side.index();
         let ctrl = self.state.controlled_idx[s_idx];
@@ -2398,10 +2444,10 @@ impl MatchSimulation {
                 TeamSide::Home => self.state.rules.home_controller.is_cpu(),
                 TeamSide::Away => self.state.rules.away_controller.is_cpu(),
             };
-            let ctx = self.state.possession_context(side);
-            // FIFA 10–12 Rush Goalkeeper (`Y / Triangle` held off the ball)
-            let gk_rush_held =
-                side_input.pressed(BTN_GK_RUSH) && !matches!(ctx, PossessionContext::Attacking);
+            let side_in_attack_ctx = self.side_in_attack_or_buffer(side, side_input, prev_btns);
+            // FIFA 10–12 Rush Goalkeeper (`Y / Triangle` held off the ball): suppress while owning,
+            // receiving a teammate's pass, or buffering an attacking through-ball/shot!
+            let gk_rush_held = side_input.pressed(BTN_GK_RUSH) && !side_in_attack_ctx;
             let opp_carrier_snapshot = self.state.ball.owner.and_then(|(o_side, o_idx)| {
                 if o_side == side.opponent() {
                     let op = &self.state.players[opp_s_idx][o_idx];
@@ -2796,7 +2842,7 @@ impl MatchSimulation {
                                                 .sqrt()
                                                 .min(max_vz);
                                         }
-                                    } else if !own_team_receiving {
+                                    } else if !own_team_receiving && !side_has_buffer {
                                         // FIFA 12 Defending Actions: Standing Tackle / Push-Pull (`B/Circle`), Sliding Tackle (`X/Square`),
                                         // and Legacy Defending Auto-Tackle when holding Contain (`A/Cross`)!
                                         let tackle_rising =
@@ -5347,6 +5393,7 @@ impl MatchSimulation {
         self.state.ball.pos.z = trapped_z;
         self.state.ball.vel = Vec3::new(cushioned_xy.x, cushioned_xy.y, trapped_vz);
         self.state.manual_switch_lock[s_idx] = 0;
+        self.state.input_buffer[side.opponent().index()] = None;
         self.set_last_touch(side, idx);
 
         if idx != 0 && self.state.controlled_idx[s_idx] != idx {
@@ -8778,5 +8825,155 @@ mod tests {
             "World Class CPU vs CPU must never lock into a repetitive duel loop (max_stall_ticks={max_stall_ticks}, max_zone_flips={max_zone_flips})"
         );
     }
+
+    #[test]
+    fn two_button_pass_buffer_preserves_receiver_and_through_buffer_suppresses_gk_rush() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(7709);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+
+        // 1. Codex P2 (`IMG_0478`): Two-Button preset `South` (`BTN_PASS | BTN_CONTAIN | BTN_SWITCH`)
+        //    pressed while receiving a teammate's pass MUST buffer `BTN_PASS` on receiver #3 and NEVER
+        //    switch movement control away to #4 or engage `manual_switch_lock`!
+        let mut sim = MatchSimulation::new(&snap).unwrap();
+        sim.state.phase = MatchPhase::OpenPlay;
+        sim.state.controlled_idx = [3, 2];
+        sim.state.dual_map_controls = [true, true];
+        sim.state.players[0][3].pos = Vec2::from_milli(2_000, 0);
+        sim.state.players[0][3].vel = Vec2::ZERO;
+        // Put #4 closer/goal-side so `best_switch_target(Home)` would pick #4 if defensive switch ran
+        sim.state.players[0][4].pos = Vec2::from_milli(1_200, 400);
+        sim.state.players[0][1].pos = Vec2::from_milli(-14_000, -5_000);
+        sim.state.players[0][2].pos = Vec2::from_milli(-14_000, 5_000);
+        sim.state.ball.owner = None;
+        sim.state.ball.pos = Vec3::from_milli(4_200, 0, 0);
+        sim.state.ball.vel = Vec3::from_milli(-6_500, 0, 0);
+        sim.state.ball.last_touch_team = Some(TeamSide::Home);
+        sim.state.ball.last_touch_player = Some((TeamSide::Home, 2));
+        sim.state.ball.pass_in_flight = Some(PassInFlight {
+            team: TeamSide::Home,
+            passer_idx: 2,
+            passer_id: "h2".to_string(),
+            passer_name: "Home 2".to_string(),
+            intended_receiver_idx: 3,
+            target_pos: Vec2::from_milli(2_000, 0),
+            launched_tick: 0,
+            receiver_was_offside: false,
+        });
+        assert_eq!(sim.best_switch_target(TeamSide::Home), Some(4));
+
+        sim.tick(&[
+            InputFrame {
+                move_x: 127,
+                buttons: BTN_PASS | BTN_CONTAIN | BTN_SWITCH,
+                reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::AssistedBall, 0),
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert_eq!(
+            sim.state().controlled_idx[0],
+            3,
+            "Two-Button South pass buffer during teammate pass must preserve receiver #3"
+        );
+        assert_eq!(
+            sim.state().manual_switch_lock[0],
+            0,
+            "Two-Button South pass buffer must not lock defensive manual_switch_lock"
+        );
+        assert_eq!(
+            sim.state().input_buffer[0].map(|b| b.button),
+            Some(BTN_PASS),
+            "Two-Button South must buffer BTN_PASS on receiver #3"
+        );
+
+        // Also verify RB/R1 (`BTN_FINESSE | BTN_TEAMMATE_CONTAIN`) & LB/L1 (`BTN_CALL_RUN | BTN_SWITCH`)
+        // during own pass in flight stay strictly in Attacking context (no teammate_contain, no switch)!
+        sim.tick(&[
+            InputFrame {
+                move_x: 127,
+                buttons: BTN_PASS | BTN_FINESSE | BTN_TEAMMATE_CONTAIN | BTN_CALL_RUN | BTN_SWITCH,
+                reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::AssistedBall, 0),
+                ..InputFrame::IDLE
+            },
+            InputFrame::IDLE,
+        ]);
+        assert_eq!(sim.state().controlled_idx[0], 3);
+        assert_eq!(sim.state().teammate_contain_idx[0], None);
+        assert_eq!(sim.state().input_buffer[0].map(|b| b.finesse), Some(true));
+        assert!(
+            sim.state().players[0][1..].iter().any(|p| p.run_boost_ticks > 0),
+            "LB/L1 (BTN_CALL_RUN | BTN_SWITCH) during own pass in flight must trigger teammate run instead of switching"
+        );
+
+        // 2. Codex P2 (`IMG_0479`): Classic `Y / Triangle` (`BTN_THROUGH | BTN_GK_RUSH`) held while
+        //    receiving a teammate's pass within `penalty_box_depth + 4.5m` (`-16.0m` vs Home goal `-28.0m`,
+        //    outside box `-19.0m`) MUST buffer `BTN_THROUGH` and NEVER rush Home GK (`players[0][0]`)!
+        let run_gk_pass_buffer = |hold_through_rush: bool, own_pass: bool| -> (Vec2, Option<u16>) {
+            let mut s = MatchSimulation::new(&snap).unwrap();
+            s.state.phase = MatchPhase::OpenPlay;
+            s.state.controlled_idx = [3, 2];
+            s.state.dual_map_controls = [true, true];
+            s.state.players[0][0].pos = Vec2::from_milli(-26_800, 0);
+            s.state.players[0][0].vel = Vec2::ZERO;
+            s.state.players[0][1].pos = Vec2::from_milli(4_000, -7_000);
+            s.state.players[0][2].pos = Vec2::from_milli(4_000, 7_000);
+            s.state.players[0][3].pos = Vec2::from_milli(-11_500, 0);
+            s.state.players[0][3].vel = Vec2::ZERO;
+            s.state.players[0][4].pos = Vec2::from_milli(10_000, 0);
+            for opp in &mut s.state.players[1][1..] {
+                opp.pos = Vec2::from_milli(18_000, 9_000);
+            }
+            s.state.ball.owner = None;
+            // x = -16.0m -> 12.0m from Home goal (-28.0m): outside 9.0m box (`close_loose_ball == false`),
+            // inside `9.0m + 4.5m = 13.5m` human GK-rush trigger window!
+            s.state.ball.pos = Vec3::from_milli(-16_000, 0, 0);
+            s.state.ball.vel = Vec3::from_milli(3_000, 0, 0);
+            if own_pass {
+                s.state.ball.last_touch_team = Some(TeamSide::Home);
+                s.state.ball.last_touch_player = Some((TeamSide::Home, 1));
+            } else {
+                s.state.ball.last_touch_team = None;
+            }
+            let inp = if hold_through_rush {
+                InputFrame {
+                    move_x: 127,
+                    buttons: BTN_THROUGH | BTN_GK_RUSH,
+                    reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::Manual, 0),
+                    ..InputFrame::IDLE
+                }
+            } else {
+                InputFrame {
+                    move_x: 127,
+                    reserved: InputFrame::encode_gameplay_reserved(AutoSwitchMode::Manual, 0),
+                    ..InputFrame::IDLE
+                }
+            };
+            for _ in 0..8 {
+                s.tick(&[inp, InputFrame::IDLE]);
+            }
+            (
+                s.state().players[0][0].pos,
+                s.state().input_buffer[0].map(|b| b.button),
+            )
+        };
+
+        let (gk_idle_own, _) = run_gk_pass_buffer(false, true);
+        let (gk_through_own, buf_own) = run_gk_pass_buffer(true, true);
+        assert_eq!(buf_own, Some(BTN_THROUGH));
+        assert_eq!(
+            gk_through_own, gk_idle_own,
+            "holding Y/Triangle (BTN_THROUGH | BTN_GK_RUSH) during teammate pass must NOT rush own GK"
+        );
+
+        let (gk_idle_neutral, _) = run_gk_pass_buffer(false, false);
+        let (gk_through_neutral, buf_neutral) = run_gk_pass_buffer(true, false);
+        assert_eq!(buf_neutral, Some(BTN_THROUGH));
+        assert_eq!(
+            gk_through_neutral, gk_idle_neutral,
+            "buffering a first-time through-ball on a neutral loose ball must NOT rush own GK"
+        );
+    }
 }
+
 
