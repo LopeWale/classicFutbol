@@ -229,6 +229,21 @@ impl MatchSimulation {
         }
     }
 
+    /// IFAB Law 12: when a referee advantage window ends at any stoppage (Throw-In, Corner, Goal Kick,
+    /// Free Kick, Goal, Half-Time, or Full-Time), issue any delayed Yellow Card before clearing state.
+    fn flush_pending_advantage_card(&mut self) {
+        if let Some(adv) = self.state.pending_advantage.take() {
+            if adv.pending_yellow {
+                self.issue_yellow_card(
+                    adv.fouling_side,
+                    adv.fouler_idx,
+                    &adv.fouler_id,
+                    &adv.fouler_name,
+                );
+            }
+        }
+    }
+
     #[inline]
     pub fn state(&self) -> &MatchState {
         &self.state
@@ -998,7 +1013,7 @@ impl MatchSimulation {
         let is_5v5 = self.state.format.players_per_side <= 6;
         self.state.manual_switch_lock = [0, 0];
         self.state.restart_touch_state = None;
-        self.state.pending_advantage = None;
+        self.flush_pending_advantage_card();
         self.state.cpu_target_charge = [0, 0];
         self.state.input_buffer = [None, None];
 
@@ -5290,15 +5305,17 @@ impl MatchSimulation {
             if self.state.ball.pos.z.min(prev_pos.z) <= bar_center_z + post_radius {
                 for post_y in [-post_center_y, post_center_y] {
                     let post_xy = Vec2::new(goal_x, post_y);
-                    let (swept_d, t_hit) =
-                        point_to_segment_dist_and_t(post_xy, prev_pos.xy(), self.state.ball.pos.xy());
-                    if swept_d < post_radius {
-                        let contact_xy = prev_pos.xy().lerp(self.state.ball.pos.xy(), t_hit);
+                    if let Some(contact_xy) = segment_circle_first_hit(
+                        post_xy,
+                        post_radius,
+                        prev_pos.xy(),
+                        self.state.ball.pos.xy(),
+                    ) {
                         let delta = contact_xy - post_xy;
                         let normal = if delta.len() > Fp::from_milli(5) {
                             delta.normalize_or_zero()
                         } else {
-                            Vec2::new(Fp::from_int(-sign as i32), Fp::ZERO)
+                            (-self.state.ball.vel.xy()).normalize_or_zero()
                         };
                         let v_xy = self.state.ball.vel.xy();
                         let vn = v_xy.dot(normal);
@@ -5323,9 +5340,7 @@ impl MatchSimulation {
                 let bar_xz = Vec2::new(goal_x, bar_center_z);
                 let prev_xz = Vec2::new(prev_pos.x, prev_pos.z);
                 let cur_xz = Vec2::new(self.state.ball.pos.x, self.state.ball.pos.z);
-                let (d_bar, t_bar) = point_to_segment_dist_and_t(bar_xz, prev_xz, cur_xz);
-                if d_bar < post_radius {
-                    let hit_xz = prev_xz.lerp(cur_xz, t_bar);
+                if let Some(hit_xz) = segment_circle_first_hit(bar_xz, post_radius, prev_xz, cur_xz) {
                     let delta_xz = hit_xz - bar_xz;
                     let n_xz = if delta_xz.len() > Fp::from_milli(5) {
                         delta_xz.normalize_or_zero()
@@ -5685,9 +5700,6 @@ impl MatchSimulation {
         let drib_attr = self.state.players[s_idx][idx].attributes.dribbling as i64;
         let opp_control_threshold = Fp::from_milli(10_200 + drib_attr * 52);
         if ball_speed > opp_control_threshold && self.state.ball.last_touch_team != Some(side) {
-            if idx != 0 {
-                self.rollback_pending_shot_on_target();
-            }
             let p_pos = self.state.players[s_idx][idx].pos;
             let p_vel = self.state.players[s_idx][idx].vel;
             let v_in = self.state.ball.vel.xy();
@@ -5717,10 +5729,25 @@ impl MatchSimulation {
             self.state.ball.spin_top = Fp::from_milli(-450);
             self.state.manual_switch_lock[s_idx] = 0;
             self.set_last_touch(side, idx);
-            // IFAB Law 11: accidental deflection/block does NOT reset `offside_mask`!
+            // IFAB Law 10 & 11: accidental deflection/block does NOT reset `offside_mask`, and if an
+            // already on-target shot still travels toward goal after glancing off a defender, preserve
+            // `pending_shot_on_target` & `assist_candidate` so a deflected goal credits the shooter!
+            let blocked_away_from_goal = self
+                .state
+                .ball
+                .pending_shot_on_target
+                .as_ref()
+                .map(|(shot_side, _)| {
+                    let shot_sign = shot_side.attack_sign(self.state.second_half_swapped());
+                    defl_xy.x.to_milli() * shot_sign <= 500
+                })
+                .unwrap_or(true);
+            if idx != 0 && blocked_away_from_goal {
+                self.rollback_pending_shot_on_target();
+                self.state.ball.assist_candidate = None;
+            }
             self.state.ball.deliberate_foot_backpass = None;
             self.state.ball.pass_in_flight = None;
-            self.state.ball.assist_candidate = None;
             self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 11 };
             return;
         }
@@ -6258,7 +6285,7 @@ impl MatchSimulation {
         let defending_team = scoring_team.opponent();
         self.state.score[s_idx] += 1;
         self.state.ball.owner = None;
-        self.state.pending_advantage = None;
+        self.flush_pending_advantage_card();
         self.state.restart_touch_state = None;
         let pending_sot = self.state.ball.pending_shot_on_target.take();
         // Preserve 82% entry momentum so the ball flies into the back of the 3D goal net before hitting the mesh!
@@ -6447,6 +6474,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < half_limit + 150 {
                 return;
             }
+            self.flush_pending_advantage_card();
             self.emit_event(
                 MatchEventType::HalfTime,
                 TeamSide::Home,
@@ -6465,6 +6493,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < full_limit + 150 {
                 return;
             }
+            self.flush_pending_advantage_card();
             if self.state.rules.extra_time_enabled && self.state.score[0] == self.state.score[1] {
                 self.emit_event(
                     MatchEventType::HalfTime,
@@ -6484,6 +6513,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < et_first_limit + 150 {
                 return;
             }
+            self.flush_pending_advantage_card();
             self.emit_event(
                 MatchEventType::HalfTime,
                 TeamSide::Home,
@@ -6502,6 +6532,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < et_full_limit + 150 {
                 return;
             }
+            self.flush_pending_advantage_card();
             if self.state.score[0] == self.state.score[1] {
                 self.resolve_penalty_shootout();
             }
@@ -6805,6 +6836,29 @@ fn point_to_segment_dist_and_t(p: Vec2, a: Vec2, b: Vec2) -> (Fp, Fp) {
     };
     let closest = a + ab.scale(t);
     (p.dist(closest), t)
+}
+
+/// Computes the first intersection point along segment `a -> b` against a circle of `radius` at `center`
+/// so swept high-speed post/crossbar strikes always produce an outward normal opposing incoming travel (`vn < 0`).
+fn segment_circle_first_hit(center: Vec2, radius: Fp, a: Vec2, b: Vec2) -> Option<Vec2> {
+    let ab = b - a;
+    let len = ab.len();
+    if len <= Fp::from_milli(1) {
+        return (a.dist(center) < radius).then_some(a);
+    }
+    let u = ab.scale(Fp::ONE.div(len));
+    let ac = center - a;
+    let s_closest = ac.dot(u);
+    let s_clamped = s_closest.clamp(Fp::ZERO, len);
+    let closest = a + u.scale(s_clamped);
+    if closest.dist(center) >= radius {
+        return None;
+    }
+    let perp_vec = (a + u.scale(s_closest)) - center;
+    let r_sq = radius.mul(radius);
+    let half_chord = (r_sq - perp_vec.len_sq()).max(Fp::ZERO).sqrt();
+    let s_entry = (s_closest - half_chord).clamp(Fp::ZERO, len);
+    Some(a + u.scale(s_entry))
 }
 
 /// Returns true when Finesse / Driven modifier is active (`RB / R1` `BTN_FINESSE`).
@@ -10114,7 +10168,159 @@ mod tests {
             "IFAB Law 14: penalty taker touching post rebound before any other player must award Away FreeKick"
         );
     }
+
+    #[test]
+    fn codex_pr20_swept_post_first_hit_delayed_advantage_card_and_deflected_sot_goal() {
+        let mut snap = FixtureSnapshot::sample_five_a_side(2026_1127);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+
+        // 1. Codex P1: Fast shot passing 100mm beside post center (`< 170mm` collision radius) within 1 tick
+        //    must hit the entry surface of the post cylinder (`vn < 0`) and bounce back!
+        let mut post_sim = MatchSimulation::new(&snap).unwrap();
+        post_sim.state.phase = MatchPhase::OpenPlay;
+        for s in 0..2 {
+            for p in &mut post_sim.state.players[s] {
+                p.pos = Vec2::from_milli(0, -14_000);
+            }
+        }
+        // 5v5 half_len = 28_000mm, goal_half_w = 2_000mm -> post center at (28_000, 2_060)
+        // Trajectory at y = 2_160mm (`100mm` outside post center, inside `170mm` swept radius!)
+        post_sim.state.ball.owner = None;
+        post_sim.state.ball.pos = Vec3::from_milli(27_800, 2_160, 500);
+        post_sim.state.ball.vel = Vec3::from_milli(26_000, 0, 0);
+        post_sim.state.ball.last_touch_team = Some(TeamSide::Home);
+        post_sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert!(
+            post_sim.state().ball.vel.x < Fp::ZERO,
+            "fast shot passing 100mm beside post center must reflect off first cylinder impact (vel={:?})",
+            post_sim.state().ball.vel
+        );
+        assert!(
+            post_sim
+                .state()
+                .recorded_events
+                .iter()
+                .any(|e| e.event_type == MatchEventType::Woodwork),
+            "swept post strike must emit Woodwork event"
+        );
+
+        // 2. Codex P2 #1: Pending yellow card under Referee Advantage must be issued when play stops for a Throw-In!
+        let mut adv_sim = MatchSimulation::new(&snap).unwrap();
+        adv_sim.state.phase = MatchPhase::OpenPlay;
+        adv_sim.state.pending_advantage = Some(PendingAdvantage {
+            victim_side: TeamSide::Home,
+            fouling_side: TeamSide::Away,
+            fouler_idx: 2,
+            fouler_id: adv_sim.state.players[1][2].footballer_id.clone(),
+            fouler_name: adv_sim.state.players[1][2].name.clone(),
+            foul_pos: Vec2::from_milli(2_000, 12_000),
+            start_ball_x: Fp::from_milli(2_000),
+            ticks_left: 120,
+            pending_yellow: true,
+        });
+        // Ball rolls out over touchline (`half_wid = 18_000mm`) before advantage timer expires
+        adv_sim.state.ball.owner = None;
+        adv_sim.state.ball.pos = Vec3::from_milli(4_000, 18_250, 0);
+        adv_sim.state.ball.vel = Vec3::from_milli(0, 4_000, 0);
+        adv_sim.state.ball.last_touch_team = Some(TeamSide::Home);
+        adv_sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        assert!(matches!(
+            adv_sim.state().phase,
+            MatchPhase::SetPiece {
+                kind: RestartKind::ThrowIn,
+                ..
+            }
+        ));
+        assert_eq!(
+            adv_sim.state().players[1][2].yellow_cards, 1,
+            "delayed yellow card must be issued when advantage ends at a Throw-In stoppage"
+        );
+
+        // 3. Codex P2 #2: On-target shot glancing off an outfield defender into the net MUST credit the
+        //    original shooter (goal + shot_on_target) AND passer (assist), whereas an off-target shot
+        //    redirected into the net by a defender records an Own Goal!
+        let mut sot_sim = MatchSimulation::new(&snap).unwrap();
+        sot_sim.state.phase = MatchPhase::OpenPlay;
+        for s in 0..2 {
+            for p in &mut sot_sim.state.players[s] {
+                p.pos = Vec2::from_milli(-15_000, -14_000);
+            }
+        }
+        let shooter_id = sot_sim.state.players[0][4].footballer_id.clone();
+        let passer_id = sot_sim.state.players[0][2].footballer_id.clone();
+        let passer_name = sot_sim.state.players[0][2].name.clone();
+        sot_sim.set_last_touch(TeamSide::Home, 4);
+        sot_sim.state.player_stats[0][4].shots = 1;
+        sot_sim.state.player_stats[0][4].shots_on_target = 1;
+        sot_sim.state.ball.pending_shot_on_target = Some((TeamSide::Home, shooter_id.clone()));
+        sot_sim.state.ball.assist_candidate = Some(crate::state::AssistCandidate {
+            team: TeamSide::Home,
+            passer_idx: 2,
+            passer_id: passer_id.clone(),
+            passer_name,
+            receiver_idx: 4,
+            receiver_id: shooter_id.clone(),
+            completed_tick: 0,
+        });
+        // Away defender #1 positioned beside the ball's path so the 26 m/s shot glances off their hip into the net!
+        sot_sim.state.players[1][1].pos = Vec2::from_milli(26_600, 580);
+        sot_sim.state.players[1][1].vel = Vec2::ZERO;
+        sot_sim.state.ball.owner = None;
+        sot_sim.state.ball.pos = Vec3::from_milli(26_450, 150, 200);
+        sot_sim.state.ball.vel = Vec3::from_milli(26_000, 0, 0);
+        for _ in 0..16 {
+            sot_sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sot_sim.state().score[0] >= 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            sot_sim.state().ball.last_touch_team,
+            Some(TeamSide::Away),
+            "ball must genuinely deflect off Away defender #1"
+        );
+        assert_eq!(sot_sim.state().score[0], 1, "glancing deflected shot must enter goal");
+        let h_stats = sot_sim.state().combined_player_stats(TeamSide::Home);
+        let sh_st = h_stats.iter().find(|s| s.footballer_id == shooter_id).unwrap();
+        let pa_st = h_stats.iter().find(|s| s.footballer_id == passer_id).unwrap();
+        assert_eq!(sh_st.goals, 1, "on-target shot deflected off defender into net must credit original shooter");
+        assert_eq!(sh_st.shots_on_target, 1, "on-target deflected goal must retain shot_on_target");
+        assert_eq!(pa_st.assists, 1, "on-target deflected goal must retain passer assist");
+
+        // Conversely, an OFF-TARGET ball (`pending_shot_on_target == None`) glancing off Away defender #1 into net MUST be an Own Goal!
+        let mut og_sim = MatchSimulation::new(&snap).unwrap();
+        og_sim.state.phase = MatchPhase::OpenPlay;
+        for s in 0..2 {
+            for p in &mut og_sim.state.players[s] {
+                p.pos = Vec2::from_milli(-15_000, -14_000);
+            }
+        }
+        og_sim.set_last_touch(TeamSide::Home, 4);
+        og_sim.state.ball.pending_shot_on_target = None;
+        og_sim.state.players[1][1].pos = Vec2::from_milli(26_600, 580);
+        og_sim.state.players[1][1].vel = Vec2::ZERO;
+        og_sim.state.ball.owner = None;
+        og_sim.state.ball.pos = Vec3::from_milli(26_450, 150, 200);
+        og_sim.state.ball.vel = Vec3::from_milli(26_000, 0, 0);
+        for _ in 0..16 {
+            og_sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if og_sim.state().score[0] >= 1 {
+                break;
+            }
+        }
+        assert_eq!(og_sim.state().score[0], 1);
+        assert!(
+            og_sim
+                .state()
+                .recorded_events
+                .iter()
+                .any(|e| e.event_type == MatchEventType::Goal && e.detail.contains("(OG)")),
+            "off-target strike redirected into net by defender must record OWN GOAL (OG)"
+        );
+    }
 }
+
 
 
 
