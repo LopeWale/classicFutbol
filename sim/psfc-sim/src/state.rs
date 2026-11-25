@@ -330,6 +330,26 @@ impl MatchState {
         }
     }
 
+    /// True when `side` is in the Attacking control context:
+    /// taking a KickOff/SetPiece, owning the ball, receiving its own pass/last-touch,
+    /// or holding an active pre-contact attacking `input_buffer`.
+    pub fn is_attacking_context(&self, side: TeamSide) -> bool {
+        match self.phase {
+            MatchPhase::KickOff { team, .. } | MatchPhase::SetPiece { team, .. } => {
+                return team == side;
+            }
+            _ => {}
+        }
+        match self.ball.owner {
+            Some((owner_side, _)) => owner_side == side,
+            None => {
+                self.input_buffer[side.index()].is_some()
+                    || self.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side)
+                    || self.ball.last_touch_team == Some(side)
+            }
+        }
+    }
+
     /// Returns stats for all starters and substitutes who appeared for `side`.
     pub fn combined_player_stats(&self, side: TeamSide) -> Vec<PlayerMatchStats> {
         let s = side.index();

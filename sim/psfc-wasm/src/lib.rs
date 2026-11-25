@@ -455,7 +455,12 @@ pub extern "C" fn sim_pack_render_state() -> usize {
             // Trailing words:
             // `[spin_side_milli, spin_top_milli, home_aim_bam, away_aim_bam, home_next_switch_idx, away_next_switch_idx,
             //   ball_hold_and_touch_word, player_kinematic_cue[0 .. 2*pps]]`
-            let ball_hold_and_touch = ((i32::from(st.ball.gk_hold_ticks)) << 8)
+            let home_att = i32::from(st.is_attacking_context(TeamSide::Home));
+            let away_att = i32::from(st.is_attacking_context(TeamSide::Away));
+            let ball_hold_and_touch = 0x0400_0000
+                | (home_att << 24)
+                | (away_att << 25)
+                | ((i32::from(st.ball.gk_hold_ticks) & 0xFFFF) << 8)
                 | (i32::from(st.ball.dribble_touch_cd) & 0xFF);
             out.extend_from_slice(&[
                 st.ball.spin_side.to_milli() as i32,
