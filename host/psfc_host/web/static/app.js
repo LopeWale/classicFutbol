@@ -1960,9 +1960,8 @@ function samplePrimaryHumanInput(allowArrows, isAttacking = true) {
   // Route P1 keyboard through Layer 2 ControlProfile so Classic / Alternate / Two-Button / Custom
   // presets immediately govern keyboard controls too!
   const mapped = mapPhysicalToSimInput(samplePhysicalKeyboardP1(allowArrows), controlProfile, isAttacking);
-  // Preserve optional direct keyboard convenience keys without interfering with preset bindings
+  // Preserve optional direct keyboard convenience key without interfering with preset bindings
   if (keysDown.has("KeyC")) mapped.btns |= BTN_SLIDE;
-  if (keysDown.has("KeyR")) mapped.btns |= BTN_TEAMMATE_CONTAIN | BTN_CALL_RUN;
   return mapped;
 }
 
@@ -2108,7 +2107,7 @@ function updateControllerVisualizer() {
   const ltPct = Math.round(((activeGp && activeGp.ltValue) || (keysDown.has("KeyF") ? 1 : 0)) * 100);
   const rtPct = Math.round(((activeGp && activeGp.rtValue) || (keysDown.has("ShiftLeft") || keysDown.has("ShiftRight") ? 1 : 0)) * 100);
   if (l1El) l1El.classList.toggle("lit", Boolean((activeGp && activeGp.l1) || keysDown.has("KeyQ")));
-  if (r1El) r1El.classList.toggle("lit", Boolean((activeGp && activeGp.r1) || keysDown.has("KeyE") || keysDown.has("KeyR")));
+  if (r1El) r1El.classList.toggle("lit", Boolean((activeGp && activeGp.r1) || keysDown.has("KeyE")));
   if (l2El) l2El.classList.toggle("lit", ltPct > 10);
   if (r2El) r2El.classList.toggle("lit", rtPct > 10);
   if (ltFill) ltFill.style.width = `${ltPct}%`;
@@ -3875,35 +3874,36 @@ function mainLoop(nowMs) {
     } else {
       if (!paused && currentScreen === "match" && steps > 0) {
         const sideMode = SIDE_MODES[pmSideIdx].id;
-        const ownerNow = currSimPacked ? currSimPacked[15] : -1;
-        const effOwner = ownerNow === 0 || ownerNow === 1 ? ownerNow : lastKnownOwnerSide;
-        const ppsNow = currSimPacked ? currSimPacked[6] : 0;
-        const holdWordIdx = 18 + ppsNow * 20 + 6;
-        const holdWord =
-          currSimPacked && currSimPacked.length > holdWordIdx ? currSimPacked[holdWordIdx] >>> 0 : 0;
-        const hasAuthoritativeCtx = (holdWord & 0x04000000) !== 0;
-        const homeAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 24)) !== 0 : effOwner === 0;
-        const awayAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 25)) !== 0 : effOwner === 1;
-        let hIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
-        let aIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
-
-        if (sideMode === "local_2p") {
-          hIn = samplePrimaryHumanInput(false, homeAttacking);
-          aIn = sampleSecondaryHumanInput(awayAttacking);
-        } else if (sideMode === "away_vs_cpu") {
-          aIn = samplePrimaryHumanInput(true, awayAttacking);
-        } else if (sideMode === "home_vs_cpu") {
-          hIn = samplePrimaryHumanInput(true, homeAttacking);
-        }
-
         const homeHuman = sideMode === "home_vs_cpu" || sideMode === "local_2p";
         const awayHuman = sideMode === "away_vs_cpu" || sideMode === "local_2p";
         const swBits = ((AUTO_SWITCH_OPTIONS[autoSwitchIdx]?.code ?? 0) & 0x3) << 12;
         const dualMapBit = 0x0800;
-        const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
-        const aSprintBits = (aIn.sprintAnalog || 0) & 0x7f;
+
         for (let s = 0; s < steps; s++) {
           if (currSimPacked) prevSimPacked = currSimPacked;
+          const ownerNow = currSimPacked ? currSimPacked[15] : -1;
+          const effOwner = ownerNow === 0 || ownerNow === 1 ? ownerNow : lastKnownOwnerSide;
+          const ppsNow = currSimPacked ? currSimPacked[6] : 0;
+          const holdWordIdx = 18 + ppsNow * 20 + 6;
+          const holdWord =
+            currSimPacked && currSimPacked.length > holdWordIdx ? currSimPacked[holdWordIdx] >>> 0 : 0;
+          const hasAuthoritativeCtx = (holdWord & 0x04000000) !== 0;
+          const homeAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 24)) !== 0 : effOwner === 0;
+          const awayAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 25)) !== 0 : effOwner === 1;
+
+          let hIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
+          let aIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
+          if (sideMode === "local_2p") {
+            hIn = samplePrimaryHumanInput(false, homeAttacking);
+            aIn = sampleSecondaryHumanInput(awayAttacking);
+          } else if (sideMode === "away_vs_cpu") {
+            aIn = samplePrimaryHumanInput(true, awayAttacking);
+          } else if (sideMode === "home_vs_cpu") {
+            hIn = samplePrimaryHumanInput(true, homeAttacking);
+          }
+
+          const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
+          const aSprintBits = (aIn.sprintAnalog || 0) & 0x7f;
           const hQueued = queuedReservedQueue[0].length > 0 ? queuedReservedQueue[0].shift() : 0;
           const aQueued = queuedReservedQueue[1].length > 0 ? queuedReservedQueue[1].shift() : 0;
           const hReserved =
@@ -3933,10 +3933,10 @@ function mainLoop(nowMs) {
             if (replayBuffer.length >= REPLAY_CAPACITY) replayBuffer.shift();
             replayBuffer.push(new Int32Array(subPacked));
             if (subPacked[15] === 0) {
-              homePossTicks++;
+              if (subPacked[3] === 1) homePossTicks++;
               lastKnownOwnerSide = 0;
             } else if (subPacked[15] === 1) {
-              awayPossTicks++;
+              if (subPacked[3] === 1) awayPossTicks++;
               lastKnownOwnerSide = 1;
             }
           }
@@ -3980,6 +3980,7 @@ function mainLoop(nowMs) {
           }
         }
 
+        engine3d.proSide = SIDE_MODES[pmSideIdx]?.id === "away_vs_cpu" ? 1 : 0;
         engine3d.renderFrame(packed, null, prevSimPacked || packed, interpAlpha);
       }
     }

@@ -62,6 +62,12 @@ pub struct PlayerState {
     pub action: PlayerActionState,
     /// Triggered forward burst timer (`BTN_CALL_RUN`).
     pub run_boost_ticks: u16,
+    /// Post-strike visual cue timer (`0..=14`) so kick leg-swing plays on exact contact even for 1-tick taps.
+    #[serde(default)]
+    pub recent_kick_ticks: u8,
+    /// Visual kick category (`1=Pass, 2=Through, 3=Lob, 4=Shot, 5=Chip`) during `recent_kick_ticks`.
+    #[serde(default)]
+    pub recent_kick_kind: u8,
     pub yellow_cards: u8,
     pub sent_off: bool,
 }
@@ -121,9 +127,35 @@ pub struct AssistCandidate {
     pub completed_tick: u32,
 }
 
+/// Tracks an untouched restart delivery to enforce IFAB double-touch & direct-goal restrictions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartTouchState {
+    /// `None` represents a KickOff; `Some(kind)` represents the corresponding `SetPiece`.
+    pub kind: Option<RestartKind>,
+    pub taker_side: TeamSide,
+    pub taker_idx: usize,
+    pub indirect: bool,
+}
+
+/// Active IFAB Law 12 Referee Advantage window (`~2.5s`), calling play back only if advantage fails.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAdvantage {
+    pub victim_side: TeamSide,
+    pub fouling_side: TeamSide,
+    pub fouler_idx: usize,
+    pub fouler_id: String,
+    pub fouler_name: String,
+    pub foul_pos: Vec2,
+    pub start_ball_x: Fp,
+    pub ticks_left: u8,
+    pub pending_yellow: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BallState {
     pub pos: Vec3,
+    #[serde(default)]
+    pub prev_pos: Vec3,
     pub vel: Vec3,
     /// Horizontal Magnus curve spin (`rad/s` approx in Q32.32).
     pub spin_side: Fp,
@@ -144,6 +176,17 @@ pub struct BallState {
     /// Per-team substitution-safe `(footballer_id, name)` so shots deflected off an opponent/GK still credit an outgoing shooter.
     #[serde(default)]
     pub last_team_touch_meta: [Option<(String, String)>; 2],
+    /// IFAB Law 11 snapshot of all offside teammates (`1 << idx`) at the moment `offside_team` last played the ball.
+    #[serde(default)]
+    pub offside_team: Option<TeamSide>,
+    #[serde(default)]
+    pub offside_mask: u16,
+    /// IFAB Law 12 back-pass tracking: `Some(side)` when `side` deliberately kicked or threw-in the ball (forbids own GK hand catch).
+    #[serde(default)]
+    pub deliberate_foot_backpass: Option<TeamSide>,
+    /// Shooter credited with a tentative on-target shot so outfield blocks or woodwork misses roll it back accurately.
+    #[serde(default)]
+    pub pending_shot_on_target: Option<(TeamSide, String)>,
     pub pass_in_flight: Option<PassInFlight>,
     pub assist_candidate: Option<AssistCandidate>,
 }
@@ -296,6 +339,15 @@ pub struct MatchState {
     /// Pre-contact `~250ms` (`15`-tick) input lookahead & power-bar buffer per team for crisp one-touch play.
     #[serde(default)]
     pub input_buffer: [Option<BufferedAction>; 2],
+    /// Desired pass/shot charge ticks computed from exact target distance when CPU initiates `Charging`.
+    #[serde(default)]
+    pub cpu_target_charge: [u8; 2],
+    /// Untouched set-piece / kickoff state for IFAB double-touch & direct-goal enforcement.
+    #[serde(default)]
+    pub restart_touch_state: Option<RestartTouchState>,
+    /// Active non-teleporting IFAB Law 12 Referee Advantage window.
+    #[serde(default)]
+    pub pending_advantage: Option<PendingAdvantage>,
     #[serde(default)]
     pub subs_used: [u8; 2],
     /// `[home_players, away_players]`.
@@ -330,9 +382,40 @@ impl MatchState {
         }
     }
 
+    /// Earliest reachable ball-intercept tick across active outfielders (`1..len`) for `side`.
+    pub fn fastest_outfield_intercept_ticks(&self, side: TeamSide) -> u32 {
+        let is_5v5 = self.format.players_per_side <= 6;
+        let mut best = 120_u32;
+        if self.ball.owner.is_some() {
+            let pt = crate::ai::predict_ball_xy_at_ticks(self, 8);
+            for p in self.players[side.index()].iter().skip(1) {
+                if !p.sent_off {
+                    let (_, t) = crate::ai::best_ball_intercept_for_player(self, side, p.index);
+                    let _ = pt;
+                    if t < best {
+                        best = t;
+                    }
+                }
+            }
+            return best;
+        }
+        let waypoints = crate::ai::sample_ball_3d_waypoints(self);
+        for p in self.players[side.index()].iter().skip(1) {
+            if !p.sent_off {
+                let (_, t) = crate::ai::best_intercept_from_waypoints(p, &waypoints, is_5v5, false);
+                if t < best {
+                    best = t;
+                }
+            }
+        }
+        best
+    }
+
     /// True when `side` is in the Attacking control context:
-    /// taking a KickOff/SetPiece, owning the ball, receiving its own pass/last-touch,
-    /// or holding an active pre-contact attacking `input_buffer`.
+    /// taking a KickOff/SetPiece, owning the ball, holding an active pre-contact `input_buffer`,
+    /// receiving its own pass in flight, or clearly beating the opponent to its own loose touch/knock-on.
+    /// Crucially returns `false` on contested rebounds, deflections, or defender toe-pokes where an
+    /// opponent is as close or faster to the ball so defensive Switch/Tackle/Contain/GK-Rush never lock out!
     pub fn is_attacking_context(&self, side: TeamSide) -> bool {
         match self.phase {
             MatchPhase::KickOff { team, .. } | MatchPhase::SetPiece { team, .. } => {
@@ -343,9 +426,23 @@ impl MatchState {
         match self.ball.owner {
             Some((owner_side, _)) => owner_side == side,
             None => {
-                self.input_buffer[side.index()].is_some()
-                    || self.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side)
-                    || self.ball.last_touch_team == Some(side)
+                if self.input_buffer[side.index()].is_some() {
+                    return true;
+                }
+                let own_pass_in_flight = self
+                    .ball
+                    .pass_in_flight
+                    .as_ref()
+                    .is_some_and(|pf| pf.team == side);
+                if !own_pass_in_flight && self.ball.last_touch_team != Some(side) {
+                    return false;
+                }
+                let us_ticks = self.fastest_outfield_intercept_ticks(side);
+                let opp_ticks = self.fastest_outfield_intercept_ticks(side.opponent());
+                if own_pass_in_flight {
+                    return us_ticks <= opp_ticks + 18;
+                }
+                us_ticks + 2 <= opp_ticks
             }
         }
     }
@@ -445,8 +542,40 @@ impl MatchState {
         }
         h.u8(self.push_pull_slow_ticks[0]);
         h.u8(self.push_pull_slow_ticks[1]);
+        h.u8(self.cpu_target_charge[0]);
+        h.u8(self.cpu_target_charge[1]);
         h.u8(self.subs_used[0]);
         h.u8(self.subs_used[1]);
+        match self.restart_touch_state {
+            Some(rs) => {
+                h.u8(1);
+                match rs.kind {
+                    Some(k) => {
+                        h.u8(1);
+                        h.u8(k as u8);
+                    }
+                    None => h.u8(0),
+                }
+                h.u8(rs.taker_side.index() as u8);
+                h.u32(rs.taker_idx as u32);
+                h.u8(u8::from(rs.indirect));
+            }
+            None => h.u8(0),
+        }
+        match &self.pending_advantage {
+            Some(pa) => {
+                h.u8(1);
+                h.u8(pa.victim_side.index() as u8);
+                h.u8(pa.fouling_side.index() as u8);
+                h.u32(pa.fouler_idx as u32);
+                h.i64(pa.foul_pos.x.raw());
+                h.i64(pa.foul_pos.y.raw());
+                h.i64(pa.start_ball_x.raw());
+                h.u8(pa.ticks_left);
+                h.u8(u8::from(pa.pending_yellow));
+            }
+            None => h.u8(0),
+        }
         for slot in &self.input_buffer {
             match slot {
                 Some(buf) => {
@@ -511,6 +640,9 @@ impl MatchState {
         h.i64(self.ball.pos.x.raw());
         h.i64(self.ball.pos.y.raw());
         h.i64(self.ball.pos.z.raw());
+        h.i64(self.ball.prev_pos.x.raw());
+        h.i64(self.ball.prev_pos.y.raw());
+        h.i64(self.ball.prev_pos.z.raw());
         h.i64(self.ball.vel.x.raw());
         h.i64(self.ball.vel.y.raw());
         h.i64(self.ball.vel.z.raw());
@@ -526,6 +658,36 @@ impl MatchState {
         }
         h.u16(self.ball.gk_hold_ticks);
         h.u8(self.ball.dribble_touch_cd);
+        match self.ball.last_touch_team {
+            Some(ts) => {
+                h.u8(1);
+                h.u8(ts.index() as u8);
+            }
+            None => h.u8(0),
+        }
+        match self.ball.last_touch_player {
+            Some((ts, idx)) => {
+                h.u8(1);
+                h.u8(ts.index() as u8);
+                h.u32(idx as u32);
+            }
+            None => h.u8(0),
+        }
+        match self.ball.offside_team {
+            Some(ts) => {
+                h.u8(1);
+                h.u8(ts.index() as u8);
+                h.u16(self.ball.offside_mask);
+            }
+            None => h.u8(0),
+        }
+        match self.ball.deliberate_foot_backpass {
+            Some(ts) => {
+                h.u8(1);
+                h.u8(ts.index() as u8);
+            }
+            None => h.u8(0),
+        }
         match &self.ball.last_touch_meta {
             Some((ts, fid, _)) => {
                 h.u8(1);
@@ -549,9 +711,13 @@ impl MatchState {
             Some(pf) => {
                 h.u8(1);
                 h.u8(pf.team.index() as u8);
+                h.u32(pf.passer_idx as u32);
                 h.u32(pf.passer_id.len() as u32);
                 h.bytes(pf.passer_id.as_bytes());
                 h.u32(pf.intended_receiver_idx as u32);
+                h.i64(pf.target_pos.x.raw());
+                h.i64(pf.target_pos.y.raw());
+                h.u32(pf.launched_tick);
                 h.u8(u8::from(pf.receiver_was_offside));
             }
             None => h.u8(0),
@@ -585,6 +751,8 @@ impl MatchState {
                 h.u16(p.facing_bam);
                 h.i32(p.stamina_permille);
                 h.u16(p.run_boost_ticks);
+                h.u8(p.recent_kick_ticks);
+                h.u8(p.recent_kick_kind);
                 h.u8(p.yellow_cards);
                 h.u8(u8::from(p.sent_off));
                 match p.action {
