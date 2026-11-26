@@ -1107,6 +1107,80 @@ function lerpAngleRad(a, b, t) {
   return a + wrapAngleRad(b - a) * t;
 }
 
+// ---------------------------------------------------------------------------
+// Sub-tick interpolation between two 60 Hz sim states.
+//
+// Pure lerp makes rendered velocity a staircase (constant per tick, jumping at
+// every tick boundary), which reads as stepping at display rates above 60 Hz.
+// The sim integrates semi-implicitly (x1 = x0 + v1*h, verified by the anim
+// harness: |dx/h - v1| p50 = 0.03 m/s), so the reported velocities give the
+// per-tick mean velocity s and the previous one u0. A cubic Hermite with
+// tangents m0 = (u0+s)/2 and m1 = s + (s-u0)/2 reproduces constant acceleration
+// exactly (linear velocity across the tick) and keeps velocity continuous across
+// tick boundaries. When the tick displacement is not explained by the reported
+// velocity (separation pushes, bounces, restarts) it falls back to lerp.
+// ---------------------------------------------------------------------------
+const SIM_TICK_S = 1 / 60;
+
+// Locomotion / pose smoothing constants (see docs/animation-smoothness.md for the measurements).
+const YAW_SMOOTH_CTRL_S = 0.058; // user-controlled player: unchanged, responsive
+const YAW_SMOOTH_AI_S = 0.074; // AI players: ~38% lower peak yaw accel on sim facing steps
+const ACCEL_SMOOTH_S = 0.09; // was 0.075: per-tick sim accel is a staircase of +-30 m/s^2
+const LOCO_RELEASE_S = 0.16; // run -> idle release time (rise stays 0.05 s)
+const GETUP_RECOVER_S = 0.5; // dive / tumble get-up blend window
+// Fraction of leg-IK quaternion smoothing removed while a foot is pinned. Measured 0.5 / 0.8: less
+// pinned slip but knee angular-accel p95 +45..70%, so it stays 0 (only the foot-goal damp is bypassed).
+const FOOT_PIN_IK_BYPASS = 0.0;
+const TOE_OFF_START_U = 0.6; // stance fraction where the heel starts to rise (was 0.72)
+const HERMITE_CONSISTENCY_MS = 0.6; // |dx/h - v1| above this -> displacement not velocity-driven
+const HERMITE_MAX_DV_MS = 6.0; // per-tick velocity change above this -> impact, use lerp
+const _interpOut = { x: 0, y: 0, vx: 0, vy: 0, hermite: false };
+const INTERP_CORRECTION_MIN_M = 0.03; // ignore mm-level quantisation residue
+const INTERP_CORRECTION_MAX_M = 2.5; // larger non-velocity jumps snap (treated as teleport)
+const INTERP_CORRECTION_TAU_S = 0.09; // decay time constant of the absorbed correction
+
+function interpPlanarHermite(x0, y0, x1, y1, u0x, u0y, u1x, u1y, t, out) {
+  const h = SIM_TICK_S;
+  const sx = (x1 - x0) / h;
+  const sy = (y1 - y0) / h;
+  const consistent =
+    Math.hypot(sx - u1x, sy - u1y) < HERMITE_CONSISTENCY_MS &&
+    Math.hypot(sx - u0x, sy - u0y) < HERMITE_MAX_DV_MS;
+  if (!consistent) {
+    out.x = x0 + (x1 - x0) * t;
+    out.y = y0 + (y1 - y0) * t;
+    out.vx = u0x + (u1x - u0x) * t;
+    out.vy = u0y + (u1y - u0y) * t;
+    out.hermite = false;
+    return out;
+  }
+  let m0x = (u0x + sx) * 0.5;
+  let m0y = (u0y + sy) * 0.5;
+  let m1x = sx + (sx - u0x) * 0.5;
+  let m1y = sy + (sy - u0y) * 0.5;
+  // Never let an extrapolated end tangent reverse the tick's travel direction
+  // (a hard stop would otherwise overshoot and creep backwards for a frame).
+  if (m1x * sx < 0) m1x = 0;
+  if (m1y * sy < 0) m1y = 0;
+  if (m0x * sx < 0) m0x = 0;
+  if (m0y * sy < 0) m0y = 0;
+  const t2 = t * t;
+  const t3 = t2 * t;
+  const h01 = -2 * t3 + 3 * t2;
+  const h10 = t3 - 2 * t2 + t;
+  const h11 = t3 - t2;
+  out.x = x0 + (x1 - x0) * h01 + h * (m0x * h10 + m1x * h11);
+  out.y = y0 + (y1 - y0) * h01 + h * (m0y * h10 + m1y * h11);
+  // Analytic derivative -> rendered velocity matches rendered root motion (feeds stride/gait).
+  const d01 = 6 * t - 6 * t2;
+  const d10 = 3 * t2 - 4 * t + 1;
+  const d11 = 3 * t2 - 2 * t;
+  out.vx = sx * d01 + m0x * d10 + m1x * d11;
+  out.vy = sy * d01 + m0y * d10 + m1y * d11;
+  out.hermite = true;
+  return out;
+}
+
 function parseHexSrgb(hex) {
   const s = String(hex || "#cc0000").trim().replace(/^#/, "");
   if (s.length === 3) {
@@ -4135,9 +4209,10 @@ function evaluateDirectionalFootTarget(
   gkAlert,
   isGk,
   pivotWeight,
-  outVec
+  outVec,
+  locoFloor = 0
 ) {
-  const locoWeight = Math.max(pivotWeight * 0.55, smoothstep(0.04, 0.68, speed));
+  const locoWeight = Math.max(pivotWeight * 0.55, smoothstep(0.04, 0.68, speed), locoFloor);
   const strafeRatio = speed > 0.12 ? Math.abs(vLat) / speed : 0;
   const backBlend = speed > 0.12 ? smoothstep(0.15, -0.75, vFwd) : 0;
 
@@ -4158,11 +4233,12 @@ function evaluateDirectionalFootTarget(
     sideSign *
     ((isGk ? 0.142 + gkAlert * 0.025 : 0.095) + strafeRatio * (isGk ? 0.055 : 0.045));
   const halfSpan =
-    Math.min(0.56, (0.11 + speed * (0.054 - backBlend * 0.014 - strafeRatio * 0.012))) *
+    Math.min(0.56, (0.13 + speed * (0.062 - backBlend * 0.016 - strafeRatio * 0.014))) *
     locoWeight;
   const spanZ = dirZ * halfSpan;
   const spanX = dirX * halfSpan * 0.74;
   const runBlend = smoothstep(1.5, 3.8, speed);
+  const toeOffLiftMax = (0.044 + 0.05 * runBlend * (1 - backBlend)) * locoWeight;
 
   let gx = idleX + (baseWidth - idleX) * locoWeight;
   let gy = SOLE_HEIGHT;
@@ -4190,7 +4266,11 @@ function evaluateDirectionalFootTarget(
               ? 0.06 * gkAlert
               : 0.0;
     }
-    const toeLiftY = u > 0.72 ? ((u - 0.72) / 0.28) * 0.044 * locoWeight : 0.0;
+    // Heel rise / toe-off: starts earlier and lifts higher at running pace so the cleat leaves the
+    // turf before the stance pin releases (was 0.044 m from u > 0.72, which dragged the foot along
+    // the grass through toe-off and early swing).
+    const toeU = u > TOE_OFF_START_U ? (u - TOE_OFF_START_U) / (1 - TOE_OFF_START_U) : 0;
+    const toeLiftY = toeU * Math.sqrt(toeU) * toeOffLiftMax;
     gy = SOLE_HEIGHT + toeLiftY;
   } else {
     // Aerial swing phase (w: 0 -> 1)
@@ -4206,7 +4286,8 @@ function evaluateDirectionalFootTarget(
         (0.060 + speedNorm * 0.33 * (0.35 + 0.65 * runBlend)) *
           Math.max(0.32, strideLiftScale)) *
       locoWeight;
-    gy = SOLE_HEIGHT + Math.sin(w * Math.PI) * peakLift;
+    // Carry the toe-off height into early swing (continuous at p = pi) and fade it out.
+    gy = SOLE_HEIGHT + Math.sin(w * Math.PI) * peakLift + toeOffLiftMax * (1 - w) * (1 - w);
 
     if (backBlend > 0.45) {
       pitch += (0.22 + 0.18 * Math.sin(w * Math.PI)) * locoWeight;
@@ -4247,14 +4328,14 @@ function applyWorldFootPin(
 ) {
   if (!allowPin) {
     pin.active = false;
-    return;
+    return 0;
   }
   const p = ((phase % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
   const stanceStart = 0.05 * Math.PI;
   const stanceEnd = 0.80 * Math.PI;
   if (p < stanceStart || p > stanceEnd) {
     pin.active = false;
-    return;
+    return 0;
   }
 
   const floorBSY = minBodyYForWorldFloor(targetFootBS.x, ankleWorldFloorY, actor);
@@ -4276,18 +4357,23 @@ function applyWorldFootPin(
   if (drift > 0.56) {
     // Exceeded physiological stride stretch -> release & re-step cleanly
     pin.active = false;
-    return;
+    return 0;
   }
 
   const windowU = (p - stanceStart) / (stanceEnd - stanceStart);
-  const pinEnvelope = Math.sin(windowU * Math.PI);
+  // Flat-topped stance envelope (was sin(u*pi), which only fully pinned the foot at mid-stance and
+  // let it slide through the first and last thirds of every contact).
+  const pinEnvelope = smoothstep(0.0, 0.16, windowU) * (1.0 - smoothstep(0.84, 1.0, windowU));
   const stretchFade = 1.0 - smoothstep(0.28, 0.54, drift);
   const w = pinEnvelope * stretchFade;
 
   targetFootBS.x += (_pinLocalTmp.x - targetFootBS.x) * w;
-  targetFootBS.y += (_pinLocalTmp.y - targetFootBS.y) * w;
+  // Height is left to the gait (toe-off lift) so the cleat peels off the turf instead of being
+  // held flat and then dragged when the pin releases.
+  targetFootBS.y += (_pinLocalTmp.y - targetFootBS.y) * w * (1.0 - smoothstep(0.55, 0.8, windowU));
   targetFootBS.z += (_pinLocalTmp.z - targetFootBS.z) * w;
   clampBodyPointWorldFloor(targetFootBS, ankleWorldFloorY, actor);
+  return w;
 }
 
 function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
@@ -4350,7 +4436,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   if (discontinuousMove) {
     actor.smoothYaw = targetYaw;
   } else {
-    dampAngle(actor, "smoothYaw", targetYaw, 0.058, dt);
+    // SmoothDamp (critically damped, velocity-continuous). Peak angular acceleration on a facing
+    // step scales with 1/smoothTime^2, so off-ball AI players use a slightly longer time than the
+    // user-controlled player (who keeps the snappier 0.058 s response).
+    dampAngle(actor, "smoothYaw", targetYaw, isControlled ? YAW_SMOOTH_CTRL_S : YAW_SMOOTH_AI_S, dt);
   }
   const yawRate = discontinuousMove
     ? 0
@@ -4391,14 +4480,23 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const vLat = vx * leftX + vy * leftZ;
   const speed = Math.hypot(vx, vy);
   const speedNorm = Math.min(1.25, speed / 6.8);
-  const locoWeight = smoothstep(0.04, 0.68, speed);
+  // Locomotion weight rises with speed instantly (no start lag) but releases through a SmoothDamp:
+  // the sim brakes at ~30 m/s^2, so raw speed drops through the 0.68 m/s blend band inside one or
+  // two ticks and the whole run pose used to collapse into idle in a single frame.
+  const rawLocoWeight = smoothstep(0.04, 0.68, speed);
+  if (discontinuousMove || actor.smoothLoco === undefined) {
+    actor.smoothLoco = rawLocoWeight;
+  } else {
+    damp(actor, "smoothLoco", rawLocoWeight, rawLocoWeight > actor.smoothLoco ? 0.05 : LOCO_RELEASE_S, dt);
+  }
+  const locoWeight = Math.max(rawLocoWeight, actor.smoothLoco);
   const strafeRatio = speed > 0.12 ? Math.abs(vLat) / speed : 0;
   const backBlend = speed > 0.12 ? smoothstep(0.15, -0.75, vFwd) : 0;
 
   const rawAccelFwd = Math.max(-22, Math.min(22, axTick * fwdX + ayTick * fwdZ));
   const rawAccelLat = Math.max(-22, Math.min(22, axTick * leftX + ayTick * leftZ));
-  damp(actor, "smoothAccelFwd", rawAccelFwd, 0.075, dt);
-  damp(actor, "smoothAccelLat", rawAccelLat, 0.075, dt);
+  damp(actor, "smoothAccelFwd", rawAccelFwd, ACCEL_SMOOTH_S, dt);
+  damp(actor, "smoothAccelLat", rawAccelLat, ACCEL_SMOOTH_S, dt);
 
   // Physical Opponent Jostling Proximity (`IMG_0363.jpeg` — shoulder lean + non-penetrating shielding arm IK!)
   const jostleWeight = !actor.isReferee && !actor.isGk ? 1.0 - smoothstep(0.68, 1.48, oppDist) : 0;
@@ -4630,6 +4728,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       (Math.PI * 2);
   } else if (pivotWeight > 0.02) {
     actor.stridePhase = (actor.stridePhase + Math.abs(yawRate) * 1.45 * dt) % (Math.PI * 2);
+  } else if (locoWeight > 0.05) {
+    // Decel settle: finish the current step in place while the run pose releases, instead of
+    // freezing the feet mid-swing when the root stops.
+    actor.stridePhase = (actor.stridePhase + Math.PI * 2 * 1.7 * locoWeight * dt) % (Math.PI * 2);
   }
 
   const s = Math.sin(actor.stridePhase);
@@ -4690,7 +4792,13 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   // STEP A: PELVIS, SPINE & CHEST KINEMATICS ACROSS ALL REGIMES
   // ==========================================================================
   const bones = actor.bones;
-  const idleBreathe = seededNoise2D(actor.phaseSeed, nowSec * 0.9) * 0.006 * (1 - locoWeight);
+  // Per-actor breathing rate and slow weight shift so a line of idle players never bobs in sync.
+  const idleRate = 0.72 + ((actor.phaseSeed * 0.6180339) % 1) * 0.4;
+  const idleBreathe = seededNoise2D(actor.phaseSeed, nowSec * idleRate) * 0.006 * (1 - locoWeight);
+  const idleShift =
+    seededNoise2D(actor.phaseSeed * 1.7 + 11.3, nowSec * (0.16 + idleRate * 0.08)) *
+    (1 - locoWeight) *
+    (1 - smoothstep(0.0, 0.3, actor.smoothJumpY));
 
   let targetJumpLift = jumpZ;
   let targetHipY = 0.885;
@@ -4906,10 +5014,26 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     chestRz = spineRz * 0.65;
   }
 
-  damp(actor, "smoothHipY", targetHipY, 0.042, dt);
-  bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
-  const torsoSmooth = headerSnapWeight > 0.3 ? 0.034 : 0.048;
-  dampBoneEuler(bones[B_HIPS], hipsRx, hipsRy, hipsRz, 0.048, dt);
+  // Get-up blend: leaving a GK dive (4) or turf tumble (5) used to snap back to stance within
+  // ~0.1 s (hip height 0.36 -> 0.88). Hold a recovery window during which the pelvis/torso ease up.
+  if (discontinuousMove) {
+    actor.recoverTimer = 0;
+  } else if ((actor.prevPoseAction === 4 || actor.prevPoseAction === 5) && action !== 4 && action !== 5) {
+    actor.recoverTimer = GETUP_RECOVER_S;
+  } else if (actor.recoverTimer > 0) {
+    actor.recoverTimer = Math.max(0, actor.recoverTimer - dt);
+  }
+  actor.prevPoseAction = action;
+  const recoverW = actor.recoverTimer > 0 ? smoothstep(0, GETUP_RECOVER_S * 0.6, actor.recoverTimer) : 0;
+  if (recoverW > 0 && targetHipY > actor.smoothHipY) {
+    // Rise from the turf with a slower ease, never faster than the stand-up pace.
+    targetHipY = actor.smoothHipY + Math.min(targetHipY - actor.smoothHipY, 2.4 * dt);
+  }
+  damp(actor, "smoothHipY", targetHipY, 0.042 + 0.10 * recoverW, dt);
+  hipsRz += idleShift * 0.035;
+  bones[B_HIPS].position.set(idleShift * 0.014, actor.smoothHipY, 0);
+  const torsoSmooth = (headerSnapWeight > 0.3 ? 0.034 : 0.048) + 0.12 * recoverW;
+  dampBoneEuler(bones[B_HIPS], hipsRx, hipsRy, hipsRz, 0.048 + 0.12 * recoverW, dt);
   dampBoneEuler(bones[B_SPINE], spineRx, spineRy, spineRz, torsoSmooth, dt);
   dampBoneEuler(bones[B_CHEST], chestRx, chestRy, chestRz, torsoSmooth, dt);
 
@@ -4976,6 +5100,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   let rollL = -actor.smoothBankRoll * 0.35;
   let rollR = -actor.smoothBankRoll * 0.35;
   let legSmoothTime = 0.028;
+  // Stance pin weights (0..1) from applyWorldFootPin: a pinned foot bypasses most of the goal/IK
+  // smoothing, otherwise the damping lag drags the planted cleat along with the body (foot skate).
+  let pinWL = 0;
+  let pinWR = 0;
 
   if (action === 3) {
     // Turf-Clamped Slide Tackle: sweeping extended right cleat + tucked underneath left knee!
@@ -5099,7 +5227,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       gkAlert,
       actor.isGk,
       pivotWeight,
-      _tmpFootL
+      _tmpFootL,
+      actor.smoothLoco || 0
     );
     pitchR = evaluateDirectionalFootTarget(
       actor.stridePhase + Math.PI,
@@ -5111,7 +5240,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       gkAlert,
       actor.isGk,
       pivotWeight,
-      _tmpFootR
+      _tmpFootR,
+      actor.smoothLoco || 0
     );
 
     // Map gait foot targets onto the banked world turf plane before foot-pinning & overrides
@@ -5140,7 +5270,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       chargeCockBlend > 0.02 ||
       whipArc > 0.02;
 
-    applyWorldFootPin(
+    pinWL = applyWorldFootPin(
       actor.footPinL,
       actor.stridePhase,
       !specialStance && (locoWeight > 0.02 || pivotWeight > 0.02),
@@ -5148,7 +5278,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       _tmpFootL,
       ankleWorldFloorY
     );
-    applyWorldFootPin(
+    pinWR = applyWorldFootPin(
       actor.footPinR,
       actor.stridePhase + Math.PI,
       !specialStance && (locoWeight > 0.02 || pivotWeight > 0.02),
@@ -5330,8 +5460,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     actor.footGoalL.copy(_tmpFootL);
     actor.footGoalR.copy(_tmpFootR);
   } else {
-    damp3(actor.footGoalL, _tmpFootL, 0.020, dt);
-    damp3(actor.footGoalR, _tmpFootR, 0.020, dt);
+    damp3(actor.footGoalL, _tmpFootL, Math.max(0.002, 0.020 * (1 - pinWL)), dt);
+    damp3(actor.footGoalR, _tmpFootR, Math.max(0.002, 0.020 * (1 - pinWR)), dt);
   }
   clampBodyPointWorldFloor(actor.footGoalL, ankleWorldFloorY, actor);
   clampBodyPointWorldFloor(actor.footGoalR, ankleWorldFloorY, actor);
@@ -5345,7 +5475,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     actor.footGoalL,
     _dynPoleL,
     pitchL,
-    discontinuousMove ? 0 : legSmoothTime,
+    discontinuousMove ? 0 : legSmoothTime * (1 - FOOT_PIN_IK_BYPASS * pinWL),
     dt,
     yawL,
     rollL,
@@ -5362,7 +5492,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     actor.footGoalR,
     _dynPoleR,
     pitchR,
-    discontinuousMove ? 0 : legSmoothTime,
+    discontinuousMove ? 0 : legSmoothTime * (1 - FOOT_PIN_IK_BYPASS * pinWR),
     dt,
     yawR,
     rollR,
@@ -7623,12 +7753,26 @@ export class ClassicFifa3DEngine {
       const bz1 = currPacked[11] / 1000;
       const ballTeleported = Math.hypot(bx1 - bx0, by1 - by0) > 6.5;
 
-      ballX = ballTeleported ? bx1 : bx0 + (bx1 - bx0) * tInterp;
-      ballY = ballTeleported ? by1 : by0 + (by1 - by0) * tInterp;
-      ballZ = ballTeleported ? bz1 : bz0 + (bz1 - bz0) * tInterp;
+      // Ball uses the same prev/curr pair, alpha and Hermite scheme as the players so a dribbled
+      // ball and the carrier's feet stay in one frame of reference.
       ballVx = (p0[12] + (currPacked[12] - p0[12]) * tInterp) / 1000;
       ballVy = (p0[13] + (currPacked[13] - p0[13]) * tInterp) / 1000;
       ballVz = (p0[14] + (currPacked[14] - p0[14]) * tInterp) / 1000;
+      if (ballTeleported) {
+        ballX = bx1;
+        ballY = by1;
+        ballZ = bz1;
+      } else {
+        interpPlanarHermite(
+          bx0, by0, bx1, by1,
+          p0[12] / 1000, p0[13] / 1000, currPacked[12] / 1000, currPacked[13] / 1000,
+          tInterp, _interpOut
+        );
+        ballX = _interpOut.x;
+        ballY = _interpOut.y;
+        interpPlanarHermite(bz0, 0, bz1, 0, p0[14] / 1000, 0, currPacked[14] / 1000, 0, tInterp, _interpOut);
+        ballZ = Math.max(0, _interpOut.x);
+      }
 
       ownerSide = currPacked[15];
       const ownerIdx = currPacked[16];
@@ -7708,6 +7852,9 @@ export class ClassicFifa3DEngine {
       let spTakerCharge = 0;
 
       const actorCount = Math.min(pps * 2, this.actors.length);
+      // A new sim tick arrived since the previous rendered frame (per-tick bookkeeping only once).
+      const tickAdvanced = this._interpLastCurr !== currPacked;
+      this._interpLastCurr = currPacked;
       for (let n = 0; n < actorCount; n++) {
         const b = 18 + n * 10;
         const side = currPacked[b + 0];
@@ -7717,17 +7864,55 @@ export class ClassicFifa3DEngine {
         const wy0 = p0[b + 5] / 1000;
         const wx1 = currPacked[b + 4] / 1000;
         const wy1 = currPacked[b + 5] / 1000;
-        const teleported = Math.hypot(wx1 - wx0, wy1 - wy0) > 4.0;
-
-        const wx = teleported ? wx1 : wx0 + (wx1 - wx0) * tInterp;
-        const wy = teleported ? wy1 : wy0 + (wy1 - wy0) * tInterp;
-
         const vx0 = p0[b + 6] / 1000;
         const vy0 = p0[b + 7] / 1000;
         const vx1 = currPacked[b + 6] / 1000;
         const vy1 = currPacked[b + 7] / 1000;
-        const vx = teleported ? vx1 : vx0 + (vx1 - vx0) * tInterp;
-        const vy = teleported ? vy1 : vy0 + (vy1 - vy0) * tInterp;
+        const actorI = this.actors[n];
+
+        // Non-velocity displacement this tick (separation push, set-piece nudge): the part of
+        // the step not explained by v1*h. Up to INTERP_CORRECTION_MAX_M it is absorbed into a
+        // decaying visual offset (a short glide) instead of a one-tick slide or a snap.
+        const exX = wx1 - wx0 - vx1 * SIM_TICK_S;
+        const exY = wy1 - wy0 - vy1 * SIM_TICK_S;
+        const exMag = Math.hypot(exX, exY);
+        const stepDist = Math.hypot(wx1 - wx0, wy1 - wy0);
+        const teleported = stepDist > 4.0 || exMag > INTERP_CORRECTION_MAX_M;
+        let wx;
+        let wy;
+        let vx;
+        let vy;
+        if (teleported) {
+          wx = wx1;
+          wy = wy1;
+          vx = vx1;
+          vy = vy1;
+          actorI.interpOffX = 0;
+          actorI.interpOffY = 0;
+        } else {
+          let bx0 = wx0;
+          let by0 = wy0;
+          if (exMag > INTERP_CORRECTION_MIN_M) {
+            if (tickAdvanced) {
+              actorI.interpOffX = (actorI.interpOffX || 0) - exX;
+              actorI.interpOffY = (actorI.interpOffY || 0) - exY;
+            }
+            bx0 += exX;
+            by0 += exY;
+          }
+          interpPlanarHermite(bx0, by0, wx1, wy1, vx0, vy0, vx1, vy1, tInterp, _interpOut);
+          const offX = actorI.interpOffX || 0;
+          const offY = actorI.interpOffY || 0;
+          if (offX !== 0 || offY !== 0) {
+            const k = Math.exp(-dt / INTERP_CORRECTION_TAU_S);
+            actorI.interpOffX = Math.abs(offX * k) < 1e-4 ? 0 : offX * k;
+            actorI.interpOffY = Math.abs(offY * k) < 1e-4 ? 0 : offY * k;
+          }
+          wx = _interpOut.x + (actorI.interpOffX || 0);
+          wy = _interpOut.y + (actorI.interpOffY || 0);
+          vx = _interpOut.vx;
+          vy = _interpOut.vy;
+        }
 
         // Clean 60Hz tick-step acceleration (immune to variable browser rAF dt!)
         const axTick = teleported ? 0 : (vx1 - vx0) * 60;

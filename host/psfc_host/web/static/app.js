@@ -3612,6 +3612,13 @@ let prevSimPacked = null;
 let currSimPacked = null;
 const SIM_STEP_MS = 1000 / 60;
 
+// The prev/curr interpolation pair is only reset on a half change or packed-layout change. Phase
+// changes (open play <-> restarts) used to reset it too, which made every actor jump one full tick
+// in a single frame; renderFrame already snaps real per-actor and ball teleports on its own.
+function simInterpPairBroken(prev, curr) {
+  return !prev || prev.length !== curr.length || prev[2] !== curr[2];
+}
+
 const camBasisLatch = [
   { prevKey: "rail", prevBasis: null, latchedBasis: null, ticksLeft: 0, refX: 0, refY: 0 },
   { prevKey: "rail", prevBasis: null, latchedBasis: null, ticksLeft: 0, refX: 0, refY: 0 },
@@ -3847,7 +3854,12 @@ function mainLoop(nowMs) {
     const steps = paused ? 0 : Math.min(6, Math.floor(simAccumMs / SIM_STEP_MS));
     if (!paused) {
       simAccumMs -= steps * SIM_STEP_MS;
+      // Step cap hit (tab hitch): drop the unrecoverable backlog instead of letting it pin alpha at
+      // 1.0 and force max-step frames until it drains (spiral of catch-up frames).
+      if (simAccumMs >= SIM_STEP_MS) simAccumMs = SIM_STEP_MS * 0.999;
     }
+    // Render time = last tick - 1 + alpha, alpha in [0, 1): monotonic across 0-step and multi-step
+    // frames because prev/curr always hold the last two consecutive ticks.
     const interpAlpha = paused ? 1.0 : Math.min(1.0, Math.max(0.0, simAccumMs / SIM_STEP_MS));
 
     // Advance simulation ticks at deterministic 60.0 Hz wall-clock pace
@@ -3858,7 +3870,7 @@ function mainLoop(nowMs) {
         const sub = readPackedState();
         if (sub) {
           currSimPacked = new Int32Array(sub);
-          if (!prevSimPacked || prevSimPacked[3] !== currSimPacked[3]) {
+          if (simInterpPairBroken(prevSimPacked, currSimPacked)) {
             prevSimPacked = currSimPacked;
           }
           if (sub[17] > 0) wasm.sim_drain_events_json();
@@ -3928,7 +3940,7 @@ function mainLoop(nowMs) {
           const subPacked = readPackedState();
           if (subPacked) {
             currSimPacked = new Int32Array(subPacked);
-            if (!prevSimPacked || prevSimPacked[3] !== currSimPacked[3]) {
+            if (simInterpPairBroken(prevSimPacked, currSimPacked)) {
               prevSimPacked = currSimPacked;
             }
           }
