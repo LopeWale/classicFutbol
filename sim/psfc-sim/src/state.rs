@@ -2,7 +2,7 @@
 
 use crate::config::{MatchFormat, RuleSet, TeamSide};
 use crate::events::{MatchEvent, PlayerMatchStats};
-use crate::input::ControlSettings;
+use crate::input::{charge_permille_for, ControlSettings};
 use crate::math::{Fp, Vec2, Vec3};
 use crate::rng::DeterministicRng;
 use crate::snapshot::{PlayerAttributes, PlayerRole, TeamSnapshot};
@@ -108,7 +108,7 @@ impl PlayerState {
     #[inline]
     pub fn charge_ratio_permille(&self) -> u16 {
         match self.action {
-            PlayerActionState::Charging { ticks, .. } => ((ticks as u32 * 1000) / 22).min(1000) as u16,
+            PlayerActionState::Charging { button, ticks, .. } => charge_permille_for(button, ticks),
             _ => 0,
         }
     }
@@ -304,7 +304,7 @@ pub struct BufferedAction {
     /// EA FC 26 Low Driven modifier (`double-tap BTN_SHOOT` before foot contact).
     #[serde(default)]
     pub low_driven: bool,
-    /// Accumulated charge ticks (`1..=22`) recorded while holding the kick button pre-contact.
+    /// Accumulated charge ticks (`1..=max_charge_ticks_for(button)`) recorded while holding the kick button pre-contact.
     #[serde(default)]
     pub charge_ticks: u16,
     /// True while the player is still holding the kick button down pre-contact.
@@ -316,7 +316,7 @@ pub struct BufferedAction {
 impl BufferedAction {
     #[inline]
     pub fn charge_ratio_permille(&self) -> u16 {
-        ((self.charge_ticks as u32 * 1000) / 22).min(1000) as u16
+        charge_permille_for(self.button, self.charge_ticks)
     }
 }
 
@@ -370,7 +370,7 @@ pub struct MatchState {
     /// Pre-contact `~250ms` (`15`-tick) input lookahead & power-bar buffer per team for crisp one-touch play.
     #[serde(default)]
     pub input_buffer: [Option<BufferedAction>; 2],
-    /// Desired pass/shot charge ticks computed from exact target distance when CPU initiates `Charging`.
+    /// Desired pass/shot charge in legacy 22-unit scale (converted with `charge_units_to_ticks` at use).
     #[serde(default)]
     pub cpu_target_charge: [u8; 2],
     /// Untouched set-piece / kickoff state for IFAB double-touch & direct-goal enforcement.

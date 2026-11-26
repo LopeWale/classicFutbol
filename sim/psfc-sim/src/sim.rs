@@ -13,6 +13,7 @@ use crate::input::{
     BTN_SHOOT, BTN_SKILL, BTN_SLIDE, BTN_SPRINT, BTN_SWITCH, BTN_TACKLE, BTN_TEAMMATE_CONTAIN,
     BTN_THROUGH, RESERVED_SETTINGS_FLAG, RESERVED_SUB_FLAG,
 };
+use crate::input::{charge_units_to_ticks, max_charge_ticks_for};
 use crate::math::{angle_diff_bam, atan2_bam, turn_toward_bam, Fp, Vec2, Vec3};
 use crate::rng::DeterministicRng;
 use crate::snapshot::{FixtureSnapshot, PlayerRole};
@@ -23,7 +24,13 @@ use crate::state::{
 };
 
 const CHARGE_MASK: u16 = BTN_PASS | BTN_THROUGH | BTN_LOB | BTN_SHOOT;
-const MAX_CHARGE_TICKS: u16 = 22;
+/// Normalised power-bar fill `(0, 1]` for `ticks` held on `button`, using the per-action fill time
+/// from [`max_charge_ticks_for`] (pass 500 ms, lob/cross 600 ms, shot 900 ms).
+#[inline]
+fn charge_norm_for(button: u16, ticks: u16) -> Fp {
+    let max = max_charge_ticks_for(button);
+    Fp::from_ratio(ticks.clamp(1, max) as i64, max as i64)
+}
 /// 15 ticks at 60 Hz = exact 250ms pre-contact input buffer window.
 const INPUT_BUFFER_TTL_TICKS: u8 = 15;
 /// Unified Right-Stick deflection threshold (`0.58`) for rising-edge directional switches, skill moves, and knock-ons.
@@ -411,7 +418,7 @@ impl MatchSimulation {
                         buf.finesse = true;
                     }
                     buf.aim = resolve_kick_aim(side_in, is_cpu, dual_map, buf.aim);
-                    if still_held && buf.charge_ticks < MAX_CHARGE_TICKS {
+                    if still_held && buf.charge_ticks < max_charge_ticks_for(buf.button) {
                         buf.charge_ticks = buf.charge_ticks.saturating_add(1);
                         buf.ttl_ticks = INPUT_BUFFER_TTL_TICKS;
                         self.state.input_buffer[s_idx] = Some(buf);
@@ -519,7 +526,7 @@ impl MatchSimulation {
                         default_aim.normalize_or_zero()
                     };
                     self.state.phase = MatchPhase::OpenPlay;
-                    self.execute_kick(team, taker_idx, BTN_PASS, 8, false, false, aim);
+                    self.execute_kick(team, taker_idx, BTN_PASS, charge_units_to_ticks(8, BTN_PASS), false, false, aim);
                     // IFAB Law 8: kicker may not touch the ball a second time before another player,
                     // and cannot score an own goal directly from kick-off!
                     self.state.restart_touch_state = Some(RestartTouchState {
@@ -604,7 +611,7 @@ impl MatchSimulation {
                             live_aim
                         };
                         self.state.players[t_s_idx][taker_idx].facing_bam = eff_aim.to_bam();
-                        if !still_held || next_ticks >= MAX_CHARGE_TICKS {
+                        if !still_held || next_ticks >= max_charge_ticks_for(button) {
                             self.state.players[t_s_idx][taker_idx].action =
                                 PlayerActionState::Cooldown { ticks_left: 8 };
                             fire_delivery = Some((button, next_ticks, next_finesse, eff_aim));
@@ -677,7 +684,7 @@ impl MatchSimulation {
                             };
                             fire_delivery = Some((
                                 default_btn,
-                                default_charge,
+                                charge_units_to_ticks(default_charge, default_btn),
                                 kind == RestartKind::FreeKick && default_btn == BTN_SHOOT,
                                 live_aim,
                             ));
@@ -1969,7 +1976,7 @@ impl MatchSimulation {
                 } else {
                     chosen_btn
                 };
-                let use_charge = charge_ticks.max(safe_charge.min(13));
+                let use_charge = charge_ticks.max(safe_charge.min(charge_units_to_ticks(13, use_btn)));
                 self.execute_kick(team, taker_idx, use_btn, use_charge, finesse, false, use_aim);
                 // IFAB Law 11: NO offside offence directly from a Goal Kick!
                 self.state.ball.offside_team = None;
@@ -2018,10 +2025,7 @@ impl MatchSimulation {
         let attack_sign = side.attack_sign(self.state.second_half_swapped());
         let y_sign = if spot.y >= Fp::ZERO { 1_i64 } else { -1_i64 };
 
-        let charge_norm = Fp::from_ratio(
-            charge_ticks.clamp(1, MAX_CHARGE_TICKS) as i64,
-            MAX_CHARGE_TICKS as i64,
-        );
+        let charge_norm = charge_norm_for(button, charge_ticks);
         let aim_norm = self.clamp_set_piece_aim(RestartKind::ThrowIn, side, spot, aim_dir);
 
         // Step thrower cleanly inside touchline after release so he immediately rejoins open play!
@@ -2178,10 +2182,7 @@ impl MatchSimulation {
         let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
         let y_sign = if spot.y >= Fp::ZERO { 1_i64 } else { -1_i64 };
 
-        let charge_norm = Fp::from_ratio(
-            charge_ticks.clamp(1, MAX_CHARGE_TICKS) as i64,
-            MAX_CHARGE_TICKS as i64,
-        );
+        let charge_norm = charge_norm_for(button, charge_ticks);
         let aim_norm = self.clamp_set_piece_aim(RestartKind::CornerKick, side, spot, aim_dir);
 
         let kicker_id = self.state.players[s_idx][taker_idx].footballer_id.clone();
@@ -3214,7 +3215,7 @@ impl MatchSimulation {
                                 );
                                 let next_finesse =
                                     finesse || is_finesse_pressed(side_input, side_dual_map);
-                                if !still_held || next_ticks >= MAX_CHARGE_TICKS {
+                                if !still_held || next_ticks >= max_charge_ticks_for(next_button) {
                                     p.action = PlayerActionState::Cooldown { ticks_left: 6 };
                                     new_cpu_charge = Some(0);
                                     kick_to_execute = Some((next_button, next_ticks, next_finesse, aim));
@@ -3940,10 +3941,7 @@ impl MatchSimulation {
         let s_idx = side.index();
         let is_5v5 = self.state.format.players_per_side <= 6;
         let ctrl_cfg = self.state.control_settings[s_idx];
-        let charge_norm = Fp::from_ratio(
-            charge_ticks.clamp(1, MAX_CHARGE_TICKS) as i64,
-            MAX_CHARGE_TICKS as i64,
-        );
+        let charge_norm = charge_norm_for(button, charge_ticks);
         let attack_sign = side.attack_sign(self.state.second_half_swapped());
         let half_len = self.state.format.half_length();
         let half_wid = self.state.format.half_width();
@@ -4085,7 +4083,9 @@ impl MatchSimulation {
             };
             let shot_assist = ctrl_cfg.shot_assist;
             let is_chip_shot = (button & BTN_LOB) != 0;
-            let is_low_driven = !is_chip_shot && (low_driven || charge_norm < Fp::from_milli(280));
+            // FIFA 10-12 had no low-driven shot: a tap is a placed finish. Low Driven is only the explicit
+            // FC-style double-tap latch (`BufferedAction::low_driven`).
+            let is_low_driven = !is_chip_shot && low_driven;
             let aim_toward_goal = aim_norm.x.mul(Fp::from_int(attack_sign as i32));
             let dx_goal = (opp_goal_x - kicker_pos.x).abs().max(Fp::from_milli(1_500));
             let opp_gk_y = self.state.players[side.opponent().index()][0].pos.y;
@@ -4109,12 +4109,17 @@ impl MatchSimulation {
                     // CPU `aim_norm` is already an exact world-space ray toward the open corner!
                     ray_y
                 } else if aim_norm.y.abs() < Fp::from_milli(160) && aim_toward_goal > Fp::from_milli(250) {
-                    if opp_gk_y.abs() > Fp::from_milli(320) {
-                        -Fp::from_int(opp_gk_y.signum_int())
-                            .mul(goal_half_w.mul(Fp::from_milli(660)))
+                    // Neutral stick: snap to the far corner away from the GK. If the GK is centred, pick the
+                    // far post across the shooter's body (opposite the shooter's lateral offset).
+                    let ref_y = if opp_gk_y.abs() > Fp::from_milli(320) {
+                        opp_gk_y
+                    } else if kicker_pos.y.abs() > Fp::from_milli(600) {
+                        kicker_pos.y
                     } else {
-                        Fp::ZERO
-                    }
+                        opp_gk_y - kicker_pos.y
+                    };
+                    let away_sign = if ref_y >= Fp::ZERO { Fp::NEG_ONE } else { Fp::ONE };
+                    away_sign.mul(goal_half_w.mul(Fp::from_milli(660)))
                 } else {
                     let frame_y = aim_norm
                         .y
@@ -4263,31 +4268,59 @@ impl MatchSimulation {
                 let low_vz = Fp::from_milli(320) + charge_norm.mul(Fp::from_milli(1_050));
                 let swerve = self.state.rng.range_milli(-480, 480);
                 (low_spd, low_vz, swerve, Fp::from_milli(980))
-            } else if charge_norm <= Fp::from_milli(840) {
-                let drv_spd = Fp::from_milli(base_speed_mm + charge_boost_mm).mul(power_keep);
-                let ft = dx_goal.div(drv_spd.max(Fp::from_int(10)));
-                let raw_drv_vz = Fp::from_milli(800) + charge_norm.mul(Fp::from_milli(3_850));
-                let max_bar_vz = ((self.state.format.goal_height() - Fp::from_milli(220) - launch_z)
-                    .div(ft)
-                    + Fp::from_milli(4_750).mul(ft))
-                .max(Fp::from_milli(1_250));
-                let drv_vz = if use_bar_ceiling {
-                    raw_drv_vz.min(max_bar_vz)
-                } else {
-                    raw_drv_vz
-                };
-                let swerve = self.state.rng.range_milli(-780, 780);
-                let dip_top = Fp::from_milli(1_750) + charge_norm.mul(Fp::from_milli(1_250));
-                (drv_spd, drv_vz, swerve, dip_top)
             } else {
-                let over_t = (charge_norm - Fp::from_milli(840)).mul(Fp::from_int(6));
-                let composure_sky = ((100_i64 - kicker_attrs.shooting as i64).max(4)) * 22;
-                let blast_spd = Fp::from_milli(base_speed_mm + charge_boost_mm + 800).mul(power_keep);
-                let blast_vz = Fp::from_milli(5_150)
-                    + over_t.mul(Fp::from_milli(2_750 + composure_sky))
-                    + turn_penalty.mul(Fp::from_milli(1_200));
-                let swerve = self.state.rng.range_milli(-1_250, 1_250);
-                (blast_spd, blast_vz, swerve, Fp::from_milli(1_450))
+                // Driven shot with a tuned, predictable red-bar overcharge (`> 84%` fill):
+                // vz is continuous across the threshold and blends linearly from the 84% drive up to a
+                // balloon that crosses the goal line `0.9 m + composure` over the bar at 100% fill,
+                // independent of shot distance (no RNG on the vertical axis).
+                let red_start = Fp::from_milli(840);
+                let goal_h = self.state.format.goal_height();
+                let vz_to_reach = |z_at_goal: Fp, ft: Fp| -> Fp {
+                    (z_at_goal - launch_z).div(ft) + Fp::from_milli(4_750).mul(ft)
+                };
+                let drive_vz_at = |c: Fp, spd: Fp| -> Fp {
+                    let ft = dx_goal.div(spd.max(Fp::from_int(10)));
+                    let raw = Fp::from_milli(800) + c.mul(Fp::from_milli(3_850));
+                    let max_bar = vz_to_reach(goal_h - Fp::from_milli(220), ft).max(Fp::from_milli(1_250));
+                    if use_bar_ceiling {
+                        raw.min(max_bar)
+                    } else {
+                        raw
+                    }
+                };
+                let drv_spd = Fp::from_milli(base_speed_mm + charge_boost_mm).mul(power_keep);
+                if charge_norm <= red_start {
+                    let drv_vz = drive_vz_at(charge_norm, drv_spd);
+                    let swerve = self.state.rng.range_milli(-780, 780);
+                    let dip_top = Fp::from_milli(1_750) + charge_norm.mul(Fp::from_milli(1_250));
+                    (drv_spd, drv_vz, swerve, dip_top)
+                } else {
+                    let over_frac = (charge_norm - red_start)
+                        .div(Fp::ONE - red_start)
+                        .clamp(Fp::ZERO, Fp::ONE);
+                    let blast_spd = drv_spd + over_frac.mul(Fp::from_milli(800)).mul(power_keep);
+                    let ft = dx_goal.div(blast_spd.max(Fp::from_int(10)));
+                    let edge_spd = (Fp::from_milli(base_speed_mm) + red_start.mul(Fp::from_milli(10_400)))
+                        .mul(power_keep);
+                    let edge_vz = drive_vz_at(red_start, edge_spd);
+                    let dip_top = Fp::from_milli(2_800) - over_frac.mul(Fp::from_milli(1_350));
+                    // Balloon target uses gravity + the vertical Magnus dip `step_free_ball_kinematics` applies.
+                    let spd_scale = blast_spd
+                        .div(Fp::from_milli(15_500))
+                        .clamp(Fp::from_milli(450), Fp::from_milli(1_380));
+                    let half_g_eff = (Fp::from_milli(9_810)
+                        + dip_top.mul(Fp::from_milli(720)).mul(spd_scale))
+                    .mul(Fp::HALF);
+                    let composure_sky_mm = ((100_i64 - kicker_attrs.shooting as i64).max(4)) * 12;
+                    let balloon_z = goal_h + Fp::from_milli(900 + composure_sky_mm);
+                    let balloon_vz = (balloon_z - launch_z).div(ft) + half_g_eff.mul(ft);
+                    let blast_vz = edge_vz
+                        + over_frac.mul((balloon_vz - edge_vz).max(Fp::ZERO))
+                        + turn_penalty.mul(Fp::from_milli(1_200));
+                    let swerve_mm = 780 + over_frac.mul(Fp::from_milli(470)).to_milli();
+                    let swerve = self.state.rng.range_milli(-swerve_mm, swerve_mm);
+                    (blast_spd, blast_vz, swerve, dip_top)
+                }
             };
 
             let flight_t = dx_goal.div(speed.max(Fp::from_int(8)));
@@ -4634,7 +4667,8 @@ impl MatchSimulation {
                 (Fp::from_milli(680) + solver_dist.mul(Fp::from_milli(34)) + charge_norm.mul(Fp::from_milli(220)))
                     .clamp(Fp::from_milli(780), Fp::from_milli(1_680))
             };
-            let (spd, lift) = solve_ballistic_lob_launch(solver_dist, launch_z, target_z, flight_t, spin_top);
+            let (spd, lift) =
+                solve_ballistic_lob_launch(solver_dist, launch_z, target_z, flight_t, spin_top, is_5v5);
             let whip_mag = if is_driven { 5_100 } else { 3_800 };
             pass_spin_side = if kicker_pos.y >= Fp::ZERO {
                 Fp::from_milli(-whip_mag * attack_sign)
@@ -4661,6 +4695,7 @@ impl MatchSimulation {
                 Fp::from_milli(280),
                 flight_t,
                 check_backspin,
+                is_5v5,
             );
             (
                 spd.clamp(Fp::from_milli(7_800), Fp::from_milli(22_000)),
@@ -4680,9 +4715,19 @@ impl MatchSimulation {
             (spd, Fp::ZERO, Fp::from_milli(350))
         } else {
             let blocker_zip = if bypassing_blocker { Fp::from_milli(2_600) } else { Fp::ZERO };
-            let target_arr = Fp::from_milli(5_200) + charge_norm.mul(Fp::from_milli(4_800));
+            let charged_arr = Fp::from_milli(5_200) + charge_norm.mul(Fp::from_milli(4_800));
+            // Assisted: power is scaled automatically by the receiver distance. The bar only adds pace up to a
+            // distance-based arrival cap (`4.2 m/s + 0.32 /s * d`), so a 3 m lay-off is never blasted.
+            let (target_arr, min_spd) = if assist_level == AssistLevel::Assisted {
+                (
+                    charged_arr.min(Fp::from_milli(4_200) + solver_dist.mul(Fp::from_milli(320))),
+                    Fp::from_milli(6_200),
+                )
+            } else {
+                (charged_arr, Fp::from_milli(8_200))
+            };
             let spd = (solve_ground_pass_speed(solver_dist, target_arr, is_5v5) + blocker_zip)
-                .clamp(Fp::from_milli(8_200), Fp::from_milli(22_800));
+                .clamp(min_spd, Fp::from_milli(22_800));
             let skim_vz = if solver_dist > Fp::from_milli(12_000) && charge_norm > Fp::from_milli(620) {
                 Fp::from_milli(220)
             } else {
@@ -6409,7 +6454,8 @@ impl MatchSimulation {
         // Consume any pre-buffered command (`input_buffer`) with its real recorded charge bar power, Low Driven latch & aim!
         if idx != 0 {
             if let Some(buffered) = self.state.input_buffer[s_idx].take() {
-                if buffered.charging && ball_z <= Fp::from_milli(1_050) && buffered.charge_ticks < MAX_CHARGE_TICKS {
+                let buf_max_ticks = max_charge_ticks_for(buffered.button);
+                if buffered.charging && ball_z <= Fp::from_milli(1_050) && buffered.charge_ticks < buf_max_ticks {
                     // Button is still held down on contact -> smoothly continue charging on the ball!
                     self.state.players[s_idx][idx].action = PlayerActionState::Charging {
                         button: buffered.button,
@@ -6419,8 +6465,11 @@ impl MatchSimulation {
                     };
                 } else {
                     self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 6 };
-                    let min_one_touch: u16 = if (buffered.button & BTN_SHOOT) != 0 { 6 } else { 5 };
-                    let eff_charge = buffered.charge_ticks.max(min_one_touch).min(MAX_CHARGE_TICKS);
+                    let min_one_touch: u16 = charge_units_to_ticks(
+                        if (buffered.button & BTN_SHOOT) != 0 { 6 } else { 5 },
+                        buffered.button,
+                    );
+                    let eff_charge = buffered.charge_ticks.max(min_one_touch).min(buf_max_ticks);
                     self.execute_kick(
                         side,
                         idx,
@@ -7324,34 +7373,75 @@ const fn is_pace_control_pressed(inp: InputFrame, dual_map: bool) -> bool {
     is_pace_control_bits(inp.buttons, dual_map)
 }
 
-/// Solves initial horizontal ground pass velocity `v0 = sqrt(v_arr^2 + 2 * a_eff * d)` matching `step_ball`'s
-/// exact Coulomb turf rolling resistance (`1.75 / 1.88 m/s^2`) + viscous grass-blade damping (`~0.18 s^-1`).
+/// Solves the launch speed of a ground pass that covers `dist` and arrives at `target_arrival_spd`,
+/// by integrating `step_free_ball_kinematics`'s rolling model *backwards* tick by tick:
+/// the forward step is `v' = (v - c*dt) * 0.997` (Coulomb turf resistance `c = 1.75 / 1.88 m/s^2`
+/// plus viscous grass damping `~0.18 s^-1`), then `x += v' * dt`. The inverse is exact for the
+/// discrete stepper (no `ln`/`sqrt` approximation), fully fixed-point and bounded to 10 s of roll.
 fn solve_ground_pass_speed(dist: Fp, target_arrival_spd: Fp, is_5v5: bool) -> Fp {
-    let a_eff = Fp::from_milli(if is_5v5 { 3_850 } else { 4_050 });
-    let v_arr_sq = target_arrival_spd.mul(target_arrival_spd);
-    let energy_term = a_eff.mul(Fp::from_int(2)).mul(dist.max(Fp::ZERO));
-    (v_arr_sq + energy_term).sqrt()
+    let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
+    let decel = Fp::from_milli(if is_5v5 { 1_750 } else { 1_880 }).mul(dt);
+    let keep = Fp::from_milli(997);
+    let dist = dist.max(Fp::ZERO);
+    let mut v = target_arrival_spd.max(decel + Fp::from_milli(1));
+    let mut covered = Fp::ZERO;
+    for _ in 0..(10 * TICKS_PER_SECOND) {
+        let step = v.mul(dt);
+        let v_prev = v.div(keep) + decel;
+        if covered + step >= dist {
+            // Fractional final tick: interpolate between this tick's speed and the previous one.
+            let frac = if step > Fp::ZERO {
+                (dist - covered).div(step).clamp(Fp::ZERO, Fp::ONE)
+            } else {
+                Fp::ZERO
+            };
+            return v + (v_prev - v).mul(frac);
+        }
+        covered += step;
+        v = v_prev;
+    }
+    v
 }
 
-/// Solves drag-compensated 3D ballistic launch `(v_xy, v_z)` for aerial crosses & lobs matching `step_ball`'s
-/// quadratic aerodynamic drag (`k_d = 0.014 m^-1`), gravity (`9.81 m/s^2`), and vertical Magnus force (`-0.72 * spin_top`).
+/// Solves `(v_xy, v_z)` for aerial crosses & lobs so the ball is `dist` downrange at height `target_z`
+/// after `flight_t`. An analytic drag/Magnus-compensated guess is refined by shooting: the exact shared
+/// `step_free_ball_kinematics` stepper (quadratic drag, gravity, vertical Magnus with spin decay) is run
+/// forward for `flight_t` and the launch is corrected (`v_xy *= dist / x_T`, `v_z += (z* - z_T) / t`).
+/// Four fixed iterations keep this deterministic and bounded (~4 x 120 stepper calls per kick).
 fn solve_ballistic_lob_launch(
     dist: Fp,
     launch_z: Fp,
     target_z: Fp,
     flight_t: Fp,
     spin_top: Fp,
+    is_5v5: bool,
 ) -> (Fp, Fp) {
     let t = flight_t.max(Fp::from_milli(350));
-    // First-order analytic inversion of quadratic air drag `d = (1/k_d) * ln(1 + k_d * v0 * t)`
+    // Initial guess: first-order analytic inversion of drag + effective gravity incl. vertical Magnus.
     let drag_comp = (Fp::ONE + dist.mul(Fp::from_milli(7))).clamp(Fp::ONE, Fp::from_milli(1_320));
-    let v_xy = dist.div(t).mul(drag_comp);
-    // Effective vertical acceleration combining gravity (`9.81`) and vertical Magnus (`+0.72 * spin_top`; backspin < 0 lifts!)
+    let mut v_xy = dist.div(t).mul(drag_comp);
     let g_eff = (Fp::from_milli(9_810) + spin_top.mul(Fp::from_milli(720)))
         .clamp(Fp::from_milli(6_800), Fp::from_milli(12_800));
-    let raw_vz = (target_z - launch_z).div(t) + g_eff.mul(t).mul(Fp::HALF);
-    // Mild vertical air-drag compensation (`+4%`)
-    let v_z = raw_vz.mul(Fp::from_milli(1_040));
+    let mut v_z =
+        ((target_z - launch_z).div(t) + g_eff.mul(t).mul(Fp::HALF)).mul(Fp::from_milli(1_040));
+
+    let n_ticks = (t.mul(Fp::from_int(TICKS_PER_SECOND as i32)).to_milli() + 500) / 1_000;
+    let n_ticks = n_ticks.clamp(1, 4 * TICKS_PER_SECOND as i64);
+    for _ in 0..4 {
+        let mut pos = Vec3::new(Fp::ZERO, Fp::ZERO, launch_z);
+        let mut vel = Vec3::new(v_xy, Fp::ZERO, v_z);
+        let mut spin_side = Fp::ZERO;
+        let mut spin_t = spin_top;
+        for _ in 0..n_ticks {
+            step_free_ball_kinematics(&mut pos, &mut vel, &mut spin_side, &mut spin_t, is_5v5);
+        }
+        if pos.x > Fp::from_milli(500) {
+            v_xy = v_xy
+                .mul(dist.div(pos.x))
+                .clamp(Fp::from_milli(1_000), Fp::from_milli(40_000));
+        }
+        v_z = (v_z + (target_z - pos.z).div(t)).clamp(Fp::from_milli(-2_000), Fp::from_milli(16_000));
+    }
     (v_xy, v_z)
 }
 
@@ -7362,6 +7452,9 @@ const _: fn(Fp, Fp) -> u16 = atan2_bam;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::input::{
+        charge_permille_for, LOB_CHARGE_TICKS, PASS_CHARGE_TICKS, SHOT_CHARGE_TICKS,
+    };
     use crate::config::{CpuDifficulty, MatchFormat, SideController};
 
     #[test]
@@ -8393,7 +8486,8 @@ mod tests {
         let low_vz = sim.state().ball.vel.z;
 
         setup_shooter(&mut sim);
-        for _ in 0..27 {
+        // Hold past the full 54-tick (900 ms) shot bar so it auto-fires at 100% red-bar overcharge.
+        for _ in 0..60 {
             sim.tick(&[
                 InputFrame {
                     move_x: 127,
@@ -10931,8 +11025,425 @@ mod tests {
             "GK Goal Kick must never trigger a self-trap double-touch foul"
         );
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // Area B audit: power bars, input buffer, assistance blending, defending, analog sprint, kick physics
+    // ---------------------------------------------------------------------------------------------
+
+    /// Clean 5v5 "kick lab": human vs human, open play, everybody parked far away from the action.
+    fn kick_lab(seed: u64) -> MatchSimulation {
+        let mut snap = FixtureSnapshot::sample_five_a_side(seed);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut s = MatchSimulation::new(&snap).unwrap();
+        s.state.phase = MatchPhase::OpenPlay;
+        s.state.controlled_idx = [1, 1];
+        for (i, p) in s.state.players[0].iter_mut().enumerate() {
+            p.pos = Vec2::from_milli(-24_000, -15_000 + (i as i64) * 600);
+            p.vel = Vec2::ZERO;
+            p.facing_bam = 0;
+        }
+        for (i, p) in s.state.players[1].iter_mut().enumerate() {
+            p.pos = Vec2::from_milli(24_000, 15_000 - (i as i64) * 600);
+            p.vel = Vec2::ZERO;
+        }
+        s
+    }
+
+    fn place(s: &mut MatchSimulation, side: usize, idx: usize, x_mm: i64, y_mm: i64) {
+        let p = &mut s.state.players[side][idx];
+        p.pos = Vec2::from_milli(x_mm, y_mm);
+        p.vel = Vec2::ZERO;
+        p.facing_bam = 0;
+    }
+
+    fn hold(btns: u16, mx: i8, my: i8) -> InputFrame {
+        InputFrame {
+            move_x: mx,
+            move_y: my,
+            buttons: btns,
+            ..InputFrame::IDLE
+        }
+    }
+
+    /// Flies the current ball with the shared stepper until it crosses `x_line`; returns `(y, z)` there.
+    fn fly_ball_to_x(s: &MatchSimulation, x_line: Fp) -> (Fp, Fp) {
+        let is_5v5 = s.state.format.players_per_side <= 6;
+        let mut pos = s.state.ball.pos;
+        let mut vel = s.state.ball.vel;
+        let mut ss = s.state.ball.spin_side;
+        let mut st = s.state.ball.spin_top;
+        for _ in 0..240 {
+            step_free_ball_kinematics(&mut pos, &mut vel, &mut ss, &mut st, is_5v5);
+            if pos.x >= x_line {
+                break;
+            }
+        }
+        (pos.y, pos.z)
+    }
+
+    #[test]
+    fn power_bar_fill_times_differ_per_action_and_hud_matches_sim() {
+        // Hold each kick button well past full: it must auto-fire exactly when its own bar is full.
+        let release_tick = |btn: u16| -> (usize, u16) {
+            let mut s = kick_lab(8101);
+            place(&mut s, 0, 1, -10_000, 0);
+            place(&mut s, 0, 2, 4_000, 0);
+            s.state.ball.owner = Some((TeamSide::Home, 1));
+            s.state.ball.pos = Vec3::from_milli(-9_650, 0, 0);
+            let mut hud_mid = 0;
+            for t in 1..=80 {
+                s.tick(&[hold(btn, 0, 0), InputFrame::IDLE]);
+                if let PlayerActionState::Charging { button, ticks, .. } = s.state().players[0][1].action {
+                    let hud = s.state().players[0][1].charge_ratio_permille();
+                    assert_eq!(hud, charge_permille_for(button, ticks), "HUD bar must equal sim charge");
+                    if t == 15 {
+                        hud_mid = hud;
+                    }
+                }
+                if s.state().ball.owner.is_none() {
+                    return (t, hud_mid);
+                }
+            }
+            (usize::MAX, hud_mid)
+        };
+        let (pass_t, pass_hud) = release_tick(BTN_PASS);
+        let (lob_t, _) = release_tick(BTN_LOB);
+        let (shot_t, shot_hud) = release_tick(BTN_SHOOT);
+        assert_eq!(pass_t, PASS_CHARGE_TICKS as usize, "pass bar full at 500 ms");
+        assert_eq!(lob_t, LOB_CHARGE_TICKS as usize, "lob/cross bar full at 600 ms");
+        assert_eq!(shot_t, SHOT_CHARGE_TICKS as usize, "shot bar full at 900 ms");
+        assert!(pass_hud > shot_hud + 150, "pass bar fills faster than shot bar (pass={pass_hud}, shot={shot_hud})");
+
+        // Pre-contact buffered charge exports the same per-action permille the sim will use.
+        let buf = BufferedAction {
+            button: BTN_SHOOT,
+            aim: Vec2::new(Fp::ONE, Fp::ZERO),
+            finesse: false,
+            low_driven: false,
+            charge_ticks: 27,
+            charging: true,
+            ttl_ticks: INPUT_BUFFER_TTL_TICKS,
+        };
+        assert_eq!(buf.charge_ratio_permille(), 500);
+        assert_eq!(charge_permille_for(BTN_PASS, 15), 500);
+        assert_eq!(charge_units_to_ticks(11, BTN_SHOOT), 27);
+        assert_eq!(charge_units_to_ticks(22, BTN_LOB), LOB_CHARGE_TICKS);
+    }
+
+    #[test]
+    fn buffered_pass_fires_on_contact_with_recorded_power_and_aim() {
+        // Ball rolls onto stationary #1; the user taps/holds Pass before contact and RELEASES before contact.
+        let run = |hold_ticks: usize| -> (Fp, Vec2, usize, usize, u16) {
+            let mut s = kick_lab(8102);
+            s.state.control_settings[0].pass_assist = AssistLevel::Manual;
+            place(&mut s, 0, 1, 0, 0);
+            s.state.ball.owner = None;
+            s.state.ball.pos = Vec3::from_milli(-2_900, 0, 0);
+            s.state.ball.vel = Vec3::from_milli(9_000, 0, 0);
+            s.state.ball.last_touch_team = Some(TeamSide::Home);
+            s.state.ball.last_touch_player = Some((TeamSide::Home, 2));
+            let aim_in = InputFrame {
+                aim_x: 90,
+                aim_y: 90,
+                ..InputFrame::IDLE
+            };
+            let mut recorded_charge = 0;
+            for t in 0..40 {
+                let btns = if t < hold_ticks { BTN_PASS } else { 0 };
+                s.tick(&[InputFrame { buttons: btns, ..aim_in }, InputFrame::IDLE]);
+                if let Some(b) = s.state().input_buffer[0] {
+                    assert_eq!(b.button & !CHARGE_MASK, 0, "buffer may only hold kick buttons");
+                    recorded_charge = b.charge_ticks;
+                }
+                if s.state().ball.last_touch_player == Some((TeamSide::Home, 1))
+                    && s.state().ball.owner.is_none()
+                {
+                    let v = s.state().ball.vel.xy();
+                    assert!(
+                        matches!(s.state().players[0][1].action, PlayerActionState::Cooldown { .. }),
+                        "buffer must fire a pass, never a tackle/contain"
+                    );
+                    return (v.len(), v, t, hold_ticks, recorded_charge);
+                }
+            }
+            panic!("buffered pass never fired (hold={hold_ticks})");
+        };
+        let (spd_a, dir_a, contact_a, hold_a, charge_a) = run(9);
+        let (spd_b, _, contact_b, hold_b, charge_b) = run(4);
+        assert!(contact_a >= hold_a && contact_b >= hold_b, "button must already be up at contact");
+        assert!(
+            contact_a - hold_a <= INPUT_BUFFER_TTL_TICKS as usize,
+            "fires inside the 250 ms window"
+        );
+        assert_eq!(charge_a, 9, "release locks the recorded power (no further charging)");
+        assert_eq!(charge_b, 4);
+        // Recorded aim (45 deg) honoured on Manual.
+        let ratio = dir_a.y.div(dir_a.x);
+        assert!(
+            ratio > Fp::from_milli(850) && ratio < Fp::from_milli(1_180),
+            "buffered pass must follow recorded 45 deg aim (vy/vx={ratio:?})"
+        );
+        // Recorded power: the buffered kick equals a direct kick with the same charge (one stepper tick later).
+        let mut r = kick_lab(8102);
+        r.state.control_settings[0].pass_assist = AssistLevel::Manual;
+        place(&mut r, 0, 1, 0, 0);
+        r.execute_kick(TeamSide::Home, 1, BTN_PASS, 9, false, false, Vec2::from_milli(707, 707));
+        let ref_spd = r.state().ball.vel.xy().len();
+        assert!(
+            (spd_a - ref_spd).abs() < Fp::from_milli(250),
+            "buffered pass must use recorded charge power (buffered={spd_a:?}, direct={ref_spd:?})"
+        );
+        assert!(
+            spd_a > spd_b + Fp::from_milli(600),
+            "more recorded charge must mean more power (9={spd_a:?}, 4-> min one-touch={spd_b:?})"
+        );
+    }
+
+    #[test]
+    fn pass_assistance_manual_semi_assisted_direction_and_power() {
+        // Teammate 14 m away, 30 deg off the stick aim (+X).
+        let kick = |assist: AssistLevel, charge: u16, mate: (i64, i64)| -> Vec2 {
+            let mut s = kick_lab(8103);
+            s.state.control_settings[0].pass_assist = assist;
+            place(&mut s, 0, 1, -10_000, 0);
+            place(&mut s, 0, 2, mate.0, mate.1);
+            s.state.players[0][1].attributes.passing = 99;
+            s.state.ball.pos = Vec3::from_milli(-9_650, 0, 0);
+            s.execute_kick(TeamSide::Home, 1, BTN_PASS, charge, false, false, Vec2::new(Fp::ONE, Fp::ZERO));
+            s.state().ball.vel.xy()
+        };
+        let mate30 = (-10_000 + 12_124, 7_000);
+        let manual = kick(AssistLevel::Manual, 15, mate30);
+        let semi = kick(AssistLevel::Semi, 15, mate30);
+        let assisted = kick(AssistLevel::Assisted, 15, mate30);
+        let tan = |v: Vec2| v.y.div(v.x);
+        // tan(30 deg) = 0.577, tan(15 deg) = 0.268
+        assert!(tan(manual).abs() < Fp::from_milli(60), "Manual stays on the raw stick (~30 deg off mate): {:?}", tan(manual));
+        assert!(
+            tan(assisted) > Fp::from_milli(500) && tan(assisted) < Fp::from_milli(660),
+            "Assisted snaps onto the teammate: {:?}",
+            tan(assisted)
+        );
+        assert!(
+            tan(semi) > Fp::from_milli(180) && tan(semi) < Fp::from_milli(400),
+            "Semi lands in between: {:?}",
+            tan(semi)
+        );
+        assert!(
+            (semi.len() - manual.len()).abs() < Fp::from_milli(5),
+            "Semi keeps power manual (== Manual for equal charge): semi={:?} manual={:?}",
+            semi.len(),
+            manual.len()
+        );
+
+        // Assisted scales power by distance; a 3 m pass is never blasted even on a full bar.
+        let short_full = kick(AssistLevel::Assisted, PASS_CHARGE_TICKS, (-7_000, 0)).len();
+        let short_tap = kick(AssistLevel::Assisted, 2, (-7_000, 0)).len();
+        let long_tap = kick(AssistLevel::Assisted, 2, (10_000, 0)).len();
+        assert!(short_full < Fp::from_milli(8_000), "3 m assisted full-bar pass must be soft: {short_full:?}");
+        assert!(short_tap < Fp::from_milli(7_200), "3 m assisted tap: {short_tap:?}");
+        assert!(
+            long_tap > short_full + Fp::from_milli(4_000),
+            "Assisted auto-scales power by distance even on a tap (20 m={long_tap:?}, 3 m={short_full:?})"
+        );
+        // Manual power ignores the receiver distance entirely.
+        let man_short = kick(AssistLevel::Manual, 10, (-7_000, 0)).len();
+        let man_long = kick(AssistLevel::Manual, 10, (10_000, 0)).len();
+        assert_eq!(man_short, man_long, "Manual power must come only from the bar");
+    }
+
+    #[test]
+    fn shot_assistance_far_corner_blend_and_predictable_overcharge() {
+        let shoot = |assist: AssistLevel, charge: u16, aim: Vec2, gk_y: i64, kick_x_back: i64| -> MatchSimulation {
+            let mut s = kick_lab(8104);
+            let half_len = s.state.format.pitch_length_mm / 2;
+            s.state.control_settings[0].shot_assist = assist;
+            place(&mut s, 0, 4, half_len - kick_x_back, 0);
+            s.state.players[0][4].attributes.shooting = 95;
+            place(&mut s, 1, 0, half_len - 600, gk_y);
+            s.state.ball.pos = Vec3::from_milli(half_len - kick_x_back + 350, 0, 0);
+            s.execute_kick(TeamSide::Home, 4, BTN_SHOOT, charge, false, false, aim);
+            s
+        };
+        let fwd = Vec2::new(Fp::ONE, Fp::ZERO);
+        let half_len_of = |s: &MatchSimulation| s.state.format.half_length();
+        let ghw = kick_lab(8104).state.format.goal_half_width();
+
+        // Neutral stick, Assisted: far corner away from the GK.
+        for gk_y in [900_i64, -900] {
+            let s = shoot(AssistLevel::Assisted, 30, fwd, gk_y, 12_000);
+            let (y, _) = fly_ball_to_x(&s, half_len_of(&s));
+            assert!(
+                y.mul(Fp::from_int(gk_y.signum() as i32)) < -ghw.mul(Fp::from_milli(250)),
+                "assisted neutral shot must go to the corner away from GK (gk_y={gk_y}, y={y:?})"
+            );
+            assert!(y.abs() < ghw, "assisted neutral shot stays inside the posts ({y:?})");
+        }
+
+        // Wide diagonal aim: Manual raw > Semi blend > Assisted inside the frame.
+        let diag = Vec2::from_milli(780, 625).normalize_or_zero();
+        let y_at = |a: AssistLevel| {
+            let s = shoot(a, 30, diag, 0, 12_000);
+            fly_ball_to_x(&s, half_len_of(&s)).0
+        };
+        let (ym, ys, ya) = (y_at(AssistLevel::Manual), y_at(AssistLevel::Semi), y_at(AssistLevel::Assisted));
+        assert!(ym > ys + Fp::from_milli(1_000) && ys > ya + Fp::from_milli(500), "blend order (m={ym:?}, s={ys:?}, a={ya:?})");
+        assert!(ya.abs() < ghw, "Assisted keeps the shot on frame ({ya:?})");
+
+        // Tuned overcharge: 83% stays under the bar, the red zone rises monotonically, 100% balloons over it.
+        for assist in [AssistLevel::Assisted, AssistLevel::Manual] {
+            for back in [11_000_i64, 18_000] {
+                let z_at = |c: u16| {
+                    let s = shoot(assist, c, fwd, 2_600, back);
+                    fly_ball_to_x(&s, half_len_of(&s)).1
+                };
+                let gh = kick_lab(8104).state.format.goal_height();
+                let (z83, z92, z100) = (z_at(45), z_at(50), z_at(SHOT_CHARGE_TICKS));
+                assert!(z83 < gh, "{assist:?} {back}mm: 83% bar must stay under the bar (z={z83:?})");
+                assert!(z92 > z83 && z100 > z92, "{assist:?} {back}mm: overcharge must rise monotonically ({z83:?},{z92:?},{z100:?})");
+                assert!(
+                    z100 > gh + Fp::from_milli(400),
+                    "{assist:?} {back}mm: full red bar must balloon over the bar (z={z100:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn kick_solvers_match_the_ball_stepper() {
+        // Ground pass: launch speed arrives at the requested speed after exactly `d` metres.
+        for is_5v5 in [true, false] {
+            for d_mm in [3_000_i64, 8_000, 15_000, 25_000, 35_000] {
+                for va_mm in [5_200_i64, 10_000, 15_200] {
+                    let v0 = solve_ground_pass_speed(Fp::from_milli(d_mm), Fp::from_milli(va_mm), is_5v5);
+                    let mut pos = Vec3::ZERO;
+                    let mut vel = Vec3::new(v0, Fp::ZERO, Fp::ZERO);
+                    let (mut ss, mut st) = (Fp::ZERO, Fp::ZERO);
+                    while pos.x < Fp::from_milli(d_mm) && vel.x > Fp::ZERO {
+                        step_free_ball_kinematics(&mut pos, &mut vel, &mut ss, &mut st, is_5v5);
+                    }
+                    assert!(
+                        (vel.x - Fp::from_milli(va_mm)).abs() < Fp::from_milli(120),
+                        "ground pass d={d_mm} va={va_mm}: arrived at {:?}",
+                        vel.x
+                    );
+                }
+            }
+        }
+        // Lob / cross: downrange distance and height after the requested flight time.
+        for (d_mm, t_ms, spin) in [(14_000_i64, 1_250_i64, -2_200_i64), (24_000, 1_600, -1_750), (30_000, 1_500, -1_250)] {
+            let (vxy, vz) = solve_ballistic_lob_launch(
+                Fp::from_milli(d_mm),
+                Fp::ZERO,
+                Fp::from_milli(280),
+                Fp::from_milli(t_ms),
+                Fp::from_milli(spin),
+                false,
+            );
+            let mut pos = Vec3::ZERO;
+            let mut vel = Vec3::new(vxy, Fp::ZERO, vz);
+            let (mut ss, mut st) = (Fp::ZERO, Fp::from_milli(spin));
+            for _ in 0..((t_ms * 60 + 500) / 1_000) {
+                step_free_ball_kinematics(&mut pos, &mut vel, &mut ss, &mut st, false);
+            }
+            assert!(
+                (pos.x - Fp::from_milli(d_mm)).abs() < Fp::from_milli(400)
+                    && (pos.z - Fp::from_milli(280)).abs() < Fp::from_milli(300),
+                "lob d={d_mm}: at t the ball is at x={:?} z={:?}",
+                pos.x,
+                pos.z
+            );
+        }
+    }
+
+    #[test]
+    fn analog_sprint_half_throttle_and_stick_magnitude_scale_speed() {
+        let speed = |mx: i8, btns: u16, raw: u8| -> Fp {
+            let mut s = kick_lab(8105);
+            place(&mut s, 0, 1, -14_000, 0);
+            s.state.ball.pos = Vec3::from_milli(20_000, 12_000, 0);
+            let res = InputFrame::encode_gameplay_reserved(AutoSwitchMode::Manual, raw);
+            for _ in 0..60 {
+                s.tick(&[
+                    InputFrame {
+                        move_x: mx,
+                        buttons: btns,
+                        reserved: res,
+                        ..InputFrame::IDLE
+                    },
+                    InputFrame::IDLE,
+                ]);
+            }
+            s.state().players[0][1].vel.len()
+        };
+        let jog = speed(127, 0, 0);
+        let half = speed(127, BTN_SPRINT, 64);
+        let full = speed(127, BTN_SPRINT, 127);
+        assert!(
+            half > jog + Fp::from_milli(300) && half < full - Fp::from_milli(300),
+            "50% analog sprint must sit strictly between jog and full sprint (jog={jog:?}, half={half:?}, full={full:?})"
+        );
+        let walk = speed(45, 0, 0);
+        assert!(
+            walk < jog.mul(Fp::from_milli(450)) && walk > Fp::from_milli(800),
+            "360 deg analog stick magnitude scales speed (walk={walk:?}, jog={jog:?})"
+        );
+    }
+
+    #[test]
+    fn jockey_strafes_slower_facing_ball_and_teammate_contain_stamina_cools_down() {
+        // Jockey (LT) off the ball: reduced top speed while facing the ball.
+        let run = |btns: u16| -> (Fp, u16, Vec2, Vec2) {
+            let mut s = kick_lab(8106);
+            s.state.controlled_idx = [2, 1];
+            place(&mut s, 0, 2, 0, 0);
+            s.state.ball.owner = Some((TeamSide::Home, 2));
+            s.state.ball.pos = Vec3::from_milli(320, 0, 0);
+            place(&mut s, 1, 1, 4_000, 0);
+            for _ in 0..40 {
+                s.tick(&[InputFrame::IDLE, hold(btns, 0, 127)]);
+            }
+            let p = &s.state().players[1][1];
+            (p.vel.len(), p.facing_bam, p.pos, s.state().ball.pos.xy())
+        };
+        let (free_spd, _, _, _) = run(0);
+        let (jockey_spd, jockey_face, jpos, ball) = run(BTN_JOCKEY);
+        assert!(
+            jockey_spd < free_spd.mul(Fp::from_milli(900)),
+            "jockey must be slower than a normal run (jockey={jockey_spd:?}, free={free_spd:?})"
+        );
+        let to_ball = (ball - jpos).to_bam();
+        assert!(
+            angle_diff_bam(jockey_face, to_ball).unsigned_abs() < 6_000,
+            "jockeying defender keeps facing the ball while strafing"
+        );
+
+        // Teammate Contain stamina: depletes -> 2.5 s cooldown -> another presser takes over -> recovers.
+        let mut s = kick_lab(8106);
+        s.state.controlled_idx = [2, 3];
+        place(&mut s, 0, 2, 6_000, 0);
+        s.state.ball.owner = Some((TeamSide::Home, 2));
+        s.state.ball.pos = Vec3::from_milli(6_320, 0, 0);
+        place(&mut s, 1, 3, 12_000, 8_000);
+        place(&mut s, 1, 1, 10_500, 500);
+        place(&mut s, 1, 2, 13_000, -3_000);
+        s.tick(&[InputFrame::IDLE, hold(BTN_TEAMMATE_CONTAIN, 0, 0)]);
+        let first = s.state().teammate_contain_idx[1].expect("RB summons a second-man presser");
+        s.state.players[1][first].contain_stamina = 3;
+        for _ in 0..12 {
+            s.tick(&[InputFrame::IDLE, hold(BTN_TEAMMATE_CONTAIN, 0, 0)]);
+        }
+        assert_eq!(s.state().players[1][first].contain_stamina, 0, "presser stamina drains while RB held");
+        assert!(s.state().players[1][first].contain_cooldown > 100, "depleted presser enters cooldown");
+        assert!(
+            s.state().teammate_contain_idx[1].is_some_and(|i| i != first),
+            "another teammate takes over the second-man press"
+        );
+        for _ in 0..200 {
+            s.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+        }
+        assert_eq!(s.state().players[1][first].contain_cooldown, 0);
+        assert!(s.state().players[1][first].contain_stamina > 0, "contain stamina regenerates after cooldown");
+    }
 }
-
-
-
-

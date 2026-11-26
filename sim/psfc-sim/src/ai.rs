@@ -2,8 +2,8 @@
 
 use crate::config::{CpuDifficulty, TeamSide};
 use crate::input::{
-    InputFrame, BTN_CONTAIN, BTN_FINESSE, BTN_JOCKEY, BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_SKILL,
-    BTN_SPRINT, BTN_TACKLE, BTN_THROUGH,
+    charge_units_to_ticks, InputFrame, BTN_CONTAIN, BTN_FINESSE, BTN_JOCKEY, BTN_LOB, BTN_PASS,
+    BTN_SHOOT, BTN_SKILL, BTN_SPRINT, BTN_TACKLE, BTN_THROUGH,
 };
 use crate::math::{Fp, Vec2, Vec3};
 use crate::sim::step_free_ball_kinematics;
@@ -401,6 +401,7 @@ pub fn compute_goalkeeper_intent(
     }
 }
 
+/// Returns `(button, charge_ticks, aim)`; `charge_ticks` is already scaled to the button's power bar.
 /// Scans the pitch for the safest GK outlet pass or lofted clearance so the Goalkeeper
 /// never distributes blindly into an opposing striker standing in the box.
 pub fn choose_safe_gk_distribution(state: &MatchState, side: TeamSide) -> (u16, u16, Vec2) {
@@ -463,12 +464,12 @@ pub fn choose_safe_gk_distribution(state: &MatchState, side: TeamSide) -> (u16, 
 
     if let Some((dir, dist, _)) = best_short {
         let charge = desired_pass_charge_ticks(dist, is_5v5, false) as u16;
-        return (BTN_PASS, charge.clamp(6, 18), dir);
+        return (BTN_PASS, charge_units_to_ticks(charge.clamp(6, 18), BTN_PASS), dir);
     }
 
     if let Some((dir, dist, _)) = best_long {
         let charge = desired_pass_charge_ticks(dist, is_5v5, true) as u16;
-        return (BTN_LOB, charge.clamp(11, 19), dir);
+        return (BTN_LOB, charge_units_to_ticks(charge.clamp(11, 19), BTN_LOB), dir);
     }
 
     let flank_y = if gk_pos.y >= Fp::ZERO {
@@ -478,7 +479,7 @@ pub fn choose_safe_gk_distribution(state: &MatchState, side: TeamSide) -> (u16, 
     };
     (
         BTN_LOB,
-        14,
+        charge_units_to_ticks(14, BTN_LOB),
         Vec2::new(forward_vec.x, flank_y).normalize_or_zero(),
     )
 }
@@ -1304,7 +1305,7 @@ pub fn generate_cpu_input(
                 } else {
                     Vec2::from_bam(taker.facing_bam, Fp::ONE)
                 };
-                if ticks >= target_charge {
+                if ticks >= charge_units_to_ticks(target_charge, button) {
                     return vec_and_buttons_to_input(hold_aim, hold_aim, 0);
                 }
                 return vec_and_buttons_to_input(hold_aim, hold_aim, button);
@@ -1526,7 +1527,7 @@ pub fn generate_cpu_input(
         };
         let glide_dir = evade_stride(base_glide);
         let hold_btns = if finesse { button | BTN_FINESSE } else { button };
-        if ticks >= target_charge {
+        if ticks >= charge_units_to_ticks(target_charge, button) {
             return vec_and_buttons_to_input(glide_dir, hold_aim, 0);
         } else {
             return vec_and_buttons_to_input(glide_dir, hold_aim, hold_btns);

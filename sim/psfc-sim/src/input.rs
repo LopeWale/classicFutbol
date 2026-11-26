@@ -31,6 +31,46 @@ pub const RESERVED_SETTINGS_FLAG: u16 = 0x4000;
 /// (`BTN_FINESSE` / `BTN_PACE_CONTROL` explicitly separated from defensive `BTN_JOCKEY`).
 pub const RESERVED_DUAL_MAP_FLAG: u16 = 0x0800;
 
+/// Legacy single-scale power-bar resolution (`22` ticks = 367 ms). AI planning tables, set-piece
+/// default deliveries and `ai::desired_pass_charge_ticks` are expressed in these "charge units";
+/// convert them into per-action ticks with [`charge_units_to_ticks`].
+pub const CHARGE_UNITS_FULL: u16 = 22;
+/// Ground pass / through ball power bar: full in 30 ticks (500 ms at 60 Hz).
+pub const PASS_CHARGE_TICKS: u16 = 30;
+/// Lob / cross / lofted through power bar: full in 36 ticks (600 ms).
+pub const LOB_CHARGE_TICKS: u16 = 36;
+/// Shot (incl. chip / finesse / low driven) power bar: full in 54 ticks (900 ms).
+pub const SHOT_CHARGE_TICKS: u16 = 54;
+
+/// Ticks needed to fill the power bar for the kick `button` (shot > lob/cross > pass/through).
+#[inline]
+pub const fn max_charge_ticks_for(button: u16) -> u16 {
+    if (button & BTN_SHOOT) != 0 {
+        SHOT_CHARGE_TICKS
+    } else if (button & BTN_LOB) != 0 {
+        LOB_CHARGE_TICKS
+    } else {
+        PASS_CHARGE_TICKS
+    }
+}
+
+/// Normalised power-bar fill for `ticks` held on `button`, in permille (`0..=1000`).
+/// This is the single source of truth for both `execute_kick` power and the HUD bar.
+#[inline]
+pub const fn charge_permille_for(button: u16, ticks: u16) -> u16 {
+    let max = max_charge_ticks_for(button) as u32;
+    let t = if (ticks as u32) > max { max } else { ticks as u32 };
+    ((t * 1000) / max) as u16
+}
+
+/// Converts legacy 22-unit charge targets (AI / set-piece tables) into per-action ticks (rounded up).
+#[inline]
+pub const fn charge_units_to_ticks(units: u16, button: u16) -> u16 {
+    let max = max_charge_ticks_for(button) as u32;
+    let u = if units > CHARGE_UNITS_FULL { CHARGE_UNITS_FULL } else { units } as u32;
+    (u * max).div_ceil(CHARGE_UNITS_FULL as u32) as u16
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InputFrame {
     pub move_x: i8,
