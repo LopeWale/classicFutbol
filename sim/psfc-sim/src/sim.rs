@@ -904,7 +904,7 @@ impl MatchSimulation {
         let prog_gain = (self.state.ball.pos.x.to_milli() - adv.start_ball_x.to_milli()) * victim_sign;
 
         if self.state.ball.owner.map(|(s, _)| s) == Some(adv.fouling_side) {
-            if adv.pending_yellow && !self.state.players[adv.fouling_side.index()][adv.fouler_idx].sent_off {
+            if adv.pending_yellow {
                 self.issue_yellow_card(adv.fouling_side, adv.fouler_idx, &adv.fouler_id, &adv.fouler_name);
             }
             self.emit_event(
@@ -921,7 +921,7 @@ impl MatchSimulation {
         let materialized = self.state.ball.owner.map(|(s, _)| s) == Some(adv.victim_side)
             && prog_gain >= 7_500;
         if materialized || adv.ticks_left <= 1 {
-            if adv.pending_yellow && !self.state.players[adv.fouling_side.index()][adv.fouler_idx].sent_off {
+            if adv.pending_yellow {
                 self.issue_yellow_card(adv.fouling_side, adv.fouler_idx, &adv.fouler_id, &adv.fouler_name);
             }
             return;
@@ -938,27 +938,75 @@ impl MatchSimulation {
         fouler_id: &str,
         fouler_name: &str,
     ) {
-        self.state.players[fouling_side.index()][fouler_idx].yellow_cards += 1;
-        self.state.player_stats[fouling_side.index()][fouler_idx].yellow_cards += 1;
-        self.emit_event(
-            MatchEventType::YellowCard,
-            fouling_side,
-            Some(fouler_id.to_string()),
-            None,
-            format!("Yellow card for {fouler_name}"),
-        );
-        if self.state.players[fouling_side.index()][fouler_idx].yellow_cards >= 2 {
-            self.state.players[fouling_side.index()][fouler_idx].sent_off = true;
-            self.state.players[fouling_side.index()][fouler_idx].pos =
-                Vec2::from_milli(0, self.state.format.pitch_width_mm);
-            self.state.player_stats[fouling_side.index()][fouler_idx].red_cards += 1;
+        let s_idx = fouling_side.index();
+        let on_pitch_slot = if !fouler_id.is_empty() {
+            self.state.players[s_idx]
+                .iter()
+                .position(|p| p.footballer_id == fouler_id)
+        } else {
+            (fouler_idx < self.state.players[s_idx].len()).then_some(fouler_idx)
+        };
+
+        if let Some(slot) = on_pitch_slot {
+            if self.state.players[s_idx][slot].sent_off {
+                return;
+            }
+            self.state.players[s_idx][slot].yellow_cards += 1;
+            self.state.player_stats[s_idx][slot].yellow_cards += 1;
             self.emit_event(
-                MatchEventType::RedCard,
+                MatchEventType::YellowCard,
                 fouling_side,
                 Some(fouler_id.to_string()),
                 None,
-                format!("Second yellow — {fouler_name} sent off"),
+                format!("Yellow card for {fouler_name}"),
             );
+            if self.state.players[s_idx][slot].yellow_cards >= 2 {
+                self.state.players[s_idx][slot].sent_off = true;
+                self.state.players[s_idx][slot].pos =
+                    Vec2::from_milli(0, self.state.format.pitch_width_mm);
+                self.state.player_stats[s_idx][slot].red_cards += 1;
+                self.emit_event(
+                    MatchEventType::RedCard,
+                    fouling_side,
+                    Some(fouler_id.to_string()),
+                    None,
+                    format!("Second yellow — {fouler_name} sent off"),
+                );
+            }
+        } else if !fouler_id.is_empty() {
+            // Fouler was substituted off during the advantage window: book the outgoing footballer in `archived_player_stats`!
+            let mut already_dismissed = false;
+            let mut second_yellow = false;
+            if let Some(st) = self.state.player_stats_mut_by_id(fouling_side, fouler_id) {
+                if st.red_cards >= 1 {
+                    already_dismissed = true;
+                } else {
+                    st.yellow_cards += 1;
+                    if st.yellow_cards >= 2 {
+                        st.red_cards += 1;
+                        second_yellow = true;
+                    }
+                }
+            }
+            if already_dismissed {
+                return;
+            }
+            self.emit_event(
+                MatchEventType::YellowCard,
+                fouling_side,
+                Some(fouler_id.to_string()),
+                None,
+                format!("Yellow card for {fouler_name}"),
+            );
+            if second_yellow {
+                self.emit_event(
+                    MatchEventType::RedCard,
+                    fouling_side,
+                    Some(fouler_id.to_string()),
+                    None,
+                    format!("Second yellow — {fouler_name} sent off"),
+                );
+            }
         }
     }
 
@@ -2348,6 +2396,12 @@ impl MatchSimulation {
         if is_gk_slot != (incoming.role == PlayerRole::Goalkeeper) {
             return false;
         }
+        if self.state.archived_player_stats[s_idx]
+            .iter()
+            .any(|st| st.footballer_id == incoming.footballer_id && st.red_cards > 0)
+        {
+            return false;
+        }
 
         let outgoing_snap = self.state.teams[s_idx].starters[pitch_slot].clone();
         let outgoing_name = self.state.players[s_idx][pitch_slot].name.clone();
@@ -2375,6 +2429,7 @@ impl MatchSimulation {
         self.state.teams[s_idx].starters[pitch_slot] = incoming.clone();
         self.state.teams[s_idx].substitutes[bench_idx] = outgoing_snap;
 
+        let restored_yellows = self.state.player_stats[s_idx][pitch_slot].yellow_cards;
         let p = &mut self.state.players[s_idx][pitch_slot];
         p.footballer_id = incoming.footballer_id;
         p.name = incoming.name;
@@ -2386,7 +2441,7 @@ impl MatchSimulation {
         p.contain_cooldown = 0;
         p.skill_chain_count = 0;
         p.skill_chain_decay_ticks = 0;
-        p.yellow_cards = 0;
+        p.yellow_cards = restored_yellows;
 
         self.state.subs_used[s_idx] += 1;
 
@@ -4018,7 +4073,7 @@ impl MatchSimulation {
                 .is_some_and(|adv| adv.victim_side == side)
             {
                 if let Some(adv) = self.state.pending_advantage.take() {
-                    if adv.pending_yellow && !self.state.players[adv.fouling_side.index()][adv.fouler_idx].sent_off {
+                    if adv.pending_yellow {
                         self.issue_yellow_card(adv.fouling_side, adv.fouler_idx, &adv.fouler_id, &adv.fouler_name);
                     }
                 }
@@ -10608,6 +10663,48 @@ mod tests {
         assert_eq!(
             foul_adv_sim.state().players[1][2].yellow_cards, 1,
             "delayed yellow card from prior advantage must be flushed when a subsequent foul stops play"
+        );
+
+        // Also verify delayed booking resolves by `fouler_id` when the fouler is substituted off during the advantage window!
+        let mut sub_adv_sim = MatchSimulation::new(&snap).unwrap();
+        sub_adv_sim.state.phase = MatchPhase::OpenPlay;
+        let outgoing_fouler_id = sub_adv_sim.state.players[1][2].footballer_id.clone();
+        let outgoing_fouler_name = sub_adv_sim.state.players[1][2].name.clone();
+        let incoming_sub_id = sub_adv_sim.state.teams[1].substitutes[2].footballer_id.clone();
+        sub_adv_sim.state.pending_advantage = Some(PendingAdvantage {
+            victim_side: TeamSide::Home,
+            fouling_side: TeamSide::Away,
+            fouler_idx: 2,
+            fouler_id: outgoing_fouler_id.clone(),
+            fouler_name: outgoing_fouler_name,
+            foul_pos: Vec2::ZERO,
+            start_ball_x: Fp::ZERO,
+            ticks_left: 100,
+            pending_yellow: true,
+        });
+        assert!(sub_adv_sim.apply_substitution(TeamSide::Away, 2, 2));
+        sub_adv_sim.flush_pending_advantage_card();
+        assert_eq!(
+            sub_adv_sim.state().players[1][2].yellow_cards, 0,
+            "incoming substitute must NOT inherit outgoing fouler's delayed yellow card"
+        );
+        let away_combined = sub_adv_sim.state().combined_player_stats(TeamSide::Away);
+        assert_eq!(
+            away_combined
+                .iter()
+                .find(|s| s.footballer_id == outgoing_fouler_id)
+                .unwrap()
+                .yellow_cards,
+            1,
+            "outgoing substituted fouler must receive delayed yellow card in archived stats"
+        );
+        assert_eq!(
+            away_combined
+                .iter()
+                .find(|s| s.footballer_id == incoming_sub_id)
+                .unwrap()
+                .yellow_cards,
+            0
         );
 
         // 3. Codex P2 #2: On-target shot glancing off an outfield defender into the net MUST credit the
