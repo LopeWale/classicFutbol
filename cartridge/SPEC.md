@@ -43,3 +43,38 @@ Flash media unplugged mid-write can corrupt an in-place file. Each mounted cartr
    - Compute `next_gen = max(gen_a, gen_b) + 1`.
    - Write `[next_gen][crc32][envelope_bytes]` to `<inactive_slot>.tmp`, flush, and atomically rename over `<inactive_slot>` while the previous generation slot remains untouched.
    - Wait until rename + sync completes before signalling **`SAFE_TO_REMOVE`**.
+
+---
+
+## 3. Controller Profile Payload (`preferences.controller_mapping`)
+
+The cartridge carries the player's button layout as **data**, validated against
+[`control_profile.schema.json`](../shared/schemas/control_profile.schema.json) (ControlProfile **version 2**):
+
+```jsonc
+"controller_mapping": {
+  "layout": "auto",              // Layer-1 hardware pad profile (auto | snes_usb | snes_std | switch | dinput | custom)
+  "custom_map": null,            // optional calibrated raw-button map for unknown pads
+  "control_profile": {           // Layer-2 ControlProfile v2 — canonical snake_case
+    "version": 2,
+    "preset": "classic",         // classic | alternate | two_button | custom
+    "auto_switch": "auto", "auto_switch_move_assist": "low",
+    "pass_assist": "assisted", "through_assist": "assisted", "shot_assist": "assisted", "cross_assist": "assisted",
+    "defending_mode": "tactical", "analog_sprint": true,
+    "attack":  { "pass": "south", "shoot": "east", "cross": "west", "through_ball": "north",
+                 "sprint": "rt", "finesse": "rb", "pace_control": "lt", "chip_run": "lb" },
+    "defense": { "contain": "south", "standing_tackle": "east", "sliding_tackle": "west", "rush_gk": "north",
+                 "sprint": "rt", "teammate_contain": "rb", "jockey": "lt", "switch_player": "lb" }
+  },
+  "fifa_profile": { "...": "same object; alias read by older clients" }
+}
+```
+
+Rules:
+
+- **Physical, never gameplay**: bindings name *positional physical inputs* (`south`, `east`, `west`, `north`, `lb`, `rb`, `lt`, `rt`, `select`), never `BTN_*` bits. The client's Layer 2 turns them into the `InputFrame` bitmask, so the same cartridge works on an Xbox, PlayStation, Switch, SNES-style or PSFC RP2040 pad, and the HUD prompts show that pad's glyphs.
+- **Two maps**: `attack` (in possession) and `defense` (out of possession) are both evaluated every tick; psfc-sim's `PossessionContext` picks the half that applies (deterministic and replayable).
+- **Shared inputs / unbound**: several actions may share one input (the `two_button` preset puts pass, through ball and cross on `south`; the client resolves one per press from match context). `null` = unbound.
+- **Key case**: snake_case is canonical on the cartridge and in Godot (`user://psfc_control_profile.json`). The web client keeps camelCase in memory and converts at load/save; it also accepts legacy camelCase files.
+- **Settings sync**: on load, import and match start the eight gameplay settings are sent to psfc-sim as a `0x4000`-tagged `InputFrame.reserved` word (`ControlSettings::encode_reserved`).
+- **Portability**: the web Controllers screen has **EXPORT JSON / IMPORT JSON** buttons; an exported file (or a whole `controller_mapping` object) can be imported directly. Hosts that don't send a profile may store a legacy mapping object; clients ignore keys they don't know and fall back to Classic.

@@ -3,8 +3,14 @@
  *
  * - Samples 4 Hall-effect analog axes (LX, LY, RX, RY) + 11 digital tactile switches at 1000 Hz.
  * - Applies per-unit radial dead-zone and center calibration stored in RP2040 QSPI flash.
- * - Packs reports directly matching the 8-byte `psfc_sim::InputFrame` wire layout:
- *     int8 move_x, int8 move_y, int8 aim_x, int8 aim_y, uint16 buttons, uint16 seq
+ * - Reports a standard HID gamepad: 4 x int8 axes + 16 PHYSICAL button bits + uint16 sequence
+ *   (8 bytes). The pad NEVER decides gameplay: the client's ControlProfile (Layer 2,
+ *   host/psfc_host/web/static/control_profile.js / client/scripts/input/controller_interface.gd)
+ *   maps physical buttons to Pass/Shoot/Contain/... so presets and remapping work on this pad
+ *   exactly as on any Xbox / PlayStation pad.
+ *   Button bit order = W3C "standard" Gamepad order, so browsers/SDL need no special mapping:
+ *     0 South  1 East  2 West  3 North  4 L1  5 R1  6 L2  7 R2
+ *     8 Select 9 Start 10 L3  11 R3    12 Up 13 Down 14 Left 15 Right
  */
 
 #include <stdint.h>
@@ -14,27 +20,34 @@
 #include "hardware/gpio.h"
 #include "tusb.h"
 
-/* Exact bitflags matching `sim/psfc-sim/src/input.rs` */
-#define BTN_PASS      (1u << 0)
-#define BTN_THROUGH   (1u << 1)
-#define BTN_LOB       (1u << 2)
-#define BTN_SHOOT     (1u << 3)
-#define BTN_SPRINT    (1u << 4)
-#define BTN_SWITCH    (1u << 5)
-#define BTN_JOCKEY    (1u << 6)
-#define BTN_TACKLE    (1u << 7)
-#define BTN_SLIDE     (1u << 8)
-#define BTN_CALL_RUN  (1u << 9)
-#define BTN_SKILL     (1u << 10)
+/* Physical button bits (W3C standard gamepad order). NOT gameplay bits. */
+#define PHYS_SOUTH   (1u << 0)
+#define PHYS_EAST    (1u << 1)
+#define PHYS_WEST    (1u << 2)
+#define PHYS_NORTH   (1u << 3)
+#define PHYS_L1      (1u << 4)
+#define PHYS_R1      (1u << 5)
+#define PHYS_L2      (1u << 6)
+#define PHYS_R2      (1u << 7)
+#define PHYS_SELECT  (1u << 8)
+#define PHYS_START   (1u << 9)
+#define PHYS_L3      (1u << 10)
+#define PHYS_R3      (1u << 11)
+#define PHYS_DPAD_UP    (1u << 12)
+#define PHYS_DPAD_DOWN  (1u << 13)
+#define PHYS_DPAD_LEFT  (1u << 14)
+#define PHYS_DPAD_RIGHT (1u << 15)
 
 typedef struct __attribute__((packed)) {
-    int8_t   move_x;
-    int8_t   move_y;
-    int8_t   aim_x;
-    int8_t   aim_y;
-    uint16_t buttons;
+    int8_t   lx;
+    int8_t   ly;
+    int8_t   rx;
+    int8_t   ry;
+    uint16_t buttons;   /* PHYS_* bits */
     uint16_t sequence;
 } psfc_hid_report_t;
+
+_Static_assert(sizeof(psfc_hid_report_t) == 8, "HID report must stay 8 bytes (see usb_descriptors.c)");
 
 typedef struct {
     uint16_t center_adc[4];
@@ -46,18 +59,25 @@ static stick_calibration_t g_cal = {
     .deadzone_adc = 140 /* ~6.8% Hall-effect center dead-zone */
 };
 
+/* GPIO pin -> physical button bit (hardware wiring unchanged from v1). */
 static const uint8_t BUTTON_PINS[11] = {
-    2,  /* South  -> BTN_PASS / BTN_TACKLE */
-    3,  /* North  -> BTN_THROUGH */
-    4,  /* West   -> BTN_LOB / BTN_SLIDE */
-    5,  /* East   -> BTN_SHOOT */
-    6,  /* RT     -> BTN_SPRINT */
-    7,  /* LB     -> BTN_SWITCH */
-    8,  /* LT     -> BTN_JOCKEY */
-    9,  /* RB     -> BTN_CALL_RUN */
-    10, /* R3     -> BTN_SKILL (Roulette / Skill Move) */
-    11, /* Select -> Calibrationchord */
-    12  /* Start  -> Pause */
+    2,  /* South  (A / Cross)    */
+    3,  /* North  (Y / Triangle) */
+    4,  /* West   (X / Square)   */
+    5,  /* East   (B / Circle)   */
+    6,  /* R2 / RT (microswitch) */
+    7,  /* L1 / LB               */
+    8,  /* L2 / LT (microswitch) */
+    9,  /* R1 / RB               */
+    10, /* R3 (right stick click) */
+    11, /* Select (+ Start = re-zero chord) */
+    12  /* Start  */
+};
+
+static const uint16_t BUTTON_BITS[11] = {
+    PHYS_SOUTH, PHYS_NORTH, PHYS_WEST, PHYS_EAST,
+    PHYS_R2, PHYS_L1, PHYS_L2, PHYS_R1,
+    PHYS_R3, PHYS_SELECT, PHYS_START
 };
 
 static int8_t normalize_hall_axis(uint16_t raw_12bit, uint16_t center, uint16_t dz, bool invert) {
@@ -141,16 +161,13 @@ int main(void) {
         uint16_t rx = read_muxed_hall_adc(2);
         uint16_t ry = read_muxed_hall_adc(3);
 
+        /* Physical state only — gameplay meaning is assigned by the client's ControlProfile. */
         uint16_t btns = 0;
-        if (!gpio_get(BUTTON_PINS[0])) btns |= (BTN_PASS | BTN_TACKLE);
-        if (!gpio_get(BUTTON_PINS[1])) btns |= BTN_THROUGH;
-        if (!gpio_get(BUTTON_PINS[2])) btns |= (BTN_LOB | BTN_SLIDE);
-        if (!gpio_get(BUTTON_PINS[3])) btns |= BTN_SHOOT;
-        if (!gpio_get(BUTTON_PINS[4])) btns |= BTN_SPRINT;
-        if (!gpio_get(BUTTON_PINS[5])) btns |= BTN_SWITCH;
-        if (!gpio_get(BUTTON_PINS[6])) btns |= BTN_JOCKEY;
-        if (!gpio_get(BUTTON_PINS[7])) btns |= BTN_CALL_RUN;
-        if (!gpio_get(BUTTON_PINS[8])) btns |= BTN_SKILL;
+        for (unsigned i = 0; i < 11; ++i) {
+            if (!gpio_get(BUTTON_PINS[i])) { /* active-low */
+                btns |= BUTTON_BITS[i];
+            }
+        }
 
         /* Re-zero Hall centers on Select + Start chord */
         if (!gpio_get(BUTTON_PINS[9]) && !gpio_get(BUTTON_PINS[10])) {
@@ -158,10 +175,10 @@ int main(void) {
         }
 
         psfc_hid_report_t report = {
-            .move_x   = normalize_hall_axis(lx, g_cal.center_adc[0], g_cal.deadzone_adc, false),
-            .move_y   = normalize_hall_axis(ly, g_cal.center_adc[1], g_cal.deadzone_adc, true),
-            .aim_x    = normalize_hall_axis(rx, g_cal.center_adc[2], g_cal.deadzone_adc, false),
-            .aim_y    = normalize_hall_axis(ry, g_cal.center_adc[3], g_cal.deadzone_adc, true),
+            .lx       = normalize_hall_axis(lx, g_cal.center_adc[0], g_cal.deadzone_adc, false),
+            .ly       = normalize_hall_axis(ly, g_cal.center_adc[1], g_cal.deadzone_adc, true),
+            .rx       = normalize_hall_axis(rx, g_cal.center_adc[2], g_cal.deadzone_adc, false),
+            .ry       = normalize_hall_axis(ry, g_cal.center_adc[3], g_cal.deadzone_adc, true),
             .buttons  = btns,
             .sequence = ++report_seq,
         };

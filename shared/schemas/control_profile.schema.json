@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://classicfutbol.local/schemas/control_profile.schema.json",
+  "title": "ControlProfile",
+  "description": "Portable FIFA 10–12 style control profile (version 2). Canonical on-disk form uses snake_case keys; the web client converts to camelCase in memory at the boundary (host/psfc_host/web/static/control_profile.js) and the Godot client (client/scripts/input/controller_interface.gd) uses this form directly. Physical inputs map to abstract actions through two context maps: `attack` (in possession) and `defense` (out of possession). Several actions may share one physical input (Two-Button preset); `null` means unbound. The eight gameplay settings are synced to psfc-sim as the 14-bit 0x4000-tagged ControlSettings word (sim/psfc-sim/src/input.rs).",
+  "type": "object",
+  "required": [
+    "version",
+    "preset",
+    "auto_switch",
+    "auto_switch_move_assist",
+    "pass_assist",
+    "through_assist",
+    "shot_assist",
+    "cross_assist",
+    "defending_mode",
+    "analog_sprint",
+    "attack",
+    "defense"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "version": { "const": 2 },
+    "preset": {
+      "type": "string",
+      "enum": ["classic", "alternate", "two_button", "custom"],
+      "description": "Preset the bindings came from; any manual rebind switches it to `custom`."
+    },
+    "auto_switch": {
+      "type": "string",
+      "enum": ["auto", "air_balls", "manual"],
+      "description": "AutoSwitchMode: auto = AssistedBall (0), air_balls = AirAndLoose (1), manual = Manual (2)."
+    },
+    "auto_switch_move_assist": {
+      "type": "string",
+      "enum": ["none", "low", "high"],
+      "description": "AutoSwitchMoveAssist momentum carry after a switch."
+    },
+    "pass_assist": { "$ref": "#/$defs/assist_level" },
+    "through_assist": { "$ref": "#/$defs/assist_level" },
+    "shot_assist": { "$ref": "#/$defs/assist_level" },
+    "cross_assist": { "$ref": "#/$defs/assist_level" },
+    "defending_mode": {
+      "type": "string",
+      "enum": ["tactical", "legacy"],
+      "description": "FIFA 12 Tactical (contain shadows, manual timed tackle) or Legacy (contain presses + auto-tackle)."
+    },
+    "analog_sprint": {
+      "type": "boolean",
+      "description": "true: sprint scales with trigger depth 0.0–1.0; false: any press past the 0.10 deadzone is full sprint."
+    },
+    "attack": {
+      "type": "object",
+      "description": "In Possession map: action -> physical input.",
+      "additionalProperties": false,
+      "required": ["pass", "shoot", "cross", "through_ball", "sprint", "finesse", "pace_control", "chip_run"],
+      "properties": {
+        "pass": { "$ref": "#/$defs/binding", "description": "Ground Pass / Header (BTN_PASS)." },
+        "shoot": { "$ref": "#/$defs/binding", "description": "Shoot / Volley / Clear (BTN_SHOOT)." },
+        "cross": { "$ref": "#/$defs/binding", "description": "Lob Pass / Cross / Clear (BTN_LOB)." },
+        "through_ball": { "$ref": "#/$defs/binding", "description": "Through Ball (BTN_THROUGH)." },
+        "sprint": { "$ref": "#/$defs/binding", "description": "Sprint (BTN_SPRINT + analog depth)." },
+        "finesse": { "$ref": "#/$defs/binding", "description": "Finesse Shot Modifier (BTN_FINESSE)." },
+        "pace_control": { "$ref": "#/$defs/binding", "description": "Pace Control / Skill Modifier (BTN_PACE_CONTROL)." },
+        "chip_run": { "$ref": "#/$defs/binding", "description": "Chip Modifier / Trigger Run (BTN_CALL_RUN)." }
+      }
+    },
+    "defense": {
+      "type": "object",
+      "description": "Out of Possession map: action -> physical input.",
+      "additionalProperties": false,
+      "required": [
+        "contain",
+        "standing_tackle",
+        "sliding_tackle",
+        "rush_gk",
+        "sprint",
+        "teammate_contain",
+        "jockey",
+        "switch_player"
+      ],
+      "properties": {
+        "contain": { "$ref": "#/$defs/binding", "description": "Contain hold (BTN_CONTAIN)." },
+        "standing_tackle": { "$ref": "#/$defs/binding", "description": "Standing Tackle / Push-Pull (BTN_TACKLE)." },
+        "sliding_tackle": { "$ref": "#/$defs/binding", "description": "Sliding Tackle (BTN_SLIDE)." },
+        "rush_gk": { "$ref": "#/$defs/binding", "description": "Rush Goalkeeper hold (BTN_GK_RUSH)." },
+        "sprint": { "$ref": "#/$defs/binding", "description": "Sprint (BTN_SPRINT + analog depth)." },
+        "teammate_contain": { "$ref": "#/$defs/binding", "description": "Teammate Contain hold (BTN_TEAMMATE_CONTAIN)." },
+        "jockey": { "$ref": "#/$defs/binding", "description": "Jockey / Strafe (BTN_JOCKEY)." },
+        "switch_player": { "$ref": "#/$defs/binding", "description": "Switch Player (BTN_SWITCH)." }
+      }
+    }
+  },
+  "$defs": {
+    "assist_level": {
+      "type": "string",
+      "enum": ["assisted", "semi", "manual"]
+    },
+    "physical_input": {
+      "type": "string",
+      "enum": ["south", "east", "west", "north", "rt", "rb", "lt", "lb", "select"],
+      "description": "Positional physical input: south = A/✕/Nintendo B, east = B/○/Nintendo A, west = X/□/Nintendo Y, north = Y/△/Nintendo X, rt = RT/R2/ZR, rb = RB/R1/R, lt = LT/L2/ZL, lb = LB/L1/L, select = View/Share/−. Sticks are fixed: left = 360° dribble / movement, right = skill moves / manual directional switch."
+    },
+    "binding": {
+      "oneOf": [{ "$ref": "#/$defs/physical_input" }, { "type": "null" }]
+    }
+  }
+}

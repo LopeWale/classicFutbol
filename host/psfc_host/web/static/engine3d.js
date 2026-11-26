@@ -1210,6 +1210,9 @@ const SH_SOCKET_L = new THREE.Vector3(0.186, 0.125, 0);
 const SH_SOCKET_R = new THREE.Vector3(-0.186, 0.125, 0);
 
 // Bone indices in the 18-bone wrist-articulated humanoid skeleton
+// Header contact whip duration (s): weight holds ~0.14s then releases over 0.10s.
+const HEADER_SNAP_SECONDS = 0.24;
+
 const B_ROOT = 0;
 const B_HIPS = 1;
 const B_SPINE = 2;
@@ -4051,6 +4054,7 @@ function createFootballerActor(spec) {
     prevJumpY: 0,
     jumpLeadLeg: 1,
     headerSnapTimer: 0,
+    smoothHeaderIntent: 0,
     prevBallSpeed: 0,
     prevWx: 0,
     prevWy: 0,
@@ -4527,7 +4531,13 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const chargeReleasedStrike =
     !hasAuthoritativeKickCue && actor.prevAction === 1 && action !== 1 && action !== 7;
 
-  if (authoritativeStrike || chargeReleasedStrike || legacyOneTouchKick) {
+  // An authoritative strike cue while airborne IS the header contact (bullet / clearing / headed pass):
+  // whip the torso & head through the ball instead of swinging a leg in mid-air.
+  const airborneHeaderStrike =
+    authoritativeStrike && !actor.isGk && !actor.isReferee && jumpZ > 0.1 && action !== 4;
+  if (airborneHeaderStrike) {
+    actor.headerSnapTimer = HEADER_SNAP_SECONDS;
+  } else if (authoritativeStrike || chargeReleasedStrike || legacyOneTouchKick) {
     if (isThrowInTaker || actor.throwFollowTimer > 0.01) {
       actor.throwFollowTimer = 0.25;
     } else {
@@ -4715,27 +4725,44 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const airborneBlend = action === 4 ? 0 : smoothstep(0.05, 0.30, actor.smoothJumpY);
   const jumpAscent = airborneBlend > 0.02 ? smoothstep(0.25, 1.85, actor.smoothJumpVel) : 0;
   const jumpDescent = airborneBlend > 0.02 ? smoothstep(-0.25, -1.85, actor.smoothJumpVel) : 0;
+  // Header wind-up intent from TIME-TO-CONTACT (not raw distance): ball closing on the forehead band
+  // within ~0.55s cocks the neck/upper torso back with arms up; it releases if the ball passes by.
+  let headerIntentTarget = 0;
+  if (!actor.isGk && !actor.isReferee && airborneBlend > 0.08 && action !== 3 && action !== 5) {
+    const foreheadY = actor.smoothJumpY + 1.6;
+    const dzHead = 0.11 + Math.max(0, ballZ) - foreheadY;
+    const closing =
+      ballDistHoriz > 1e-3 ? -(bDx * (ballVx - vx) + bDz * (ballVy - vy)) / ballDistHoriz : 0;
+    if (dzHead > -0.55 && dzHead < 0.85 && ballDistHoriz < 3.4 && (closing > 0.6 || ballDistHoriz < 0.85)) {
+      const ttc = ballDistHoriz / Math.max(0.6, closing);
+      headerIntentTarget = Math.max(1.0 - smoothstep(0.16, 0.55, ttc), ballDistHoriz < 0.85 ? 1 : 0);
+      // Only wind up for a ball arriving IN FRONT of the face; one sailing overhead/behind is a plain leap.
+      headerIntentTarget *= smoothstep(-0.05, 0.3, ballLocalZ);
+    }
+  }
+  damp(actor, "smoothHeaderIntent", headerIntentTarget, 0.05, dt);
+  // Legacy replays without the authoritative kick cue: fall back to proximity-triggered snap.
   if (
+    !hasAuthoritativeKickCue &&
     !actor.isGk &&
     airborneBlend > 0.15 &&
-    ballDistHoriz < 1.35 &&
+    ballDistHoriz < 0.9 &&
     ballZ > 1.25 &&
-    (actor.smoothJumpVel < 1.15 || ballDistHoriz < 0.78)
+    actor.headerSnapTimer <= 0
   ) {
-    actor.headerSnapTimer = Math.max(actor.headerSnapTimer, 0.20);
+    actor.headerSnapTimer = HEADER_SNAP_SECONDS;
   }
-  const headerSnapWeight = !actor.isGk
-    ? Math.max(
-        smoothstep(0.0, 0.12, actor.headerSnapTimer),
-        airborneBlend > 0.15 && ballDistHoriz < 1.15 && ballZ > 1.35 && actor.smoothJumpVel < 1.25 ? 0.85 : 0
-      )
-    : 0;
-  // Strict convex partition of aerial phases (`jumpSnapW + jumpAscW + jumpDescW + jumpApexW === 1.0`)
+  const headerSnapWeight =
+    !actor.isGk && airborneBlend > 0.02 ? smoothstep(0.0, 0.1, actor.headerSnapTimer) : 0;
+  // Strict convex partition of aerial phases
+  // (`jumpSnapW + jumpCockW + jumpAscW + jumpDescW + jumpApexW === 1.0`):
+  // snap = forward whip through contact, cock = wind-up (arched back, arms up), then ascent / descent / apex.
   const jumpSnapW = headerSnapWeight;
-  const jumpRemW = Math.max(0, 1.0 - jumpSnapW);
+  const jumpCockW = (actor.isGk ? 0 : actor.smoothHeaderIntent || 0) * (1.0 - jumpSnapW);
+  const jumpRemW = Math.max(0, 1.0 - jumpSnapW - jumpCockW);
   const jumpAscW = jumpAscent * jumpRemW;
   const jumpDescW = jumpDescent * jumpRemW;
-  const jumpApexW = Math.max(0, 1.0 - jumpSnapW - jumpAscW - jumpDescW);
+  const jumpApexW = Math.max(0, 1.0 - jumpSnapW - jumpCockW - jumpAscW - jumpDescW);
 
   if (action === 3) {
     // Grounded Turf Slide Tackle (`IMG_0366`)
@@ -4828,8 +4855,11 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     spineRy = s * 0.12 * locoWeight * Math.min(1, speedNorm + 0.25);
     spineRz = -pelvisHipDrop * 0.45 + kickBank * 0.5;
 
+    let airChestRx = null;
     if (airborneBlend > 0.05) {
-      // 3-phase athletic aerial leap / forehead header (NEVER arch backward thrusting chest out!)
+      // 5-phase athletic aerial leap / forehead header: arch BACK on wind-up (upper torso + neck cocked,
+      // eyes on ball), WHIP forward through contact, fold slightly forward on descent.
+      // Sign convention (verified): +Rx pitches the segment FORWARD (head toward +Z), -Rx arches back.
       if (actor.isGk) {
         hipsRx += 0.02 * airborneBlend;
         spineRx = spineRx * (1 - airborneBlend) + 0.03 * airborneBlend;
@@ -4837,10 +4867,12 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       } else {
         const lead = actor.jumpLeadLeg || 1;
         const jumpHipsRx =
-          0.04 * jumpAscW + 0.08 * jumpSnapW + 0.09 * jumpDescW + 0.05 * jumpApexW;
+          0.02 * jumpAscW - 0.05 * jumpCockW + 0.10 * jumpSnapW + 0.09 * jumpDescW + 0.04 * jumpApexW;
         const jumpSpineRx =
-          0.02 * jumpAscW + 0.17 * jumpSnapW + 0.10 * jumpDescW + 0.06 * jumpApexW;
-        const jumpSpineRy = lead * (0.14 * jumpAscW - 0.12 * jumpSnapW);
+          -0.03 * jumpAscW - 0.12 * jumpCockW + 0.24 * jumpSnapW + 0.12 * jumpDescW + 0.02 * jumpApexW;
+        airChestRx =
+          -0.05 * jumpAscW - 0.14 * jumpCockW + 0.26 * jumpSnapW + 0.10 * jumpDescW - 0.02 * jumpApexW;
+        const jumpSpineRy = lead * (0.12 * jumpAscW + 0.04 * jumpCockW - 0.10 * jumpSnapW);
         hipsRx += jumpHipsRx * airborneBlend;
         hipsRy += -lead * 0.10 * jumpAscW * airborneBlend;
         spineRx = spineRx * (1 - airborneBlend) + jumpSpineRx * airborneBlend;
@@ -4867,8 +4899,8 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     }
 
     chestRx =
-      airborneBlend > 0.05 && !actor.isGk
-        ? spineRx * 0.96 + 0.04 * headerSnapWeight * airborneBlend
+      airChestRx !== null
+        ? spineRx * 0.96 * (1 - airborneBlend) + airChestRx * airborneBlend
         : spineRx * 0.96;
     chestRy = spineRy * 1.16;
     chestRz = spineRz * 0.65;
@@ -4876,9 +4908,10 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
 
   damp(actor, "smoothHipY", targetHipY, 0.042, dt);
   bones[B_HIPS].position.set(0, actor.smoothHipY, 0);
+  const torsoSmooth = headerSnapWeight > 0.3 ? 0.034 : 0.048;
   dampBoneEuler(bones[B_HIPS], hipsRx, hipsRy, hipsRz, 0.048, dt);
-  dampBoneEuler(bones[B_SPINE], spineRx, spineRy, spineRz, 0.048, dt);
-  dampBoneEuler(bones[B_CHEST], chestRx, chestRy, chestRz, 0.048, dt);
+  dampBoneEuler(bones[B_SPINE], spineRx, spineRy, spineRz, torsoSmooth, dt);
+  dampBoneEuler(bones[B_CHEST], chestRx, chestRy, chestRz, torsoSmooth, dt);
 
   // ==========================================================================
   // STEP B: EXACT CHEST-SPACE TRANSFORMS & 3D BALL HEAD LOOK-AT (ALL POSES!)
@@ -4908,15 +4941,17 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
   const rawHeadPitch = headHoriz > 1e-3 ? -Math.atan2(_auxVecA.y, headHoriz) : 0;
   const idleNoise = seededNoise2D(nowSec * 0.55, actor.phaseSeed * 3.1) * 0.04 * (1 - locoWeight);
   const clampedHeadYaw = Math.max(-0.76, Math.min(0.76, rawHeadYaw * 0.72 + yawRate * 0.035)) + idleNoise;
-  const headPitchMin = !actor.isGk && airborneBlend > 0.05 ? -0.18 : -0.56;
-  const headerNod = !actor.isGk ? 0.26 * headerSnapWeight * airborneBlend : 0;
+  const airHead = !actor.isGk && airborneBlend > 0.05 ? airborneBlend : 0;
+  const headPitchMin = airHead > 0 ? -0.2 - 0.4 * jumpCockW : -0.56;
+  const headerNod = airHead * (0.44 * headerSnapWeight - 0.12 * jumpCockW);
   const clampedHeadPitch = Math.max(
     headPitchMin,
-    Math.min(0.48, rawHeadPitch * 0.60 * (1 - headerSnapWeight * 0.55) + headerNod)
+    Math.min(0.52, rawHeadPitch * 0.6 * (1 - headerSnapWeight * 0.7) + headerNod)
   );
+  const neckSmooth = headerSnapWeight > 0.3 ? 0.032 : 0.065;
 
-  dampBoneEuler(bones[B_NECK], clampedHeadPitch * 0.32, clampedHeadYaw * 0.30, 0, 0.065, dt);
-  dampBoneEuler(bones[B_HEAD], clampedHeadPitch * 0.68, clampedHeadYaw * 0.70, 0, 0.065, dt);
+  dampBoneEuler(bones[B_NECK], clampedHeadPitch * 0.32, clampedHeadYaw * 0.30, 0, neckSmooth, dt);
+  dampBoneEuler(bones[B_HEAD], clampedHeadPitch * 0.68, clampedHeadYaw * 0.70, 0, neckSmooth, dt);
 
   // ==========================================================================
   // STEP C: TURF FLOOR CONSTRAINTS & FULL-STATE TWO-BONE LEG IK
@@ -5026,10 +5061,14 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     } else {
       // Athletic Single-Leg Takeoff -> Header Snap -> Staggered Landing Reach!
       const lead = actor.jumpLeadLeg || 1;
-      const driveY = 0.38 * (1 - jumpDescent * 0.72) - headerSnapWeight * 0.10;
-      const driveZ = 0.18 * (1 - jumpDescent * 0.55) - headerSnapWeight * 0.16;
-      const plantY = 0.08 + 0.04 * (1 - jumpDescent);
-      const plantZ = -0.10 + jumpDescent * 0.14;
+      const driveY =
+        0.40 * jumpAscW + 0.36 * jumpCockW + 0.30 * jumpSnapW + 0.16 * jumpDescW + 0.30 * jumpApexW;
+      const driveZ =
+        0.18 * jumpAscW - 0.06 * jumpCockW + 0.16 * jumpSnapW + 0.10 * jumpDescW + 0.10 * jumpApexW;
+      const plantY =
+        0.10 * jumpAscW + 0.30 * jumpCockW + 0.22 * jumpSnapW + 0.10 * jumpDescW + 0.14 * jumpApexW;
+      const plantZ =
+        -0.10 * jumpAscW - 0.24 * jumpCockW + 0.02 * jumpSnapW + 0.02 * jumpDescW - 0.08 * jumpApexW;
       const leftY = lead > 0 ? driveY : plantY;
       const leftZ = lead > 0 ? driveZ : plantZ;
       const rightY = lead > 0 ? plantY : driveY;
@@ -5581,17 +5620,18 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
         _auxVecA.set(0.22, 1.60, 0.28);
         _auxVecB.set(-0.22, 1.60, 0.28);
       } else {
-        // Athletic single-leg jump drive -> elbows pull back & down during forehead header snap!
+        // Arms swing UP & forward for lift and balance (hands shoulder-to-head height in front of the body),
+        // then DRIVE down & back through the header snap, and come down/out for balance on descent.
         const lead = actor.jumpLeadLeg || 1;
         const driveArmY =
-          1.15 * jumpAscW + 1.00 * jumpSnapW + 1.02 * jumpDescW + 1.06 * jumpApexW;
+          1.50 * jumpAscW + 1.52 * jumpCockW + 1.06 * jumpSnapW + 1.18 * jumpDescW + 1.48 * jumpApexW;
         const driveArmZ =
-          0.17 * jumpAscW - 0.16 * jumpSnapW + 0.05 * jumpDescW + 0.04 * jumpApexW;
+          0.26 * jumpAscW + 0.22 * jumpCockW - 0.18 * jumpSnapW + 0.08 * jumpDescW + 0.18 * jumpApexW;
         const balArmY =
-          0.90 * jumpAscW + 0.99 * jumpSnapW + 1.01 * jumpDescW + 1.02 * jumpApexW;
+          1.40 * jumpAscW + 1.48 * jumpCockW + 1.10 * jumpSnapW + 1.16 * jumpDescW + 1.44 * jumpApexW;
         const balArmZ =
-          -0.05 * jumpAscW - 0.15 * jumpSnapW + 0.05 * jumpDescW - 0.02 * jumpApexW;
-        const armX = 0.28 + 0.04 * jumpSnapW;
+          0.18 * jumpAscW + 0.2 * jumpCockW - 0.16 * jumpSnapW + 0.06 * jumpDescW + 0.14 * jumpApexW;
+        const armX = 0.28 + 0.04 * jumpCockW + 0.03 * jumpSnapW + 0.1 * jumpDescW;
         // Opposite arm drives up with the lifted takeoff knee (running jump coordination)
         if (lead > 0) {
           _auxVecA.set(armX, balArmY, balArmZ);
@@ -5633,7 +5673,12 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     }
 
     // Non-Penetrating Opponent Shoulder/Rib Shielding Arm IK (`jostleWeight > 0.12`, fixes `v9_03`!)
-    if (jostleWeight > 0.12 && oppDist > 0.05 && Math.abs(oppLocalFwd) < 0.95) {
+    if (
+      jostleWeight > 0.12 &&
+      oppDist > 0.05 &&
+      Math.abs(oppLocalFwd) < 0.95 &&
+      airborneBlend < 0.3 // aerial duels keep the raised balance arms (no chest-height shielding)
+    ) {
       // Contact barrier sits 0.29m outside opponent's torso center so the forearm NEVER pierces their chest!
       const invOpp = 1.0 / oppDist;
       const surfWorldX = wx + oppWorldDx - oppWorldDx * invOpp * 0.29;

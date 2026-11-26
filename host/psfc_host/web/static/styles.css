@@ -2651,3 +2651,83 @@ kbd {
     overflow-y: auto;
   }
 }
+
+/* Context button-prompt strip (resolved from ControlProfile: attack in possession / defend out of possession) */
+.hud-prompt-strip {
+  position: fixed;
+  bottom: 172px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: min(92vw, 860px);
+  pointer-events: none;
+  z-index: 4;
+}
+
+.hud-prompt-row {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 4px 10px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgba(7, 13, 24, 0.62);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  font-family: var(--font-display);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  opacity: 0.88;
+}
+
+.hud-prompt-tag {
+  font-weight: 800;
+  color: var(--turf-bright);
+}
+
+.hud-prompt-defense .hud-prompt-tag {
+  color: var(--sky-accent);
+}
+
+.hud-prompt-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+
+.hud-prompt-item kbd {
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: 11px;
+  min-width: 18px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  text-align: center;
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.12);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+}
+
+.cset-hint {
+  margin: 0 8px 4px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: var(--text-muted);
+}
+
+.cset-hint:empty {
+  display: none;
+}
+
+@media (max-width: 720px) {
+  .hud-prompt-strip {
+    bottom: 150px;
+  }
+  .hud-prompt-row {
+    font-size: 11px;
+  }
+}
