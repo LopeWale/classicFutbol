@@ -446,6 +446,25 @@ pub struct TeamAiMemory {
     pub cmd_vel: Vec<Vec2>,
     #[serde(default)]
     pub cmd_tick: Vec<u32>,
+    /// Exclusivity layer (`docs/exclusivity-layer.md`): the one outfielder elected to chase a loose
+    /// ball. `0` = none (the keeper index is never an elected outfield chaser).
+    #[serde(default)]
+    pub chaser: u8,
+    /// Ticks the current chaser has held the role.
+    #[serde(default)]
+    pub chaser_ticks: u16,
+    /// `tick + 1` of the last challenger evaluation (challengers are checked every few ticks).
+    #[serde(default)]
+    pub chaser_eval_tick: u32,
+    /// The chaser's continuous intercept point (his reserved path end for the teammate yield rule).
+    #[serde(default)]
+    pub chaser_pt: Vec2,
+    /// The keeper is committed to this loose ball (collect / claim / sweep / rush): no outfield chaser.
+    #[serde(default)]
+    pub keeper_claim: bool,
+    /// Movement priority class per player for this tick (`0` carrier/chaser .. `3` idle/cruise/yield).
+    #[serde(default)]
+    pub move_class: Vec<u8>,
 }
 
 impl TeamAiMemory {
@@ -474,6 +493,9 @@ impl TeamAiMemory {
         if self.cmd_vel.len() != n || self.cmd_tick.len() != n {
             self.cmd_vel = vec![Vec2::ZERO; n];
             self.cmd_tick = vec![0; n];
+        }
+        if self.move_class.len() != n {
+            self.move_class = vec![2; n];
         }
     }
 
@@ -511,6 +533,14 @@ impl TeamAiMemory {
             h.i64(v.y.raw());
             h.u32(*t);
         }
+        h.u8(self.chaser);
+        h.u16(self.chaser_ticks);
+        h.u32(self.chaser_eval_tick);
+        h.i64(self.chaser_pt.x.raw());
+        h.i64(self.chaser_pt.y.raw());
+        h.u8(u8::from(self.keeper_claim));
+        h.u32(self.move_class.len() as u32);
+        h.bytes(&self.move_class);
     }
 }
 

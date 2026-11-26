@@ -1324,7 +1324,6 @@ pub fn compute_outfield_ai_intent(
     idx: usize,
 ) -> AiMoveIntent {
     let p = &state.players[side.index()][idx];
-    let is_5v5 = state.format.players_per_side <= 6;
     let attack_sign = side.attack_sign(state.second_half_swapped());
     let half_len = state.format.half_length();
     let ball_xy = state.ball.pos.xy();
@@ -1408,43 +1407,12 @@ pub fn compute_outfield_ai_intent(
         };
     }
 
-    // 3. Loose ball pursuit: ONLY the single fastest outfielder sprints to intercept if faster than controlled!
+    // 3. Loose ball: exactly ONE elected chaser per team (exclusivity layer, `elect_chaser`). Everyone
+    //    else goes to his tactical slot, yielding around the chaser's path.
     if state.ball.owner.is_none() {
-        let waypoints = sample_ball_3d_waypoints(state);
-        let controlled = state.controlled_idx[side.index()];
-        let (_, ctrl_ticks) = best_intercept_from_waypoints(
-            &state.players[side.index()][controlled],
-            &waypoints,
-            is_5v5,
-            controlled == 0,
-        );
-        let (my_intercept, my_ticks) = best_intercept_from_waypoints(p, &waypoints, is_5v5, false);
-        let mut fastest_outfield = true;
-        for (other_idx, other) in state.players[side.index()].iter().enumerate() {
-            if other_idx == 0 || other_idx == idx || other.sent_off {
-                continue;
-            }
-            let (_, other_ticks) = best_intercept_from_waypoints(other, &waypoints, is_5v5, false);
-            if other_ticks + 2 < my_ticks || (other_ticks == my_ticks && other_idx < idx) {
-                fastest_outfield = false;
-                break;
-            }
-        }
-        if fastest_outfield && my_ticks + 6 < ctrl_ticks {
-            let _ = my_intercept;
-            let chase_pt = if p.pos.dist(ball_xy) <= Fp::from_milli(1_500)
-                && state.ball.pos.z <= Fp::from_milli(900)
-            {
-                predict_ball_xy_at_ticks(state, 3)
-            } else {
-                smooth_ball_intercept(p, &waypoints, is_5v5)
-            };
-            return AiMoveIntent {
-                move_dir: (chase_pt - p.pos).normalize_or_zero(),
-                sprint: true,
-                jockey: false,
-                trigger_dive: None,
-            };
+        update_team_plan(state, side);
+        if elected_chaser(state, side) == Some(idx) {
+            return chase_intent(state, side, idx);
         }
     }
 
@@ -2203,7 +2171,78 @@ pub fn generate_cpu_input(
         return vec_and_buttons_to_input(drive_corridor, Vec2::ZERO, btns);
     }
 
-    // --- OFF-BALL CPU DEFENDING ---
+    // --- OFF-BALL CPU PLAYER ---
+    // Exclusivity layer: the CPU-controlled player is an ordinary member of the team plan. He chases a
+    // loose ball only as the elected chaser and closes a carrier only as the committed presser (or when
+    // nobody is); otherwise he follows his tactical slot like the AI teammates (no third engager).
+    update_team_plan(state, side);
+    let (plan_presser, plan_cover) = {
+        let mems = state.ai_memory.borrow();
+        let m = &mems[side_idx];
+        (m.presser, m.cover)
+    };
+    let opp_owns_ball = state.ball.owner.is_some_and(|(os, _)| os != side);
+    let engage = match state.ball.owner {
+        None => elected_chaser(state, side) == Some(ctrl_idx),
+        Some((os, _)) if os == side => false,
+        Some(_) => plan_presser as usize == ctrl_idx || (plan_presser == AI_NONE && plan_cover as usize != ctrl_idx),
+    };
+    let (move_dir, mut buttons) = if engage {
+        cpu_engage_move(state, side, difficulty, me, ctrl_idx, is_5v5, own_goal_x)
+    } else {
+        let intent = outfield_shape_intent(state, side, ctrl_idx);
+        let mut b = 0_u16;
+        if intent.sprint {
+            b |= BTN_SPRINT;
+        }
+        if intent.jockey && opp_owns_ball {
+            b |= BTN_JOCKEY;
+        }
+        (intent.move_dir, b)
+    };
+    let my_dist = me.pos.dist(state.ball.pos.xy());
+
+    // Tackle timing: difficulty sets the base cadence/reach, the defender's `tackling` sets how
+    // often he commits (confident tacklers pick the moment sooner) and how rash he is (a low
+    // tackler also lunges at a carrier who is turned away from him).
+    let (base_cadence, base_reach_mm): (i64, i64) = match difficulty {
+        CpuDifficulty::Easy => (30, 1_020),
+        CpuDifficulty::Normal => (20, 1_100),
+        CpuDifficulty::Hard => (12, 1_180),
+    };
+    let tackle_conf = player_style(me).tackle_confidence;
+    let tackle_cadence = (base_cadence * (1_400 - tackle_conf) / 540).clamp(6, 48) as u32;
+    let tackle_reach_mm = base_reach_mm + (tackle_conf - 860) / 5;
+    let rash_pm = 480 + (600 - tackle_conf).max(0);
+    if let Some((o_side, o_idx)) = state.ball.owner {
+        if o_side != side && state.ball.possession_grace_ticks == 0 {
+            let carrier = &state.players[o_side.index()][o_idx];
+            let c_fwd = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
+            let def_to_c = (carrier.pos - me.pos).normalize_or_zero();
+            let front_or_side = def_to_c.dot(c_fwd) < Fp::from_milli(rash_pm);
+            if front_or_side
+                && my_dist <= Fp::from_milli(tackle_reach_mm)
+                && cadence_tick.is_multiple_of(tackle_cadence)
+            {
+                buttons |= BTN_TACKLE;
+            }
+        }
+    }
+
+    vec_and_buttons_to_input(move_dir, Vec2::ZERO, buttons)
+}
+
+/// The CPU-controlled player's own chase / contain movement (he is the elected chaser or the
+/// committed presser): arrive at the goal-side contain point, sprint/jockey with hysteresis.
+fn cpu_engage_move(
+    state: &MatchState,
+    side: TeamSide,
+    difficulty: CpuDifficulty,
+    me: &PlayerState,
+    ctrl_idx: usize,
+    is_5v5: bool,
+    own_goal_x: Fp,
+) -> (Vec2, u16) {
     let ball_xy = state.ball.pos.xy();
     let my_dist = me.pos.dist(ball_xy);
     let (mut my_intercept, _) = best_ball_intercept_for_player(state, side, ctrl_idx);
@@ -2256,35 +2295,7 @@ pub fn generate_cpu_input(
     } else {
         buttons |= BTN_JOCKEY | BTN_CONTAIN;
     }
-
-    // Tackle timing: difficulty sets the base cadence/reach, the defender's `tackling` sets how
-    // often he commits (confident tacklers pick the moment sooner) and how rash he is (a low
-    // tackler also lunges at a carrier who is turned away from him).
-    let (base_cadence, base_reach_mm): (i64, i64) = match difficulty {
-        CpuDifficulty::Easy => (30, 1_020),
-        CpuDifficulty::Normal => (20, 1_100),
-        CpuDifficulty::Hard => (12, 1_180),
-    };
-    let tackle_conf = player_style(me).tackle_confidence;
-    let tackle_cadence = (base_cadence * (1_400 - tackle_conf) / 540).clamp(6, 48) as u32;
-    let tackle_reach_mm = base_reach_mm + (tackle_conf - 860) / 5;
-    let rash_pm = 480 + (600 - tackle_conf).max(0);
-    if let Some((o_side, o_idx)) = state.ball.owner {
-        if o_side != side && state.ball.possession_grace_ticks == 0 {
-            let carrier = &state.players[o_side.index()][o_idx];
-            let c_fwd = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
-            let def_to_c = (carrier.pos - me.pos).normalize_or_zero();
-            let front_or_side = def_to_c.dot(c_fwd) < Fp::from_milli(rash_pm);
-            if front_or_side
-                && my_dist <= Fp::from_milli(tackle_reach_mm)
-                && cadence_tick.is_multiple_of(tackle_cadence)
-            {
-                buttons |= BTN_TACKLE;
-            }
-        }
-    }
-
-    vec_and_buttons_to_input(move_dir, Vec2::ZERO, buttons)
+    (move_dir, buttons)
 }
 
 pub fn world_anchor_for_player(
@@ -2979,7 +2990,30 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
     let anchors: Vec<Vec2> = ctx.slots.iter().map(|s| slot_pos(&ctx, &blk, s, attacking)).collect();
     assign_slots(&ctx, state, mem, &anchors);
 
+    // 3b. Exclusivity layer: elect the one loose-ball chaser (agent2d margins + GRF ratio hysteresis).
+    let cpu_side = side_is_cpu(state, side);
+    // Same role cost as the presser ranking: centre-backs hold the line instead of chasing a ball
+    // far in front of it.
+    let chase_role_cost: Vec<u32> = {
+        let line = defend_block(&ctx, state, ref_ball, false).line;
+        let ball_p = ctx.prog(ball_xy.x);
+        (0..n)
+            .map(|i| {
+                let back = ctx.slot(mem.slot_of[i]).is_some_and(|s| s.role.is_back_line());
+                if back && ball_p > line + 8_000 { 14 } else { 0 }
+            })
+            .collect()
+    };
+    elect_chaser(state, side, mem, controlled, cpu_side, &chase_role_cost);
+    let chaser = mem.chaser;
+    // On a loose ball the elected chaser (or the committed keeper) is the only player going to the
+    // ball, so there is no presser on it: the presser role is for a carrier.
+    let loose_exclusive = state.ball.owner.is_none() && (chaser != 0 || mem.keeper_claim);
+
     // 4. One presser (+ a second presser while counter-pressing) and one cover, with hysteresis.
+    //    As before, an AI presser is committed only when clearly faster than the controlled player;
+    //    when one is, a CPU-controlled player stands off (cover / mark / slot) so at most two players
+    //    engage. The chaser is never the presser, and a human-controlled player is never planned for.
     let opp_owns = owner_ours == Some(false);
     let defensive = is_defensive_phase(phase) && owner_ours != Some(true);
     let def_blk = defend_block(&ctx, state, ref_ball, false);
@@ -3018,15 +3052,23 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             }
             c -= (st.aggression - 500) / 100;
             c += (500 - st.work_rate).max(0) / 100;
+            // No bonus for the CPU-controlled player here: control follows the presser via the
+            // auto-switch, and a bonus that moves with control would flip the presser back and forth.
             c.max(0) as u32
         };
         let ctrl_ticks = if controlled > 0 && controlled < n && !players[controlled].sent_off {
             eval(controlled)
         } else {
-            120
+            u32::MAX / 4
         };
         let mut ranked: Vec<(u32, usize)> = (1..n)
-            .filter(|&i| i != controlled && !players[i].sent_off && players[i].pos.dist(ball_xy) <= radius)
+            .filter(|&i| {
+                i != controlled
+                    && i as u8 != chaser
+                    && !loose_exclusive
+                    && !players[i].sent_off
+                    && players[i].pos.dist(ball_xy) <= radius
+            })
             .map(|i| (press_cost(i), i))
             .collect();
         ranked.sort_unstable();
@@ -3048,7 +3090,7 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             if phase == AI_PHASE_COUNTER_PRESS && opp_owns {
                 new_second = ranked
                     .iter()
-                    .find(|&&(c, i)| i != chosen && c < 70)
+                    .find(|&&(c, i)| i != chosen && c < 70 && i as u8 != new_presser)
                     .map_or(AI_NONE, |&(_, i)| i as u8);
             }
         }
@@ -3062,9 +3104,13 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
     mem.second_presser = new_second;
 
     let mut new_cover = AI_NONE;
-    if defensive {
+    // On a loose ball the chaser (or keeper) is the only player with a job on it: everyone else, the
+    // would-be cover included, goes to his tactical slot.
+    if defensive && !loose_exclusive {
         let pressing_pos = if new_presser != AI_NONE {
             players[new_presser as usize].pos
+        } else if chaser != 0 {
+            players[chaser as usize].pos
         } else if controlled > 0 && controlled < n {
             players[controlled].pos
         } else {
@@ -3075,7 +3121,12 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
         let cover_pt = ball_xy.lerp(pressing_pos, Fp::HALF) + (own_goal - ball_xy).normalize_or_zero().scale(depth);
         let mut best: Option<(i64, usize)> = None;
         for (i, cand) in players.iter().enumerate().skip(1) {
-            if cand.sent_off || i == controlled || i as u8 == new_presser || i as u8 == new_second {
+            if cand.sent_off
+                || (i == controlled && (!cpu_side || new_presser == AI_NONE))
+                || i as u8 == chaser
+                || i as u8 == new_presser
+                || i as u8 == new_second
+            {
                 continue;
             }
             let pref = match ctx.slot(mem.slot_of[i]).map(|s| s.role) {
@@ -3092,6 +3143,19 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             }
         }
         new_cover = best.map_or(AI_NONE, |(_, i)| i as u8);
+        // A CPU-controlled player standing off an AI presser is the cover (the second engager),
+        // so standing off never pulls an extra AI player out of the shape.
+        if cpu_side
+            && new_presser != AI_NONE
+            && controlled > 0
+            && controlled < n
+            && !players[controlled].sent_off
+            && controlled as u8 != new_presser
+            && controlled as u8 != new_second
+            && controlled as u8 != chaser
+        {
+            new_cover = controlled as u8;
+        }
     }
     if new_cover != mem.cover {
         mem.cover_ticks = 0;
@@ -3112,7 +3176,8 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
         let slot = ctx.slot(mem.slot_of[i]);
         let eligible = matches!(phase, AI_PHASE_DEFEND | AI_PHASE_RETREAT)
             && !p.sent_off
-            && i != controlled
+            && (i != controlled || (cpu_side && new_presser != AI_NONE))
+            && i as u8 != chaser
             && i as u8 != new_presser
             && i as u8 != new_cover
             && slot.is_some_and(|s| !matches!(s.role, SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger));
@@ -3167,6 +3232,7 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             }
         }
     }
+    assign_move_classes(state, side, mem, controlled, cpu_side);
     mem.plan_tick = tick.wrapping_add(1);
 }
 
@@ -3193,6 +3259,339 @@ pub fn committed_presser(state: &MatchState, side: TeamSide) -> Option<usize> {
 /// Current AI team phase (`AI_PHASE_*`) for `side` (public for metrics and tests).
 pub fn team_phase(state: &MatchState, side: TeamSide) -> u8 {
     state.ai_memory.borrow()[side.index()].phase
+}
+
+/// Formation-slot anchor `players[side][idx]` owns in the current phase's block, before role
+/// refinements, spacing and yield (public for metrics and tests).
+pub fn shape_slot_anchor(state: &MatchState, side: TeamSide, idx: usize) -> Vec2 {
+    let ctx = ShapeCtx::new(state, side);
+    let (slot, ref_ball, phase) = {
+        let mems = state.ai_memory.borrow();
+        let m = &mems[side.index()];
+        (m.slot_of.get(idx).copied().unwrap_or(AI_NONE), m.ref_ball, m.phase)
+    };
+    match ctx.slot(slot) {
+        Some(s) => {
+            let (blk, attacking) = phase_block(&ctx, state, ref_ball, phase);
+            slot_pos(&ctx, &blk, &s, attacking)
+        }
+        None => world_anchor_for_player(state, side, idx, Fp::ZERO),
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Exclusivity layer (see `docs/exclusivity-layer.md`): one chaser per team, engager cap, one runner
+// per destination, teammate yield radius, off-ball cruise speed, keeper-defender arbitration and
+// movement priority classes. All decisions are made once per side per tick inside the team plan
+// and stored in `TeamAiMemory`, so the read-outs below are cheap and deterministic.
+// -------------------------------------------------------------------------------------------------
+
+/// Challengers to an incumbent chaser are evaluated no more often than every 8 ticks (133 ms).
+const CHASER_EVAL_PERIOD: u32 = 8;
+/// GRF designated-player smoothing: `(best + K) / (incumbent + K) < 0.8` with `K` = 500 ms.
+const CHASER_RATIO_K: u32 = 30;
+/// agent2d contest rule `self <= 3 || self < opp + 3` in 100 ms cycles, converted to 60 Hz ticks.
+const CHASE_CONTEST_TICKS: u32 = 18;
+/// An incumbent chaser keeps the ball until the opponent is clearly first by this many ticks.
+const CHASE_RELEASE_TICKS: u32 = 30;
+/// Tick bonus for the CPU-controlled player in chaser / presser ranking (agrees with auto-switch).
+const CPU_CTRL_CHASE_BONUS: u32 = 4;
+/// Off-ball cruise speed of an uninvolved (class 3) player: 70% of top (sprint) speed.
+const CRUISE_TOP_SPEED_PM: i64 = 700;
+
+#[inline]
+fn side_is_cpu(state: &MatchState, side: TeamSide) -> bool {
+    let ctrl = match side {
+        TeamSide::Home => state.rules.home_controller,
+        TeamSide::Away => state.rules.away_controller,
+    };
+    ctrl.is_cpu()
+}
+
+/// The keeper is committed to a loose ball (Collect / CrossClaim / Sweep, or a human-held rush).
+pub fn keeper_committed(state: &MatchState, side: TeamSide) -> bool {
+    state.ball.owner.is_none()
+        && matches!(
+            state.gk_brain[side.index()].scenario,
+            GkScenario::Collect | GkScenario::CrossClaim | GkScenario::Sweep | GkScenario::HumanRush
+        )
+}
+
+/// `true` when `best` beats `incumbent` by the GRF ratio rule `(best + K) / (incumbent + K) < 0.8`.
+#[inline]
+const fn clearly_better(best: u32, incumbent: u32) -> bool {
+    (best as u64 + CHASER_RATIO_K as u64) * 10 < (incumbent as u64 + CHASER_RATIO_K as u64) * 8
+}
+
+/// A human-controlled player is "closing" when he is on the ball or running at >= 2 m/s toward his
+/// intercept point.
+fn human_closing(p: &PlayerState, intercept: Vec2, ball: Vec2) -> bool {
+    p.pos.dist(ball) <= Fp::from_milli(2_500)
+        || p.vel.dot((intercept - p.pos).normalize_or_zero()) >= Fp::from_milli(2_000)
+}
+
+/// Elects at most one loose-ball chaser for `side` and stores it in `mem.chaser` / `mem.chaser_pt`.
+///
+/// - Ball owned, or the keeper committed to it: no chaser (`keeper_claim` records the second case).
+/// - Our own pass in flight: the intended receiver is the chaser.
+/// - Human side: the human-controlled player is never elected but counts as the chaser while he is
+///   about as fast as the best AI teammate, or closing and not clearly beaten (GRF ratio rule).
+/// - Otherwise the best intercept time wins if contested (agent2d: `t <= 18` or `t < opp + 18`
+///   ticks); the incumbent keeps the role unless a challenger is clearly better (ratio < 0.8,
+///   checked every `CHASER_EVAL_PERIOD` ticks) or the opponent is first by `CHASE_RELEASE_TICKS`.
+fn elect_chaser(
+    state: &MatchState,
+    side: TeamSide,
+    mem: &mut TeamAiMemory,
+    controlled: usize,
+    cpu_side: bool,
+    role_cost: &[u32],
+) {
+    let players = &state.players[side.index()];
+    let n = players.len();
+    let tick = state.tick;
+    let is_5v5 = state.format.players_per_side <= 6;
+    let ball_xy = state.ball.pos.xy();
+    let prev = mem.chaser;
+    let mut chosen: u8 = 0;
+    let mut chosen_pt = ball_xy;
+    let mut eval_now = false;
+    mem.keeper_claim = false;
+    if state.ball.owner.is_none() {
+        let receiver = state.ball.pass_in_flight.as_ref().and_then(|pf| {
+            (pf.team == side && pf.intended_receiver_idx > 0 && pf.intended_receiver_idx < n)
+                .then_some(pf.intended_receiver_idx)
+                .filter(|&r| !players[r].sent_off)
+        });
+        let waypoints = sample_ball_3d_waypoints(state);
+        if keeper_committed(state, side) {
+            mem.keeper_claim = true;
+        } else if let Some(r) = receiver {
+            chosen = r as u8;
+            chosen_pt = best_intercept_from_waypoints(&players[r], &waypoints, is_5v5, false).0;
+        } else {
+            let human = !cpu_side && controlled > 0 && controlled < n && !players[controlled].sent_off;
+            // Candidate AI outfielders: (ranking cost, index, raw ticks).
+            let mut best: Option<(u32, usize)> = None;
+            let mut inc_cost: Option<u32> = None;
+            for (i, p) in players.iter().enumerate().skip(1) {
+                if p.sent_off || (human && i == controlled) {
+                    continue;
+                }
+                let t = best_intercept_from_waypoints(p, &waypoints, is_5v5, false).1;
+                let mut c = t + role_cost.get(i).copied().unwrap_or(0);
+                if cpu_side && i == controlled {
+                    c = c.saturating_sub(CPU_CTRL_CHASE_BONUS);
+                }
+                if best.is_none_or(|(bc, _)| c < bc) {
+                    best = Some((c, i));
+                }
+                if i as u8 == prev {
+                    inc_cost = Some(c);
+                }
+            }
+            let mut opp_best = u32::MAX / 4;
+            for (oi, op) in state.players[side.opponent().index()].iter().enumerate() {
+                if !op.sent_off {
+                    opp_best = opp_best.min(best_intercept_from_waypoints(op, &waypoints, is_5v5, oi == 0).1);
+                }
+            }
+            let human_chaser = human && {
+                let hp = &players[controlled];
+                let (h_pt, h_t) = best_intercept_from_waypoints(hp, &waypoints, is_5v5, false);
+                let best_ai = best.map_or(u32::MAX / 4, |(c, _)| c);
+                h_t <= best_ai + 6 || (human_closing(hp, h_pt, ball_xy) && !clearly_better(best_ai, h_t))
+            };
+            if human_chaser {
+                chosen = controlled as u8;
+                chosen_pt = smooth_ball_intercept(&players[controlled], &waypoints, is_5v5);
+            } else if let Some((best_c, best_i)) = best {
+                let due = mem.chaser_eval_tick == 0
+                    || tick.wrapping_sub(mem.chaser_eval_tick.wrapping_sub(1)) >= CHASER_EVAL_PERIOD;
+                chosen = match inc_cost {
+                    Some(ic) if ic > CHASE_CONTEST_TICKS && ic >= opp_best + CHASE_RELEASE_TICKS => 0,
+                    Some(ic) => {
+                        if due {
+                            eval_now = true;
+                        }
+                        if due && best_i as u8 != prev && clearly_better(best_c, ic) {
+                            best_i as u8
+                        } else {
+                            prev
+                        }
+                    }
+                    None if best_c <= CHASE_CONTEST_TICKS || best_c < opp_best + CHASE_CONTEST_TICKS => {
+                        eval_now = true;
+                        best_i as u8
+                    }
+                    None => 0,
+                };
+                if chosen != 0 {
+                    chosen_pt = smooth_ball_intercept(&players[chosen as usize], &waypoints, is_5v5);
+                }
+            }
+        }
+    }
+    if chosen != prev {
+        mem.chaser_ticks = 0;
+        eval_now = chosen != 0;
+    } else {
+        mem.chaser_ticks = mem.chaser_ticks.saturating_add(1);
+    }
+    if chosen == 0 {
+        mem.chaser_eval_tick = 0;
+    } else if eval_now {
+        mem.chaser_eval_tick = tick.wrapping_add(1);
+    }
+    mem.chaser = chosen;
+    mem.chaser_pt = chosen_pt;
+}
+
+/// Baseline movement priority class per player for this tick (refined per player by
+/// `outfield_shape_intent`): 0 = carrier / elected chaser / committed or ball-holding keeper,
+/// 1 = presser, second presser, cover and the human-controlled player, 2 = everyone else.
+fn assign_move_classes(state: &MatchState, side: TeamSide, mem: &mut TeamAiMemory, controlled: usize, cpu_side: bool) {
+    let n = state.players[side.index()].len();
+    for i in 0..n {
+        let c = if state.ball.owner == Some((side, i)) || (i != 0 && i as u8 == mem.chaser) {
+            0
+        } else if i == 0 {
+            if keeper_committed(state, side) { 0 } else { 2 }
+        } else if i as u8 == mem.presser
+            || i as u8 == mem.second_presser
+            || i as u8 == mem.cover
+            || (!cpu_side && i == controlled)
+        {
+            1
+        } else {
+            2
+        };
+        mem.move_class[i] = c;
+    }
+}
+
+#[inline]
+fn plan_is_fresh(state: &MatchState, m: &TeamAiMemory) -> bool {
+    matches!(state.phase, MatchPhase::OpenPlay)
+        && (m.plan_tick == state.tick.wrapping_add(1) || m.plan_tick == state.tick)
+}
+
+/// The one outfielder elected to chase the loose ball for `side` (the human-controlled player when
+/// he is the one closing on it), or `None` (ball owned, keeper committed, or nobody contests it).
+pub fn elected_chaser(state: &MatchState, side: TeamSide) -> Option<usize> {
+    if state.ball.owner.is_some() || keeper_committed(state, side) {
+        return None;
+    }
+    let mems = state.ai_memory.try_borrow().ok()?;
+    let m = &mems[side.index()];
+    (plan_is_fresh(state, m) && m.chaser != 0).then_some(m.chaser as usize)
+}
+
+/// Movement priority class of `players[side][idx]` for local avoidance (lower = higher priority):
+///
+/// - `0`: the ball carrier, the elected chaser, or the keeper while committed to a loose ball;
+///   never yields to teammates.
+/// - `1`: an engager (presser, second presser, cover) or the human-controlled player.
+/// - `2`: a tactical mover (recovery run, reserved attacking run, marking, far from his slot).
+/// - `3`: idle, cruising to his slot, or yielding (most yielding).
+///
+/// Reads the tick's team plan only (no recomputation). Outside open play, or before the side has
+/// been planned this tick, it returns `2` for everyone but the carrier.
+pub fn move_priority(state: &MatchState, side: TeamSide, idx: usize) -> u8 {
+    let players = &state.players[side.index()];
+    if idx >= players.len() || players[idx].sent_off {
+        return 3;
+    }
+    if state.ball.owner == Some((side, idx)) {
+        return 0;
+    }
+    if idx == 0 {
+        return if keeper_committed(state, side) { 0 } else { 2 };
+    }
+    let Ok(mems) = state.ai_memory.try_borrow() else {
+        return 2;
+    };
+    let m = &mems[side.index()];
+    if !plan_is_fresh(state, m) {
+        return 2;
+    }
+    if m.chaser as usize == idx && !keeper_committed(state, side) && state.ball.owner.is_none() {
+        return 0;
+    }
+    m.move_class.get(idx).copied().map_or(2, |c| c.max(1))
+}
+
+/// Loose-ball chase for the elected AI chaser: slide along the ball path (continuous intercept),
+/// attack the ball itself once on top of it.
+fn chase_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMoveIntent {
+    let p = &state.players[side.index()][idx];
+    let is_5v5 = state.format.players_per_side <= 6;
+    let chase_pt = if p.pos.dist(state.ball.pos.xy()) <= Fp::from_milli(1_500)
+        && state.ball.pos.z <= Fp::from_milli(900)
+    {
+        predict_ball_xy_at_ticks(state, 3)
+    } else {
+        smooth_ball_intercept(p, &sample_ball_3d_waypoints(state), is_5v5)
+    };
+    AiMoveIntent {
+        move_dir: (chase_pt - p.pos).normalize_or_zero(),
+        sprint: true,
+        jockey: false,
+        trigger_dive: None,
+    }
+}
+
+/// Closest point to `pt` on the segment `a..b`.
+fn closest_on_segment(a: Vec2, b: Vec2, pt: Vec2) -> Vec2 {
+    let ab = b - a;
+    let len = ab.len();
+    if len <= Fp::from_milli(5) {
+        return a;
+    }
+    let dir = ab.normalize_or_zero();
+    a + dir.scale((pt - a).dot(dir).clamp(Fp::ZERO, len))
+}
+
+/// Konami US 2010/0240429 teammate yield: a `target` within `r` of the reserved segment `a..b`
+/// (the carrier's near-term path or the chaser's run) moves outward along the radial from the
+/// nearest path point through the teammate's current position, to `r + l * (1 - d / r)` (continuous
+/// at `d = r`, at least `r`). If that radial runs along the path (or off the pitch) the
+/// perpendicular on the teammate's side is used instead (the patent's rotation by theta).
+#[allow(clippy::too_many_arguments)]
+pub fn yield_target(a: Vec2, b: Vec2, target: Vec2, mate_pos: Vec2, r: Fp, l: Fp, half_len: Fp, half_wid: Fp) -> Option<Vec2> {
+    let closest = closest_on_segment(a, b, target);
+    let d = target.dist(closest);
+    if d >= r {
+        return None;
+    }
+    let push = r + l.mul(Fp::ONE - d.div(r));
+    let inside = |q: Vec2| q.x.abs() <= half_len - Fp::from_milli(1_500) && q.y.abs() <= half_wid - Fp::from_milli(1_500);
+    let clear = |q: Vec2| closest_on_segment(a, b, q).dist(q) >= r - Fp::from_milli(2);
+    let mut radial = mate_pos - closest;
+    if radial.len() < Fp::from_milli(200) {
+        radial = target - closest;
+    }
+    if radial.len() >= Fp::from_milli(200) {
+        let cand = closest + radial.normalize_or_zero().scale(push);
+        if clear(cand) && inside(cand) {
+            return Some(cand);
+        }
+    }
+    // Perpendicular to the path, on the side the teammate is on (lateral fallback).
+    let path = b - a;
+    let path_dir = if path.len() > Fp::from_milli(5) {
+        path.normalize_or_zero()
+    } else {
+        (target - a).normalize_or_zero()
+    };
+    let perp = Vec2::new(-path_dir.y, path_dir.x);
+    let side_ref = if (mate_pos - a).len() > Fp::from_milli(50) { mate_pos - a } else { target - a };
+    let sgn = if perp.dot(side_ref) >= Fp::ZERO { Fp::ONE } else { Fp::NEG_ONE };
+    let c1 = closest + perp.scale(sgn.mul(push));
+    if inside(c1) || perp == Vec2::ZERO {
+        return Some(c1);
+    }
+    Some(closest - perp.scale(sgn.mul(push)))
 }
 
 /// Shape, role behaviours and committed movement for an AI outfielder in open play.
@@ -3227,6 +3626,11 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             m.flags.get(idx).copied().unwrap_or(0),
         )
     };
+    let (chaser, chaser_pt, mate_targets, mate_target_ticks) = {
+        let mems = state.ai_memory.borrow();
+        let m = &mems[side.index()];
+        (m.chaser, m.chaser_pt, m.target.clone(), m.target_tick.clone())
+    };
     let me = idx as u8;
     let slot = ctx.slot(slot_k);
     let role = slot.map(|s| s.role);
@@ -3243,6 +3647,8 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
     let mut press_role = false;
     let mut force_sprint = false;
     let mut counter_run = false;
+    let mut reserved_run = false;
+    let mut yielding = false;
     let mut alpha_pm = 120 + style.discipline / 5;
 
     if is_defensive_phase(phase) && !we_own {
@@ -3293,6 +3699,8 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             let depth = Fp::from_milli(if is_5v5 { 4_500 } else { 6_500 });
             let presser_pos = if presser != AI_NONE {
                 state.players[side.index()][presser as usize].pos
+            } else if chaser != 0 {
+                state.players[side.index()][chaser as usize].pos
             } else {
                 state.players[side.index()][state.controlled_idx[side.index()]].pos
             };
@@ -3500,6 +3908,12 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             }
             _ => true,
         };
+        // Exclusivity: GRF support-field spacing and one runner per destination (possession only).
+        let in_possession = we_own
+            || (state.ball.owner.is_none() && state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side));
+        if in_possession {
+            att_target = support_spacing(state, side, idx, att_target, is_5v5);
+        }
         let runner_role = matches!(
             role,
             Some(SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger | SlotRole::Ala | SlotRole::WideMid)
@@ -3525,14 +3939,19 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             if counter {
                 counter_run = true;
             }
+            reserved_run = true;
+        }
+        if in_possession {
+            att_target = reserve_destination(state, side, idx, att_target, &mate_targets, &mate_target_ticks, chaser, is_5v5);
         }
         raw = att_target;
     }
 
-    // Anti-swarm spacing: only the designated presser(s) engage; everyone else keeps a goal-side
-    // gap of 2.2 m from the carrier so one presser + one cover never becomes a three-man swarm.
+    // Anti-swarm spacing (engager cap): only the committed presser engages inside the contain gap;
+    // everyone else (the second presser and the cover included) keeps a goal-side gap of 2.2 m
+    // (3 m for the cover) from the carrier, so at most two players ever engage him.
     if let Some(ci) = opp_carrier {
-        if !press_role && me != second {
+        if !press_role {
             let c_pos = state.players[side.opponent().index()][ci].pos;
             let min_gap = Fp::from_milli(if me == cover { 3_000 } else { 2_200 });
             let off = raw - c_pos;
@@ -3550,6 +3969,49 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
 
     let half_len_fp = state.format.half_length();
     let half_wid_fp = state.format.half_width();
+
+    // Teammate yield radius (Konami US 2010/0240429): clear the class-0 teammate's near-term path
+    // (our carrier's next 0.5 s, the elected chaser's run to his intercept point, or on a loose ball
+    // nobody is elected for, the presser's run to his contain point). A teammate already standing
+    // inside the radius steps out from where he is, so he does not cut across the reserved path.
+    let loose = state.ball.owner.is_none() && !keeper_committed(state, side);
+    let path = if let Some((os, oi)) = state.ball.owner.filter(|&(os, oi)| os == side && oi != idx) {
+        let c = &state.players[os.index()][oi];
+        Some((c.pos, c.pos + c.vel.scale(Fp::from_milli(500))))
+    } else if loose && chaser != 0 && chaser != me {
+        Some((state.players[side.index()][chaser as usize].pos, chaser_pt))
+    } else if loose && chaser == 0 && presser != AI_NONE && presser != me {
+        let pi = presser as usize;
+        Some((state.players[side.index()][pi].pos, mate_targets.get(pi).copied().unwrap_or(ball_xy)))
+    } else {
+        None
+    };
+    if let Some((a, b)) = path {
+        let (r, l) = yield_radius(is_5v5);
+        // Back-line players hold the line height while defending: they yield only by target, and
+        // sideways (same depth) whenever that clears the radius.
+        let holds_line = is_defensive_phase(phase) && role.is_some_and(|r| r.is_back_line());
+        let yielded = yield_target(a, b, raw, p.pos, r, l, half_len_fp, half_wid_fp).or_else(|| {
+            (!holds_line).then(|| yield_target(a, b, p.pos, p.pos, r, l, half_len_fp, half_wid_fp)).flatten()
+        });
+        if let Some(t) = yielded {
+            let sideways = Vec2::new(raw.x, t.y);
+            raw = if holds_line && closest_on_segment(a, b, sideways).dist(sideways) >= r { sideways } else { t };
+            yielding = true;
+        }
+    }
+    // Keeper-defender arbitration: while the keeper is committed to the loose ball, his line to the
+    // claim point is reserved; defenders inside the corridor step aside laterally.
+    if keeper_committed(state, side) {
+        let gk = &state.players[side.index()][0];
+        let brain = &state.gk_brain[side.index()];
+        let claim = if brain.target == Vec2::ZERO { ball_xy } else { brain.target };
+        if let Some(t) = keeper_corridor_yield(gk.pos, claim, raw, p.pos, is_5v5) {
+            raw = t;
+            yielding = true;
+        }
+    }
+
     raw.x = raw.x.clamp(-(half_len_fp - Fp::from_milli(1_500)), half_len_fp - Fp::from_milli(1_500));
     raw.y = raw.y.clamp(-(half_wid_fp - Fp::from_milli(1_500)), half_wid_fp - Fp::from_milli(1_500));
 
@@ -3612,10 +4074,34 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
     let dist_sprint = if was_sprint { dist > sprint_hi.mul(Fp::from_milli(550)) } else { dist > sprint_hi };
     let press_sprint = press_role && dist > Fp::from_milli(1_400) && (p.stamina_permille as i64) > 400 + (1_000 - style.work_rate) / 4;
     let counter_sprint = counter_run && dist > Fp::from_milli(3_000);
-    let sprint = (p.run_boost_ticks > 0 && !opp_owns) || force_sprint || press_sprint || counter_sprint || dist_sprint;
+    let mut sprint = (p.run_boost_ticks > 0 && !opp_owns) || force_sprint || press_sprint || counter_sprint || dist_sprint;
     let was_jockey = (prev_flags & FLAG_JOCKEY) != 0 && continuous;
     let jockey_r = Fp::from_milli(if was_jockey { 3_200 } else { 2_600 });
     let jockey = opp_owns && is_defensive_phase(phase) && my_dist < jockey_r && !force_sprint;
+
+    // Movement priority class and off-ball cruise speed: an uninvolved (class 3) player moves at
+    // <= 70% of his top (sprint) speed and never sprints; only engagers and triggered runs sprint.
+    let engaged = press_role || me == cover || me == second;
+    let triggered = force_sprint
+        || counter_run
+        || reserved_run
+        || p.run_boost_ticks > 0
+        || (mark != AI_NONE && is_defensive_phase(phase))
+        // Holding the defensive line is a tactical task, not idle cruising.
+        || (is_defensive_phase(phase) && role.is_some_and(|r| r.is_back_line() || r == SlotRole::Holding))
+        || dist_sprint;
+    let class = if engaged {
+        1
+    } else if !yielding && triggered {
+        2
+    } else {
+        3
+    };
+    if class == 3 {
+        sprint = false;
+        let sprint_mult = if is_5v5 { 1_205 } else { 1_220 };
+        move_vec = move_vec.clamp_len(Fp::from_milli(CRUISE_TOP_SPEED_PM * sprint_mult / 1_000));
+    }
 
     {
         let mut mems = state.ai_memory.borrow_mut();
@@ -3625,6 +4111,9 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             m.target_tick[idx] = state.tick;
             m.flags[idx] = (u8::from(sprint) * FLAG_SPRINT) | (u8::from(jockey) * FLAG_JOCKEY);
         }
+        if let Some(c) = m.move_class.get_mut(idx) {
+            *c = class;
+        }
     }
 
     AiMoveIntent {
@@ -3633,6 +4122,133 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         jockey,
         trigger_dive: None,
     }
+}
+
+
+/// Teammate yield radius `R` and displacement `L` (metres, estimate on Konami's unspecified values).
+const fn yield_radius(is_5v5: bool) -> (Fp, Fp) {
+    if is_5v5 {
+        (Fp::from_milli(2_500), Fp::from_milli(1_500))
+    } else {
+        (Fp::from_milli(3_000), Fp::from_milli(2_000))
+    }
+}
+
+/// GRF `GetSupportPosition_ForceField` teammate term, in possession only: the six nearest teammates
+/// repel the target with weight 0.4 over a 10.5 m scale (6.5 m in 5v5), total shift capped.
+fn support_spacing(state: &MatchState, side: TeamSide, idx: usize, target: Vec2, is_5v5: bool) -> Vec2 {
+    let scale = Fp::from_milli(if is_5v5 { 6_500 } else { 10_500 });
+    let cap = Fp::from_milli(if is_5v5 { 2_000 } else { 3_000 });
+    let mut near: Vec<(Fp, usize)> = state.players[side.index()]
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|&(j, m)| j != idx && !m.sent_off)
+        .map(|(j, m)| (m.pos.dist(target), j))
+        .collect();
+    near.sort_unstable();
+    let mut push = Vec2::ZERO;
+    for &(d, j) in near.iter().take(6) {
+        if d >= scale {
+            break;
+        }
+        let away = target - state.players[side.index()][j].pos;
+        let dir = if away.len() > Fp::from_milli(150) {
+            away.normalize_or_zero()
+        } else if idx > j {
+            Vec2::new(Fp::ZERO, Fp::ONE)
+        } else {
+            Vec2::new(Fp::ZERO, Fp::NEG_ONE)
+        };
+        push += dir.scale((scale - d).mul(Fp::from_milli(400)));
+    }
+    target + push.clamp_len(cap)
+}
+
+/// One runner per destination (Konami US 8,616,946): if a teammate's committed target lies within
+/// 6 m (5 m in 5v5) of ours, the player who is farther from that destination (ties: higher index)
+/// moves his target out to that distance. The carrier and the chaser hold no destination.
+#[allow(clippy::too_many_arguments)]
+fn reserve_destination(
+    state: &MatchState,
+    side: TeamSide,
+    idx: usize,
+    mut target: Vec2,
+    mate_targets: &[Vec2],
+    mate_target_ticks: &[u32],
+    chaser: u8,
+    is_5v5: bool,
+) -> Vec2 {
+    let res = Fp::from_milli(if is_5v5 { 5_000 } else { 6_000 });
+    let players = &state.players[side.index()];
+    let me = &players[idx];
+    let carrier = state.ball.owner.and_then(|(os, oi)| (os == side).then_some(oi));
+    for _ in 0..2 {
+        let mut moved = false;
+        for (j, mate) in players.iter().enumerate().skip(1) {
+            if j == idx || mate.sent_off || Some(j) == carrier || j as u8 == chaser || j >= mate_targets.len() {
+                continue;
+            }
+            // Only live reservations (refreshed this tick or the previous one).
+            let tt = mate_target_ticks.get(j).copied().unwrap_or(0);
+            if tt == 0 || state.tick.wrapping_sub(tt) > 1 {
+                continue;
+            }
+            let rj = mate_targets[j];
+            let d = target.dist(rj);
+            if d >= res {
+                continue;
+            }
+            let d_mate = mate.pos.dist(rj);
+            let d_me = me.pos.dist(rj);
+            if d_me < d_mate || (d_me == d_mate && idx < j) {
+                continue;
+            }
+            let away = target - rj;
+            let dir = if away.len() > Fp::from_milli(200) {
+                away.normalize_or_zero()
+            } else {
+                let lat = Vec2::new(Fp::ZERO, if idx > j { Fp::ONE } else { Fp::NEG_ONE });
+                if (rj + lat.scale(res)).y.abs() > state.format.half_width() - Fp::from_milli(1_500) {
+                    lat.scale(Fp::NEG_ONE)
+                } else {
+                    lat
+                }
+            };
+            target = rj + dir.scale(res);
+            moved = true;
+        }
+        if !moved {
+            break;
+        }
+    }
+    target
+}
+
+/// While the keeper is committed, the corridor from the keeper to his claim point (extended 1.5 m
+/// past it, half-width 1.8 m / 1.5 m in 5v5) is reserved: a defender whose target or position is
+/// inside steps aside laterally to 1.2 m outside the corridor, on the side he is already on.
+fn keeper_corridor_yield(gk: Vec2, claim: Vec2, target: Vec2, me: Vec2, is_5v5: bool) -> Option<Vec2> {
+    let half_w = Fp::from_milli(if is_5v5 { 1_500 } else { 1_800 });
+    let dir = (claim - gk).normalize_or_zero();
+    if dir == Vec2::ZERO {
+        return None;
+    }
+    let end = claim + dir.scale(Fp::from_milli(1_500));
+    let len = end.dist(gk);
+    let perp = Vec2::new(-dir.y, dir.x);
+    let inside = |q: Vec2| {
+        let along = (q - gk).dot(dir);
+        along > Fp::from_milli(-1_000) && along < len && (q - gk).dot(perp).abs() < half_w
+    };
+    if !inside(target) && !inside(me) {
+        return None;
+    }
+    let lat_me = (me - gk).dot(perp);
+    let sgn = if lat_me >= Fp::ZERO { Fp::ONE } else { Fp::NEG_ONE };
+    let base = if inside(target) { target } else { me };
+    let along = (base - gk).dot(dir).clamp(Fp::ZERO, len);
+    Some(gk + dir.scale(along) + perp.scale(sgn.mul(half_w + Fp::from_milli(1_200))))
 }
 
 /// Continuous loose-ball intercept for an outfield chaser: linearly interpolates the zero crossing
