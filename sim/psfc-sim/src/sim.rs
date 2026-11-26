@@ -5618,7 +5618,26 @@ impl MatchSimulation {
             if hit_woodwork {
                 // Woodwork rebound clears `kicker_lockout` so Penalty post-rebounds still enforce IFAB Law 14 double-touch!
                 self.state.ball.kicker_lockout = None;
-                if self.state.ball.pos.x.abs() <= half_len + Fp::from_milli(110) {
+                let vx_in = self.state.ball.vel.x.to_milli() * sign;
+                let past_line = self.state.ball.pos.x.to_milli() * sign > half_len.to_milli() + 110
+                    && self.state.ball.pos.y.abs() <= goal_half_w
+                    && self.state.ball.pos.z <= goal_h;
+                let going_in = if past_line {
+                    true
+                } else if vx_in > 450 {
+                    let rem_dx = (half_len.to_milli() + 110) - (self.state.ball.pos.x.to_milli() * sign);
+                    if rem_dx <= 0 {
+                        self.state.ball.pos.y.abs() <= goal_half_w && self.state.ball.pos.z <= goal_h
+                    } else {
+                        let proj_y = self.state.ball.pos.y.to_milli()
+                            + (self.state.ball.vel.y.to_milli() * rem_dx) / vx_in;
+                        proj_y.abs() <= goal_half_w.to_milli()
+                            && (self.state.ball.pos.z <= goal_h || self.state.ball.vel.z < Fp::ZERO)
+                    }
+                } else {
+                    false
+                };
+                if !going_in {
                     self.rollback_pending_shot_on_target();
                 }
                 let shoot_side = self.state.ball.last_touch_team.unwrap_or(TeamSide::Home);
@@ -5630,6 +5649,14 @@ impl MatchSimulation {
                     "Rattles the woodwork!".to_string(),
                 );
             }
+        }
+
+        // If a tentative on-target shot/rebound loses all forward momentum on the grass before crossing the line, roll back SOT!
+        if self.state.ball.pending_shot_on_target.is_some()
+            && self.state.ball.pos.z <= Fp::from_milli(120)
+            && self.state.ball.vel.xy().len() < Fp::from_milli(250)
+        {
+            self.rollback_pending_shot_on_target();
         }
     }
 
@@ -6358,10 +6385,14 @@ impl MatchSimulation {
             (Fp::ZERO, Fp::ZERO)
         };
 
+        if idx != 0 {
+            self.rollback_pending_shot_on_target();
+        } else {
+            self.state.ball.pending_shot_on_target = None;
+        }
         self.state.ball.owner = Some((side, idx));
         self.state.ball.gk_hold_ticks = if allow_gk_hand_catch { 75 } else { 0 };
         self.state.ball.deliberate_foot_backpass = if idx == 0 { None } else { Some(side) };
-        self.state.ball.pending_shot_on_target = None;
         self.state.ball.possession_grace_ticks = 6;
         self.state.ball.dribble_touch_cd = 6;
         self.state.ball.pos.z = trapped_z;
@@ -6862,6 +6893,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < half_limit + 150 {
                 return;
             }
+            self.rollback_pending_shot_on_target();
             self.flush_pending_advantage_card();
             self.emit_event(
                 MatchEventType::HalfTime,
@@ -6881,6 +6913,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < full_limit + 150 {
                 return;
             }
+            self.rollback_pending_shot_on_target();
             self.flush_pending_advantage_card();
             if self.state.rules.extra_time_enabled && self.state.score[0] == self.state.score[1] {
                 self.emit_event(
@@ -6901,6 +6934,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < et_first_limit + 150 {
                 return;
             }
+            self.rollback_pending_shot_on_target();
             self.flush_pending_advantage_card();
             self.emit_event(
                 MatchEventType::HalfTime,
@@ -6920,6 +6954,7 @@ impl MatchSimulation {
             if active_box_attack && self.state.clock_ticks < et_full_limit + 150 {
                 return;
             }
+            self.rollback_pending_shot_on_target();
             self.flush_pending_advantage_card();
             if self.state.score[0] == self.state.score[1] {
                 self.resolve_penalty_shootout();
@@ -10608,6 +10643,45 @@ mod tests {
                 .iter()
                 .any(|e| e.event_type == MatchEventType::Woodwork),
             "swept post strike must emit Woodwork event"
+        );
+
+        // Also verify an on-target shot glancing IN off the inside of the post preserves `shots_on_target == 1`!
+        let mut in_off_post_sim = MatchSimulation::new(&snap).unwrap();
+        in_off_post_sim.state.phase = MatchPhase::OpenPlay;
+        for team_arr in &mut in_off_post_sim.state.players {
+            for p in team_arr {
+                p.pos = Vec2::from_milli(0, -14_000);
+            }
+        }
+        let post_scorer_id = in_off_post_sim.state.players[0][4].footballer_id.clone();
+        in_off_post_sim.set_last_touch(TeamSide::Home, 4);
+        in_off_post_sim.state.player_stats[0][4].shots = 1;
+        in_off_post_sim.state.player_stats[0][4].shots_on_target = 1;
+        in_off_post_sim.state.ball.pending_shot_on_target =
+            Some((TeamSide::Home, post_scorer_id));
+        in_off_post_sim.state.ball.owner = None;
+        // Post center at `(p_half_len, p_goal_hw + 60)`: `y = p_goal_hw - 85` is `145mm < 170mm` on the INSIDE of the post!
+        in_off_post_sim.state.ball.pos = Vec3::from_milli(p_half_len - 200, p_goal_hw - 85, 500);
+        in_off_post_sim.state.ball.vel = Vec3::from_milli(26_000, 0, 0);
+        for _ in 0..8 {
+            in_off_post_sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if in_off_post_sim.state().score[0] >= 1 {
+                break;
+            }
+        }
+        assert!(
+            in_off_post_sim
+                .state()
+                .recorded_events
+                .iter()
+                .any(|e| e.event_type == MatchEventType::Woodwork),
+            "inside-post strike must hit woodwork"
+        );
+        assert_eq!(in_off_post_sim.state().score[0], 1, "inside-post glance must score");
+        assert_eq!(
+            in_off_post_sim.state().player_stats[0][4].shots_on_target,
+            1,
+            "shot going in off the inside of the post must retain shots_on_target == 1"
         );
 
         // 2. Codex P2 #1: Pending yellow card under Referee Advantage must be issued when play stops for a Throw-In
