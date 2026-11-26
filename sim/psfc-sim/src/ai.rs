@@ -1479,7 +1479,24 @@ fn measure_free_space_ahead(
     free
 }
 
+/// Side-effect-free variant of [`generate_cpu_input`] for callers OUTSIDE `MatchSimulation::tick`
+/// (auto-pilot of a human side, HUD suggestions, tools). `generate_cpu_input` runs the team plan and
+/// the shape intent for the controlled player, which write into `MatchState::ai_memory` (hashed
+/// state). Inside `tick` that is wanted, once per tick per CPU side; outside it the writes would
+/// not be reproduced by a replay of the recorded inputs, so this wrapper snapshots and restores the
+/// AI memory around the call and leaves `state_hash` unchanged.
+pub fn suggest_cpu_input(state: &MatchState, side: TeamSide, difficulty: CpuDifficulty) -> InputFrame {
+    let saved = state.ai_memory.borrow().clone();
+    let frame = generate_cpu_input(state, side, difficulty);
+    *state.ai_memory.borrow_mut() = saved;
+    frame
+}
+
 /// Generates a deterministic `InputFrame` for a CPU-controlled team (`Easy`, `Normal`, `Hard`).
+/// NOTE: writes the tick's team plan and the controlled player's smoothed shape target into
+/// `state.ai_memory` (interior mutability; part of the hashed state). Call it exactly once per tick
+/// per CPU side from `MatchSimulation::tick`; anything outside the tick must use
+/// [`suggest_cpu_input`], or a replay of the recorded inputs will diverge.
 pub fn generate_cpu_input(
     state: &MatchState,
     side: TeamSide,

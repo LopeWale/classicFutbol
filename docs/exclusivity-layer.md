@@ -251,3 +251,15 @@ bounds sit at the noise edge. With 3 seeds, small changes move them by ±1 m and
   and the 18–30-tick claim flag. The layer reads the keeper's own committed scenario (whose commit
   timer already acts as the flag) and does not change the goalkeeper module.
 - **Path-crossing avoidance between non-class-0 players.** That is Area J's velocity-stage solver.
+
+## Calling the CPU input generator from outside the tick
+
+`ai::generate_cpu_input` now runs the team plan (`update_team_plan`) and, for the controlled player,
+the shape intent with its smoothed target memory. Both write into `MatchState::ai_memory`, which is
+serialized and hashed. Inside `MatchSimulation::tick` that is the intended once-per-tick update for a
+CPU side. Anything that wants a CPU suggestion for a *human* side from outside the tick (the WASM
+`sim_auto_step` auto-pilot, HUD hints, tools) must call `ai::suggest_cpu_input`, which snapshots and
+restores the AI memory around the call and leaves `state_hash` unchanged. Without it the recorded
+input log no longer reproduces the match: the host's `psfc-replay verify` reported a checkpoint hash
+mismatch for auto-piloted matches when this layer first landed. `tests/autopilot_replay.rs` pins the
+invariant (suggestion leaves the hash unchanged; an auto-piloted log replays to identical hashes).

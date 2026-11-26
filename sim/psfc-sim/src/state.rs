@@ -87,6 +87,10 @@ pub struct PlayerState {
     /// Aerial landing recovery (`0..=42` ticks, `0.7s`): no re-jump while counting down (anti bunny-hop).
     #[serde(default)]
     pub jump_recover_ticks: u8,
+    /// Consecutive ticks this player's body has overlapped another (push-out stuck-pair detector;
+    /// above `avoidance::STUCK_TICKS` the pair gets a lateral nudge).
+    #[serde(default)]
+    pub overlap_ticks: u8,
     pub yellow_cards: u8,
     pub sent_off: bool,
 }
@@ -1048,6 +1052,7 @@ impl MatchState {
                 h.u8(p.skill_chain_count);
                 h.u8(p.skill_chain_decay_ticks);
                 h.u8(p.jump_recover_ticks);
+                h.u8(p.overlap_ticks);
                 h.u8(p.yellow_cards);
                 h.u8(u8::from(p.sent_off));
                 match p.action {
