@@ -42,7 +42,17 @@
           "required": ["camera_preset", "controller_mapping"],
           "properties": {
             "camera_preset": { "type": "string" },
-            "controller_mapping": { "type": "object" }
+            "controller_mapping": {
+              "type": "object",
+              "description": "Controller preferences. `control_profile` is the portable ControlProfile v2 (canonical snake_case, control_profile.schema.json); `fifa_profile` is an alias kept for older clients. `layout` / `custom_map` describe the Layer-1 hardware pad profile. Other keys (e.g. the host's legacy default mapping) are ignored by clients.",
+              "properties": {
+                "control_profile": { "$ref": "control_profile.schema.json" },
+                "fifa_profile": { "$ref": "control_profile.schema.json" },
+                "layout": { "type": "string" },
+                "custom_map": { "type": ["object", "null"] }
+              },
+              "additionalProperties": true
+            }
           }
         },
         "career_summary": {

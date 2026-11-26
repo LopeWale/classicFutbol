@@ -1,6 +1,9 @@
 /*
  * Parallel Season FC — Custom RP2040 Controller USB HID Descriptors
- * Exposes a 1000 Hz (`bInterval = 1`) 8-byte HID Gamepad report matching `psfc_sim::InputFrame`.
+ * Exposes a 1000 Hz (`bInterval = 1`) 8-byte standard HID Gamepad report:
+ *   4 x int8 axes (X = LX, Y = LY, Z = RX, Rz = RY) + 16 PHYSICAL buttons (W3C standard order,
+ *   see main.c PHYS_*) + 16-bit constant sequence counter.
+ * Gameplay actions are NOT encoded here; the client's ControlProfile maps physical -> action.
  */
 
 #include "tusb.h"
@@ -9,7 +12,7 @@
 #define PSFC_USB_VID 0x1209 /* pid.codes open-hardware VID */
 #define PSFC_USB_PID 0xF5FC /* Parallel Season FC 5v5 Pad */
 
-/* 8-byte HID report: 4 signed int8 axes (LX, LY, RX, RY) + 16-bit button bitmask + 16-bit reserved */
+/* 8-byte HID report: 4 signed int8 axes (LX, LY, RX, RY) + 16 physical buttons + 16-bit sequence */
 uint8_t const desc_hid_report[] = {
     0x05, 0x01,       /* Usage Page (Generic Desktop Ctrls) */
     0x09, 0x05,       /* Usage (Game Pad) */
@@ -24,8 +27,8 @@ uint8_t const desc_hid_report[] = {
     0x95, 0x04,       /*   Report Count (4 axes) */
     0x81, 0x02,       /*   Input (Data,Var,Abs) */
     0x05, 0x09,       /*   Usage Page (Button) */
-    0x19, 0x01,       /*   Usage Minimum (Button 1) */
-    0x29, 0x10,       /*   Usage Maximum (Button 16) */
+    0x19, 0x01,       /*   Usage Minimum (Button 1  = South) */
+    0x29, 0x10,       /*   Usage Maximum (Button 16 = D-Pad Right) */
     0x15, 0x00,       /*   Logical Minimum (0) */
     0x25, 0x01,       /*   Logical Maximum (1) */
     0x75, 0x01,       /*   Report Size (1 bit) */
@@ -47,7 +50,7 @@ tusb_desc_device_t const desc_device = {
     .bMaxPacketSize0    = CFG_TUD_ENDPOINT0_SIZE,
     .idVendor           = PSFC_USB_VID,
     .idProduct          = PSFC_USB_PID,
-    .bcdDevice          = 0x0100,
+    .bcdDevice          = 0x0200, /* v2: physical-button report (v1 emitted InputFrame gameplay bits) */
     .iManufacturer      = 0x01,
     .iProduct           = 0x02,
     .iSerialNumber      = 0x03,

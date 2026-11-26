@@ -5,262 +5,34 @@ import {
   resolveMatchKits,
 } from "./engine3d.js";
 
-// InputFrame button bitmasks (must match sim/psfc-sim/src/input.rs)
-const BTN_PASS = 1 << 0;
-const BTN_THROUGH = 1 << 1;
-const BTN_LOB = 1 << 2;
-const BTN_SHOOT = 1 << 3;
-const BTN_SPRINT = 1 << 4;
-const BTN_SWITCH = 1 << 5;
-const BTN_JOCKEY = 1 << 6;
-const BTN_TACKLE = 1 << 7;
-const BTN_SLIDE = 1 << 8;
-const BTN_CALL_RUN = 1 << 9;
-const BTN_SKILL = 1 << 10;
-const BTN_FINESSE = 1 << 11;
-const BTN_CONTAIN = 1 << 12;
-const BTN_TEAMMATE_CONTAIN = 1 << 13;
-const BTN_GK_RUSH = 1 << 14;
-const BTN_PACE_CONTROL = 1 << 15;
+import {
+  PHYSICAL_BINDABLE_INPUTS,
+  CONTROL_PRESETS,
+  ATTACK_ACTION_META,
+  DEFENSE_ACTION_META,
+  createDefaultControlProfile,
+  sanitizeControlProfile,
+  profileToCanonical,
+  applyPresetToProfile,
+  rebindProfileAction,
+  encodeControlSettingsReserved,
+  autoSwitchCodeFromName,
+  glyphFor,
+  buildPromptEntries,
+  mapPhysicalToSimInput as mapPhysicalToSimInputPure,
+  createContextPassLatch,
+  applyContextPassLatch,
+} from "./control_profile.js";
 
+// InputFrame BTN_* bitmasks (must match sim/psfc-sim/src/input.rs) are defined in ./control_profile.js.
 // =========================================================================
 // ACTION-BASED INPUT ABSTRACTION LAYER (FIFA 10–12 PRESETS & SERIALIZATION)
+// Pure profile / preset / glyph / Layer-2 mapping code lives in ./control_profile.js
+// (node-testable: static/tests/control_profile.test.mjs). On-disk form is the
+// canonical snake_case schema shared/schemas/control_profile.schema.json.
 // =========================================================================
 
 const CONTROL_PROFILE_STORAGE_KEY = "psfc_control_profile_v2";
-const PHYSICAL_BINDABLE_INPUTS = ["south", "east", "west", "north", "rt", "rb", "lt", "lb", "select"];
-
-const CONTROL_PRESETS = {
-  classic: {
-    label: "CLASSIC (FIFA)",
-    attack: {
-      pass: "south",         // A / Cross -> Ground Pass / Header
-      shoot: "east",         // B / Circle -> Shoot / Volley / Clear
-      cross: "west",         // X / Square -> Lob Pass / Cross / Clear
-      throughBall: "north",  // Y / Triangle -> Through Ball
-      sprint: "rt",          // RT / R2 -> Sprint (Analog or Digital)
-      finesse: "rb",         // RB / R1 -> Finesse Shot Modifier
-      paceControl: "lt",     // LT / L2 -> Pace Control / Skill Modifier
-      chipRun: "lb",         // LB / L1 -> Chip Shot Modifier / Trigger Run
-    },
-    defense: {
-      contain: "south",          // A / Cross -> Contain (Hold)
-      standingTackle: "east",    // B / Circle -> Standing Tackle / Push-Pull (FIFA 12)
-      slidingTackle: "west",     // X / Square -> Sliding Tackle
-      rushGk: "north",           // Y / Triangle -> Rush Goalkeeper (Hold)
-      sprint: "rt",              // RT / R2 -> Sprint
-      teammateContain: "rb",     // RB / R1 -> Teammate Contain (Hold)
-      jockey: "lt",              // LT / L2 -> Jockey / Strafe
-      switchPlayer: "lb",        // LB / L1 -> Switch Player (Auto/Nearest)
-    },
-  },
-  alternate: {
-    label: "ALTERNATE (SWAP X-B)",
-    attack: {
-      pass: "south",
-      shoot: "west",         // PES / Alternate: X / Square shoots
-      cross: "east",         // PES / Alternate: B / Circle crosses
-      throughBall: "north",
-      sprint: "rt",
-      finesse: "rb",
-      paceControl: "lt",
-      chipRun: "lb",
-    },
-    defense: {
-      contain: "south",
-      standingTackle: "east",
-      slidingTackle: "west",
-      rushGk: "north",
-      sprint: "rt",
-      teammateContain: "rb",
-      jockey: "lt",
-      switchPlayer: "lb",
-    },
-  },
-  two_button: {
-    label: "TWO-BUTTON",
-    attack: {
-      pass: "south",
-      shoot: "east",
-      cross: "west",
-      throughBall: "north",
-      sprint: "rt",
-      finesse: "rb",
-      paceControl: "lt",
-      chipRun: "lb",
-    },
-    defense: {
-      contain: "south",
-      standingTackle: "east",
-      slidingTackle: "west",
-      rushGk: "north",
-      sprint: "rt",
-      teammateContain: "rb",
-      jockey: "lt",
-      switchPlayer: "south",
-    },
-  },
-};
-
-const ATTACK_ACTION_META = [
-  { key: "pass", label: "Ground Pass / Header", kb: "Space / J" },
-  { key: "shoot", label: "Shoot / Volley / Clear", kb: "L / Enter" },
-  { key: "cross", label: "Lob Pass / Cross / Clear", kb: "U" },
-  { key: "throughBall", label: "Through Ball", kb: "K" },
-  { key: "sprint", label: "Sprint (Analog / Digital)", kb: "Shift" },
-  { key: "finesse", label: "Finesse Shot Modifier", kb: "E" },
-  { key: "paceControl", label: "Pace Control / Skill Modifier", kb: "F" },
-  { key: "chipRun", label: "Chip Modifier / Trigger Run", kb: "Q" },
-];
-
-const DEFENSE_ACTION_META = [
-  { key: "contain", label: "Contain (Hold)", kb: "Space / J" },
-  { key: "standingTackle", label: "Standing Tackle / Push-Pull", kb: "L / E" },
-  { key: "slidingTackle", label: "Sliding Tackle", kb: "U / C" },
-  { key: "rushGk", label: "Rush Goalkeeper (Hold)", kb: "K" },
-  { key: "sprint", label: "Sprint", kb: "Shift" },
-  { key: "teammateContain", label: "Teammate Contain (Hold)", kb: "R" },
-  { key: "jockey", label: "Jockey / Strafe", kb: "F" },
-  { key: "switchPlayer", label: "Switch Player (Auto / Nearest)", kb: "Q" },
-];
-
-function createDefaultControlProfile(presetName = "classic") {
-  const base = CONTROL_PRESETS[presetName] || CONTROL_PRESETS.classic;
-  return {
-    version: 2,
-    preset: CONTROL_PRESETS[presetName] ? presetName : "classic",
-    autoSwitch: "auto",              // "auto" | "air_balls" | "manual"
-    autoSwitchMoveAssist: "low",     // "none" | "low" | "high"
-    passAssist: "assisted",          // "assisted" | "semi" | "manual"
-    throughAssist: "assisted",
-    shotAssist: "assisted",
-    crossAssist: "assisted",
-    defendingMode: "tactical",       // "tactical" | "legacy"
-    analogSprint: true,
-    attack: { ...base.attack },
-    defense: { ...base.defense },
-  };
-}
-
-function sanitizeControlProfile(raw) {
-  const def = createDefaultControlProfile("classic");
-  if (!raw || typeof raw !== "object") return def;
-  const preset = ["classic", "alternate", "two_button", "custom"].includes(raw.preset) ? raw.preset : "classic";
-  const validAssist = (v) => (["assisted", "semi", "manual"].includes(v) ? v : "assisted");
-  const validMove = (v) => (["none", "low", "high"].includes(v) ? v : "low");
-  const validSw = (v) => (["auto", "air_balls", "manual"].includes(v) ? v : "auto");
-  const validPhys = (v, fb) => (PHYSICAL_BINDABLE_INPUTS.includes(v) ? v : fb);
-  const presetBase = CONTROL_PRESETS[preset] || CONTROL_PRESETS.classic;
-  const attack = {};
-  for (const k of Object.keys(presetBase.attack)) {
-    attack[k] = validPhys(raw.attack && raw.attack[k], presetBase.attack[k]);
-  }
-  const defense = {};
-  for (const k of Object.keys(presetBase.defense)) {
-    defense[k] = validPhys(raw.defense && raw.defense[k], presetBase.defense[k]);
-  }
-  return {
-    version: 2,
-    preset,
-    autoSwitch: validSw(raw.autoSwitch),
-    autoSwitchMoveAssist: validMove(raw.autoSwitchMoveAssist),
-    passAssist: validAssist(raw.passAssist),
-    throughAssist: validAssist(raw.throughAssist),
-    shotAssist: validAssist(raw.shotAssist),
-    crossAssist: validAssist(raw.crossAssist),
-    defendingMode: raw.defendingMode === "legacy" ? "legacy" : "tactical",
-    analogSprint: typeof raw.analogSprint === "boolean" ? raw.analogSprint : true,
-    attack,
-    defense,
-  };
-}
-
-function encodeControlSettingsReserved(prof) {
-  const assistCode = (v) => (v === "semi" ? 1 : v === "manual" ? 2 : 0);
-  const moveAssistCode = (v) => (v === "low" ? 1 : v === "high" ? 2 : 0);
-  const swCode = (v) => (v === "air_balls" ? 1 : v === "manual" ? 2 : 0);
-  const defBit = prof.defendingMode === "legacy" ? 1 : 0;
-  const analogBit = prof.analogSprint ? 1 : 0;
-  return (
-    (0x4000 |
-      (assistCode(prof.passAssist) & 0x3) |
-      ((assistCode(prof.throughAssist) & 0x3) << 2) |
-      ((assistCode(prof.shotAssist) & 0x3) << 4) |
-      ((assistCode(prof.crossAssist) & 0x3) << 6) |
-      ((defBit & 0x1) << 8) |
-      ((moveAssistCode(prof.autoSwitchMoveAssist) & 0x3) << 9) |
-      ((analogBit & 0x1) << 11) |
-      ((swCode(prof.autoSwitch) & 0x3) << 12)) &
-    0xffff
-  );
-}
-
-function autoSwitchCodeFromName(name) {
-  return name === "air_balls" ? 1 : name === "manual" ? 2 : 0;
-}
-
-function formatPhysicalGlyph(physKey, style = "modern") {
-  const tables = {
-    modern: {
-      south: "A / ✕",
-      east: "B / ○",
-      west: "X / □",
-      north: "Y / △",
-      rt: "RT / R2",
-      rb: "RB / R1",
-      lt: "LT / L2",
-      lb: "LB / L1",
-      select: "VIEW / SHARE",
-    },
-    ps: {
-      south: "✕ Cross",
-      east: "○ Circle",
-      west: "□ Square",
-      north: "△ Triangle",
-      rt: "R2",
-      rb: "R1",
-      lt: "L2",
-      lb: "L1",
-      select: "SHARE",
-    },
-    xbox: {
-      south: "A",
-      east: "B",
-      west: "X",
-      north: "Y",
-      rt: "RT",
-      rb: "RB",
-      lt: "LT",
-      lb: "LB",
-      select: "VIEW",
-    },
-    snes: {
-      south: "SNES B (Bottom)",
-      east: "SNES A (Right)",
-      west: "SNES Y (Left)",
-      north: "SNES X (Top)",
-      rt: "SNES R",
-      rb: "SNES R",
-      lt: "SNES L",
-      lb: "SNES L",
-      select: "SELECT",
-    },
-  };
-  const tbl = tables[style] || tables.modern;
-  return tbl[physKey] || String(physKey || "?").toUpperCase();
-}
-
-const PHYSICAL_KEYBOARD_LABELS = {
-  south: "Space / J",
-  east: "L / Enter",
-  west: "U",
-  north: "K",
-  rt: "Shift",
-  rb: "E",
-  lt: "F",
-  lb: "Q",
-  select: "Z",
-};
 
 const PHASE_LABELS = {
   0: "KICK OFF",
@@ -656,11 +428,41 @@ let subsSide = 0;
 let subsArmedSlot = null;
 let rebindState = null; // { context: "attack"|"defense", actionKey, label, waitingRelease }
 
+// Two-Button context pass resolver latch per side (0 = Home, 1 = Away)
+const contextPassLatches = [createContextPassLatch(), createContextPassLatch()];
+// Last device the primary human touched ("keyboard" | "pad") — drives HUD prompt glyph family
+let lastPrimaryInputKind = "keyboard";
+let lastPrimaryPadIndex = 0;
+
 function saveControlProfile() {
   try {
-    localStorage.setItem(CONTROL_PROFILE_STORAGE_KEY, JSON.stringify(controlProfile));
+    // Persist the canonical snake_case schema form (sanitizeControlProfile reads both spellings)
+    localStorage.setItem(CONTROL_PROFILE_STORAGE_KEY, JSON.stringify(profileToCanonical(controlProfile)));
     localStorage.setItem(AUTO_SWITCH_STORAGE_KEY, String(autoSwitchCodeFromName(controlProfile.autoSwitch)));
   } catch (_e) {}
+}
+
+/** Canonical (snake_case, schema v2) profile JSON text. */
+function exportControlProfileJson() {
+  return JSON.stringify(profileToCanonical(controlProfile), null, 2);
+}
+
+/**
+ * Loads a profile JSON (canonical snake_case or legacy camelCase) straight into gameplay and UI:
+ * persists it, queues a 0x4000 ControlSettings sync frame and refreshes every prompt. Throws on bad JSON.
+ */
+function importControlProfileJson(text) {
+  const parsed = typeof text === "string" ? JSON.parse(text) : text;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("not a profile object");
+  // Accept a full cartridge `preferences.controller_mapping` object too
+  const src = parsed.control_profile || parsed.fifa_profile || parsed;
+  controlProfile = sanitizeControlProfile(src);
+  for (const latch of contextPassLatches) latch.bit = 0;
+  saveControlProfile();
+  enqueueControlSettingsSync();
+  syncControlSettingsUi();
+  hudPromptCacheKey = "";
+  return controlProfile;
 }
 
 function enqueueControlSettingsSync() {
@@ -847,7 +649,7 @@ function isSnesSignature(idStr, btnCount = 16) {
 
 function classifyGamepadVendor(idStr, btnCount = 16) {
   const s = String(idStr || "").toLowerCase();
-  if (s.includes("psfc") || s.includes("rp2040") || s.includes("2e8a")) return "PSFC RP2040 PAD";
+  if (isPsfcPadId(s) || s.includes("psfc") || s.includes("rp2040") || s.includes("2e8a")) return "PSFC RP2040 PAD";
   if (isSnesSignature(s, btnCount)) return "SNES RETRO PAD";
   if (s.includes("2dc8") || s.includes("8bitdo")) return "8BITDO PAD";
   if (s.includes("057e") || s.includes("pro controller") || s.includes("nintendo")) return "SWITCH PAD";
@@ -934,8 +736,31 @@ function getConnectedPads() {
   return out;
 }
 
+/**
+ * PSFC RP2040 pad (firmware v2) WebHID report — 8 bytes, no report ID:
+ *   [0..3] int8 LX, LY, RX, RY  ·  [4..5] u16 LE physical buttons (W3C standard order)  ·  [6..7] u16 sequence
+ */
+function decodePsfcHidReport(vPad, bytes) {
+  if (bytes.length < 6) return;
+  const s8 = (v) => (v > 127 ? v - 256 : v) / 127;
+  vPad.axes = [s8(bytes[0]), s8(bytes[1]), s8(bytes[2]), s8(bytes[3])];
+  const bits = bytes[4] | (bytes[5] << 8);
+  if (!vPad.buttons || vPad.buttons.length < 16) {
+    vPad.buttons = Array.from({ length: 16 }, () => ({ pressed: false, value: 0 }));
+  }
+  for (let i = 0; i < 16; i++) {
+    const on = ((bits >> i) & 1) === 1;
+    vPad.buttons[i].pressed = on;
+    vPad.buttons[i].value = on ? 1 : 0;
+  }
+}
+
 function decodeWebHidReport(vPad, bytes) {
   if (!bytes || bytes.length === 0) return;
+  if (vPad._vidPid === "1209:f5fc") {
+    decodePsfcHidReport(vPad, bytes);
+    return;
+  }
   if (bytes.length >= 7 && (bytes[5] & 0x0f) === 0x0f) {
     vPad._isDragonRiseFormat = true;
   }
@@ -1520,16 +1345,29 @@ function applyCircularDeadzone(rawX, rawY, deadzone = 0.12) {
   return [(rawX / mag) * scaled, (rawY / mag) * scaled];
 }
 
-function detectConnectedPromptStyle() {
-  const pads = getConnectedPads();
-  if (!pads.length) return "modern";
-  const p = pads[0];
+/**
+ * PSFC RP2040 pad (firmware/): pid.codes VID 0x1209 / PID 0xF5FC. Since firmware v2 it reports
+ * PHYSICAL buttons in W3C standard-gamepad order (bit0 south .. bit15 dpad right), so Layer 1
+ * reads it with the standard layout even though the browser exposes `mapping === ""`.
+ */
+function isPsfcPadId(idStr) {
+  const s = String(idStr || "").toLowerCase();
+  return (s.includes("1209") && s.includes("f5fc")) || s.includes("parallel season");
+}
+
+/** Glyph family for one pad: "xbox" | "ps" | "switch" | "snes" | "modern". */
+function detectPromptStyleForPad(p) {
+  if (!p) return "modern";
   const idLc = String(p.id || "").toLowerCase();
   const btnCount = p.buttons ? p.buttons.length : 16;
   const profSel = document.getElementById("pad-profile-select");
   const hwProf = profSel ? profSel.value : "auto";
+  if (isPsfcPadId(idLc)) return "modern";
   if (hwProf === "snes_usb" || hwProf === "snes_std" || (hwProf === "auto" && isSnesSignature(idLc, btnCount))) {
     return "snes";
+  }
+  if (hwProf === "switch" || idLc.includes("057e") || idLc.includes("pro controller") || idLc.includes("joy-con") || idLc.includes("nintendo")) {
+    return "switch";
   }
   if (idLc.includes("054c") || idLc.includes("dualsense") || idLc.includes("dualshock") || idLc.includes("wireless controller")) {
     return "ps";
@@ -1538,6 +1376,27 @@ function detectConnectedPromptStyle() {
     return "xbox";
   }
   return "modern";
+}
+
+function detectConnectedPromptStyle() {
+  const pads = getConnectedPads();
+  if (!pads.length) return "modern";
+  return detectPromptStyleForPad(pads[0]);
+}
+
+/**
+ * Prompt family for a human slot (0 = P1, 1 = P2): the pad they are using, or the
+ * keyboard layout that slot reads (P1 WASD/Space…, P2 arrows/numpad).
+ */
+function promptFamilyForSlot(slot) {
+  const pads = getConnectedPads();
+  if (slot === 0) {
+    if (lastPrimaryInputKind === "pad" && pads[lastPrimaryPadIndex]) {
+      return detectPromptStyleForPad(pads[lastPrimaryPadIndex]);
+    }
+    return pads.length && lastPrimaryInputKind === "pad" ? detectPromptStyleForPad(pads[0]) : "keyboard";
+  }
+  return pads[1] ? detectPromptStyleForPad(pads[1]) : "keyboard_p2";
 }
 
 /**
@@ -1557,7 +1416,9 @@ function samplePhysicalGamepad(logicalSlot) {
   const btnCount = pad.buttons ? pad.buttons.length : 0;
   const axisStates = updatePadAxisTrackers(pad);
 
-  const snesDetected = isSnesSignature(idLc, btnCount);
+  // PSFC RP2040 pad reports physical buttons in standard order (see firmware/README.md)
+  const isPsfcPad = isPsfcPadId(idLc) && profile === "auto";
+  const snesDetected = !isPsfcPad && isSnesSignature(idLc, btnCount);
   const useCustom = profile === "custom" && customPadMap;
   const isSnesUsb =
     profile === "snes_usb" ||
@@ -1571,6 +1432,7 @@ function samplePhysicalGamepad(logicalSlot) {
     profile === "dinput" ||
     (profile === "auto" &&
       !isSnesUsb &&
+      !isPsfcPad &&
       pad.mapping !== "standard" &&
       !idLc.includes("xbox") &&
       !idLc.includes("xinput") &&
@@ -1638,7 +1500,7 @@ function samplePhysicalGamepad(logicalSlot) {
     if (!isSnesMode) {
       const rawRx = readAxisRaw(2);
       const rawRy =
-        isDirectInput && pad.axes && pad.axes.length >= 6 && Math.abs(readAxisRaw(3)) < 0.05
+        (isDirectInput || isPsfcPad) && pad.axes && pad.axes.length >= 6 && Math.abs(readAxisRaw(3)) < 0.05
           ? readAxisRaw(5)
           : readAxisRaw(3);
       [rx, ry] = applyCircularDeadzone(rawRx, rawRy, 0.16);
@@ -1652,7 +1514,7 @@ function samplePhysicalGamepad(logicalSlot) {
     if (b(13)) dpadY += 1;
 
     // Fallback secondary D-Pad axes (`axes[4]/axes[5]` or `axes[6]/axes[7]` on multi-axis USB adapters)
-    if (dpadX === 0 && dpadY === 0 && lx === 0 && ly === 0 && pad.axes) {
+    if (dpadX === 0 && dpadY === 0 && lx === 0 && ly === 0 && pad.axes && !isPsfcPad) {
       for (const [axI, ayI] of [
         [6, 7],
         [4, 5],
@@ -1671,7 +1533,7 @@ function samplePhysicalGamepad(logicalSlot) {
     }
 
     // Stateless 8-way POV Hat switch (`axes[9]`): active in [-1.0, +1.0], neutral > +1.05 or 0.0
-    if (dpadX === 0 && dpadY === 0 && lx === 0 && ly === 0 && pad.axes && pad.axes.length > 9) {
+    if (dpadX === 0 && dpadY === 0 && lx === 0 && ly === 0 && pad.axes && pad.axes.length > 9 && !isPsfcPad) {
       const [hx, hy] = decodeHatDirection(Number(pad.axes[9] || 0));
       dpadX = hx;
       dpadY = hy;
@@ -1803,86 +1665,9 @@ function samplePhysicalGamepad(logicalSlot) {
  * resolves Attacking / Defending / LooseBall deterministically on every 60 Hz tick.
  */
 function mapPhysicalToSimInput(phys, prof = controlProfile, isAttacking = true) {
-  const p = phys.buttons;
-  const pressed = (key) => Boolean(key && p[key]);
-  const triggerDepth = (key) => {
-    if (key === "rt") return phys.rtValue;
-    if (key === "lt") return phys.ltValue;
-    return pressed(key) ? 1.0 : 0.0;
-  };
-
-  let buttons = 0;
-
-  // --- In Possession (Attacking) Map ---
-  if (pressed(prof.attack.pass)) buttons |= BTN_PASS;
-  if (pressed(prof.attack.shoot)) buttons |= BTN_SHOOT;
-  if (pressed(prof.attack.cross)) buttons |= BTN_LOB;
-  if (pressed(prof.attack.throughBall)) buttons |= BTN_THROUGH;
-  if (pressed(prof.attack.finesse)) buttons |= BTN_FINESSE;
-  if (pressed(prof.attack.paceControl)) buttons |= BTN_PACE_CONTROL;
-  if (pressed(prof.attack.chipRun)) buttons |= BTN_CALL_RUN;
-
-  // --- Out of Possession (Defending) Map ---
-  if (pressed(prof.defense.contain)) buttons |= BTN_CONTAIN;
-  if (pressed(prof.defense.standingTackle)) buttons |= BTN_TACKLE;
-  if (pressed(prof.defense.slidingTackle)) buttons |= BTN_SLIDE;
-  if (pressed(prof.defense.rushGk)) buttons |= BTN_GK_RUSH;
-  if (pressed(prof.defense.teammateContain)) buttons |= BTN_TEAMMATE_CONTAIN;
-  if (pressed(prof.defense.jockey)) buttons |= BTN_JOCKEY;
-  if (pressed(prof.defense.switchPlayer)) buttons |= BTN_SWITCH;
-
-  // --- Sprint (Analog or Digital past 0.10 deadzone), resolved strictly from active context ---
-  const activeSprintKey = isAttacking ? prof.attack.sprint : prof.defense.sprint;
-  const sprintDepth = triggerDepth(activeSprintKey);
-  let sprintAnalog = 0;
-  if (sprintDepth > 0.10) {
-    buttons |= BTN_SPRINT;
-    sprintAnalog = prof.analogSprint ? Math.max(1, Math.min(127, Math.round(sprintDepth * 127))) : 127;
-  }
-
-  // --- Skill Move Button (Select / L3 / R3; Right Stick also triggers directional skills/knock-on) ---
-  if (p.select || p.l3 || p.r3) buttons |= BTN_SKILL;
-
-  // SNES retro pad convenience: L also allows Finesse when shooting since SNES lacks separate RB
-  if (phys.isSnesMode && p.lb) {
-    buttons |= BTN_FINESSE;
-  }
-
-  const mx = Math.max(-127, Math.min(127, Math.round(phys.lx * 127)));
-  const my = Math.max(-127, Math.min(127, Math.round(phys.ly * 127)));
-  // Always keep Left Stick in (mx, my) and pure Right Stick in (ax, ay) so Human kick aiming
-  // uses Left Stick in psfc-sim while Right Stick stays cleanly independent for directional switching
-  // (even while holding Contain/Jockey) and Skill Moves / Knock-On!
-  const ax = Math.max(-127, Math.min(127, Math.round(phys.rx * 127)));
-  const ay = Math.max(-127, Math.min(127, Math.round(phys.ry * 127)));
-
-  return {
-    mx,
-    my,
-    ax,
-    ay,
-    btns: buttons,
-    sprintAnalog,
-    south: p.south,
-    east: p.east,
-    west: p.west,
-    north: p.north,
-    l1: p.lb,
-    r1: p.rb,
-    l2: p.lt,
-    r2: p.rt,
-    ltValue: phys.ltValue,
-    rtValue: phys.rtValue,
-    select: p.select,
-    start: p.start,
-    lx: phys.lx,
-    ly: phys.ly,
-    rx: phys.rx,
-    ry: phys.ry,
-    phys,
-    id: phys.id,
-    rawPad: phys.rawPad,
-  };
+  // Pure implementation in ./control_profile.js (both maps OR'd; shared pass-family
+  // bindings reported in `ctxPassMask` for the Two-Button context resolver).
+  return mapPhysicalToSimInputPure(phys, prof, isAttacking);
 }
 
 function sampleRawGamepad(logicalSlot, isAttacking = true) {
@@ -1928,7 +1713,7 @@ function samplePhysicalKeyboardP1(allowArrows) {
     buttons: {
       south: keysDown.has("Space") || keysDown.has("KeyJ"),
       east: keysDown.has("KeyL") || keysDown.has("Enter"),
-      west: keysDown.has("KeyU"),
+      west: keysDown.has("KeyU") || keysDown.has("KeyC"),
       north: keysDown.has("KeyK"),
       lb: keysDown.has("KeyQ"),
       rb: keysDown.has("KeyE"),
@@ -1950,18 +1735,26 @@ function samplePrimaryHumanInput(allowArrows, isAttacking = true) {
     const pads = getConnectedPads();
     for (let i = 0; i < pads.length; i++) {
       const gpAny = sampleRawGamepad(i, isAttacking);
-      if (isPadInputActive(gpAny)) return gpAny;
+      if (isPadInputActive(gpAny)) {
+        lastPrimaryInputKind = "pad";
+        lastPrimaryPadIndex = i;
+        return gpAny;
+      }
     }
   } else {
     const gp = sampleRawGamepad(0, isAttacking);
-    if (isPadInputActive(gp)) return gp;
+    if (isPadInputActive(gp)) {
+      lastPrimaryInputKind = "pad";
+      lastPrimaryPadIndex = 0;
+      return gp;
+    }
   }
 
   // Route P1 keyboard through Layer 2 ControlProfile so Classic / Alternate / Two-Button / Custom
   // presets immediately govern keyboard controls too!
+  // (C is a second physical alias of West — no key is hardwired to a gameplay bit.)
   const mapped = mapPhysicalToSimInput(samplePhysicalKeyboardP1(allowArrows), controlProfile, isAttacking);
-  // Preserve optional direct keyboard convenience key without interfering with preset bindings
-  if (keysDown.has("KeyC")) mapped.btns |= BTN_SLIDE;
+  if (isPadInputActive(mapped)) lastPrimaryInputKind = "keyboard";
   return mapped;
 }
 
@@ -2009,20 +1802,8 @@ function sampleSecondaryHumanInput(isAttacking = true) {
 }
 
 function rebindControlProfileAction(context, actionKey, newPhys) {
-  if ((context !== "attack" && context !== "defense") || !controlProfile[context]) return;
-  const map = controlProfile[context];
-  const prevPhys = map[actionKey];
-  if (prevPhys === newPhys) return;
-  // Auto-swap colliding bindings inside the same context so two actions never accidentally double-fire
-  // (e.g., rebinding Shoot -> West swaps Cross -> East instead of firing Chip Shot on every press).
-  for (const otherKey of Object.keys(map)) {
-    if (otherKey !== actionKey && map[otherKey] === newPhys) {
-      map[otherKey] = prevPhys;
-      break;
-    }
-  }
-  map[actionKey] = newPhys;
-  controlProfile.preset = "custom";
+  // Collision auto-swap lives in control_profile.js (`null` unbinds an action).
+  if (!rebindProfileAction(controlProfile, context, actionKey, newPhys)) return;
   saveControlProfile();
   enqueueControlSettingsSync();
 }
@@ -2783,6 +2564,8 @@ function setupLiveMatchHud(snapshot, contextLabel) {
   lastKnownOwnerSide = -1;
   matchEventsLog = [];
   queuedReservedQueue = [[], []];
+  for (const latch of contextPassLatches) latch.bit = 0;
+  hudPromptCacheKey = "";
   enqueueControlSettingsSync();
   subsUsedCount = [0, 0];
   subsArmedSlot = null;
@@ -3115,8 +2898,9 @@ function renderControlBindingLists() {
 
   const buildList = (ul, context, metaList, stickRows) => {
     ul.innerHTML = "";
-    for (const [lbl, glyph] of stickRows) {
+    for (const [lbl, stickAction] of stickRows) {
       const li = document.createElement("li");
+      const glyph = `${glyphFor(controlProfile, stickAction, context, style)} / ${glyphFor(controlProfile, stickAction, context, "keyboard")}`;
       li.innerHTML = `<span>${lbl}</span><span class="rebind-pill static-pill">${glyph}</span>`;
       ul.appendChild(li);
     }
@@ -3125,21 +2909,28 @@ function renderControlBindingLists() {
       const isListening = Boolean(
         rebindState && rebindState.context === context && rebindState.actionKey === item.key
       );
-      const glyph = formatPhysicalGlyph(boundPhys, style);
-      const kbLabel = PHYSICAL_KEYBOARD_LABELS[boundPhys] || item.kb;
+      const glyph = boundPhys ? glyphFor(controlProfile, item.key, context, style) : "UNBOUND";
+      const kbLabel = boundPhys ? glyphFor(controlProfile, item.key, context, "keyboard") : "—";
+      const sharedWith = boundPhys
+        ? metaList.filter((m) => m.key !== item.key && controlProfile[context][m.key] === boundPhys).map((m) => m.short)
+        : [];
       const li = document.createElement("li");
       const labelSpan = document.createElement("span");
       labelSpan.textContent = item.label;
       const btn = document.createElement("button");
       btn.type = "button";
       btn.className = `rebind-pill${isListening ? " listening" : ""}`;
-      btn.title = `Keyboard: ${kbLabel} · Click to rebind with controller or click again to cycle`;
+      btn.title =
+        `Keyboard: ${kbLabel}` +
+        (sharedWith.length ? ` · Shared with ${sharedWith.join(", ")} (context-resolved)` : "") +
+        " · Click to rebind with controller or click again to cycle (last option = unbound)";
       btn.textContent = isListening ? "PRESS BUTTON..." : `${glyph} · ${kbLabel}`;
       btn.addEventListener("click", () => {
         if (isListening) {
-          // Clicking while listening cycles through canonical physical inputs with collision auto-swap!
-          const curIdx = PHYSICAL_BINDABLE_INPUTS.indexOf(boundPhys);
-          const nextPhys = PHYSICAL_BINDABLE_INPUTS[(curIdx + 1) % PHYSICAL_BINDABLE_INPUTS.length];
+          // Clicking while listening cycles through canonical physical inputs (then "unbound") with collision auto-swap!
+          const cycle = [...PHYSICAL_BINDABLE_INPUTS, null];
+          const curIdx = cycle.indexOf(boundPhys ?? null);
+          const nextPhys = cycle[(curIdx + 1) % cycle.length];
           rebindControlProfileAction(context, item.key, nextPhys);
           rebindState = null;
           const banner = document.getElementById("rebind-capture-banner");
@@ -3157,12 +2948,12 @@ function renderControlBindingLists() {
   };
 
   buildList(attUl, "attack", ATTACK_ACTION_META, [
-    ["360° Dribble & Aim", "L-Stick / WASD"],
-    ["Skill Moves / Knock-On", "R-Stick / Z"],
+    ["360° Dribble & Aim", "dribble"],
+    ["Skill Moves / Knock-On", "skillMove"],
   ]);
   buildList(defUl, "defense", DEFENSE_ACTION_META, [
-    ["Player Movement", "L-Stick / WASD"],
-    ["Manual Player Switch (Dir)", "R-Stick"],
+    ["Player Movement", "move"],
+    ["Manual Player Switch (Dir)", "manualSwitch"],
   ]);
 
   const defBadge = document.getElementById("ctrl-def-mode-badge");
@@ -3195,6 +2986,17 @@ function syncControlSettingsUi() {
     const presetMeta = CONTROL_PRESETS[controlProfile.preset];
     pmPreset.textContent = presetMeta ? presetMeta.label : "CUSTOM";
   }
+  // Preset description / tooltip (Screen 5 + Pause drawer)
+  const presetMeta = CONTROL_PRESETS[controlProfile.preset];
+  const presetDesc = presetMeta
+    ? presetMeta.description
+    : "Custom: your own remapped Attack / Defense bindings (exported with the profile JSON).";
+  document.querySelectorAll("[data-cset-hint='preset']").forEach((el) => {
+    el.textContent = presetDesc;
+  });
+  document.querySelectorAll("select[data-cset='preset']").forEach((el) => {
+    el.title = presetDesc;
+  });
   const pmDef = document.getElementById("pm-def-val");
   if (pmDef) {
     pmDef.textContent = controlProfile.defendingMode === "legacy" ? "LEGACY" : "TACTICAL";
@@ -3205,13 +3007,8 @@ function syncControlSettingsUi() {
 
 function applyControlSettingChange(key, value) {
   if (key === "preset") {
-    if (CONTROL_PRESETS[value]) {
-      controlProfile.preset = value;
-      controlProfile.attack = { ...CONTROL_PRESETS[value].attack };
-      controlProfile.defense = { ...CONTROL_PRESETS[value].defense };
-    } else if (value === "custom") {
-      controlProfile.preset = "custom";
-    }
+    // Applies bindings (and Two-Button's bundled Assisted/Legacy settings) — see control_profile.js
+    applyPresetToProfile(controlProfile, value);
   } else if (key === "analogSprint") {
     controlProfile.analogSprint = value === "on" || value === true;
   } else if (key === "autoSwitch") {
@@ -3877,6 +3674,122 @@ function projectInputToCameraBasis(inObj, slotIdx) {
   return { ...inObj, mx, my, ax, ay };
 }
 
+// --- HUD button-prompt strip (attack prompts in possession, defense prompts out of possession) ---
+const HUD_PROMPTS_STORAGE_KEY = "psfc_hud_prompts_v1";
+let hudPromptsEnabled = (() => {
+  try {
+    return localStorage.getItem(HUD_PROMPTS_STORAGE_KEY) !== "off";
+  } catch (_e) {
+    return true;
+  }
+})();
+let hudPromptCacheKey = "";
+
+/** Mirrors the main-loop context resolution (authoritative sim hold-word bits, else ball owner). */
+function sideAttackingFromPacked(packed, side) {
+  if (!packed) return false;
+  const ownerNow = packed[15];
+  const effOwner = ownerNow === 0 || ownerNow === 1 ? ownerNow : lastKnownOwnerSide;
+  const holdWordIdx = 18 + packed[6] * 20 + 6;
+  const holdWord = packed.length > holdWordIdx ? packed[holdWordIdx] >>> 0 : 0;
+  if ((holdWord & 0x04000000) !== 0) return (holdWord & (1 << (24 + side))) !== 0;
+  return effOwner === side;
+}
+
+function setHudPromptsEnabled(on) {
+  hudPromptsEnabled = Boolean(on);
+  try {
+    localStorage.setItem(HUD_PROMPTS_STORAGE_KEY, hudPromptsEnabled ? "on" : "off");
+  } catch (_e) {}
+  hudPromptCacheKey = "";
+  const btn = document.getElementById("btn-hud-prompts");
+  if (btn) {
+    btn.textContent = hudPromptsEnabled ? "PROMPTS: ON" : "PROMPTS: OFF";
+    btn.setAttribute("aria-pressed", hudPromptsEnabled ? "true" : "false");
+  }
+  const strip = document.getElementById("hud-prompt-strip");
+  if (strip && !hudPromptsEnabled) strip.hidden = true;
+}
+
+function updateHudPromptStrip(packed) {
+  const strip = document.getElementById("hud-prompt-strip");
+  if (!strip) return;
+  const sideMode = SIDE_MODES[pmSideIdx]?.id || "home_vs_cpu";
+  const rows = [];
+  if (sideMode === "home_vs_cpu" || sideMode === "local_2p") rows.push({ side: 0, slot: 0 });
+  if (sideMode === "away_vs_cpu") rows.push({ side: 1, slot: 0 });
+  if (sideMode === "local_2p") rows.push({ side: 1, slot: 1 });
+  if (!hudPromptsEnabled || !rows.length || replayActive) {
+    strip.hidden = true;
+    hudPromptCacheKey = "";
+    return;
+  }
+  const resolved = rows.map((r) => ({
+    ...r,
+    ctx: sideAttackingFromPacked(packed, r.side) ? "attack" : "defense",
+    family: promptFamilyForSlot(r.slot),
+  }));
+  const key = JSON.stringify([resolved, controlProfile.attack, controlProfile.defense]);
+  if (key === hudPromptCacheKey && !strip.hidden) return;
+  hudPromptCacheKey = key;
+  strip.innerHTML = "";
+  for (const r of resolved) {
+    const row = document.createElement("div");
+    row.className = `hud-prompt-row hud-prompt-${r.ctx}`;
+    const tag = document.createElement("span");
+    tag.className = "hud-prompt-tag";
+    tag.textContent = `${rows.length > 1 ? `P${r.slot + 1} ` : ""}${r.ctx === "attack" ? "ATTACK" : "DEFEND"}`;
+    row.appendChild(tag);
+    for (const e of buildPromptEntries(controlProfile, r.ctx, r.family)) {
+      const item = document.createElement("span");
+      item.className = "hud-prompt-item";
+      const g = document.createElement("kbd");
+      g.textContent = e.glyph;
+      const l = document.createElement("span");
+      l.textContent = e.label;
+      item.appendChild(g);
+      item.appendChild(l);
+      row.appendChild(item);
+    }
+    strip.appendChild(row);
+  }
+  strip.hidden = false;
+}
+
+/**
+ * Resolves `ctxPassMask` (several pass-family actions sharing one physical input, i.e. the
+ * Two-Button preset) into exactly one of BTN_PASS / BTN_THROUGH / BTN_LOB using the ball
+ * position along this side's attacking direction and the WORLD-space left stick. The choice is
+ * latched at the press edge so the sim's power charge sees one constant button. Only the emitted
+ * InputFrame is recorded, so replays and rollback stay deterministic.
+ */
+function applyContextPassForSide(inObj, side, packed) {
+  const latch = contextPassLatches[side];
+  const mask = inObj && inObj.ctxPassMask ? inObj.ctxPassMask : 0;
+  if (!mask) {
+    latch.bit = 0;
+    return inObj;
+  }
+  let ctx = {};
+  if (packed && packed.length > 10 && currentSnapshot && currentSnapshot.format) {
+    const halfL = Math.max(1, (currentSnapshot.format.pitch_length_mm || 42000) / 2);
+    const halfW = Math.max(1, (currentSnapshot.format.pitch_width_mm || 25000) / 2);
+    const half = packed[2];
+    // psfc-sim TeamSide::attack_sign: Home +x / Away −x, flipped when `half` is even
+    const attackSign = (side === 0 ? 1 : -1) * (half % 2 === 0 ? -1 : 1);
+    const mx = (inObj.mx || 0) / 127;
+    const my = (inObj.my || 0) / 127;
+    ctx = {
+      forward: (packed[9] * attackSign) / halfL,
+      wide: Math.abs(packed[10]) / halfW,
+      stickFwd: mx * attackSign,
+      stickMag: Math.min(1, Math.hypot(mx, my)),
+    };
+  }
+  const bit = applyContextPassLatch(latch, mask, ctx);
+  return { ...inObj, btns: (inObj.btns | bit) & 0xffff };
+}
+
 function resetSimInterpState() {
   simAccumMs = 0;
   for (const st of camBasisLatch) {
@@ -3988,6 +3901,10 @@ function mainLoop(nowMs) {
             hIn = projectInputToCameraBasis(samplePrimaryHumanInput(true, homeAttacking), 0);
           }
 
+          // Two-Button: collapse shared pass-family presses into ONE latched bit from match context
+          hIn = applyContextPassForSide(hIn, 0, currSimPacked);
+          aIn = applyContextPassForSide(aIn, 1, currSimPacked);
+
           const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
           const aSprintBits = (aIn.sprintAnalog || 0) & 0x7f;
           const hQueued = queuedReservedQueue[0].length > 0 ? queuedReservedQueue[0].shift() : 0;
@@ -4048,9 +3965,11 @@ function mainLoop(nowMs) {
           const mm = String(Math.floor(totalSec / 60)).padStart(2, "0");
           const ss = String(totalSec % 60).padStart(2, "0");
           document.getElementById("sb-time").textContent = `${mm}:${ss}`;
-          const passGlyph = formatPhysicalGlyph(controlProfile.attack.pass, detectConnectedPromptStyle());
+          // Kick-off prompt resolved from the live profile: action -> physical -> glyph for the active device
+          const passGlyph = glyphFor(controlProfile, "pass", "attack", promptFamilyForSlot(0));
           document.getElementById("sb-phase").textContent =
-            phase === 0 ? `KICK OFF · PRESS PASS [SPACE / ${passGlyph}]` : PHASE_LABELS[phase] || "OPEN PLAY";
+            phase === 0 ? `KICK OFF · PRESS PASS [${passGlyph}]` : PHASE_LABELS[phase] || "OPEN PLAY";
+          updateHudPromptStrip(packed);
 
           updatePlayerCornerHuds(packed);
           drawPitchRadar(packed);
@@ -5057,7 +4976,8 @@ document.getElementById("btn-season-back").addEventListener("click", () => {
   const exportBtn = document.getElementById("btn-ctrl-export-json");
   if (exportBtn) {
     exportBtn.addEventListener("click", () => {
-      const blob = new Blob([JSON.stringify(controlProfile, null, 2)], { type: "application/json" });
+      // Canonical snake_case schema v2 (shared/schemas/control_profile.schema.json) — travels on the cartridge
+      const blob = new Blob([exportControlProfileJson()], { type: "application/json" });
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
@@ -5078,10 +4998,7 @@ document.getElementById("btn-season-back").addEventListener("click", () => {
       if (!file) return;
       try {
         const text = await file.text();
-        controlProfile = sanitizeControlProfile(JSON.parse(text));
-        saveControlProfile();
-        enqueueControlSettingsSync();
-        syncControlSettingsUi();
+        importControlProfileJson(text);
         showProfileToast(`Imported control profile JSON (${controlProfile.preset.toUpperCase()}).`);
         GameAudio.uiConfirm();
       } catch (_err) {
@@ -5128,7 +5045,9 @@ document.getElementById("btn-sync-cartridge").addEventListener("click", async ()
       controller_profile: {
         layout: profSel ? profSel.value : "auto",
         custom_map: customPadMap || null,
-        fifa_profile: controlProfile,
+        // Canonical schema form; `fifa_profile` kept as an alias for older hosts/clients.
+        control_profile: profileToCanonical(controlProfile),
+        fifa_profile: profileToCanonical(controlProfile),
       },
     }),
   });
@@ -5190,6 +5109,8 @@ document.getElementById("btn-hud-zoom-in").addEventListener("click", () => {
   GameAudio.uiTick(560);
 });
 document.getElementById("btn-hud-sw").addEventListener("click", () => stepAutoSwitch(1));
+document.getElementById("btn-hud-prompts")?.addEventListener("click", () => setHudPromptsEnabled(!hudPromptsEnabled));
+setHudPromptsEnabled(hudPromptsEnabled);
 document.getElementById("btn-hud-wx").addEventListener("click", cycleMatchWeather);
 document.getElementById("btn-hud-cam").addEventListener("click", cycleMatchCamera);
 document.getElementById("btn-hud-replay").addEventListener("click", toggleInstantReplay);
@@ -5323,6 +5244,22 @@ window.__psfcDiagnostics = {
     resetSimInterpState();
     return false;
   },
+};
+
+// Control-profile hooks for automated smoke tests / devtools (no gameplay side effects beyond the UI path).
+window.__psfcControls = {
+  getProfile: () => JSON.parse(JSON.stringify(controlProfile)),
+  getQueuedReserved: () => queuedReservedQueue.map((q) => q.slice()),
+  setSetting: (key, value) => applyControlSettingChange(key, value),
+  rebind: (context, actionKey, phys) => {
+    rebindControlProfileAction(context, actionKey, phys);
+    syncControlSettingsUi();
+  },
+  exportJson: () => exportControlProfileJson(),
+  importJson: (text) => importControlProfileJson(text),
+  glyphFor: (actionKey, context = "attack", family = promptFamilyForSlot(0)) =>
+    glyphFor(controlProfile, actionKey, context, family),
+  mapKeyboardP1: (isAttacking = true) => mapPhysicalToSimInput(samplePhysicalKeyboardP1(true), controlProfile, isAttacking),
 };
 
 bootGame();

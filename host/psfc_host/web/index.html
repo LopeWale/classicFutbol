@@ -500,8 +500,8 @@
           <div class="ctrl-hdr-actions">
             <select id="pad-profile-select" class="console-select">
               <option value="auto" selected>Layout: Auto (SNES / Xbox / PS / Switch)</option>
-              <option value="snes_usb">Layout: SNES 2.4G / USB D-Input (B=Pass, A=Shoot, R=Sprint)</option>
-              <option value="snes_std">Layout: SNES XInput / Switch (Swap A-B / X-Y + R=Sprint)</option>
+              <option value="snes_usb">Layout: SNES 2.4G / USB D-Input (positional: bottom B = South, L/R = shoulders + triggers)</option>
+              <option value="snes_std">Layout: SNES XInput / Switch (Swap A-B / X-Y, L/R = shoulders + triggers)</option>
               <option value="switch">Layout: Switch Pro (Swap A-B / X-Y)</option>
               <option value="dinput">Layout: Generic USB DirectInput</option>
               <option value="custom">Layout: Custom Calibrated Mapping</option>
@@ -609,8 +609,8 @@
           <div class="ctrl-card-hdr">
             <h2>FIFA 10–12 CONTROL SETTINGS</h2>
             <div class="ctrl-hdr-actions">
-              <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-export-json" type="button" title="Download Control Profile JSON">EXPORT</button>
-              <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-import-json" type="button" title="Import Control Profile JSON">IMPORT</button>
+              <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-export-json" type="button" title="Download Control Profile JSON (schema v2, shared/schemas/control_profile.schema.json) — copy it onto your cartridge">EXPORT JSON</button>
+              <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-import-json" type="button" title="Import a Control Profile JSON (or a cartridge controller_mapping) — applies instantly to gameplay and prompts">IMPORT JSON</button>
               <button class="console-btn console-btn-ghost btn-compact" id="btn-ctrl-reset-defaults" type="button">RESET</button>
               <input type="file" id="input-ctrl-import-file" accept=".json,application/json" hidden />
             </div>
@@ -621,10 +621,11 @@
               <select id="cset-preset" class="console-select cset-select" data-cset="preset">
                 <option value="classic">Classic (FIFA 10–12)</option>
                 <option value="alternate">Alternate (Swap Shoot/Cross)</option>
-                <option value="two_button">Two-Button (Arcade)</option>
+                <option value="two_button" title="FIFA 11/12 Two Button: A = every pass (game picks ground / through / cross), B = shoot / clear; defending A = switch, B = tackle (hold to press). Applies Assisted + Legacy defending.">Two-Button (FIFA 11 Casual: Pass + Shoot)</option>
                 <option value="custom">Custom (Remapped)</option>
               </select>
             </div>
+            <p class="cset-hint" data-cset-hint="preset" aria-live="polite"></p>
             <div class="cset-row">
               <label for="cset-auto-switch">Auto Switching</label>
               <select id="cset-auto-switch" class="console-select cset-select" data-cset="autoSwitch">
@@ -758,6 +759,7 @@
     <div class="match-top-right">
       <button class="hud-mini-btn" id="btn-hud-zoom-out" type="button" title="Zoom Out (- or Scroll Down)">ZOOM −</button>
       <button class="hud-mini-btn" id="btn-hud-zoom-in" type="button" title="Zoom In (+ or Scroll Up)">ZOOM +</button>
+      <button class="hud-mini-btn" id="btn-hud-prompts" type="button" aria-pressed="true" title="Show / hide button prompts (attack prompts in possession, defend prompts out of possession)">PROMPTS: ON</button>
       <button class="hud-mini-btn" id="btn-hud-sw" type="button" title="Cycle Player Auto-Switching Mode">SW: AUTO</button>
       <button class="hud-mini-btn" id="btn-hud-wx" type="button" title="Cycle Weather &amp; Lighting (M)">WX: NIGHT</button>
       <button class="hud-mini-btn" id="btn-hud-cam" type="button" title="Cycle Broadcast Camera (V)">CAM: TELE</button>
@@ -795,6 +797,8 @@
       </div>
     </div>
 
+    <!-- CONTEXT BUTTON PROMPTS (resolved from the live ControlProfile; toggle with PROMPTS) -->
+    <div class="hud-prompt-strip" id="hud-prompt-strip" aria-live="off" hidden></div>
     <!-- BOTTOM-CENTER 3D PERSPECTIVE TRAPEZOID PITCH RADAR -->
     <div class="fifa-radar-wrap" id="radar-wrap">
       <canvas id="radar-canvas" width="218" height="132"></canvas>
@@ -884,10 +888,11 @@
                 <select id="pcset-preset" class="console-select cset-select" data-cset="preset">
                   <option value="classic">Classic (FIFA 10–12)</option>
                   <option value="alternate">Alternate (Swap Shoot/Cross)</option>
-                  <option value="two_button">Two-Button (Arcade)</option>
+                  <option value="two_button" title="FIFA 11/12 Two Button: A = every pass (game picks ground / through / cross), B = shoot / clear; defending A = switch, B = tackle (hold to press). Applies Assisted + Legacy defending.">Two-Button (FIFA 11 Casual: Pass + Shoot)</option>
                   <option value="custom">Custom (Remapped)</option>
                 </select>
               </div>
+              <p class="cset-hint" data-cset-hint="preset" aria-live="polite"></p>
               <div class="cset-row">
                 <label for="pcset-auto-switch">Auto Switching</label>
                 <select id="pcset-auto-switch" class="console-select cset-select" data-cset="autoSwitch">
