@@ -84,6 +84,9 @@ pub struct PlayerState {
     /// Decay timer (`0..=180` ticks) resetting `skill_chain_count` once dribbler settles.
     #[serde(default)]
     pub skill_chain_decay_ticks: u8,
+    /// Aerial landing recovery (`0..=42` ticks, `0.7s`): no re-jump while counting down (anti bunny-hop).
+    #[serde(default)]
+    pub jump_recover_ticks: u8,
     pub yellow_cards: u8,
     pub sent_off: bool,
 }
@@ -802,6 +805,7 @@ impl MatchState {
                 h.u8(p.contain_cooldown);
                 h.u8(p.skill_chain_count);
                 h.u8(p.skill_chain_decay_ticks);
+                h.u8(p.jump_recover_ticks);
                 h.u8(p.yellow_cards);
                 h.u8(u8::from(p.sent_off));
                 match p.action {

@@ -107,6 +107,7 @@ impl MatchSimulation {
                     contain_cooldown: 0,
                     skill_chain_count: 0,
                     skill_chain_decay_ticks: 0,
+                    jump_recover_ticks: 0,
                     yellow_cards: 0,
                     sent_off: false,
                 });
@@ -3011,50 +3012,64 @@ impl MatchSimulation {
                     Fp::from_milli(11_000)
                 };
                 {
+                    // Aerial contest: at most ONE best-placed outfield contestant per team may leap for a loose
+                    // high ball (human-controlled player preferred while pressing for it); nobody else jumps.
+                    let aerial_mate_airborne = aerial_teammate_airborne(&self.state.players[s_idx]);
+                    let aerial_plan = if !is_gk
+                        && !last_touch_was_me
+                        && is_open_play
+                        && ball_is_loose
+                        && !aerial_mate_airborne
+                    {
+                        aerial_jump_plan(&self.state, side, idx).and_then(|_| {
+                            let prefer = (!side_is_cpu
+                                && (side_has_buffer || (side_input.buttons & CHARGE_MASK) != 0))
+                                .then_some(ctrl_idx);
+                            aerial_team_contestant(&self.state, side, prefer)
+                                .filter(|&(pick, _)| pick == idx)
+                                .map(|(_, plan)| plan)
+                        })
+                    } else {
+                        None
+                    };
                     let p = &mut self.state.players[s_idx][idx];
                     let gk_in_own_box = is_gk
                         && (p.pos.x - own_goal_x_now).abs() <= own_box_depth
                         && p.pos.y.abs() <= own_box_hw;
 
                     // Step vertical jump kinematics (`p.z`, `p.vz`) for authentic forehead headers & GK high claims!
+                    p.jump_recover_ticks = p.jump_recover_ticks.saturating_sub(1);
                     if p.z > Fp::ZERO || p.vz != Fp::ZERO {
                         p.z += p.vz.mul(dt);
                         p.vz -= Fp::from_milli(9_810).mul(dt);
                         if p.z <= Fp::ZERO {
                             p.z = Fp::ZERO;
                             p.vz = Fp::ZERO;
+                            // Landing recovery: no bunny-hop re-jump for `0.7s`.
+                            p.jump_recover_ticks = AERIAL_JUMP_RECOVER_TICKS;
                         }
-                    } else if is_open_play && ball_is_loose && p.can_control_ball() {
+                    } else if is_open_play
+                        && ball_is_loose
+                        && p.can_control_ball()
+                        && p.jump_recover_ticks == 0
+                    {
                         let cur_d = p.pos.dist(ball_xy_now);
                         let p_pred_10t = p.pos + p.vel.scale(Fp::from_milli(165));
                         let pred_d = p_pred_10t.dist(pred_ball_10t);
-                        let to_ball = ball_xy_now - p.pos;
-                        let closing_dot = to_ball.dot(ball_vel_xy_now - p.vel);
                         if gk_in_own_box
-                            && ball_z_now >= Fp::from_milli(1_320)
+                            && ball_z_now.max(ball_z_now + ball_vz_now.mul(Fp::from_milli(140)))
+                                >= Fp::from_milli(1_800)
                             && ball_z_now <= Fp::from_milli(2_950)
                             && (cur_d <= Fp::from_milli(2_350) || pred_d <= Fp::from_milli(1_650))
                         {
+                            // GK claims only genuinely high balls (standing glove reach covers `< 1.8m`).
                             let jump_boost = 3_720 + (p.attributes.goalkeeping as i64) * 4;
                             p.vz = Fp::from_milli(jump_boost);
-                        } else if !is_gk
-                            && !last_touch_was_me
-                            && ball_z_now >= Fp::from_milli(1_500)
-                            && ball_z_now <= Fp::from_milli(2_650)
-                            && (cur_d <= Fp::from_milli(1_350)
-                                || (pred_d <= Fp::from_milli(1_250)
-                                    && cur_d <= Fp::from_milli(2_150)
-                                    && closing_dot <= Fp::from_milli(500)))
-                        {
-                            let est_z_apex = (ball_z_now + ball_vz_now.mul(Fp::from_milli(140)))
-                                .clamp(Fp::from_milli(1_550), Fp::from_milli(2_550));
-                            let needed_lift = (est_z_apex - Fp::from_milli(1_620))
-                                .clamp(Fp::from_milli(160), Fp::from_milli(680));
-                            let max_jump_vz = Fp::from_milli(3_320 + (p.attributes.strength as i64) * 3);
-                            let target_vz = (Fp::from_milli(19_620).mul(needed_lift))
-                                .sqrt()
-                                .min(max_jump_vz);
-                            p.vz = target_vz;
+                        } else if let Some(plan) = aerial_plan {
+                            // Time the leap so the apex meets the ball (`contact <= apex + 1` tick).
+                            if plan.contact_tick <= plan.apex_ticks + 1 {
+                                p.vz = plan.takeoff_vz;
+                            }
                         }
                     }
 
@@ -3414,7 +3429,9 @@ impl MatchSimulation {
                                         if aerial_contest
                                             && p.z == Fp::ZERO
                                             && p.vz == Fp::ZERO
-                                            && ball_z_now >= Fp::from_milli(1_450)
+                                            && p.jump_recover_ticks == 0
+                                            && !aerial_mate_airborne
+                                            && ball_z_now >= Fp::from_milli(AERIAL_MIN_JUMP_BALL_MM)
                                             && dist_ball_ctrl <= Fp::from_milli(1_850)
                                         {
                                             let needed_lift = (ball_z_now - Fp::from_milli(1_600))
@@ -5840,7 +5857,13 @@ impl MatchSimulation {
             }
         }
 
-        candidates.sort_by_key(|&(d, side, idx)| (d, side.index(), idx));
+        // Fair deterministic tie-break on equal aerial/ground distance: stronger player first, then a
+        // tick-salted index hash (never a fixed Home / low-index bias).
+        let tie_tick = self.state.tick;
+        candidates.sort_by_key(|&(d, side, idx)| {
+            let strength = self.state.players[side.index()][idx].attributes.strength;
+            (d, core::cmp::Reverse(strength), aerial_tie_hash(tie_tick, side, idx))
+        });
 
         let Some((_, side, idx)) = candidates.first().copied() else {
             return;
@@ -6250,16 +6273,33 @@ impl MatchSimulation {
                     self.state.format.goal_half_width().mul(Fp::from_milli(520))
                 };
                 let hdr_origin = self.state.players[s_idx][idx].pos;
-                let hdr_dir = (Vec2::new(opp_goal_x, corner_y) - hdr_origin).normalize_or_zero();
-                let hdr_spd = Fp::from_milli(14_500 + (self.state.players[s_idx][idx].attributes.shooting as i64) * 48);
+                // Attribute-scaled aim error (`+/-0.14..1.0m` at the target) and a realistic header speed
+                // (`11..15 m/s`, biomechanics: ~10-16 m/s off a ~13 m/s cross) instead of a laser 17-19 m/s.
+                let hdr_shooting = self.state.players[s_idx][idx].attributes.shooting as i64;
+                let aim_err_mm = (110 - hdr_shooting).clamp(10, 70) * 14;
+                let aim_err = self.state.rng.range_milli(-aim_err_mm, aim_err_mm);
+                let hdr_dir = (Vec2::new(opp_goal_x, corner_y + aim_err) - hdr_origin).normalize_or_zero();
+                let hdr_spd = Fp::from_milli(11_000 + hdr_shooting * 40).min(Fp::from_milli(15_500));
+                let hdr_vz = Fp::from_milli(-1_150);
+                // Credit a shot on target only when the headed trajectory actually reaches the frame.
+                let hdr_on_target = {
+                    let dx = (opp_goal_x - hdr_origin.x).abs();
+                    let vx = hdr_dir.x.mul(hdr_spd).abs().max(Fp::from_milli(500));
+                    let t_goal = dx.div(vx);
+                    let y_goal = hdr_origin.y + hdr_dir.y.mul(hdr_spd).mul(t_goal);
+                    let z_goal = ball_z + hdr_vz.mul(t_goal) - Fp::from_milli(4_905).mul(t_goal.mul(t_goal));
+                    hdr_dir.x.mul(Fp::from_int(attack_sign as i32)) > Fp::from_milli(100)
+                        && y_goal.abs() <= self.state.format.goal_half_width()
+                        && z_goal <= self.state.format.goal_height()
+                };
                 self.state.ball.owner = None;
-                self.state.ball.vel = Vec3::new(hdr_dir.x.mul(hdr_spd), hdr_dir.y.mul(hdr_spd), Fp::from_milli(-1_150));
+                self.state.ball.vel = Vec3::new(hdr_dir.x.mul(hdr_spd), hdr_dir.y.mul(hdr_spd), hdr_vz);
                 self.state.ball.spin_top = Fp::from_milli(1_400);
                 self.state.ball.deliberate_foot_backpass = None;
                 self.state.ball.kicker_lockout = Some((side, idx, 18));
                 self.state.ball.shot_launched_tick = self.state.tick;
                 self.state.ball.shot_origin = hdr_origin;
-                self.state.ball.pending_shot_on_target = Some((side, player_id.clone()));
+                self.state.ball.pending_shot_on_target = hdr_on_target.then(|| (side, player_id.clone()));
                 self.state.manual_switch_lock[s_idx] = 0;
                 self.set_last_touch(side, idx);
                 self.snapshot_offside_mask(side, idx);
@@ -6268,7 +6308,9 @@ impl MatchSimulation {
                 self.state.players[s_idx][idx].recent_kick_ticks = 11;
                 self.state.players[s_idx][idx].recent_kick_kind = 4;
                 self.state.player_stats[s_idx][idx].shots += 1;
-                self.state.player_stats[s_idx][idx].shots_on_target += 1;
+                if hdr_on_target {
+                    self.state.player_stats[s_idx][idx].shots_on_target += 1;
+                }
                 self.emit_event(
                     MatchEventType::Shot,
                     side,
@@ -6303,6 +6345,47 @@ impl MatchSimulation {
                 self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
                 self.state.players[s_idx][idx].recent_kick_ticks = 11;
                 self.state.players[s_idx][idx].recent_kick_kind = 3;
+                return;
+            } else {
+                // Midfield headed pass / flick-on (an airborne player HEADS the ball instead of chest-trapping
+                // it mid-leap): nod it toward the best-placed forward teammate, else straight upfield.
+                let hdr_origin = self.state.players[s_idx][idx].pos;
+                let att = Fp::from_int(attack_sign as i32);
+                let mut best_target: Option<Vec2> = None;
+                let mut best_sc = Fp::from_int(-999_999);
+                for (m_i, mate) in self.state.players[s_idx].iter().enumerate().skip(1) {
+                    if m_i == idx || mate.sent_off {
+                        continue;
+                    }
+                    let rel = mate.pos - hdr_origin;
+                    let along = rel.x.mul(att);
+                    let d = rel.len();
+                    if along < Fp::from_milli(2_500) || d < Fp::from_milli(4_500) || d > Fp::from_milli(21_000) {
+                        continue;
+                    }
+                    let sc = along - rel.y.abs().mul(Fp::from_milli(600)) - d.mul(Fp::from_milli(150));
+                    if sc > best_sc {
+                        best_sc = sc;
+                        best_target = Some(mate.pos);
+                    }
+                }
+                let target = best_target.unwrap_or(hdr_origin + Vec2::new(att.mul(Fp::from_milli(12_000)), Fp::ZERO));
+                let rel = target - hdr_origin;
+                let hdr_dir = rel.normalize_or_zero();
+                let hdr_spd = (Fp::from_milli(6_200) + rel.len().mul(Fp::from_milli(330)))
+                    .clamp(Fp::from_milli(8_000), Fp::from_milli(12_600));
+                self.state.ball.owner = None;
+                self.state.ball.vel = Vec3::new(hdr_dir.x.mul(hdr_spd), hdr_dir.y.mul(hdr_spd), Fp::from_milli(2_450));
+                self.state.ball.spin_top = Fp::from_milli(-300);
+                self.state.ball.deliberate_foot_backpass = None;
+                self.state.ball.kicker_lockout = Some((side, idx, 18));
+                self.state.manual_switch_lock[s_idx] = 0;
+                self.set_last_touch(side, idx);
+                self.snapshot_offside_mask(side, idx);
+                self.state.players[s_idx][idx].facing_bam = hdr_dir.to_bam();
+                self.state.players[s_idx][idx].action = PlayerActionState::Cooldown { ticks_left: 9 };
+                self.state.players[s_idx][idx].recent_kick_ticks = 11;
+                self.state.players[s_idx][idx].recent_kick_kind = 1;
                 return;
             }
         }
@@ -7448,6 +7531,173 @@ fn solve_ballistic_lob_launch(
 // Re-export angle_diff_bam / atan2_bam silence check if needed by callers
 const _: fn(u16, u16) -> i16 = angle_diff_bam;
 const _: fn(Fp, Fp) -> u16 = atan2_bam;
+
+// ============================================================================
+// Aerial contest selection: only ONE legitimate outfield contestant per team leaps for a loose high ball.
+// ============================================================================
+
+/// Standing forehead height assumed by aerial contact ranking (`p.z + 1.62..1.65m`).
+const AERIAL_FOREHEAD_MM: i64 = 1_620;
+/// Below this contact height the ball is chested / controlled on the ground (outfield standing reach `1.48m`).
+const AERIAL_MIN_JUMP_BALL_MM: i64 = 1_550;
+/// Comfortable standing-header ceiling: a DROPPING ball below this is simply let down onto the chest.
+const AERIAL_COMFORT_HEADER_MM: i64 = 1_750;
+/// Landing recovery (`0.7s`) before the same player may leave the ground again.
+const AERIAL_JUMP_RECOVER_TICKS: u8 = 42;
+/// Trajectory look-ahead window (`~0.67s`).
+const AERIAL_LOOKAHEAD_TICKS: i32 = 40;
+
+/// Deterministic per-player aerial plan for a loose high ball (all Fp math, fixed tick order).
+#[derive(Clone, Copy, Debug)]
+struct AerialJumpPlan {
+    /// First tick (from now) at which this player can meet the ball in the header band.
+    contact_tick: i32,
+    /// Takeoff vertical speed that puts the forehead at the predicted ball height at apex.
+    takeoff_vz: Fp,
+    /// Ticks from takeoff to apex for `takeoff_vz`.
+    apex_ticks: i32,
+    /// Lower = better placed (`contact_tick * 1000 + horizontal miss mm`).
+    score: i64,
+}
+
+#[inline]
+fn outfield_max_jump_vz(p: &PlayerState) -> Fp {
+    Fp::from_milli(3_320 + (p.attributes.strength as i64) * 3)
+}
+
+/// Predicts where/when the loose ball crosses this player's reachable header band and whether a leap is worthwhile.
+/// Returns `None` for GKs, airborne / recovering / unavailable players, the last toucher, balls that will drop
+/// onto the chest (`< 1.75m` and falling) or that stay below `1.55m`, and balls nobody can reach in time.
+fn aerial_jump_plan(state: &MatchState, side: TeamSide, idx: usize) -> Option<AerialJumpPlan> {
+    if idx == 0 {
+        return None;
+    }
+    let p = state.players.get(side.index())?.get(idx)?;
+    if !p.can_control_ball()
+        || p.z > Fp::ZERO
+        || p.vz != Fp::ZERO
+        || p.jump_recover_ticks > 0
+        || state.ball.owner.is_some()
+        || state.ball.last_touch_player == Some((side, idx))
+    {
+        return None;
+    }
+    let g = Fp::from_milli(9_810);
+    let two_g = Fp::from_milli(19_620);
+    let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
+    let bz0 = state.ball.pos.z;
+    let bvz0 = state.ball.vel.z;
+    let min_jump_z = Fp::from_milli(AERIAL_MIN_JUMP_BALL_MM);
+    let ball_apex = if bvz0 > Fp::ZERO {
+        bz0 + bvz0.mul(bvz0).div(two_g)
+    } else {
+        bz0
+    };
+    if ball_apex < min_jump_z {
+        return None;
+    }
+    let max_vz = outfield_max_jump_vz(p);
+    let max_lift = max_vz.mul(max_vz).div(two_g).min(Fp::from_milli(680));
+    let forehead = Fp::from_milli(AERIAL_FOREHEAD_MM);
+    // Forehead at apex + ~ball radius: anything higher sails over this player.
+    let reach_top = forehead + max_lift + Fp::from_milli(110);
+    let b0 = state.ball.pos.xy();
+    let bv = state.ball.vel.xy();
+    let ball_z_at = |t: i32| -> Fp {
+        let tf = dt.mul(Fp::from_int(t));
+        bz0 + bvz0.mul(tf) - g.mul(tf).mul(tf).mul(Fp::HALF)
+    };
+    for t in 0..=AERIAL_LOOKAHEAD_TICKS {
+        let tf = dt.mul(Fp::from_int(t));
+        let bz = ball_z_at(t);
+        if bz <= Fp::ZERO {
+            break;
+        }
+        let bxy = b0 + bv.scale(tf);
+        let pxy = p.pos + p.vel.scale(tf);
+        // Head/shoulder reach radius + modest steering allowance (`1.1 m/s`) on top of current run.
+        let reach_r = Fp::from_milli(560) + Fp::from_milli(1_100).mul(tf);
+        let miss = pxy.dist(bxy);
+        if miss > reach_r {
+            continue;
+        }
+        if bz > reach_top {
+            // Still over this player's head here; maybe it drops into the band later in the window.
+            continue;
+        }
+        if bz < min_jump_z {
+            // Ball arrives low enough to chest / control on the ground: never jump for it.
+            return None;
+        }
+        let bvz_t = bvz0 - g.mul(tf);
+        if bz < Fp::from_milli(AERIAL_COMFORT_HEADER_MM) && bvz_t <= Fp::ZERO {
+            // Dropping ball at chest-to-forehead height: let it come down and control it standing.
+            return None;
+        }
+        // Earliest physically meaningful contact after takeoff is ~8 ticks; aim the forehead there.
+        let aim_z = ball_z_at(t.max(8)).clamp(min_jump_z, reach_top);
+        let lift = (aim_z - forehead).clamp(Fp::from_milli(160), max_lift.max(Fp::from_milli(160)));
+        let takeoff_vz = two_g.mul(lift).sqrt().min(max_vz);
+        let apex_ticks = takeoff_vz
+            .div(g)
+            .mul(Fp::from_int(TICKS_PER_SECOND as i32))
+            .to_milli()
+            / 1_000;
+        return Some(AerialJumpPlan {
+            contact_tick: t,
+            takeoff_vz,
+            apex_ticks: apex_ticks as i32,
+            score: (t as i64) * 1_000 + miss.to_milli(),
+        });
+    }
+    None
+}
+
+/// Picks at most ONE outfield aerial contestant for `side` (best placed, deterministic lowest-index tie-break).
+/// `prefer_idx` (the human-controlled player actively pressing for the ball) wins whenever it is feasible.
+/// Returns `None` while any outfield teammate is already airborne, so a team never leaps twice for one ball.
+fn aerial_team_contestant(
+    state: &MatchState,
+    side: TeamSide,
+    prefer_idx: Option<usize>,
+) -> Option<(usize, AerialJumpPlan)> {
+    let team = state.players.get(side.index())?;
+    if aerial_teammate_airborne(team) {
+        return None;
+    }
+    if let Some(pi) = prefer_idx {
+        if let Some(plan) = aerial_jump_plan(state, side, pi) {
+            return Some((pi, plan));
+        }
+    }
+    let mut best: Option<(usize, AerialJumpPlan)> = None;
+    for idx in 1..team.len() {
+        if let Some(plan) = aerial_jump_plan(state, side, idx) {
+            if best.is_none_or(|(_, b)| plan.score < b.score) {
+                best = Some((idx, plan));
+            }
+        }
+    }
+    best
+}
+
+/// Deterministic, side-symmetric tie-break salt for equal-distance ball-contact candidates.
+#[inline]
+fn aerial_tie_hash(tick: u32, side: TeamSide, idx: usize) -> u64 {
+    let mut x = (u64::from(tick) << 8) ^ ((side.index() as u64) << 5) ^ (idx as u64);
+    x = x.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    x ^= x >> 29;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^ (x >> 32)
+}
+
+/// `true` while any (non-sent-off) outfield player of this team is off the ground.
+#[inline]
+fn aerial_teammate_airborne(team: &[PlayerState]) -> bool {
+    team.iter()
+        .skip(1)
+        .any(|m| !m.sent_off && (m.z > Fp::ZERO || m.vz != Fp::ZERO))
+}
 
 #[cfg(test)]
 mod tests {
@@ -11445,5 +11695,204 @@ mod tests {
         }
         assert_eq!(s.state().players[1][first].contain_cooldown, 0);
         assert!(s.state().players[1][first].contain_stamina > 0, "contain stamina regenerates after cooldown");
+    }
+
+    /// 11v11 open-play sim with every outfielder parked far from the centre circle (GKs stay home).
+    fn aerial_test_sim(seed: u64) -> MatchSimulation {
+        let mut snap = FixtureSnapshot::sample_eleven_a_side(seed);
+        snap.rules.home_controller = SideController::Human;
+        snap.rules.away_controller = SideController::Human;
+        let mut sim = MatchSimulation::new(&snap).unwrap();
+        sim.state.phase = MatchPhase::OpenPlay;
+        for s in 0..2 {
+            let n = sim.state.players[s].len();
+            for idx in 1..n {
+                let p = &mut sim.state.players[s][idx];
+                let y_sign = if s == 0 { -1 } else { 1 };
+                p.pos = Vec2::from_milli(-30_000 + (idx as i64) * 5_000, y_sign * 28_000);
+                p.vel = Vec2::ZERO;
+                p.z = Fp::ZERO;
+                p.vz = Fp::ZERO;
+                p.action = PlayerActionState::Normal;
+            }
+        }
+        // Controlled players are the parked far-flank #10s (idle input = they just stand).
+        sim.state.controlled_idx = [10, 10];
+        sim.state.ball.owner = None;
+        sim.state.ball.last_touch_team = Some(TeamSide::Home);
+        sim.state.ball.last_touch_player = Some((TeamSide::Home, 10));
+        sim
+    }
+
+    #[test]
+    fn aerial_only_best_placed_contestant_per_team_jumps_for_a_high_ball() {
+        let mut sim = aerial_test_sim(4_401);
+        // Five players (3 Home, 2 Away) all within the OLD `1.35m` everyone-jumps radius of a high ball.
+        let home_spots = [(4, -450, 0), (2, -950, 350), (3, -350, -950)];
+        let away_spots = [(2, -750, -420), (3, -1_150, 520)];
+        for &(idx, x, y) in &home_spots {
+            sim.state.players[0][idx].pos = Vec2::from_milli(x, y);
+        }
+        for &(idx, x, y) in &away_spots {
+            sim.state.players[1][idx].pos = Vec2::from_milli(x, y);
+        }
+        sim.state.ball.pos = Vec3::from_milli(0, 0, 2_250);
+        sim.state.ball.vel = Vec3::from_milli(-2_200, 0, 0);
+
+        let mut home_jumpers = [false; 11];
+        let mut away_jumpers = [false; 11];
+        let first_touch = sim.state.ball.last_touch_player;
+        for _ in 0..30 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            for idx in 1..11 {
+                home_jumpers[idx] |= sim.state().players[0][idx].z > Fp::ZERO;
+                away_jumpers[idx] |= sim.state().players[1][idx].z > Fp::ZERO;
+            }
+            if sim.state().ball.last_touch_player != first_touch {
+                break;
+            }
+        }
+        let home_count = home_jumpers.iter().filter(|&&j| j).count();
+        let away_count = away_jumpers.iter().filter(|&&j| j).count();
+        assert_eq!(home_count, 1, "exactly ONE Home contestant may leap (got {home_jumpers:?})");
+        assert!(home_jumpers[4], "the best-placed Home player (#4, under the ball) must be the one who leaps");
+        assert!(away_count <= 1, "at most ONE Away contestant may leap (got {away_jumpers:?})");
+        assert!(
+            !home_jumpers[2] && !home_jumpers[3],
+            "non-contestant teammates must stay grounded and keep positioning"
+        );
+    }
+
+    #[test]
+    fn aerial_no_rejump_within_landing_recovery() {
+        let mut sim = aerial_test_sim(4_402);
+        sim.state.players[0][2].pos = Vec2::ZERO;
+        let hang_ball = |sim: &mut MatchSimulation| {
+            sim.state.ball.owner = None;
+            sim.state.ball.pos = Vec3::from_milli(350, 0, 2_150);
+            sim.state.ball.vel = Vec3::ZERO;
+            sim.state.ball.kicker_lockout = None;
+            sim.state.ball.last_touch_team = Some(TeamSide::Home);
+            sim.state.ball.last_touch_player = Some((TeamSide::Home, 10));
+            sim.state.players[0][2].pos = Vec2::ZERO;
+            sim.state.players[0][2].vel = Vec2::ZERO;
+        };
+        // 1. First leap happens, then the player lands.
+        let mut took_off = false;
+        let mut landed_at = None;
+        for t in 0..90 {
+            hang_ball(&mut sim);
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            let p = &sim.state().players[0][2];
+            if p.z > Fp::ZERO {
+                took_off = true;
+            } else if took_off && p.vz == Fp::ZERO {
+                landed_at = Some(t);
+                break;
+            }
+        }
+        assert!(took_off, "player under a hanging 2.15m ball must leap for it");
+        let landed_at = landed_at.expect("player must land again");
+        assert!(sim.state().players[0][2].jump_recover_ticks > 0, "landing must start a recovery window");
+
+        // 2. Ball still hanging right above him: NO bunny-hop until the 0.7s recovery elapses.
+        let mut rejump_tick = None;
+        for t in 1..=80 {
+            hang_ball(&mut sim);
+            sim.state.players[0][2].action = PlayerActionState::Normal;
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().players[0][2].vz != Fp::ZERO {
+                rejump_tick = Some(t);
+                break;
+            }
+        }
+        let rejump_tick = rejump_tick.expect("player may leap again once recovered");
+        assert!(
+            rejump_tick >= i32::from(AERIAL_JUMP_RECOVER_TICKS) - 2,
+            "no re-jump within the landing recovery window (landed at {landed_at}, re-jumped after {rejump_tick} ticks)"
+        );
+    }
+
+    #[test]
+    fn aerial_no_jump_for_chest_height_or_dropping_ball() {
+        // (ball_z_mm, ball_vz_mm): a 1.3m ball, and a 1.65m ball already dropping onto the chest.
+        for &(bz, bvz) in &[(1_300_i64, 0_i64), (1_650, -800)] {
+            let mut sim = aerial_test_sim(4_403);
+            sim.state.players[0][2].pos = Vec2::ZERO;
+            sim.state.players[1][2].pos = Vec2::from_milli(-700, 300);
+            sim.state.ball.pos = Vec3::from_milli(800, 0, bz);
+            sim.state.ball.vel = Vec3::from_milli(-3_000, 0, bvz);
+            for _ in 0..30 {
+                sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+                for s in 0..2 {
+                    for idx in 1..11 {
+                        assert_eq!(
+                            sim.state().players[s][idx].z,
+                            Fp::ZERO,
+                            "nobody may jump for a {bz}mm ball (vz {bvz}mm/s): side {s} #{idx} left the ground"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn aerial_midfield_airborne_contact_is_a_headed_pass_not_a_chest_trap() {
+        let mut sim = aerial_test_sim(4_404);
+        // Home #6 mid-leap at the halfway line meets the ball at forehead height.
+        sim.state.players[0][6].pos = Vec2::ZERO;
+        sim.state.players[0][6].z = Fp::from_milli(300);
+        sim.state.players[0][6].vz = Fp::from_milli(400);
+        // Forward teammate to nod it on to.
+        sim.state.players[0][9].pos = Vec2::from_milli(
+            12_000 * TeamSide::Home.attack_sign(sim.state.second_half_swapped()),
+            2_000,
+        );
+        sim.state.ball.pos = Vec3::from_milli(150, 0, 1_700);
+        sim.state.ball.vel = Vec3::from_milli(-2_000, 0, -300);
+        for _ in 0..3 {
+            sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+            if sim.state().ball.last_touch_player == Some((TeamSide::Home, 6)) {
+                break;
+            }
+        }
+        assert_eq!(sim.state().ball.last_touch_player, Some((TeamSide::Home, 6)));
+        assert!(sim.state().ball.owner.is_none(), "airborne midfield contact must HEAD the ball on, not trap it");
+        assert_eq!(sim.state().players[0][6].recent_kick_kind, 1, "headed pass cue for the renderer");
+        assert!(sim.state().ball.vel.xy().len() > Fp::from_milli(7_000));
+    }
+
+    #[test]
+    fn aerial_attacking_header_speed_is_realistic_and_on_target_credit_matches_trajectory() {
+        for seed in 0..6_u64 {
+            let mut sim = aerial_test_sim(4_405 + seed);
+            let att = TeamSide::Home.attack_sign(sim.state.second_half_swapped());
+            let half_len = sim.state().format.half_length().to_milli();
+            sim.state.players[0][9].pos = Vec2::from_milli(att * (half_len - 8_000), 600);
+            sim.state.players[0][9].z = Fp::from_milli(320);
+            sim.state.players[0][9].vz = Fp::from_milli(300);
+            sim.state.ball.pos = Vec3::from_milli(att * (half_len - 8_000) - att * 150, 600, 1_750);
+            sim.state.ball.vel = Vec3::from_milli(att * 2_000, 0, -300);
+            for _ in 0..3 {
+                sim.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
+                if sim.state().ball.last_touch_player == Some((TeamSide::Home, 9)) {
+                    break;
+                }
+            }
+            assert_eq!(sim.state().ball.last_touch_player, Some((TeamSide::Home, 9)));
+            let spd = sim.state().ball.vel.xy().len();
+            assert!(
+                spd >= Fp::from_milli(10_000) && spd <= Fp::from_milli(16_000),
+                "attacking header must leave the head at 10..16 m/s (got {spd:?})"
+            );
+            let st = &sim.state().player_stats[0][9];
+            assert_eq!(st.shots, 1);
+            assert_eq!(
+                st.shots_on_target,
+                u16::from(sim.state().ball.pending_shot_on_target.is_some()),
+                "shot-on-target credit must follow the predicted trajectory"
+            );
+        }
     }
 }
