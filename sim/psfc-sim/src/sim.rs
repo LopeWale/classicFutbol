@@ -1,7 +1,7 @@
 //! Deterministic 60 Hz football simulation engine (`MatchSimulation`).
 
 use crate::ai::{
-    best_ball_intercept_for_player, choose_safe_gk_distribution, compute_goalkeeper_intent,
+    best_ball_intercept_for_player, choose_safe_gk_distribution, decide_goalkeeper,
     compute_outfield_ai_intent, generate_cpu_input, predict_ball_xy_at_ticks,
     world_anchor_for_player,
 };
@@ -188,6 +188,7 @@ impl MatchSimulation {
                 rng: DeterministicRng::new(snapshot.seed),
                 went_to_extra_time: false,
                 shootout_score: None,
+                gk_brain: [crate::state::GoalkeeperBrain::default(); 2],
                 pending_events: Vec::new(),
                 recorded_events: Vec::new(),
             },
@@ -2899,7 +2900,10 @@ impl MatchSimulation {
 
                 // Compute movement / dive intent first using immutable state borrow
                 let ai_intent = if is_gk {
-                    Some(compute_goalkeeper_intent(&self.state, side, gk_rush_held))
+                    let (gk_intent, gk_brain) =
+                        decide_goalkeeper(&self.state, side, gk_rush_held);
+                    self.state.gk_brain[s_idx] = gk_brain;
+                    Some(gk_intent)
                 } else if !is_controlled {
                     Some(compute_outfield_ai_intent(&self.state, side, idx))
                 } else {

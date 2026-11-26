@@ -288,6 +288,87 @@ impl MatchPhase {
     }
 }
 
+/// Goalkeeper decision scenario (see `docs/goalkeeper-ai.md` for the full entry / exit table).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GkScenario {
+    /// Hold the angle-bisector arc (depth scaled by ball distance and `positioning`), feet set.
+    #[default]
+    Set,
+    /// Incoming shot: reflex-latency gated save execution (lateral shuffle / dive).
+    Shot,
+    /// Committed claim of a high ball the keeper reaches first inside his command zone.
+    CrossClaim,
+    /// High ball the keeper cannot safely claim: hold a near-post / central stance and react.
+    CrossHold,
+    /// Committed sweep of a loose ball behind the defensive line.
+    Sweep,
+    /// Attacker through on goal with no covering defender: narrow the angle and stand big.
+    OneVOne,
+    /// Committed collection of a loose ball inside the box.
+    Collect,
+    /// Keeper holds / controls the ball: step to an outlet angle (distribution is in `sim.rs`).
+    Possession,
+    /// Own outfielder has the ball: central outlet stance at the goal-area edge.
+    Support,
+    /// Out of position: sprint back to the set position by the straight line.
+    Recover,
+    /// Live set-piece delivery (corner / penalty) or a dead-ball stance.
+    SetPiece,
+    /// Human-held `BTN_GK_RUSH`.
+    HumanRush,
+}
+
+impl GkScenario {
+    /// Stable wire / hash code.
+    pub const fn code(self) -> u8 {
+        match self {
+            Self::Set => 0,
+            Self::Shot => 1,
+            Self::CrossClaim => 2,
+            Self::CrossHold => 3,
+            Self::Sweep => 4,
+            Self::OneVOne => 5,
+            Self::Collect => 6,
+            Self::Possession => 7,
+            Self::Support => 8,
+            Self::Recover => 9,
+            Self::SetPiece => 10,
+            Self::HumanRush => 11,
+        }
+    }
+
+    /// Scenarios that take the keeper off his set position toward the ball.
+    pub const fn is_outward(self) -> bool {
+        matches!(
+            self,
+            Self::CrossClaim | Self::Sweep | Self::OneVOne | Self::Collect | Self::HumanRush
+        )
+    }
+
+    /// Scenarios that hold a commitment window once entered.
+    pub const fn is_committed(self) -> bool {
+        matches!(self, Self::CrossClaim | Self::Sweep | Self::OneVOne | Self::Collect)
+    }
+}
+
+/// Small deterministic per-side goalkeeper brain (scenario state machine memory).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoalkeeperBrain {
+    pub scenario: GkScenario,
+    /// Remaining ticks the current committed scenario is held unless invalidated.
+    pub commit_ticks: u16,
+    /// Tick the current scenario was entered.
+    pub entered_tick: u32,
+    /// Tick of the last decision.
+    pub last_decision_tick: u32,
+    /// Committed target (claim / sweep / collect point) for the current scenario.
+    pub target: Vec2,
+    /// After an aborted outward commitment, outward re-entry needs a larger margin for this many ticks.
+    pub reentry_block_ticks: u16,
+    /// Diagnostic: total scenario switches this match.
+    pub switches: u32,
+}
+
 /// Context-sensitive gameplay state for a team's input state machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum PossessionContext {
@@ -395,6 +476,9 @@ pub struct MatchState {
     pub went_to_extra_time: bool,
     #[serde(default)]
     pub shootout_score: Option<[u8; 2]>,
+    /// Per-side goalkeeper scenario brain (`[home, away]`).
+    #[serde(default)]
+    pub gk_brain: [GoalkeeperBrain; 2],
     #[serde(skip)]
     pub pending_events: Vec<MatchEvent>,
     pub recorded_events: Vec<MatchEvent>,
@@ -541,6 +625,16 @@ impl MatchState {
                 h.u8(ap);
             }
             None => h.u8(0),
+        }
+        for b in &self.gk_brain {
+            h.u8(b.scenario.code());
+            h.u16(b.commit_ticks);
+            h.u32(b.entered_tick);
+            h.u32(b.last_decision_tick);
+            h.i64(b.target.x.raw());
+            h.i64(b.target.y.raw());
+            h.u16(b.reentry_block_ticks);
+            h.u32(b.switches);
         }
         h.u32(self.possession_ticks[0]);
         h.u32(self.possession_ticks[1]);

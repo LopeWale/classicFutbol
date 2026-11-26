@@ -75,330 +75,16 @@ pub fn predict_ball_xy_at_ticks(state: &MatchState, ticks_ahead: u32) -> Vec2 {
     predict_ball_3d_at_ticks(state, ticks_ahead).xy()
 }
 
-/// EA SEED (`arXiv:2510.23216v4`) Two-Stage Goalkeeper Architecture:
-/// - Stage 1: Continuous Angle-Bisector Positioning + EA FC 25 *GK Rush to Contain* (`1.45m` stand-off; jump on ball only when loose).
-/// - Stage 2: Human-Like Save Execution gated by `GK Reflexes` reaction latency + *FIFA 23 GK Line of Sight* screen occlusion.
+/// Scenario-based goalkeeper movement / dive intent for `players[side][0]`.
+///
+/// Pure view over [`decide_goalkeeper`] (which also returns the updated [`GoalkeeperBrain`]); the
+/// simulation calls `decide_goalkeeper` and stores the brain so commitments and hysteresis persist.
 pub fn compute_goalkeeper_intent(
     state: &MatchState,
     side: TeamSide,
     human_gk_rush: bool,
 ) -> AiMoveIntent {
-    let p = &state.players[side.index()][0];
-    let is_5v5 = state.format.players_per_side <= 6;
-    let attack_sign = side.attack_sign(state.second_half_swapped());
-    let half_len = state.format.half_length();
-    let goal_half_w = state.format.goal_half_width();
-    let box_depth = state.format.penalty_box_depth();
-    let box_half_w = state.format.penalty_box_half_width();
-
-    // Own goal center X: if attacking +X (sign = +1), own goal is at -half_len.
-    let own_goal_x = Fp::from_milli(-attack_sign * half_len.to_milli());
-    let into_pitch_sign = Fp::from_int(attack_sign as i32);
-
-    // If holding or controlling the ball, step toward an open outlet angle.
-    if state.ball.owner == Some((side, 0)) {
-        let (_, _, safe_aim) = choose_safe_gk_distribution(state, side);
-        let target = Vec2::new(
-            own_goal_x + into_pitch_sign.mul(Fp::from_milli(if is_5v5 { 3_800 } else { 4_600 })),
-            safe_aim.y.mul(Fp::from_milli(1_600)).clamp(-goal_half_w, goal_half_w),
-        );
-        let delta = target - p.pos;
-        if delta.len() > Fp::from_milli(320) {
-            return AiMoveIntent {
-                move_dir: delta.normalize_or_zero(),
-                sprint: false,
-                jockey: false,
-                trigger_dive: None,
-            };
-        }
-        return AiMoveIntent {
-            move_dir: Vec2::ZERO,
-            sprint: false,
-            jockey: false,
-            trigger_dive: None,
-        };
-    }
-
-    // Defending Corner Kick stance: hold central/near-six-yard command spot ready to claim or parry!
-    if let MatchPhase::SetPiece {
-        kind: RestartKind::CornerKick,
-        team,
-        spot,
-        ..
-    } = state.phase
-    {
-        if team != side {
-            let y_bias = if spot.y >= Fp::ZERO {
-                Fp::from_milli(420)
-            } else {
-                Fp::from_milli(-420)
-            };
-            let ck_target = Vec2::new(
-                own_goal_x + into_pitch_sign.mul(Fp::from_milli(if is_5v5 { 1_450 } else { 1_650 })),
-                y_bias,
-            );
-            let d = ck_target - p.pos;
-            return AiMoveIntent {
-                move_dir: if d.len() > Fp::from_milli(150) {
-                    d.normalize_or_zero()
-                } else {
-                    Vec2::ZERO
-                },
-                sprint: false,
-                jockey: true,
-                trigger_dive: None,
-            };
-        }
-    }
-
-    let ball_xy = state.ball.pos.xy();
-    let ball_vel_xy = state.ball.vel.xy();
-
-    // --- STAGE 2: EA SEED SHOT-STOPPING SAVE EXECUTION + FIFA 23 GK LINE OF SIGHT ---
-    let vel_toward_goal = if attack_sign > 0 {
-        -ball_vel_xy.x
-    } else {
-        ball_vel_xy.x
-    };
-    let dist_ball_to_goal_x = (ball_xy.x - own_goal_x).abs();
-    let max_shot_react_dist = Fp::from_milli(if is_5v5 { 26_500 } else { 31_000 });
-
-    if state.ball.owner.is_none()
-        && matches!(p.action, PlayerActionState::Normal)
-        && vel_toward_goal > Fp::from_milli(5_200)
-        && dist_ball_to_goal_x < max_shot_react_dist
-        && dist_ball_to_goal_x > Fp::from_milli(220)
-    {
-        let gk_skill = p.attributes.goalkeeping as i64;
-        // Human GK neuromuscular reflex latency (~133ms elite .. ~200ms standard) + FIFA 23 Line-of-Sight screen penalty (+50ms)
-        let base_react = (13 - gk_skill / 20).clamp(7, 12) as u32;
-        let mut screened = false;
-        if state.ball.shot_launched_tick > 0 {
-            let ray = p.pos - state.ball.shot_origin;
-            let ray_len = ray.len();
-            if ray_len > Fp::from_milli(1_500) {
-                let ray_dir = ray.normalize_or_zero();
-                for (t_i, team_arr) in state.players.iter().enumerate() {
-                    for (p_i, other) in team_arr.iter().enumerate() {
-                        if other.sent_off || (t_i == side.index() && p_i == 0) {
-                            continue;
-                        }
-                        let rel = other.pos - state.ball.shot_origin;
-                        let along = rel.dot(ray_dir);
-                        if along > Fp::from_milli(700) && along < ray_len - Fp::from_milli(700) {
-                            let perp = (rel - ray_dir.scale(along)).len();
-                            if perp <= Fp::from_milli(850) {
-                                screened = true;
-                                break;
-                            }
-                        }
-                    }
-                    if screened {
-                        break;
-                    }
-                }
-            }
-        }
-        let react_ticks = base_react + if screened { 3 } else { 0 };
-        if state.ball.shot_launched_tick > 0
-            && state.tick.saturating_sub(state.ball.shot_launched_tick) < react_ticks
-        {
-            // Still inside human reflex latency window: hold balanced pre-shot set stance!
-            return AiMoveIntent {
-                move_dir: Vec2::ZERO,
-                sprint: false,
-                jockey: true,
-                trigger_dive: None,
-            };
-        }
-
-        let dist_to_gk_x = (ball_xy.x - p.pos.x).abs();
-        let t_to_gk = dist_to_gk_x.div(vel_toward_goal);
-        let pred_ticks = ((t_to_gk.to_milli() * 60 + 500) / 1_000).clamp(1, 60) as u32;
-        let proj_3d = predict_ball_3d_at_ticks(state, pred_ticks);
-        let projected_y = proj_3d.y;
-        let projected_z = proj_3d.z.max(Fp::ZERO);
-        let max_guard_y = goal_half_w + Fp::from_milli(950);
-
-        if projected_y.abs() <= max_guard_y {
-            let lateral_gap = projected_y - p.pos.y;
-            let dive_reach = Fp::from_milli(1_850 + gk_skill * 12);
-            let close_enough_in_time =
-                t_to_gk <= Fp::from_milli(440) || dist_to_gk_x <= Fp::from_milli(9_500);
-            if close_enough_in_time
-                && lateral_gap.abs() > Fp::from_milli(480)
-                && lateral_gap.abs() <= dive_reach
-            {
-                let dive_dir = Vec2::new(
-                    into_pitch_sign.mul(Fp::from_milli(180)),
-                    Fp::from_int(lateral_gap.signum_int()),
-                )
-                .normalize_or_zero();
-                let dive_vz_mm = if projected_z > Fp::from_milli(880) {
-                    let z_excess = (projected_z.to_milli() - 880).clamp(0, 1_600);
-                    (2_150 + (z_excess * 12) / 10).clamp(2_150, 4_000)
-                } else {
-                    280
-                };
-                return AiMoveIntent {
-                    move_dir: dive_dir,
-                    sprint: true,
-                    jockey: false,
-                    trigger_dive: Some((dive_dir, dive_vz_mm)),
-                };
-            } else if lateral_gap.abs() <= dive_reach + Fp::from_milli(650) {
-                let intercept = Vec2::new(p.pos.x, projected_y.clamp(-goal_half_w, goal_half_w));
-                return AiMoveIntent {
-                    move_dir: (intercept - p.pos).normalize_or_zero(),
-                    sprint: lateral_gap.abs() > Fp::from_milli(900),
-                    jockey: true,
-                    trigger_dive: None,
-                };
-            }
-        }
-    }
-
-    // High Aerial Cross / Corner Command Zone: step out to pluck/punch high balls in the 6-yard area!
-    let cross_cmd_depth = Fp::from_milli(if is_5v5 { 6_200 } else { 7_600 });
-    if state.ball.owner.is_none()
-        && matches!(state.phase, MatchPhase::OpenPlay)
-        && state.ball.pos.z > Fp::from_milli(1_200)
-        && dist_ball_to_goal_x <= cross_cmd_depth
-        && ball_xy.y.abs() <= goal_half_w + Fp::from_milli(2_500)
-    {
-        let claim_xy = predict_ball_xy_at_ticks(state, 11);
-        let clamped_claim = Vec2::new(
-            if attack_sign > 0 {
-                claim_xy.x.clamp(own_goal_x + Fp::from_milli(600), own_goal_x + cross_cmd_depth)
-            } else {
-                claim_xy.x.clamp(own_goal_x - cross_cmd_depth, own_goal_x - Fp::from_milli(600))
-            },
-            claim_xy
-                .y
-                .clamp(-(goal_half_w + Fp::from_milli(2_000)), goal_half_w + Fp::from_milli(2_000)),
-        );
-        return AiMoveIntent {
-            move_dir: (clamped_claim - p.pos).normalize_or_zero(),
-            sprint: true,
-            jockey: false,
-            trigger_dive: None,
-        };
-    }
-
-    // --- STAGE 1: CONTINUOUS POSITIONING & EA FC 25 *GK RUSH TO CONTAIN* ---
-    let ball_in_own_box = dist_ball_to_goal_x <= box_depth && ball_xy.y.abs() <= box_half_w;
-    // Jump directly onto the ball ONLY when it is loose from the attacker's feet!
-    let rush_loose_ball = state.ball.owner.is_none()
-        && matches!(state.phase, MatchPhase::OpenPlay)
-        && ((ball_in_own_box && p.pos.dist(ball_xy) < Fp::from_milli(7_200))
-            || (human_gk_rush && dist_ball_to_goal_x < box_depth + Fp::from_milli(4_500)));
-
-    if rush_loose_ball {
-        return AiMoveIntent {
-            move_dir: (ball_xy - p.pos).normalize_or_zero(),
-            sprint: true,
-            jockey: false,
-            trigger_dive: None,
-        };
-    }
-
-    // True Post-to-Post Angle-Bisector Anchor on the Goal Line (`own_goal_x, bisect_goal_y`)
-    let post_neg = Vec2::new(own_goal_x, -goal_half_w);
-    let post_pos = Vec2::new(own_goal_x, goal_half_w);
-    let d_neg = ball_xy.dist(post_neg);
-    let d_pos = ball_xy.dist(post_pos);
-    let d_sum = (d_neg + d_pos).max(Fp::ONE);
-    let bisect_goal_y = goal_half_w
-        .mul(d_neg - d_pos)
-        .div(d_sum)
-        .clamp(-(goal_half_w - Fp::from_milli(250)), goal_half_w - Fp::from_milli(250));
-    let bisect_anchor = Vec2::new(own_goal_x, bisect_goal_y);
-
-    // EA FC 25 *GK Rush to Contain*: when opponent controls the ball on a 1v1 (or human holds Y/Triangle GK Rush),
-    // steal ground along the angle bisector and hold a balanced `1.45m` contain stand-off instead of running past the ball!
-    let opp_owns_ball = state.ball.owner.map(|(s, _)| s) == Some(side.opponent());
-    if matches!(state.phase, MatchPhase::OpenPlay) && opp_owns_ball {
-        let mut trigger_contain_rush =
-            human_gk_rush && dist_ball_to_goal_x < box_depth + Fp::from_milli(5_500);
-        if !trigger_contain_rush && ball_in_own_box && dist_ball_to_goal_x >= Fp::from_milli(2_000) {
-            let mut defender_covering = false;
-            for mate in state.players[side.index()].iter().skip(1) {
-                if mate.sent_off {
-                    continue;
-                }
-                let d_carrier = mate.pos.dist(ball_xy);
-                let goal_side = (mate.pos.x - ball_xy.x).mul(Fp::from_int(-attack_sign as i32))
-                    > Fp::from_milli(-400);
-                if d_carrier <= Fp::from_milli(2_650) && goal_side {
-                    defender_covering = true;
-                    break;
-                }
-            }
-            trigger_contain_rush = !defender_covering;
-        }
-
-        if trigger_contain_rush {
-            let to_ball = ball_xy - bisect_anchor;
-            let dist_ab = to_ball.len().max(Fp::ONE);
-            let max_step = (dist_ab - Fp::from_milli(1_450)).max(Fp::from_milli(1_100));
-            let rush_r = if human_gk_rush {
-                max_step
-            } else {
-                (dist_ab.mul(Fp::from_milli(580))).clamp(Fp::from_milli(1_550), max_step)
-            };
-            let contain_pt = bisect_anchor + to_ball.normalize_or_zero().scale(rush_r);
-            let delta = contain_pt - p.pos;
-            return AiMoveIntent {
-                move_dir: if delta.len() > Fp::from_milli(180) {
-                    delta.normalize_or_zero()
-                } else {
-                    Vec2::ZERO
-                },
-                sprint: delta.len() > Fp::from_milli(1_150),
-                jockey: delta.len() <= Fp::from_milli(1_800),
-                trigger_dive: None,
-            };
-        }
-    }
-
-    // Standard Continuous Angle-Bisector Arc Positioning across the 7.32m regulation goal!
-    let to_ball = ball_xy - bisect_anchor;
-    let dist_ab = to_ball.len().max(Fp::ONE);
-    let dir_ab = to_ball.normalize_or_zero();
-    let max_arc_r_mm = if is_5v5 { 3_800 } else { 4_250 };
-    let min_arc_r_mm = if is_5v5 { 1_380 } else { 1_450 };
-    let scaled_r_mm = min_arc_r_mm
-        + ((dist_ab.to_milli().clamp(4_000, 34_000) - 4_000) * (max_arc_r_mm - min_arc_r_mm))
-            / 30_000;
-    let raw_arc = bisect_anchor + dir_ab.scale(Fp::from_milli(scaled_r_mm));
-
-    let min_line_clear = Fp::from_milli(if is_5v5 { 880 } else { 950 });
-    let target_x = if attack_sign > 0 {
-        raw_arc.x.max(own_goal_x + min_line_clear)
-    } else {
-        raw_arc.x.min(own_goal_x - min_line_clear)
-    };
-    let max_y = (goal_half_w - Fp::from_milli(220)).max(Fp::from_milli(850));
-    let target_y = raw_arc.y.clamp(-max_y, max_y);
-    let target = Vec2::new(target_x, target_y);
-
-    let delta = target - p.pos;
-    let dist = delta.len();
-    if dist < Fp::from_milli(160) {
-        AiMoveIntent {
-            move_dir: Vec2::ZERO,
-            sprint: false,
-            jockey: true,
-            trigger_dive: None,
-        }
-    } else {
-        AiMoveIntent {
-            move_dir: delta.normalize_or_zero(),
-            sprint: dist > Fp::from_milli(1_550),
-            jockey: dist < Fp::from_milli(1_250),
-            trigger_dive: None,
-        }
-    }
+    decide_goalkeeper(state, side, human_gk_rush).0
 }
 
 /// Returns `(button, charge_ticks, aim)`; `charge_ticks` is already scaled to the button's power bar.
@@ -482,6 +168,1021 @@ pub fn choose_safe_gk_distribution(state: &MatchState, side: TeamSide) -> (u16, 
         charge_units_to_ticks(14, BTN_LOB),
         Vec2::new(forward_vec.x, flank_y).normalize_or_zero(),
     )
+}
+
+// ---------------------------------------------------------------------------------------------
+// Goalkeeper scenario brain (see `docs/goalkeeper-ai.md`).
+// ---------------------------------------------------------------------------------------------
+
+use crate::state::{GkScenario, GoalkeeperBrain};
+
+/// Keeper style derived from attributes (documented in `docs/goalkeeper-ai.md`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GkStyle {
+    /// `positioning >= 80 && pace >= 60`: large sweep radius, smaller sweep margin.
+    Sweeper,
+    /// `goalkeeping >= 85 && strength >= 70`: larger cross command zone, smaller claim margin.
+    Commanding,
+    /// Everyone else: stays close to the goal, sweeps only inside a short radius.
+    Line,
+}
+
+/// Attribute + difficulty derived goalkeeper decision parameters (all integer millimetres / ticks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GkProfile {
+    pub style: GkStyle,
+    pub difficulty: CpuDifficulty,
+    /// Extra set-position depth at mid range (`-500..=1500` mm): good keepers narrow the angle, poor ones hug the line.
+    pub set_depth_bonus_mm: i64,
+    /// Max distance from the goal centre at which the keeper will sweep a loose ball.
+    pub sweep_radius_mm: i64,
+    /// Max distance from the goal centre at which the keeper will claim a high ball.
+    pub command_radius_mm: i64,
+    /// Arrival advantage (ticks) over the best attacker required to claim a cross / collect in the box.
+    pub claim_margin_ticks: i64,
+    /// Arrival advantage (ticks) over the best attacker required to sweep outside the box.
+    pub sweep_margin_ticks: i64,
+    /// Added shot reflex latency (ticks; negative = faster).
+    pub react_adjust_ticks: i64,
+    /// Max deterministic judgement error (ticks) applied to the keeper's own arrival estimate.
+    pub judgement_err_ticks: i64,
+    /// 1v1 stand-off distance from the ball.
+    pub standoff_mm: i64,
+}
+
+/// Derives the keeper style from attributes.
+pub const fn goalkeeper_style(a: &crate::snapshot::PlayerAttributes) -> GkStyle {
+    if a.positioning >= 80 && a.pace >= 60 {
+        GkStyle::Sweeper
+    } else if a.goalkeeping >= 85 && a.strength >= 70 {
+        GkStyle::Commanding
+    } else {
+        GkStyle::Line
+    }
+}
+
+/// CPU difficulty driving `side`'s keeper (`Normal` for a human-controlled side: the keeper is always AI).
+pub fn side_gk_difficulty(state: &MatchState, side: TeamSide) -> CpuDifficulty {
+    let ctrl = match side {
+        TeamSide::Home => state.rules.home_controller,
+        TeamSide::Away => state.rules.away_controller,
+    };
+    match ctrl {
+        crate::config::SideController::Cpu(d) => d,
+        crate::config::SideController::Human => CpuDifficulty::Normal,
+    }
+}
+
+/// Builds the decision profile for `side`'s keeper.
+pub fn goalkeeper_profile(state: &MatchState, side: TeamSide) -> GkProfile {
+    let a = state.players[side.index()][0].attributes;
+    let gk = a.goalkeeping as i64;
+    let pos = a.positioning as i64;
+    let pace = a.pace as i64;
+    let difficulty = side_gk_difficulty(state, side);
+    let style = goalkeeper_style(&a);
+    let box_mm = state.format.penalty_box_depth_mm;
+    let ga_mm = box_mm / 3;
+
+    let set_depth_bonus_mm = ((pos - 60) * 37).clamp(-500, 1_500);
+
+    // Line / commanding keepers sweep inside the box; a sweeper keeper reaches up to half a box beyond it.
+    let line_f = ((pos + pace - 100) * 1_000 / 90).clamp(250, 800);
+    let sweep_radius_mm = match style {
+        GkStyle::Sweeper => box_mm + (((pos + pace - 140).clamp(0, 100)) * box_mm) / 200,
+        GkStyle::Commanding => ga_mm + ((box_mm - ga_mm) * line_f * 1_100) / 1_000_000,
+        GkStyle::Line => ga_mm + ((box_mm - ga_mm) * line_f) / 1_000,
+    };
+
+    let mut cmd_f = (900 + (gk + pos - 150) * 8).clamp(750, 1_350);
+    if style == GkStyle::Commanding {
+        cmd_f = cmd_f * 1_150 / 1_000;
+    }
+    let command_radius_mm = (ga_mm * cmd_f) / 1_000;
+
+    let (claim_base, sweep_base, react_adjust_ticks, judgement_err_ticks) = match difficulty {
+        CpuDifficulty::Easy => (9, 12, 3, 6),
+        CpuDifficulty::Normal => (6, 9, 0, 2),
+        CpuDifficulty::Hard => (4, 7, -1, 0),
+    };
+    let claim_margin_ticks = (claim_base - (gk - 75) / 10
+        - i64::from(style == GkStyle::Commanding))
+    .max(2);
+    let sweep_margin_ticks =
+        (sweep_base - (pos - 75) / 10 - if style == GkStyle::Sweeper { 2 } else { 0 }).max(4);
+    let standoff_mm = 2_500 - (pos.clamp(50, 100) - 50) * 20;
+
+    GkProfile {
+        style,
+        difficulty,
+        set_depth_bonus_mm,
+        sweep_radius_mm,
+        command_radius_mm,
+        claim_margin_ticks,
+        sweep_margin_ticks,
+        react_adjust_ticks,
+        judgement_err_ticks,
+        standoff_mm,
+    }
+}
+
+/// Own-goal relative geometry: `depth` is distance from the own goal line into the pitch.
+#[derive(Clone, Copy)]
+struct GkGeo {
+    goal_x: Fp,
+    into: Fp,
+    goal_hw: Fp,
+    box_depth: Fp,
+    box_hw: Fp,
+    ga_depth: Fp,
+    ga_hw: Fp,
+    is_5v5: bool,
+}
+
+impl GkGeo {
+    fn new(state: &MatchState, side: TeamSide) -> Self {
+        let attack_sign = side.attack_sign(state.second_half_swapped());
+        let half_len = state.format.half_length();
+        let box_depth = state.format.penalty_box_depth();
+        let ga_depth = Fp::from_milli(state.format.penalty_box_depth_mm / 3);
+        let goal_hw = state.format.goal_half_width();
+        Self {
+            goal_x: Fp::from_milli(-attack_sign * half_len.to_milli()),
+            into: Fp::from_int(attack_sign as i32),
+            goal_hw,
+            box_depth,
+            box_hw: state.format.penalty_box_half_width(),
+            ga_depth,
+            ga_hw: goal_hw + ga_depth,
+            is_5v5: state.format.players_per_side <= 6,
+        }
+    }
+
+    #[inline]
+    fn depth(&self, pt: Vec2) -> Fp {
+        (pt.x - self.goal_x).mul(self.into)
+    }
+
+    #[inline]
+    fn point(&self, depth: Fp, y: Fp) -> Vec2 {
+        Vec2::new(self.goal_x + self.into.mul(depth), y)
+    }
+
+    #[inline]
+    fn goal_center(&self) -> Vec2 {
+        Vec2::new(self.goal_x, Fp::ZERO)
+    }
+
+    #[inline]
+    fn in_box(&self, pt: Vec2) -> bool {
+        let d = self.depth(pt);
+        d >= Fp::from_milli(-300) && d <= self.box_depth && pt.y.abs() <= self.box_hw
+    }
+
+    #[inline]
+    fn in_goal_area(&self, pt: Vec2) -> bool {
+        let d = self.depth(pt);
+        d <= self.ga_depth && pt.y.abs() <= self.ga_hw
+    }
+
+    /// Deepest set-position depth (stay well inside the goal area, momentum overshoot included).
+    #[inline]
+    fn max_set_depth(&self) -> Fp {
+        self.ga_depth - Fp::from_milli(600)
+    }
+
+    /// Post-to-post angle-bisector anchor on the goal line for a ball at `ball_xy`.
+    fn bisect_anchor(&self, ball_xy: Vec2) -> Vec2 {
+        let post_neg = Vec2::new(self.goal_x, -self.goal_hw);
+        let post_pos = Vec2::new(self.goal_x, self.goal_hw);
+        let d_neg = ball_xy.dist(post_neg);
+        let d_pos = ball_xy.dist(post_pos);
+        let d_sum = (d_neg + d_pos).max(Fp::ONE);
+        let y = self
+            .goal_hw
+            .mul(d_neg - d_pos)
+            .div(d_sum)
+            .clamp(-(self.goal_hw - Fp::from_milli(250)), self.goal_hw - Fp::from_milli(250));
+        Vec2::new(self.goal_x, y)
+    }
+}
+
+/// Deterministic judgement noise in `[-max, max]` ticks, re-drawn every half second.
+fn gk_judgement_noise(state: &MatchState, side: TeamSide, max: i64) -> i64 {
+    if max <= 0 {
+        return 0;
+    }
+    let mut z = ((state.tick / 30) as u64) ^ ((side.index() as u64 + 1) << 40) ^ 0x9E37_79B9_7F4A_7C15;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    (z % (2 * max as u64 + 1)) as i64 - max
+}
+
+/// Race read for a loose ball: where / when the keeper meets it versus the best attacker and defender.
+#[derive(Clone, Copy, Debug)]
+struct LooseRead {
+    gk_pt: Vec2,
+    gk_t: i64,
+    opp_t: i64,
+    mate_t: i64,
+}
+
+const NO_REACH_TICKS: i64 = 200;
+
+/// First waypoint tick `p` can reach with the ball no higher than `reach_z`.
+fn first_reach_ticks(p: &PlayerState, waypoints: &[Vec3; 21], is_5v5: bool, reach_z: Fp) -> i64 {
+    for (i, pt3) in waypoints.iter().enumerate() {
+        let t = (i as u32 + 1) * 4;
+        if pt3.z <= reach_z && estimate_ticks_to_point(p, pt3.xy(), is_5v5) <= t {
+            return t as i64;
+        }
+    }
+    NO_REACH_TICKS
+}
+
+/// Reads the loose-ball race. The keeper's point is the first waypoint he reaches (with `err` ticks of
+/// judgement error) that satisfies `region` at a height he can play (`2.9m` with hands in the box, else `1.2m`).
+fn read_loose_ball(
+    state: &MatchState,
+    side: TeamSide,
+    geo: &GkGeo,
+    waypoints: &[Vec3; 21],
+    err: i64,
+    opp_reach_z: Fp,
+    region: impl Fn(Vec2) -> bool,
+) -> Option<LooseRead> {
+    let gk = &state.players[side.index()][0];
+    let mut found: Option<(Vec2, i64)> = None;
+    for (i, pt3) in waypoints.iter().enumerate() {
+        let t = ((i as i64) + 1) * 4;
+        let pt = pt3.xy();
+        if !region(pt) {
+            continue;
+        }
+        let reach_z = if geo.in_box(pt) {
+            Fp::from_milli(2_900)
+        } else {
+            Fp::from_milli(1_200)
+        };
+        if pt3.z > reach_z {
+            continue;
+        }
+        let need = estimate_ticks_to_point(gk, pt, geo.is_5v5) as i64 + err;
+        if need <= t {
+            found = Some((pt, t));
+            break;
+        }
+    }
+    let (gk_pt, gk_t) = found?;
+    let mut opp_t = NO_REACH_TICKS;
+    for op in state.players[side.opponent().index()].iter().skip(1) {
+        if !op.sent_off {
+            opp_t = opp_t.min(first_reach_ticks(op, waypoints, geo.is_5v5, opp_reach_z));
+        }
+    }
+    let mut mate_t = NO_REACH_TICKS;
+    for mate in state.players[side.index()].iter().skip(1) {
+        if !mate.sent_off {
+            mate_t = mate_t.min(first_reach_ticks(mate, waypoints, geo.is_5v5, Fp::from_milli(2_300)));
+        }
+    }
+    Some(LooseRead {
+        gk_pt,
+        gk_t,
+        opp_t,
+        mate_t,
+    })
+}
+
+#[inline]
+fn gk_intent(move_dir: Vec2, sprint: bool, jockey: bool) -> AiMoveIntent {
+    AiMoveIntent {
+        move_dir,
+        sprint,
+        jockey,
+        trigger_dive: None,
+    }
+}
+
+/// Steers to `target`, sprinting only beyond `sprint_beyond` and setting the feet within `jockey_within`.
+fn gk_move_to(p: &PlayerState, target: Vec2, sprint_beyond: Fp, jockey_within: Fp) -> AiMoveIntent {
+    let delta = target - p.pos;
+    let dist = delta.len();
+    if dist < Fp::from_milli(160) {
+        return gk_intent(Vec2::ZERO, false, true);
+    }
+    gk_intent(delta.normalize_or_zero(), dist > sprint_beyond, dist < jockey_within)
+}
+
+/// Stage 2 shot-stopping: reflex-latency gated (`goalkeeping` + difficulty + line-of-sight screen) lateral
+/// shuffle or dive. Returns `None` when no shot is incoming or it is not on a guardable line.
+fn gk_shot_save(
+    state: &MatchState,
+    side: TeamSide,
+    geo: &GkGeo,
+    profile: &GkProfile,
+) -> Option<AiMoveIntent> {
+    let p = &state.players[side.index()][0];
+    let ball_xy = state.ball.pos.xy();
+    let ball_vel_xy = state.ball.vel.xy();
+    let vel_toward_goal = -ball_vel_xy.x.mul(geo.into);
+    let dist_ball_to_goal_x = geo.depth(ball_xy).abs();
+    let max_shot_react_dist = Fp::from_milli(if geo.is_5v5 { 26_500 } else { 31_000 });
+    let live_shot = state.ball.shot_launched_tick > 0;
+    // A fast ball on frame (deflection / header) counts as a shot even without a struck-shot flag.
+    let on_frame_fast = vel_toward_goal > Fp::from_milli(9_000) && {
+        let t = dist_ball_to_goal_x.div(vel_toward_goal.max(Fp::ONE));
+        (ball_xy.y + ball_vel_xy.y.mul(t)).abs() <= geo.goal_hw + Fp::from_milli(1_000)
+    };
+    if state.ball.owner.is_some()
+        || !matches!(p.action, PlayerActionState::Normal)
+        || vel_toward_goal <= Fp::from_milli(5_200)
+        || dist_ball_to_goal_x >= max_shot_react_dist
+        || dist_ball_to_goal_x <= Fp::from_milli(220)
+        || !(live_shot || on_frame_fast)
+    {
+        return None;
+    }
+
+    let gk_skill = p.attributes.goalkeeping as i64;
+    // Human GK reflex latency (~117ms elite Hard .. ~250ms Easy) + FIFA 23 Line-of-Sight screen penalty (+50ms).
+    let base_react = ((13 - gk_skill / 20).clamp(7, 12) + profile.react_adjust_ticks).max(6) as u32;
+    let mut screened = false;
+    if live_shot {
+        let ray = p.pos - state.ball.shot_origin;
+        let ray_len = ray.len();
+        if ray_len > Fp::from_milli(1_500) {
+            let ray_dir = ray.normalize_or_zero();
+            'outer: for (t_i, team_arr) in state.players.iter().enumerate() {
+                for (p_i, other) in team_arr.iter().enumerate() {
+                    if other.sent_off || (t_i == side.index() && p_i == 0) {
+                        continue;
+                    }
+                    let rel = other.pos - state.ball.shot_origin;
+                    let along = rel.dot(ray_dir);
+                    if along > Fp::from_milli(700) && along < ray_len - Fp::from_milli(700) {
+                        let perp = (rel - ray_dir.scale(along)).len();
+                        if perp <= Fp::from_milli(850) {
+                            screened = true;
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let react_ticks = base_react + if screened { 3 } else { 0 };
+    if live_shot && state.tick.saturating_sub(state.ball.shot_launched_tick) < react_ticks {
+        // Still inside the reflex latency window: hold a balanced set stance.
+        return Some(gk_intent(Vec2::ZERO, false, true));
+    }
+
+    let dist_to_gk_x = (ball_xy.x - p.pos.x).abs();
+    let t_to_gk = dist_to_gk_x.div(vel_toward_goal);
+    let pred_ticks = ((t_to_gk.to_milli() * 60 + 500) / 1_000).clamp(1, 60) as u32;
+    let proj_3d = predict_ball_3d_at_ticks(state, pred_ticks);
+    let projected_y = proj_3d.y;
+    let projected_z = proj_3d.z.max(Fp::ZERO);
+    let max_guard_y = geo.goal_hw + Fp::from_milli(950);
+    if projected_y.abs() > max_guard_y {
+        return None;
+    }
+
+    let lateral_gap = projected_y - p.pos.y;
+    let dive_reach = Fp::from_milli(1_850 + gk_skill * 12);
+    let close_enough_in_time =
+        t_to_gk <= Fp::from_milli(440) || dist_to_gk_x <= Fp::from_milli(9_500);
+    if close_enough_in_time
+        && lateral_gap.abs() > Fp::from_milli(480)
+        && lateral_gap.abs() <= dive_reach
+    {
+        let dive_dir = Vec2::new(
+            geo.into.mul(Fp::from_milli(180)),
+            Fp::from_int(lateral_gap.signum_int()),
+        )
+        .normalize_or_zero();
+        let dive_vz_mm = if projected_z > Fp::from_milli(880) {
+            let z_excess = (projected_z.to_milli() - 880).clamp(0, 1_600);
+            (2_150 + (z_excess * 12) / 10).clamp(2_150, 4_000)
+        } else {
+            280
+        };
+        return Some(AiMoveIntent {
+            move_dir: dive_dir,
+            sprint: true,
+            jockey: false,
+            trigger_dive: Some((dive_dir, dive_vz_mm)),
+        });
+    }
+    if lateral_gap.abs() <= dive_reach + Fp::from_milli(650) {
+        let intercept = Vec2::new(p.pos.x, projected_y.clamp(-geo.goal_hw, geo.goal_hw));
+        return Some(gk_intent(
+            (intercept - p.pos).normalize_or_zero(),
+            lateral_gap.abs() > Fp::from_milli(900),
+            true,
+        ));
+    }
+    None
+}
+
+/// Scenario 1 (Set / ready): angle-bisector arc whose depth grows with ball distance and `positioning`.
+fn gk_set_target(geo: &GkGeo, profile: &GkProfile, ball_xy: Vec2) -> Vec2 {
+    let anchor = geo.bisect_anchor(ball_xy);
+    let to_ball = ball_xy - anchor;
+    let dist_ab = to_ball.len().max(Fp::ONE);
+    let dir_ab = to_ball.normalize_or_zero();
+    let (min_arc_mm, max_arc_mm) = if geo.is_5v5 { (1_380, 3_800) } else { (1_450, 4_250) };
+    let d_mm = dist_ab.to_milli();
+    // Depth grows with ball distance up to a plateau (no in-out stepping on every midfield pass).
+    let plateau_mm = if geo.is_5v5 { 22_000 } else { 28_000 };
+    let base_mm = min_arc_mm
+        + ((d_mm.clamp(4_000, plateau_mm) - 4_000) * (max_arc_mm - min_arc_mm)) / (plateau_mm - 4_000);
+    // Positioning bonus ramps in from 5m to 12m of ball distance (no bonus point-blank).
+    let ramp_permille = ((d_mm - 5_000).clamp(0, 7_000) * 1_000) / 7_000;
+    let r_mm = (base_mm + (profile.set_depth_bonus_mm * ramp_permille) / 1_000)
+        .min(geo.max_set_depth().to_milli())
+        .min(d_mm - 1_000)
+        .max(if geo.is_5v5 { 880 } else { 950 });
+    let raw = anchor + dir_ab.scale(Fp::from_milli(r_mm));
+    let max_y = (geo.goal_hw - Fp::from_milli(220)).max(Fp::from_milli(850));
+    let depth = geo
+        .depth(raw)
+        .max(Fp::from_milli(if geo.is_5v5 { 880 } else { 950 }));
+    geo.point(depth, raw.y.clamp(-max_y, max_y))
+}
+
+/// Scenario 7b (Support): own outfielder in possession -> the set depth for the ball, shaded central so the
+/// keeper is a square back-pass outlet (same depth as Set: no in/out step on every turnover).
+fn gk_support_target(geo: &GkGeo, profile: &GkProfile, ball_xy: Vec2) -> Vec2 {
+    let set = gk_set_target(geo, profile, ball_xy);
+    geo.point(geo.depth(set), set.y.mul(Fp::from_milli(500)))
+}
+
+/// Scenario 3b (Cross hold): near-post / central ready stance for a high ball the keeper will not claim.
+fn gk_cross_hold_target(state: &MatchState, side: TeamSide, geo: &GkGeo, landing: Vec2) -> Vec2 {
+    let corner_live = state.restart_touch_state.is_some_and(|rt| {
+        rt.kind == Some(RestartKind::CornerKick) && rt.taker_side == side.opponent()
+    });
+    let depth = Fp::from_milli(if geo.is_5v5 { 1_250 } else { 1_450 });
+    let max_y = geo.goal_hw - Fp::from_milli(600);
+    let y = if corner_live {
+        Fp::from_milli(if landing.y >= Fp::ZERO { 420 } else { -420 })
+    } else {
+        landing.y.mul(Fp::from_milli(350)).clamp(-max_y, max_y)
+    };
+    geo.point(depth, y)
+}
+
+/// Dead-ball stance (corner / free kick wall-side / penalty). Only reached when the simulation steps the
+/// keeper outside open play; live deliveries are handled by the Cross / Shot scenarios.
+pub fn goalkeeper_set_piece_stance(state: &MatchState, side: TeamSide) -> Option<Vec2> {
+    let MatchPhase::SetPiece {
+        kind, team, spot, ..
+    } = state.phase
+    else {
+        return None;
+    };
+    if team == side {
+        return None;
+    }
+    let geo = GkGeo::new(state, side);
+    match kind {
+        RestartKind::CornerKick => Some(geo.point(
+            Fp::from_milli(if geo.is_5v5 { 1_450 } else { 1_650 }),
+            Fp::from_milli(if spot.y >= Fp::ZERO { 420 } else { -420 }),
+        )),
+        RestartKind::PenaltyKick => Some(geo.point(Fp::from_milli(100), Fp::ZERO)),
+        RestartKind::FreeKick if geo.depth(spot) <= geo.box_depth + Fp::from_milli(14_000) => {
+            // The wall covers the near post: keeper shades toward the far post.
+            let anchor = geo.bisect_anchor(spot);
+            let far_shift = Fp::from_milli(if spot.y >= Fp::ZERO { -450 } else { 450 });
+            let max_y = geo.goal_hw - Fp::from_milli(400);
+            Some(geo.point(
+                Fp::from_milli(if geo.is_5v5 { 900 } else { 1_000 }),
+                (anchor.y + far_shift).clamp(-max_y, max_y),
+            ))
+        }
+        _ => None,
+    }
+}
+
+/// Scenario 5 (1v1) check: opposing carrier through on goal with no goal-side covering defender.
+/// `staying` loosens the thresholds (hysteresis) once the keeper is already in the 1v1.
+fn gk_one_v_one_carrier(state: &MatchState, side: TeamSide, geo: &GkGeo, staying: bool) -> Option<Vec2> {
+    let (o_side, o_idx) = state.ball.owner?;
+    if o_side != side.opponent() {
+        return None;
+    }
+    let carrier = &state.players[o_side.index()][o_idx];
+    let c = state.ball.pos.xy();
+    let c_depth = geo.depth(c);
+    let extra = Fp::from_milli(if geo.is_5v5 { 2_500 } else { 3_500 })
+        + if staying { Fp::from_milli(3_000) } else { Fp::ZERO };
+    if c_depth > geo.box_depth + extra
+        || c_depth < Fp::from_milli(600)
+        || c.y.abs() > geo.box_hw + if staying { Fp::from_milli(2_000) } else { Fp::ZERO }
+    {
+        return None;
+    }
+    let goal = geo.goal_center();
+    let to_goal = goal - c;
+    let carrier_attacking = carrier.vel.dot(to_goal.normalize_or_zero()) > Fp::from_milli(1_500);
+    if !(carrier_attacking || c_depth <= geo.box_depth) {
+        return None;
+    }
+    let cover_w = Fp::from_milli(if staying { 1_400 } else { 2_200 });
+    let tight_r = Fp::from_milli(if staying { 1_000 } else { 1_600 });
+    let seg_len = to_goal.len().max(Fp::ONE);
+    let seg_dir = to_goal.normalize_or_zero();
+    for mate in state.players[side.index()].iter().skip(1) {
+        if mate.sent_off {
+            continue;
+        }
+        let m_depth = geo.depth(mate.pos);
+        let rel = mate.pos - c;
+        let along = rel.dot(seg_dir);
+        let perp = (rel - seg_dir.scale(along)).len();
+        let goal_side = m_depth < c_depth - Fp::from_milli(200);
+        if goal_side && along > Fp::ZERO && along < seg_len && perp <= cover_w {
+            return None;
+        }
+        if mate.pos.dist(c) <= tight_r && m_depth < c_depth + Fp::from_milli(300) {
+            return None;
+        }
+    }
+    Some(c)
+}
+
+/// Scenario 5 (1v1) movement: advance on the bisector, decelerate, stand big at the stand-off. Never dives.
+fn gk_one_v_one_intent(p: &PlayerState, geo: &GkGeo, profile: &GkProfile, c: Vec2) -> (AiMoveIntent, Vec2) {
+    let anchor = geo.bisect_anchor(c);
+    let to_ball = c - anchor;
+    let dist_ab = to_ball.len().max(Fp::ONE);
+    // Far out the keeper advances gradually (`0.42 x` ball distance); from half the box depth inwards he
+    // closes to the stand-off. Capped by a style-scaled limit.
+    let out_f = match profile.style {
+        GkStyle::Line => 250,
+        GkStyle::Commanding => 350,
+        GkStyle::Sweeper => 500,
+    };
+    let max_out = geo.ga_depth + (geo.box_depth - geo.ga_depth).mul(Fp::from_milli(out_f));
+    let half_box = geo.box_depth.mul(Fp::from_milli(500));
+    let w = ((dist_ab - half_box).div(half_box)).clamp(Fp::ZERO, Fp::ONE);
+    let r_close = dist_ab - Fp::from_milli(profile.standoff_mm);
+    let r_far = dist_ab.mul(Fp::from_milli(420));
+    let r = (r_close.mul(Fp::ONE - w) + r_far.mul(w))
+        .min(r_close)
+        .min(max_out)
+        .max(Fp::from_milli(600));
+    let target = anchor + to_ball.normalize_or_zero().scale(r);
+    let delta = target - p.pos;
+    let d = delta.len();
+    let d_carrier = p.pos.dist(c);
+    let intent = gk_intent(
+        if d > Fp::from_milli(150) {
+            delta.normalize_or_zero()
+        } else {
+            Vec2::ZERO
+        },
+        d > Fp::from_milli(2_800) && d_carrier > Fp::from_milli(6_000),
+        d < Fp::from_milli(2_200) || d_carrier < Fp::from_milli(4_500),
+    );
+    (intent, target)
+}
+
+/// Outcome of the scenario selection for one tick.
+struct GkChoice {
+    scenario: GkScenario,
+    intent: AiMoveIntent,
+    target: Vec2,
+    /// `Some(n)` starts / refreshes a commitment window of `n` ticks.
+    commit: Option<u16>,
+}
+
+/// Loose-ball scenarios (3 Cross, 4 Sweep, 6 Collect). `only` restricts the evaluation to one committed
+/// scenario (continuation check with abort slack); `extra_margin` is the post-abort re-entry penalty.
+fn gk_loose_ball_choice(
+    state: &MatchState,
+    side: TeamSide,
+    geo: &GkGeo,
+    profile: &GkProfile,
+    prev: &GoalkeeperBrain,
+    only: Option<GkScenario>,
+    extra_margin: i64,
+) -> Option<GkChoice> {
+    if state.ball.owner.is_some() || !matches!(state.phase, MatchPhase::OpenPlay) {
+        return None;
+    }
+    let p = &state.players[side.index()][0];
+    let waypoints = sample_ball_3d_waypoints(state);
+    let err = gk_judgement_noise(state, side, profile.judgement_err_ticks);
+    let ball_xy = state.ball.pos.xy();
+    let goal = geo.goal_center();
+    let continuing = only.is_some();
+    // Continuing a commitment only aborts once an attacker is clearly first (2-tick slack).
+    let margin_for = |base: i64, sc: GkScenario| -> i64 {
+        if continuing {
+            -2
+        } else if prev.scenario == sc {
+            base - 2 + extra_margin
+        } else {
+            base + extra_margin
+        }
+    };
+    // A committed claim whose ball has dropped may finish as a collect (and vice versa for a bounce).
+    let allow = |sc: GkScenario| {
+        only.is_none_or(|o| {
+            o == sc
+                || (o == GkScenario::CrossClaim && sc == GkScenario::Collect)
+                || (o == GkScenario::Collect && sc == GkScenario::CrossClaim)
+        })
+    };
+
+    let high = state.ball.pos.z > Fp::from_milli(1_200)
+        || (state.ball.vel.z > Fp::from_milli(2_500) && state.ball.pos.z > Fp::from_milli(250));
+    if high && only.is_none_or(|o| o != GkScenario::Sweep) {
+        let cmd_r = Fp::from_milli(profile.command_radius_mm);
+        let enters_box = waypoints
+            .iter()
+            .any(|w| geo.in_box(w.xy()) && w.z <= Fp::from_milli(2_900));
+        if enters_box {
+            if allow(GkScenario::CrossClaim) {
+                if let Some(read) = read_loose_ball(
+                    state,
+                    side,
+                    geo,
+                    &waypoints,
+                    err,
+                    Fp::from_milli(2_500),
+                    |pt| geo.in_box(pt) && pt.dist(goal) <= cmd_r,
+                ) {
+                    let outside_ga = !geo.in_goal_area(read.gk_pt);
+                    let margin = margin_for(profile.claim_margin_ticks, GkScenario::CrossClaim)
+                        + if outside_ga && !continuing { 6 } else { 0 };
+                    // Inside the 6-yard box a contested ball (attacker level within 2 ticks) is attacked
+                    // anyway: the contact code punches it clear when crowded.
+                    let contested_six = !outside_ga && read.gk_t <= read.opp_t + 2;
+                    if read.gk_t + margin <= read.opp_t || contested_six {
+                        let intent = gk_intent((read.gk_pt - p.pos).normalize_or_zero(), true, false);
+                        return Some(GkChoice {
+                            scenario: GkScenario::CrossClaim,
+                            intent,
+                            target: read.gk_pt,
+                            commit: (!continuing).then_some((read.gk_t + 8).clamp(12, 70) as u16),
+                        });
+                    }
+                }
+            }
+            if only.is_none() {
+                // Hold a near-post / central stance and get ready to react.
+                let landing = waypoints
+                    .iter()
+                    .find(|w| geo.in_box(w.xy()) && w.z <= Fp::from_milli(2_900))
+                    .map_or(ball_xy, |w| w.xy());
+                let target = gk_cross_hold_target(state, side, geo, landing);
+                return Some(GkChoice {
+                    scenario: GkScenario::CrossHold,
+                    intent: gk_move_to(p, target, Fp::from_milli(1_200), Fp::from_milli(1_000)),
+                    target,
+                    commit: None,
+                });
+            }
+            return None;
+        }
+    }
+
+    // Ground / dropping loose ball: collect inside the box, sweep behind the line.
+    let sweep_r = Fp::from_milli(profile.sweep_radius_mm);
+    let reach_r = sweep_r.max(geo.box_depth);
+    let read = read_loose_ball(state, side, geo, &waypoints, err, Fp::from_milli(2_300), |pt| {
+        geo.depth(pt) >= Fp::from_milli(-300)
+            && pt.dist(goal) <= reach_r
+            && pt.y.abs() <= geo.box_hw + Fp::from_milli(3_000)
+    })?;
+    // A defender clearly first (and ahead of the attacker) deals with it.
+    let mate_handles = read.mate_t + 4 <= read.gk_t && read.mate_t + 2 <= read.opp_t;
+
+    if geo.in_box(read.gk_pt) {
+        if !allow(GkScenario::Collect) {
+            return None;
+        }
+        let attacker_on_it = state.players[side.opponent().index()]
+            .iter()
+            .skip(1)
+            .any(|op| {
+                !op.sent_off
+                    && (op.pos.dist(ball_xy) <= Fp::from_milli(1_500)
+                        || op.pos.dist(read.gk_pt) <= Fp::from_milli(1_500))
+            });
+        let deep = !geo.in_goal_area(read.gk_pt);
+        let margin = margin_for(profile.claim_margin_ticks, GkScenario::Collect)
+            + if deep && !continuing { 3 } else { 0 };
+        if (continuing || (!attacker_on_it && !mate_handles)) && read.gk_t + margin <= read.opp_t {
+            return Some(GkChoice {
+                scenario: GkScenario::Collect,
+                intent: gk_intent((read.gk_pt - p.pos).normalize_or_zero(), true, false),
+                target: read.gk_pt,
+                commit: (!continuing).then_some((read.gk_t + 6).clamp(10, 60) as u16),
+            });
+        }
+        return None;
+    }
+
+    if !allow(GkScenario::Sweep) || read.gk_pt.dist(goal) > sweep_r {
+        return None;
+    }
+    // Behind the defensive line: deeper than every own outfielder, or no defender can beat the attacker.
+    let mut line_depth = Fp::from_milli(200_000);
+    for mate in state.players[side.index()].iter().skip(1) {
+        if !mate.sent_off {
+            line_depth = line_depth.min(geo.depth(mate.pos));
+        }
+    }
+    let behind_line =
+        geo.depth(read.gk_pt) < line_depth + Fp::from_milli(1_000) || read.mate_t >= read.opp_t;
+    let margin = margin_for(profile.sweep_margin_ticks, GkScenario::Sweep);
+    if (continuing || (behind_line && !mate_handles)) && read.gk_t + margin <= read.opp_t {
+        return Some(GkChoice {
+            scenario: GkScenario::Sweep,
+            intent: gk_intent((read.gk_pt - p.pos).normalize_or_zero(), true, false),
+            target: read.gk_pt,
+            commit: (!continuing).then_some((read.gk_t + 6).clamp(12, 75) as u16),
+        });
+    }
+    None
+}
+
+/// Human-held `BTN_GK_RUSH`: rush a loose ball / contain the carrier (EA FC *GK Rush to Contain*).
+fn gk_human_rush(state: &MatchState, side: TeamSide, geo: &GkGeo) -> Option<AiMoveIntent> {
+    if !matches!(state.phase, MatchPhase::OpenPlay) {
+        return None;
+    }
+    let p = &state.players[side.index()][0];
+    let ball_xy = state.ball.pos.xy();
+    let dist_ball_to_goal_x = geo.depth(ball_xy).abs();
+    if state.ball.owner.is_none() {
+        if dist_ball_to_goal_x < geo.box_depth + Fp::from_milli(4_500) {
+            return Some(gk_intent((ball_xy - p.pos).normalize_or_zero(), true, false));
+        }
+        return None;
+    }
+    let opp_owns_ball = state.ball.owner.map(|(s, _)| s) == Some(side.opponent());
+    if !opp_owns_ball || dist_ball_to_goal_x >= geo.box_depth + Fp::from_milli(5_500) {
+        return None;
+    }
+    let anchor = geo.bisect_anchor(ball_xy);
+    let to_ball = ball_xy - anchor;
+    let dist_ab = to_ball.len().max(Fp::ONE);
+    let rush_r = (dist_ab - Fp::from_milli(1_450)).max(Fp::from_milli(1_100));
+    let contain_pt = anchor + to_ball.normalize_or_zero().scale(rush_r);
+    let delta = contain_pt - p.pos;
+    Some(gk_intent(
+        if delta.len() > Fp::from_milli(180) {
+            delta.normalize_or_zero()
+        } else {
+            Vec2::ZERO
+        },
+        delta.len() > Fp::from_milli(1_150),
+        delta.len() <= Fp::from_milli(1_800),
+    ))
+}
+
+/// Deterministic goalkeeper scenario state machine. Returns this tick's movement / dive intent and the
+/// updated brain (the caller stores it in `MatchState::gk_brain`). Scenario table: `docs/goalkeeper-ai.md`.
+pub fn decide_goalkeeper(
+    state: &MatchState,
+    side: TeamSide,
+    human_gk_rush: bool,
+) -> (AiMoveIntent, GoalkeeperBrain) {
+    let prev = state.gk_brain[side.index()];
+    let choice = select_goalkeeper_scenario(state, side, human_gk_rush, &prev);
+    let mut brain = prev;
+    if choice.scenario != prev.scenario {
+        brain.switches = brain.switches.saturating_add(1);
+        brain.entered_tick = state.tick;
+        brain.commit_ticks = 0;
+    }
+    let aborted = prev.scenario.is_committed()
+        && prev.commit_ticks > 0
+        && choice.scenario != prev.scenario
+        && !choice.scenario.is_outward()
+        && !matches!(choice.scenario, GkScenario::Shot | GkScenario::Possession);
+    brain.scenario = choice.scenario;
+    brain.target = choice.target;
+    brain.last_decision_tick = state.tick;
+    brain.commit_ticks = match choice.commit {
+        Some(n) => n,
+        None if choice.scenario == prev.scenario => prev.commit_ticks.saturating_sub(1),
+        None => 0,
+    };
+    brain.reentry_block_ticks = if aborted {
+        24
+    } else {
+        prev.reentry_block_ticks.saturating_sub(1)
+    };
+    (choice.intent, brain)
+}
+
+fn select_goalkeeper_scenario(
+    state: &MatchState,
+    side: TeamSide,
+    human_gk_rush: bool,
+    prev: &GoalkeeperBrain,
+) -> GkChoice {
+    let p = &state.players[side.index()][0];
+    let geo = GkGeo::new(state, side);
+    let profile = goalkeeper_profile(state, side);
+    let ball_xy = state.ball.pos.xy();
+
+    // 7. Possession: holding / controlling the ball -> step toward an open outlet angle.
+    if state.ball.owner == Some((side, 0)) {
+        let (_, _, safe_aim) = choose_safe_gk_distribution(state, side);
+        let target = geo.point(
+            Fp::from_milli(if geo.is_5v5 { 3_800 } else { 4_600 }),
+            safe_aim.y.mul(Fp::from_milli(1_600)).clamp(-geo.goal_hw, geo.goal_hw),
+        );
+        let delta = target - p.pos;
+        let intent = if delta.len() > Fp::from_milli(320) {
+            gk_intent(delta.normalize_or_zero(), false, false)
+        } else {
+            gk_intent(Vec2::ZERO, false, false)
+        };
+        return GkChoice {
+            scenario: GkScenario::Possession,
+            intent,
+            target,
+            commit: None,
+        };
+    }
+
+    // 9. Dead-ball stance (outside open play).
+    if !matches!(state.phase, MatchPhase::OpenPlay) {
+        let target = goalkeeper_set_piece_stance(state, side).unwrap_or_else(|| gk_set_target(&geo, &profile, ball_xy));
+        let d = target - p.pos;
+        return GkChoice {
+            scenario: GkScenario::SetPiece,
+            intent: gk_intent(
+                if d.len() > Fp::from_milli(150) {
+                    d.normalize_or_zero()
+                } else {
+                    Vec2::ZERO
+                },
+                false,
+                true,
+            ),
+            target,
+            commit: None,
+        };
+    }
+
+    // Human-held GK rush (held = rush out; release = recover through the normal scenarios).
+    if human_gk_rush {
+        if let Some(intent) = gk_human_rush(state, side, &geo) {
+            return GkChoice {
+                scenario: GkScenario::HumanRush,
+                intent,
+                target: ball_xy,
+                commit: None,
+            };
+        }
+    }
+
+    // 2. Shot: highest priority over every positional scenario (including a committed 1v1).
+    if let Some(intent) = gk_shot_save(state, side, &geo, &profile) {
+        return GkChoice {
+            scenario: GkScenario::Shot,
+            intent,
+            target: p.pos,
+            commit: None,
+        };
+    }
+
+    // Commitment: a committed scenario holds until its window ends or it is invalidated.
+    let mut just_aborted = false;
+    if prev.scenario.is_committed() && prev.commit_ticks > 0 {
+        let kept = match prev.scenario {
+            GkScenario::OneVOne => gk_one_v_one_carrier(state, side, &geo, true).map(|c| {
+                let (intent, target) = gk_one_v_one_intent(p, &geo, &profile, c);
+                GkChoice {
+                    scenario: GkScenario::OneVOne,
+                    intent,
+                    target,
+                    commit: None,
+                }
+            }),
+            sc => gk_loose_ball_choice(state, side, &geo, &profile, prev, Some(sc), 0),
+        };
+        if let Some(mut choice) = kept {
+            if choice.scenario != prev.scenario {
+                // Hand-over between committed loose-ball scenarios keeps the remaining window.
+                choice.commit = Some(prev.commit_ticks.saturating_sub(1).max(1));
+            }
+            return choice;
+        }
+        just_aborted = true;
+    }
+
+    let blocked = just_aborted || prev.reentry_block_ticks > 0;
+    let extra_margin = if prev.reentry_block_ticks > 0 { 4 } else { 0 };
+
+    // 3 / 4 / 6. Loose ball: cross claim or hold, collect in the box, sweep behind the line.
+    if state.ball.owner.is_none() && !just_aborted {
+        if let Some(choice) =
+            gk_loose_ball_choice(state, side, &geo, &profile, prev, None, extra_margin)
+        {
+            return choice;
+        }
+    }
+
+    // Live penalty (before the strike registers as a shot): stay on the line.
+    let pen_live = state.restart_touch_state.is_some_and(|rt| {
+        rt.kind == Some(RestartKind::PenaltyKick) && rt.taker_side == side.opponent()
+    });
+    if pen_live {
+        let target = geo.point(Fp::from_milli(150), Fp::ZERO);
+        return GkChoice {
+            scenario: GkScenario::SetPiece,
+            intent: gk_move_to(p, target, Fp::from_milli(1_500), Fp::from_milli(1_500)),
+            target,
+            commit: None,
+        };
+    }
+
+    // 5. 1v1: attacker through on goal with no covering defender.
+    if !blocked {
+        if let Some(c) =
+            gk_one_v_one_carrier(state, side, &geo, prev.scenario == GkScenario::OneVOne)
+        {
+            let (intent, target) = gk_one_v_one_intent(p, &geo, &profile, c);
+            return GkChoice {
+                scenario: GkScenario::OneVOne,
+                intent,
+                target,
+                commit: (prev.scenario != GkScenario::OneVOne).then_some(24),
+            };
+        }
+    }
+
+    // 1 / 7b / 8. Set (or Support), with Recover when caught out of position.
+    // Support persists through the team's own passes / loose balls it is first to (no Set<->Support churn).
+    let own_outfield_ball = match state.ball.owner {
+        Some((s, i)) => s == side && i != 0,
+        None => {
+            prev.scenario == GkScenario::Support
+                && (state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side)
+                    || (state.ball.last_touch_team == Some(side)
+                        && state.fastest_outfield_intercept_ticks(side)
+                            <= state.fastest_outfield_intercept_ticks(side.opponent())))
+        }
+    };
+    let (base_scenario, fresh_target) = if own_outfield_ball {
+        (GkScenario::Support, gk_support_target(&geo, &profile, ball_xy))
+    } else {
+        (GkScenario::Set, gk_set_target(&geo, &profile, ball_xy))
+    };
+    // Target deadband: keep the previous set point while the new one is within 0.7m in depth / 0.4m across.
+    let positional = |sc: GkScenario| matches!(sc, GkScenario::Set | GkScenario::Support);
+    let target = if positional(prev.scenario)
+        && (geo.depth(prev.target) - geo.depth(fresh_target)).abs() <= Fp::from_milli(700)
+        && (prev.target.y - fresh_target.y).abs() <= Fp::from_milli(400)
+    {
+        prev.target
+    } else {
+        fresh_target
+    };
+    let dist = p.pos.dist(target);
+    let recovering = dist > Fp::from_milli(2_500)
+        || (prev.scenario == GkScenario::Recover && dist > Fp::from_milli(1_000));
+    if recovering {
+        return GkChoice {
+            scenario: GkScenario::Recover,
+            intent: gk_intent((target - p.pos).normalize_or_zero(), true, false),
+            target,
+            commit: None,
+        };
+    }
+    // Feet set: never sprint outward in Set; jockey near the target and whenever the carrier is in range.
+    let shooting_range = Fp::from_milli(if geo.is_5v5 { 20_000 } else { 25_000 });
+    let threat = state.ball.owner.is_some_and(|(s, _)| s == side.opponent())
+        && ball_xy.dist(geo.goal_center()) <= shooting_range;
+    let outward = geo.depth(target) > geo.depth(p.pos) + Fp::from_milli(300);
+    let delta = target - p.pos;
+    let intent = if dist < Fp::from_milli(160) {
+        gk_intent(Vec2::ZERO, false, true)
+    } else {
+        gk_intent(
+            delta.normalize_or_zero(),
+            dist > Fp::from_milli(1_550) && !outward,
+            dist < Fp::from_milli(1_250) || (threat && dist < Fp::from_milli(2_000)),
+        )
+    };
+    GkChoice {
+        scenario: base_scenario,
+        intent,
+        target,
+        commit: None,
+    }
 }
 
 /// Two-phase agile time-to-ball estimator (Bastiaan Konings' momentum phase -> max sprint circle).
