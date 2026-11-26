@@ -4,7 +4,10 @@
 //!
 //! Subcommands:
 //! - `psfc-replay verify --snapshot <snapshot.json> --inputs <inputs.json> [--out <result.json>]`
+//! - `psfc-replay analyze [--format 5v5|11v11] [--seeds N] [--minutes M] ...` (CPU-vs-CPU match analytics, see `analytics.rs`)
 //! - `psfc-replay simulate-demo [--format 5v5|11v11] [--seed <u64>] [--half-ticks <u32>] [--out-snapshot <f>] [--out-inputs <f>] [--out-result <f>]`
+
+mod analytics;
 
 use psfc_sim::{
     CpuDifficulty, FixtureSnapshot, InputFrame, MatchEvent, MatchSimulation, PlayerMatchStats,
@@ -131,7 +134,11 @@ fn normalize_hash_str(s: &str) -> String {
         .to_ascii_lowercase()
 }
 
-fn run_verify(snapshot_path: &str, inputs_path: &str, out_path: Option<&str>) -> Result<(), String> {
+fn run_verify(
+    snapshot_path: &str,
+    inputs_path: &str,
+    out_path: Option<&str>,
+) -> Result<(), String> {
     let snap_raw = fs::read_to_string(snapshot_path)
         .map_err(|e| format!("failed to read snapshot '{snapshot_path}': {e}"))?;
     let snapshot: FixtureSnapshot = serde_json::from_str(&snap_raw)
@@ -355,7 +362,8 @@ fn main() {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
         eprintln!(
-            "Usage:\n  psfc-replay verify --snapshot <snapshot.json> --inputs <inputs.json> [--out <result.json>]\n  psfc-replay simulate-demo [--format 5v5|11v11] [--seed <u64>] [--half-ticks <u32>]"
+            "Usage:\n  psfc-replay verify --snapshot <snapshot.json> --inputs <inputs.json> [--out <result.json>]\n  psfc-replay simulate-demo [--format 5v5|11v11] [--seed <u64>] [--half-ticks <u32>]\n  {}",
+            analytics::USAGE
         );
         process::exit(2);
     }
@@ -401,6 +409,7 @@ fn main() {
             }
         }
         "simulate-demo" => run_simulate_demo(rest),
+        "analyze" => analytics::run_analyze(rest),
         other => Err(format!("unknown subcommand '{other}'")),
     };
 

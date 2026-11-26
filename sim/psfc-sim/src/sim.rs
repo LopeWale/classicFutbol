@@ -1,11 +1,11 @@
 //! Deterministic 60 Hz football simulation engine (`MatchSimulation`).
 
 use crate::ai::{
-    best_ball_intercept_for_player, choose_safe_gk_distribution, compute_goalkeeper_intent,
+    best_ball_intercept_for_player, choose_safe_gk_distribution, decide_goalkeeper,
     compute_outfield_ai_intent, generate_cpu_input, predict_ball_xy_at_ticks,
     world_anchor_for_player,
 };
-use crate::config::{formation_anchors, SideController, TeamSide, TICKS_PER_SECOND};
+use crate::config::{SideController, TeamSide, TICKS_PER_SECOND};
 use crate::events::{MatchEvent, MatchEventType, PlayerMatchStats};
 use crate::input::{
     AssistLevel, AutoSwitchMode, ControlSettings, DefendingMode, InputFrame, BTN_CALL_RUN,
@@ -79,7 +79,12 @@ impl MatchSimulation {
         snapshot.validate().map_err(SimError)?;
 
         let build_side = |side: TeamSide, snap: &crate::snapshot::TeamSnapshot| {
-            let anchors = formation_anchors(&snap.formation, snapshot.format.players_per_side);
+            let roles: Vec<_> = snap.starters.iter().map(|p| p.role).collect();
+            let anchors = crate::config::role_aware_formation_anchors(
+                &snap.formation,
+                snapshot.format.players_per_side,
+                &roles,
+            );
             let mut players = Vec::with_capacity(snap.starters.len());
             let mut stats = Vec::with_capacity(snap.starters.len());
             for (idx, p) in snap.starters.iter().enumerate() {
@@ -188,6 +193,8 @@ impl MatchSimulation {
                 rng: DeterministicRng::new(snapshot.seed),
                 went_to_extra_time: false,
                 shootout_score: None,
+                gk_brain: [crate::state::GoalkeeperBrain::default(); 2],
+                ai_memory: Default::default(),
                 pending_events: Vec::new(),
                 recorded_events: Vec::new(),
             },
@@ -2899,7 +2906,10 @@ impl MatchSimulation {
 
                 // Compute movement / dive intent first using immutable state borrow
                 let ai_intent = if is_gk {
-                    Some(compute_goalkeeper_intent(&self.state, side, gk_rush_held))
+                    let (gk_intent, gk_brain) =
+                        decide_goalkeeper(&self.state, side, gk_rush_held);
+                    self.state.gk_brain[s_idx] = gk_brain;
+                    Some(gk_intent)
                 } else if !is_controlled {
                     Some(compute_outfield_ai_intent(&self.state, side, idx))
                 } else {
@@ -3792,6 +3802,28 @@ impl MatchSimulation {
                         PlayerActionState::Stumbled { .. } => p.vel.scale(Fp::from_milli(820)),
                         _ => move_dir.scale(top_speed),
                     };
+                    // Movement model (outfield): low-pass the velocity COMMAND of AI/CPU-driven
+                    // players so it cannot flip sign tick to tick. Human-controlled players and
+                    // ball carriers are never filtered (input latency unchanged).
+                    let human_driven = is_controlled && !side_is_cpu;
+                    let desired_vel = if !is_gk
+                        && !human_driven
+                        && !has_ball
+                        && matches!(p.action, PlayerActionState::Normal)
+                    {
+                        let mut mems = self.state.ai_memory.borrow_mut();
+                        crate::ai::filter_velocity_command(
+                            &mut mems[s_idx],
+                            count,
+                            idx,
+                            current_tick,
+                            &p.attributes,
+                            desired_vel,
+                        )
+                    } else {
+                        desired_vel
+                    };
+                    let vel_before = p.vel;
 
                     let base_accel = if is_5v5 {
                         17_800 + (p.attributes.acceleration as i64) * 105
@@ -3818,11 +3850,26 @@ impl MatchSimulation {
                         accel_rate_mm_s2 = (accel_rate_mm_s2 * 82) / 100;
                     }
                     let max_dv = Fp::from_milli(accel_rate_mm_s2).mul(dt);
-                    p.vel = if dv.len() <= max_dv {
+                    // AI/CPU-driven outfielders off the ball use the realistic acceleration model
+                    // (separate accelerate / brake / lateral caps); human-driven players, ball
+                    // carriers and the intended receiver of a pass keep the original response.
+                    let realistic_accel = !is_gk
+                        && !human_driven
+                        && !has_ball
+                        && my_pass_target.is_none()
+                        && matches!(p.action, PlayerActionState::Normal);
+                    p.vel = if realistic_accel {
+                        crate::ai::realistic_velocity_step(vel_before, desired_vel, &p.attributes, is_5v5)
+                    } else if dv.len() <= max_dv {
                         desired_vel
                     } else {
                         p.vel + dv.normalize_or_zero().scale(max_dv)
                     };
+                    // Agility turn-rate limit at speed (lateral-acceleration cap): direction changes
+                    // blend over several ticks; braking and the first tick from rest are unaffected.
+                    if !is_gk && !realistic_accel && matches!(p.action, PlayerActionState::Normal) {
+                        p.vel = crate::ai::limit_turn_rate(vel_before, p.vel, &p.attributes, human_driven);
+                    }
 
                     p.pos += p.vel.scale(dt);
                     p.pos.x = p.pos.x.clamp(-half_len, half_len);
@@ -3868,7 +3915,12 @@ impl MatchSimulation {
                     let sprint_min_bam: i64 = if is_5v5 { 2_850 } else { 2_100 };
                     let dyn_turn = (pivot_bam - (spd_mm * (pivot_bam - sprint_min_bam)) / 8_500)
                         .clamp(sprint_min_bam, pivot_bam) as u16;
-                    p.facing_bam = turn_toward_bam(p.facing_bam, face_target, dyn_turn);
+                    p.facing_bam = if realistic_accel {
+                        // Body-facing turn-rate limit with an idle deadband (no twitching in place).
+                        crate::ai::limit_facing_turn(p.facing_bam, face_target, p.vel, &p.attributes)
+                    } else {
+                        turn_toward_bam(p.facing_bam, face_target, dyn_turn)
+                    };
                 }
 
                 if let Some(c_tgt) = new_cpu_charge {
@@ -7734,7 +7786,9 @@ mod tests {
         let mut sim_a = MatchSimulation::new(&snap).unwrap();
         let mut sim_b = MatchSimulation::new(&snap).unwrap();
 
-        for _ in 0..2_200 {
+        // 1800 clock ticks + half-time, kick-offs, goal celebrations and the 150-tick last-attack
+        // protection: 2_600 leaves room for a two-goal match with a late corner.
+        for _ in 0..2_600 {
             sim_a.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
             sim_b.tick(&[InputFrame::IDLE, InputFrame::IDLE]);
             assert_eq!(sim_a.state_hash(), sim_b.state_hash());

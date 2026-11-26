@@ -29,6 +29,6 @@ pub use snapshot::{
     PlayerSnapshot, TeamSnapshot, GAMEPLAY_VERSION,
 };
 pub use state::{
-    BallState, MatchPhase, MatchState, PlayerActionState, PlayerState, PossessionContext,
-    RestartKind,
+    BallState, GkScenario, GoalkeeperBrain, MatchPhase, MatchState, PlayerActionState, PlayerState,
+    PossessionContext, RestartKind,
 };
