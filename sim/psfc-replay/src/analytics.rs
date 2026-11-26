@@ -31,6 +31,72 @@ const HEADER_MIN_Z: f64 = 0.14;
 /// How far back (ticks) a goal may be from the scoring side's last `Shot` event to be attributed to it.
 const GOAL_SHOT_LOOKBACK_TICKS: u32 = 10 * TICKS_PER_SECOND;
 
+// Movement-coordination metrics (round 3, see docs/04 / the research report "What to measure").
+/// Centre-to-centre distance below which two players overlap (the sim's `min_sep`, 2 x body radius 0.4 m).
+const OVERLAP_DIST_M: f64 = 0.8;
+/// An overlap episode longer than this many consecutive open-play ticks is a "stuck pair".
+const STUCK_TICKS: u32 = 10;
+/// Overlap depth above which a contact counts as real penetration rather than resting contact
+/// (the separation pass leaves resolved pairs at 0.8 m minus fixed-point rounding).
+const DEEP_OVERLAP_M: f64 = 0.01;
+/// A position-correction sample above this (m/s) counts as "corrected" (fixed-point noise is ~1e-7).
+const CORRECTED_MIN_MPS: f64 = 0.01;
+/// Position-correction velocity threshold (research report target p99).
+const CORRECTION_VEL_GATE: f64 = 0.3;
+/// Dead band (m/s per tick) on the lateral velocity component for side-flip detection.
+const SIDE_FLIP_EPS: f64 = 0.02;
+const CHASE_RADIUS_M: f64 = 8.0;
+const CHASE_CLOSING_MPS: f64 = 1.5;
+const ENGAGE_RADIUS_M: f64 = 2.5;
+const CRUISE_BALL_RADIUS_M: f64 = 8.0;
+const CRUISE_FRACTION: f64 = 0.72;
+const HEADING_P95_MIN_SPEED: f64 = 3.0;
+
+/// Sprint top speed (m/s) at full stamina, mirroring `step_all_players`:
+/// `(5450 + 26 * pace) mm/s * (1 + max_sprint_bonus)`, bonus 0.205 (5v5) / 0.220 (11v11).
+fn approx_top_speed(pace: u8, five_a_side: bool) -> f64 {
+    let base = (5_450.0 + 26.0 * f64::from(pace)) / 1_000.0;
+    base * if five_a_side { 1.205 } else { 1.220 }
+}
+
+/// Nearest-rank percentile (`q` in 0..=1) of an unsorted sample; 0 for an empty sample.
+fn percentile(v: &mut [f32], q: f64) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    v.sort_by(f32::total_cmp);
+    let rank = ((q * v.len() as f64).ceil() as usize).clamp(1, v.len());
+    f64::from(v[rank - 1])
+}
+
+/// Overlap / stuck-pair accumulator for one pair class.
+#[derive(Default, Clone)]
+struct CollAcc {
+    /// Open-play ticks with at least one overlapping pair of this class.
+    ticks: u64,
+    /// Open-play ticks with at least one pair of this class overlapping by more than 1 cm.
+    deep_ticks: u64,
+    /// Overlap episodes (pair goes from >= 0.8 m to < 0.8 m, or starts overlapped at open play).
+    events: u64,
+    depth: Mean,
+    depth_max: f64,
+    stuck: u64,
+    stuck_dur: Mean,
+}
+
+impl CollAcc {
+    fn close_run(&mut self, run: u32) {
+        if run > STUCK_TICKS {
+            self.stuck += 1;
+            self.stuck_dur.add(f64::from(run));
+        }
+    }
+}
+
+/// Pair classes: 0 any pair, 1 home-home, 2 away-away, 3 home-away.
+const COLL_ANY: usize = 0;
+const COLL_OPP: usize = 3;
+
 #[inline]
 fn f(x: Fp) -> f64 {
     x.raw() as f64 / Fp::ONE_RAW as f64
@@ -233,6 +299,11 @@ struct PhaseAcc {
     carrier_ticks: u64,
     swarm2: u64,
     swarm3: u64,
+    // Round-3 shape
+    length: Mean,
+    width: Mean,
+    stretch: Mean,
+    nearest_mate: Vec<f32>,
 }
 
 #[derive(Default, Clone)]
@@ -284,6 +355,16 @@ struct SideAcc {
     headers_pass: u64,
     // Events
     offsides: u64,
+    // Coordination (round 3)
+    corr_vel: Vec<f32>,
+    side_flips: u64,
+    heading_gt3: Vec<f32>,
+    loose_ticks: u64,
+    dual_chaser_ticks: u64,
+    max_chasers: u64,
+    engager3: u64,
+    cruise_n: u64,
+    cruise_over: u64,
 }
 
 #[derive(Clone)]
@@ -297,6 +378,8 @@ struct PrevPlayer {
     dspeed: Option<f64>,
     z: f64,
     recent_kick_ticks: u8,
+    /// Signed lateral velocity component (m/s) of the last heading sample, if that tick had one.
+    lat: Option<f64>,
 }
 
 fn close_excursion(a: &mut SideAcc) {
@@ -403,6 +486,22 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
     let mut prev_score = sim.state().score;
     let mut prev_gk_owner = [false, false];
     let mut open_ticks_total: u64 = 0;
+    let five = matches!(cfg.format, FormatKind::FiveASide);
+    // Collisions: per-pair current overlap run length, pairs indexed over the flattened
+    // (side * per_side + slot) list.
+    let per_side = sim.state().players[0]
+        .len()
+        .max(sim.state().players[1].len());
+    let n_flat = 2 * per_side;
+    let mut coll: Vec<CollAcc> = vec![CollAcc::default(); 4];
+    let mut pair_run: Vec<u32> = vec![0; n_flat * n_flat];
+    let pair_class = |a: usize, b: usize| -> usize {
+        match (a / per_side, b / per_side) {
+            (0, 0) => 1,
+            (1, 1) => 2,
+            _ => COLL_OPP,
+        }
+    };
 
     let safety_cap = cfg
         .half_duration_ticks()
@@ -494,6 +593,15 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 prev[side.index()].iter_mut().for_each(|p| *p = None);
             }
             prev_gk_owner = [false, false];
+            for a in 0..n_flat {
+                for b in (a + 1)..n_flat {
+                    let run = std::mem::take(&mut pair_run[a * n_flat + b]);
+                    if run > 0 {
+                        coll[COLL_ANY].close_run(run);
+                        coll[pair_class(a, b)].close_run(run);
+                    }
+                }
+            }
             continue;
         }
         open_ticks_total += 1;
@@ -501,6 +609,125 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         let ball = (f(st.ball.pos.x), f(st.ball.pos.y));
         let poss_team = st.ball.owner.map(|(s, _)| s).or(st.ball.last_touch_team);
         let carrier = st.ball.owner;
+
+        // ---------------- Collisions (all on-pitch pairs) ----------------
+        {
+            let pos_of = |k: usize| -> Option<(f64, f64)> {
+                let p = st.players[k / per_side].get(k % per_side)?;
+                (!p.sent_off).then(|| v2(p.pos))
+            };
+            let mut tick_hit = [false; 4];
+            let mut tick_deep = [false; 4];
+            for a in 0..n_flat {
+                let pa = pos_of(a);
+                for b in (a + 1)..n_flat {
+                    let idx = a * n_flat + b;
+                    let cls = pair_class(a, b);
+                    let d = match (pa, pos_of(b)) {
+                        (Some(x), Some(y)) => ((x.0 - y.0).powi(2) + (x.1 - y.1).powi(2)).sqrt(),
+                        _ => f64::INFINITY,
+                    };
+                    if d < OVERLAP_DIST_M {
+                        let depth = OVERLAP_DIST_M - d;
+                        for c in [COLL_ANY, cls] {
+                            let ca = &mut coll[c];
+                            if pair_run[idx] == 0 {
+                                ca.events += 1;
+                            }
+                            ca.depth.add(depth);
+                            ca.depth_max = ca.depth_max.max(depth);
+                            tick_hit[c] = true;
+                            tick_deep[c] |= depth > DEEP_OVERLAP_M;
+                        }
+                        pair_run[idx] += 1;
+                    } else {
+                        let run = std::mem::take(&mut pair_run[idx]);
+                        if run > 0 {
+                            coll[COLL_ANY].close_run(run);
+                            coll[cls].close_run(run);
+                        }
+                    }
+                }
+            }
+            for (c, hit) in tick_hit.iter().enumerate() {
+                if *hit {
+                    coll[c].ticks += 1;
+                }
+                if tick_deep[c] {
+                    coll[c].deep_ticks += 1;
+                }
+            }
+        }
+
+        // ---------------- Coordination: chasers, engagers, cruise ----------------
+        for side in [TeamSide::Home, TeamSide::Away] {
+            let s = side.index();
+            let players = &st.players[s];
+            let a = &mut acc[s];
+            let dist_ball = |p: &psfc_sim::PlayerState| {
+                let q = v2(p.pos);
+                ((q.0 - ball.0).powi(2) + (q.1 - ball.1).powi(2)).sqrt()
+            };
+            if carrier.is_none() {
+                a.loose_ticks += 1;
+                let chasers = players
+                    .iter()
+                    .filter(|p| !p.sent_off)
+                    .filter(|p| {
+                        let d = dist_ball(p);
+                        if !(1e-6..=CHASE_RADIUS_M).contains(&d) {
+                            return false;
+                        }
+                        let q = v2(p.pos);
+                        let v = v2(p.vel);
+                        let closing = (v.0 * (ball.0 - q.0) + v.1 * (ball.1 - q.1)) / d;
+                        closing > CHASE_CLOSING_MPS
+                    })
+                    .count() as u64;
+                if chasers >= 2 {
+                    a.dual_chaser_ticks += 1;
+                }
+                a.max_chasers = a.max_chasers.max(chasers);
+            }
+            if let Some((cs, ci)) = carrier {
+                if cs != side {
+                    let cpos = v2(st.players[cs.index()][ci].pos);
+                    let near = players
+                        .iter()
+                        .skip(1)
+                        .filter(|p| !p.sent_off)
+                        .filter(|p| {
+                            let q = v2(p.pos);
+                            ((q.0 - cpos.0).powi(2) + (q.1 - cpos.1).powi(2)).sqrt()
+                                <= ENGAGE_RADIUS_M
+                        })
+                        .count();
+                    if near >= 3 {
+                        a.engager3 += 1;
+                    }
+                }
+            }
+            // Cruise compliance: outfielders not carrying, > 8 m from the ball and not among the
+            // side's two outfielders closest to the ball.
+            let mut ranked: Vec<(f64, usize)> = (1..players.len())
+                .filter(|&i| !players[i].sent_off)
+                .map(|i| (dist_ball(&players[i]), i))
+                .collect();
+            ranked.sort_by(|x, y| x.0.total_cmp(&y.0).then(x.1.cmp(&y.1)));
+            for (rank, &(d, i)) in ranked.iter().enumerate() {
+                if rank < 2 || d <= CRUISE_BALL_RADIUS_M || carrier == Some((side, i)) {
+                    continue;
+                }
+                let p = &players[i];
+                let v = v2(p.vel);
+                a.cruise_n += 1;
+                if (v.0 * v.0 + v.1 * v.1).sqrt()
+                    > CRUISE_FRACTION * approx_top_speed(p.attributes.pace, five)
+                {
+                    a.cruise_over += 1;
+                }
+            }
+        }
 
         for side in [TeamSide::Home, TeamSide::Away] {
             let s = side.index();
@@ -583,6 +810,27 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 pa.bbox_area.add(depth_m * width_m);
                 pa.bbox_depth.add(depth_m);
                 pa.bbox_width.add(width_m);
+                pa.length.add(depth_m);
+                pa.width.add(width_m);
+                let n_out = outfield.len() as f64;
+                let cx = xs.iter().sum::<f64>() / n_out;
+                let cy = ys.iter().sum::<f64>() / n_out;
+                pa.stretch.add(
+                    xs.iter()
+                        .zip(&ys)
+                        .map(|(x, y)| ((x - cx).powi(2) + (y - cy).powi(2)).sqrt())
+                        .sum::<f64>()
+                        / n_out,
+                );
+                if outfield.len() >= 2 {
+                    for k in 0..outfield.len() {
+                        let nearest = (0..outfield.len())
+                            .filter(|&j| j != k)
+                            .map(|j| ((xs[k] - xs[j]).powi(2) + (ys[k] - ys[j]).powi(2)).sqrt())
+                            .fold(f64::INFINITY, f64::min);
+                        pa.nearest_mate.push(nearest as f32);
+                    }
+                }
 
                 if ph == 1 {
                     // Defensive line: role Defender; fall back to the two deepest base anchors.
@@ -653,6 +901,7 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 let z = f(p.z);
                 let mut pos_vel = None;
                 let mut dspeed = None;
+                let mut lat = None;
                 if i != 0 && z > AIRBORNE_Z {
                     airborne += 1;
                 }
@@ -668,6 +917,9 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     }
                     let hz = f64::from(TICKS_PER_SECOND);
                     let pv = ((pos.0 - pp.pos.0) * hz, (pos.1 - pp.pos.1) * hz);
+                    // Position-correction velocity: displacement not explained by the published vel.
+                    a.corr_vel
+                        .push(((pv.0 - vel.0).powi(2) + (pv.1 - vel.1).powi(2)).sqrt() as f32);
                     if let Some(ppv) = pp.pos_vel {
                         a.accel_pos
                             .add(((pv.0 - ppv.0).powi(2) + (pv.1 - ppv.1).powi(2)).sqrt() * hz);
@@ -688,6 +940,20 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                         let dot = pp.vel.0 * vel.0 + pp.vel.1 * vel.1;
                         let cross = pp.vel.0 * vel.1 - pp.vel.1 * vel.0;
                         let deg = cross.atan2(dot).abs().to_degrees();
+                        if sp0 > HEADING_P95_MIN_SPEED && sp1 > HEADING_P95_MIN_SPEED {
+                            a.heading_gt3.push(deg as f32);
+                        }
+                        // Side flip: the signed lateral component flips versus the previous sample.
+                        let l = cross / sp0;
+                        if let Some(pl) = pp.lat {
+                            if pl.abs() > SIDE_FLIP_EPS
+                                && l.abs() > SIDE_FLIP_EPS
+                                && pl.signum() != l.signum()
+                            {
+                                a.side_flips += 1;
+                            }
+                        }
+                        lat = Some(l);
                         a.turn_rate.add(deg * f64::from(TICKS_PER_SECOND));
                         // Component of the velocity change perpendicular to the previous heading.
                         a.lateral_accel
@@ -730,9 +996,20 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     dspeed,
                     z,
                     recent_kick_ticks: p.recent_kick_ticks,
+                    lat,
                 });
             }
             a.max_airborne = a.max_airborne.max(airborne);
+        }
+    }
+
+    for a in 0..n_flat {
+        for b in (a + 1)..n_flat {
+            let run = pair_run[a * n_flat + b];
+            if run > 0 {
+                coll[COLL_ANY].close_run(run);
+                coll[pair_class(a, b)].close_run(run);
+            }
         }
     }
 
@@ -908,6 +1185,136 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         m.insert("move.accel_from_pos_mean_mps2".into(), a.accel_pos.get());
         m.insert("move.dspeed_max_mps_per_tick".into(), a.max_dspeed);
 
+        // ---------------- Round 3: collisions and coordination ----------------
+        let per_min = |c: u64| {
+            if open_min > 0.0 {
+                c as f64 / open_min
+            } else {
+                0.0
+            }
+        };
+        for (name, ci) in [
+            ("any", COLL_ANY),
+            ("teammate", 1 + s),
+            ("opponent", COLL_OPP),
+        ] {
+            let c = &coll[ci];
+            m.insert(format!("collision.{name}.ticks_per_min"), per_min(c.ticks));
+            m.insert(
+                format!("collision.{name}.ticks_gt1cm_per_min"),
+                per_min(c.deep_ticks),
+            );
+            m.insert(
+                format!("collision.{name}.events_per_min"),
+                per_min(c.events),
+            );
+            m.insert(format!("collision.{name}.depth_mean_m"), c.depth.get());
+            m.insert(format!("collision.{name}.depth_max_m"), c.depth_max);
+            m.insert(format!("collision.{name}.stuck_pairs"), c.stuck as f64);
+            m.insert(
+                format!("collision.{name}.stuck_mean_ticks"),
+                c.stuck_dur.get(),
+            );
+        }
+        let mut cv = a.corr_vel.clone();
+        let over = cv
+            .iter()
+            .filter(|&&v| f64::from(v) > CORRECTION_VEL_GATE)
+            .count() as u64;
+        m.insert(
+            "collision.correction_vel_pct_gt_0_3".into(),
+            pct(over, cv.len() as u64),
+        );
+        m.insert(
+            "collision.correction_vel_p50_mps".into(),
+            percentile(&mut cv, 0.50),
+        );
+        m.insert(
+            "collision.correction_vel_p95_mps".into(),
+            percentile(&mut cv, 0.95),
+        );
+        m.insert(
+            "collision.correction_vel_p99_mps".into(),
+            percentile(&mut cv, 0.99),
+        );
+        // Conditional on a correction actually happening (contact is rare, so the unconditional
+        // percentiles are dominated by exact-zero samples).
+        let mut corrected: Vec<f32> = cv
+            .iter()
+            .copied()
+            .filter(|&v| f64::from(v) > CORRECTED_MIN_MPS)
+            .collect();
+        m.insert(
+            "collision.correction_vel_corrected_pct".into(),
+            pct(corrected.len() as u64, cv.len() as u64),
+        );
+        m.insert(
+            "collision.correction_vel_corrected_p50_mps".into(),
+            percentile(&mut corrected, 0.50),
+        );
+        m.insert(
+            "collision.correction_vel_corrected_p99_mps".into(),
+            percentile(&mut corrected, 0.99),
+        );
+        m.insert(
+            "collision.correction_vel_max_mps".into(),
+            cv.iter().fold(0.0_f64, |m, &v| m.max(f64::from(v))),
+        );
+
+        m.insert(
+            "coord.dual_chaser_ticks_per_min".into(),
+            per_min(a.dual_chaser_ticks),
+        );
+        m.insert(
+            "coord.dual_chaser_pct_of_loose".into(),
+            pct(a.dual_chaser_ticks, a.loose_ticks),
+        );
+        m.insert(
+            "coord.max_simultaneous_chasers".into(),
+            a.max_chasers as f64,
+        );
+        m.insert("coord.engagers3_ticks_per_min".into(), per_min(a.engager3));
+        m.insert(
+            "coord.engagers3_pct_of_carrier_ticks".into(),
+            pct(a.engager3, a.phase[1].carrier_ticks),
+        );
+        m.insert(
+            "coord.cruise_over72_pct".into(),
+            pct(a.cruise_over, a.cruise_n),
+        );
+
+        m.insert(
+            "move.side_flips_per_player_min".into(),
+            if pmin > 0.0 {
+                a.side_flips as f64 / pmin
+            } else {
+                0.0
+            },
+        );
+        let mut hg = a.heading_gt3.clone();
+        m.insert(
+            "move.heading_change_p95_deg_per_tick_gt3mps".into(),
+            percentile(&mut hg, 0.95),
+        );
+
+        for (ph, ph_name) in [(0, "attacking"), (1, "defending")] {
+            let pa = &a.phase[ph];
+            m.insert(format!("shape.{ph_name}.length_m"), pa.length.get());
+            m.insert(format!("shape.{ph_name}.width_m"), pa.width.get());
+            m.insert(format!("shape.{ph_name}.stretch_m"), pa.stretch.get());
+            let mut nm = pa.nearest_mate.clone();
+            let mean = if nm.is_empty() {
+                0.0
+            } else {
+                nm.iter().map(|&v| f64::from(v)).sum::<f64>() / nm.len() as f64
+            };
+            m.insert(format!("shape.{ph_name}.nearest_mate_mean_m"), mean);
+            m.insert(
+                format!("shape.{ph_name}.nearest_mate_p10_m"),
+                percentile(&mut nm, 0.10),
+            );
+        }
+
         m.insert("aerial.jumps_outfield".into(), a.jumps_outfield as f64);
         m.insert("aerial.jumps_gk".into(), a.jumps_gk as f64);
         m.insert("aerial.max_airborne_outfield".into(), a.max_airborne as f64);
@@ -1058,7 +1465,22 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ("move.accel_from_pos_mean_mps2", "Same as accel_mean_mps2 but from the second difference of positions over three consecutive open-play ticks (|(p_t - p_t-1) - (p_t-1 - p_t-2)| * 3600): what the renderer actually sees, independent of the vel field."),
         ("move.speed_oscillation_pct", "Over three consecutive open-play ticks where both speed changes exceed 0.05 m/s: % where the speed change flips sign (speed up / slow down / speed up sawtooth). A smooth accelerate-cruise-decelerate profile scores near 0."),
         ("move.dspeed_max_mps_per_tick", "Max ||vel_t| - |vel_t-1|| over the match (m/s per tick)."),
-        ("aerial.jumps_outfield / aerial.jumps_gk", "Count of z going from <= 0 to > 0 between consecutive open-play ticks (outfielders / GK; GK dives that leave the ground count)."),
+        ("collision.<class>.ticks_per_min", "Round 3. Pair classes: any (every on-pitch pair, both teams, GKs included), teammate (pairs of this side's players only), opponent (home-away pairs). An overlap is a pair whose centres are closer than 0.8 m (the sim's min_sep = 2 x 0.4 m body radius) on an open-play tick, sampled after the sim's separation pass. ticks_per_min = open-play ticks with at least one overlapping pair of the class / open-play minutes. 'any' and 'opponent' are match-level and identical in the home and away maps; 'teammate' is the side's own pairs, so match any = home teammate + away teammate + opponent for events."),
+        ("collision.<class>.ticks_gt1cm_per_min", "Open-play ticks with at least one pair of the class overlapping by more than 1 cm (centre distance < 0.79 m), per open-play minute. The state is sampled after the sim's separation pass, which leaves resolved pairs at 0.8 m minus fixed-point rounding (resting contact); this variant counts only residual penetration the pass did not resolve."),
+        ("collision.correction_vel_corrected_pct / corrected_p50_mps / corrected_p99_mps / max_mps", "Same samples restricted to corrected ones (> 0.01 m/s; fixed-point noise is ~1e-7 m/s): % of samples corrected, nearest-rank p50 / p99 of the corrected samples, and the match maximum over all samples. Contact is rare, so the unconditional p50/p95 are ~0 and the conditional ones characterise the push-out itself."),
+        ("collision.<class>.events_per_min","Overlap episodes per open-play minute: a pair's maximal run of consecutive open-play ticks below 0.8 m counts once (runs are cut when open play stops)."),
+        ("collision.<class>.depth_mean_m / depth_max_m", "Overlap depth 0.8 m - centre distance over all overlapping pair-ticks of the class: mean, and maximum over the match."),
+        ("collision.<class>.stuck_pairs / stuck_mean_ticks", "Stuck pair = overlap episode lasting more than 10 consecutive open-play ticks (no relative-speed condition). Count per match and mean episode length in ticks (60 ticks = 1 s; 0 when there are none)."),
+        ("collision.correction_vel_p50_mps / p95 / p99 / pct_gt_0_3", "Position-correction velocity per player per consecutive open-play tick pair: |(pos_t - pos_t-1) * 60 - vel_t| in m/s, all on-pitch players incl. GK. vel_t is the published end-of-tick velocity, which the sim integrated (pos += vel * dt) before the separation pass, so with no contact the value is 0 apart from touchline clamps; with contact it is push-out displacement / dt minus the separation pass's own velocity impulse/slip (both act along the contact, so this is a lower bound of the pure push-out speed). Nearest-rank percentiles over the match; pct_gt_0_3 = % of samples above 0.3 m/s (the research report's p99 target)."),
+        ("coord.dual_chaser_ticks_per_min / dual_chaser_pct_of_loose", "Open-play ticks with ball.owner == None (includes passes and shots in flight) on which >= 2 of this side's on-pitch players (GK included) are within 8 m of the ball (xy) and closing on it at > 1.5 m/s (vel . unit(ball - pos)); per open-play minute, and as % of loose-ball ticks."),
+        ("coord.max_simultaneous_chasers", "Maximum number of this side's players meeting the chaser condition on one loose-ball tick."),
+        ("coord.engagers3_ticks_per_min / engagers3_pct_of_carrier_ticks", "Open-play ticks where the opponent owns the ball and >= 3 of this side's outfielders are within 2.5 m of the carrier; per open-play minute, and as % of ticks with an opposing carrier (same denominator as swarm3_pct)."),
+        ("coord.cruise_over72_pct", "Over outfielder-ticks of eligible players (not the ball carrier, more than 8 m from the ball, and not one of the side's two outfielders closest to the ball, ties by slot): % with speed > 0.72 * top speed. Top speed approximates the sim's step_all_players at full stamina with full sprint throttle and no carrier/jockey/direction penalty: (5.45 + 0.026 * pace) m/s * 1.205 (5v5) or * 1.220 (11v11); stamina, the facing-alignment scale and run boosts are ignored, so a tired player's real top speed is lower than assumed (the metric is a lower bound on violations)."),
+        ("move.side_flips_per_player_min", "Per player, over the heading-histogram samples (speed > 1 m/s on both ticks): lateral component l_t = cross(vel_t-1, vel_t) / |vel_t-1| (m/s, sign = turning left/right of the previous heading). A side flip is a sample whose l_t and the previous tick's l_t-1 are both above 0.02 m/s in magnitude with opposite signs (avoidance oscillation). Count / player-minutes."),
+        ("move.heading_change_p95_deg_per_tick_gt3mps", "95th percentile (nearest rank) of the per-tick heading change |angle(vel_t-1, vel_t)| in degrees, over player-tick pairs with speed > 3 m/s on both ticks."),
+        ("shape.<phase>.length_m / width_m / stretch_m", "Round 3 team shape over on-pitch outfielders (GK excluded): length = x extent, width = y extent (same numbers as bbox_depth_m / bbox_width_m, named after the literature), stretch index = mean distance of outfielders to their centroid. Phase attacking = in possession, defending = out of possession (general.phase). Peer-reviewed 11v11 envelope: length 31-46 m, width 35-48 m, stretch 7-16 m; there is no published 5v5 envelope."),
+        ("shape.<phase>.nearest_mate_mean_m / nearest_mate_p10_m", "For every on-pitch outfielder and tick of the phase, distance to the nearest other outfielder of the same side; mean and 10th percentile (nearest rank)."),
+        ("aerial.jumps_outfield / aerial.jumps_gk","Count of z going from <= 0 to > 0 between consecutive open-play ticks (outfielders / GK; GK dives that leave the ground count)."),
         ("aerial.max_airborne_outfield", "Max number of the side's outfielders with z > 0 on one open-play tick."),
         ("aerial.headers (+ _shot/_clear/_pass)", "Outfielder with z > 0.14 m whose recent_kick_ticks rose versus the previous tick (a new contact); split by recent_kick_kind: 4/5 shot, 3 clearance/lob, else pass/flick."),
     ];
@@ -1081,13 +1503,71 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
-const SECTIONS: [(&str, &str); 5] = [
+const SECTIONS: [(&str, &str); 7] = [
     ("match.", "Match"),
     ("gk.", "Goalkeeper"),
     ("shape.", "Defence and shape"),
     ("move.", "Movement smoothness"),
+    ("collision.", "Collisions and push-out"),
+    ("coord.", "Coordination"),
     ("aerial.", "Aerial"),
 ];
+
+/// Peer-reviewed 11v11 team-shape envelope (research report, Parameters table).
+const SHAPE_ENVELOPE: [(&str, f64, f64); 3] = [
+    ("length_m", 31.0, 46.0),
+    ("width_m", 35.0, 48.0),
+    ("stretch_m", 7.0, 16.0),
+];
+
+fn render_shape_envelope(out: &mut String, r: &ConfigReport) {
+    let _ = writeln!(out, "### Team shape vs envelope (teams mean)\n");
+    let eleven = matches!(r.config.format, FormatKind::ElevenASide);
+    let _ = writeln!(
+        out,
+        "| metric | in possession | out of possession | 11v11 envelope (m) |\n|---|---:|---:|---|"
+    );
+    let get = |k: String| {
+        r.mean_teams
+            .get(&k)
+            .map_or_else(|| "n/a".to_string(), |v| fmt_num(*v))
+    };
+    for (k, lo, hi) in SHAPE_ENVELOPE {
+        // For 11v11 mark values outside the envelope; 5v5 has none to compare against.
+        let cell = |ph: &str| {
+            let key = format!("shape.{ph}.{k}");
+            match r.mean_teams.get(&key) {
+                Some(v) if eleven && (*v < lo || *v > hi) => format!("{} (outside)", fmt_num(*v)),
+                _ => get(key),
+            }
+        };
+        let _ = writeln!(
+            out,
+            "| {k} | {} | {} | {lo:.0}-{hi:.0} |",
+            cell("attacking"),
+            cell("defending")
+        );
+    }
+    for k in ["nearest_mate_mean_m", "nearest_mate_p10_m"] {
+        let _ = writeln!(
+            out,
+            "| {k} | {} | {} | none published (in-possession mean near 9-10 m, estimate) |",
+            get(format!("shape.attacking.{k}")),
+            get(format!("shape.defending.{k}"))
+        );
+    }
+    if eleven {
+        let _ = writeln!(
+            out,
+            "\nEnvelope: peer-reviewed 11v11 ranges (length 31-46 m, width 35-48 m, stretch index 7-16 m) quoted in the research report; the report's tighter targets are 31-36 / 35-40 / 7-10 m out of possession and 40-46 / 42-48 / 12-16 m in possession (estimates).\n"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "\nNote: 5v5 has no published team-shape envelope; the 11v11 ranges are printed for reference only and do not apply to a 4-outfielder team on a small pitch.\n"
+        );
+    }
+}
 
 pub fn render_markdown(report: &AnalysisReport, include_definitions: bool) -> String {
     let mut out = String::new();
@@ -1142,6 +1622,7 @@ pub fn render_markdown(report: &AnalysisReport, include_definitions: bool) -> St
             }
             out.push('\n');
         }
+        render_shape_envelope(&mut out, r);
         if !r.per_seed.is_empty() {
             let _ = writeln!(out, "### Per seed (home / away)\n");
             let mut hdr = "| metric |".to_string();
@@ -1203,10 +1684,11 @@ pub fn render_compare(before: &AnalysisReport, after: &AnalysisReport) -> String
         for k in keys {
             let bv = b.mean_teams.get(k).copied();
             let av = a.mean_teams.get(k).copied();
-            let cell = |v: Option<f64>| v.map_or_else(|| "-".to_string(), fmt_num);
+            // Keys missing on either side (e.g. round-3 metrics against an older baseline) are "n/a".
+            let cell = |v: Option<f64>| v.map_or_else(|| "n/a".to_string(), fmt_num);
             let delta = match (bv, av) {
                 (Some(x), Some(y)) => format!("{:+.2}", y - x),
-                _ => "-".to_string(),
+                _ => "n/a".to_string(),
             };
             let _ = writeln!(out, "| {k} | {} | {} | {delta} |", cell(bv), cell(av));
         }
@@ -1455,5 +1937,139 @@ mod tests {
         }
         let poss = a.home["match.possession_pct"] + a.away["match.possession_pct"];
         assert!((poss - 100.0).abs() < 1e-6);
+
+        // Round-3 movement-coordination metrics: present, finite, sane and deterministic.
+        for side in [&a.home, &a.away] {
+            let mut keys: Vec<String> = Vec::new();
+            for class in ["any", "teammate", "opponent"] {
+                for k in [
+                    "ticks_per_min",
+                    "events_per_min",
+                    "depth_mean_m",
+                    "depth_max_m",
+                    "stuck_pairs",
+                    "stuck_mean_ticks",
+                ] {
+                    keys.push(format!("collision.{class}.{k}"));
+                }
+            }
+            for ph in ["attacking", "defending"] {
+                for k in [
+                    "length_m",
+                    "width_m",
+                    "stretch_m",
+                    "nearest_mate_mean_m",
+                    "nearest_mate_p10_m",
+                ] {
+                    keys.push(format!("shape.{ph}.{k}"));
+                }
+            }
+            for k in [
+                "collision.correction_vel_p50_mps",
+                "collision.correction_vel_p95_mps",
+                "collision.correction_vel_p99_mps",
+                "collision.correction_vel_pct_gt_0_3",
+                "coord.dual_chaser_ticks_per_min",
+                "coord.dual_chaser_pct_of_loose",
+                "coord.max_simultaneous_chasers",
+                "coord.engagers3_ticks_per_min",
+                "coord.engagers3_pct_of_carrier_ticks",
+                "coord.cruise_over72_pct",
+                "move.side_flips_per_player_min",
+                "move.heading_change_p95_deg_per_tick_gt3mps",
+            ] {
+                keys.push(k.to_string());
+            }
+            for key in &keys {
+                let v = side
+                    .get(key)
+                    .unwrap_or_else(|| panic!("missing metric {key}"));
+                assert!(v.is_finite() && *v >= 0.0, "{key} = {v}");
+            }
+            let c = |k: &str| side[k];
+            assert!(c("collision.correction_vel_p50_mps") <= c("collision.correction_vel_p95_mps"));
+            assert!(c("collision.correction_vel_p95_mps") <= c("collision.correction_vel_p99_mps"));
+            assert!(c("collision.any.events_per_min") >= c("collision.teammate.events_per_min"));
+            assert!(c("collision.any.events_per_min") >= c("collision.opponent.events_per_min"));
+            assert!(c("collision.any.depth_max_m") <= OVERLAP_DIST_M);
+            assert!(c("coord.max_simultaneous_chasers") >= 1.0);
+            assert!(c("move.heading_change_p95_deg_per_tick_gt3mps") <= 180.0);
+            for ph in ["attacking", "defending"] {
+                assert!(c(&format!("shape.{ph}.length_m")) > 0.0);
+                assert!(c(&format!("shape.{ph}.width_m")) > 0.0);
+                assert!(c(&format!("shape.{ph}.stretch_m")) > 0.0);
+                assert!(
+                    c(&format!("shape.{ph}.nearest_mate_p10_m"))
+                        <= c(&format!("shape.{ph}.nearest_mate_mean_m")) + 1e-9
+                );
+            }
+        }
+        // Match-level collision classes are identical in both side maps.
+        for k in [
+            "collision.any.events_per_min",
+            "collision.opponent.ticks_per_min",
+        ] {
+            assert_eq!(a.home[k], a.away[k], "{k}");
+        }
+        // Teammate events of both sides + opponent events = all events (same open-play minutes).
+        let sum = a.home["collision.teammate.events_per_min"]
+            + a.away["collision.teammate.events_per_min"]
+            + a.home["collision.opponent.events_per_min"];
+        assert!((sum - a.home["collision.any.events_per_min"]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn percentile_is_nearest_rank() {
+        let mut v = vec![5.0_f32, 1.0, 4.0, 2.0, 3.0];
+        assert_eq!(percentile(&mut v, 0.5), 3.0);
+        assert_eq!(percentile(&mut v, 0.99), 5.0);
+        assert_eq!(percentile(&mut v, 0.1), 1.0);
+        assert_eq!(percentile(&mut [], 0.5), 0.0);
+    }
+
+    #[test]
+    fn compare_tolerates_missing_keys() {
+        let mk = |keys: &[(&str, f64)]| {
+            let cfg = AnalyzeConfig {
+                format: FormatKind::FiveASide,
+                seeds: 1,
+                seed_base: 1,
+                minutes: 1,
+                home_difficulty: CpuDifficulty::Normal,
+                away_difficulty: CpuDifficulty::Normal,
+            };
+            let m: Metrics = keys.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
+            AnalysisReport {
+                tool: String::new(),
+                definitions: BTreeMap::new(),
+                reports: vec![ConfigReport {
+                    id: cfg.id(),
+                    label: cfg.label(),
+                    command: cfg.command_line(),
+                    config: cfg,
+                    gameplay_version: String::new(),
+                    final_hashes: vec![],
+                    mean_match: Metrics::new(),
+                    mean_home: m.clone(),
+                    mean_away: m.clone(),
+                    mean_teams: m,
+                    per_seed: vec![],
+                }],
+            }
+        };
+        let before = mk(&[("move.accel_mean_mps2", 1.0)]);
+        let after = mk(&[
+            ("move.accel_mean_mps2", 1.5),
+            ("collision.any.events_per_min", 2.0),
+        ]);
+        let out = render_compare(&before, &after);
+        assert!(
+            out.contains("| collision.any.events_per_min | n/a | 2 | n/a |"),
+            "{out}"
+        );
+        assert!(
+            out.contains("| move.accel_mean_mps2 | 1 | 1.50 | +0.50 |"),
+            "{out}"
+        );
     }
 }
