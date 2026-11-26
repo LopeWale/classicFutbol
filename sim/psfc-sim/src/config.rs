@@ -197,6 +197,283 @@ impl RuleSet {
     }
 }
 
+/// Tactical role of a formation slot (derived from the formation string, not from the player in it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SlotRole {
+    CentreBack,
+    FullBack,
+    /// Defensive midfielder screening the zone in front of the centre-backs.
+    Holding,
+    CentralMid,
+    WideMid,
+    Winger,
+    Striker,
+    /// 5v5 last man / pivot that always stays behind the ball.
+    Fixo,
+    /// 5v5 wide midfielder ("ala").
+    Ala,
+    /// 5v5 target striker ("pivo").
+    Pivo,
+}
+
+impl SlotRole {
+    /// Matching `PlayerRole` band (`1` Defender, `2` Midfielder, `3` Forward).
+    #[inline]
+    pub const fn band(self) -> i64 {
+        match self {
+            Self::CentreBack | Self::FullBack | Self::Fixo => 1,
+            Self::Holding | Self::CentralMid | Self::WideMid | Self::Ala => 2,
+            Self::Winger | Self::Striker | Self::Pivo => 3,
+        }
+    }
+
+    #[inline]
+    pub const fn is_back_line(self) -> bool {
+        matches!(self, Self::CentreBack | Self::FullBack | Self::Fixo)
+    }
+}
+
+/// One outfield formation slot with distinct ATTACKING and DEFENDING positions.
+///
+/// `depth` is measured inside the team block (`0` = back line, `1000` = front line) and `y` is
+/// permille of the pitch half-width (negative = left when attacking `+X`), before the phase's
+/// width scale and ball-side shift are applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ShapeSlot {
+    pub role: SlotRole,
+    pub attack_depth: i64,
+    pub attack_y: i64,
+    pub defend_depth: i64,
+    pub defend_y: i64,
+}
+
+/// Parses a formation string such as `"4-3-3"`, `"4-2-3-1"`, `"1-2-1"` into row counts.
+/// Returns `None` if it does not describe exactly `outfield` players.
+fn parse_formation_rows(formation: &str, outfield: usize) -> Option<Vec<usize>> {
+    let mut rows = Vec::new();
+    for part in formation.split('-') {
+        let n: usize = part.trim().parse().ok()?;
+        if n == 0 || n > 6 {
+            return None;
+        }
+        rows.push(n);
+    }
+    if rows.len() < 2 || rows.iter().sum::<usize>() != outfield {
+        return None;
+    }
+    Some(rows)
+}
+
+fn spread_y(count: usize, half_spread: i64) -> Vec<i64> {
+    if count == 1 {
+        return vec![0];
+    }
+    (0..count)
+        .map(|i| -half_spread + (2 * half_spread * i as i64) / ((count - 1) as i64))
+        .collect()
+}
+
+/// Role-specific transform from a base `(depth, y)` into distinct attacking & defending positions.
+/// - Centre-backs hold the line in both phases and split wider to build up.
+/// - Full-backs tuck in when defending and overlap high & wide when attacking.
+/// - The holding midfielder screens in front of the centre-backs and stays behind the ball.
+/// - Wide midfielders keep their width in both phases; wingers drop to the midfield line when defending.
+/// - Strikers lead the line (front of block) in both phases.
+fn shape_slot(role: SlotRole, base_depth: i64, base_y: i64) -> ShapeSlot {
+    let (ad, ay, dd, dy) = match role {
+        SlotRole::CentreBack => (0, base_y * 125 / 100, 0, base_y),
+        SlotRole::FullBack => (540, base_y * 112 / 100, 30, base_y * 70 / 100),
+        SlotRole::Holding => (190, base_y / 2, 280, base_y / 2),
+        SlotRole::CentralMid => (base_depth.max(480) + 60, base_y * 105 / 100, base_depth.max(400), base_y * 85 / 100),
+        SlotRole::WideMid => (720, base_y * 112 / 100, 420, base_y * 96 / 100),
+        SlotRole::Winger => (900, base_y * 108 / 100, 640, base_y * 86 / 100),
+        SlotRole::Striker => (1000, base_y, 1000, base_y * 80 / 100),
+        SlotRole::Fixo => (0, base_y, 0, base_y),
+        SlotRole::Ala => (660, base_y * 115 / 100, 430, base_y * 90 / 100),
+        SlotRole::Pivo => (1000, base_y, 1000, base_y),
+    };
+    ShapeSlot {
+        role,
+        attack_depth: ad,
+        attack_y: ay.clamp(-960, 960),
+        defend_depth: dd,
+        defend_y: dy.clamp(-960, 960),
+    }
+}
+
+/// Phase-aware outfield shape for `formation` (index `0` = first outfielder, i.e. starter `1`).
+///
+/// Any `"a-b-c[-d]"` formation string whose rows sum to the outfield count is supported; unknown
+/// strings fall back to the same defence/midfield/attack split as [`formation_anchors`].
+pub fn formation_shape(formation: &str, players_per_side: usize) -> Vec<ShapeSlot> {
+    let outfield = players_per_side.saturating_sub(1);
+    if outfield == 0 {
+        return Vec::new();
+    }
+    let rows = parse_formation_rows(formation, outfield).unwrap_or_else(|| {
+        if outfield == 4 {
+            // Default 5v5 diamond "1-2-1".
+            vec![1, 2, 1]
+        } else if outfield == 10 {
+            vec![4, 3, 3]
+        } else {
+            let def = outfield.div_ceil(3).max(1);
+            let fwd = (outfield / 3).max(1);
+            let mid = outfield.saturating_sub(def + fwd);
+            [def, mid, fwd].into_iter().filter(|&c| c > 0).collect()
+        }
+    });
+    let small = outfield <= 5;
+    let n_rows = rows.len();
+    let mut out = Vec::with_capacity(outfield);
+    for (r, &count) in rows.iter().enumerate() {
+        let is_back = r == 0;
+        let is_front = r + 1 == n_rows;
+        let base_depth = if n_rows <= 1 { 0 } else { (r as i64 * 1000) / ((n_rows - 1) as i64) };
+        let roles_y: Vec<(SlotRole, i64)> = if small {
+            if is_back {
+                match count {
+                    1 => vec![(SlotRole::Fixo, 0)],
+                    _ => spread_y(count, 420).into_iter().map(|y| (SlotRole::CentreBack, y)).collect(),
+                }
+            } else if is_front {
+                match count {
+                    1 => vec![(SlotRole::Pivo, 0)],
+                    _ => spread_y(count, 520).into_iter().map(|y| (SlotRole::Winger, y)).collect(),
+                }
+            } else {
+                match count {
+                    1 => vec![(SlotRole::CentralMid, 0)],
+                    _ => spread_y(count, 600).into_iter().map(|y| (SlotRole::Ala, y)).collect(),
+                }
+            }
+        } else if is_back {
+            match count {
+                4 => vec![
+                    (SlotRole::FullBack, -820),
+                    (SlotRole::CentreBack, -270),
+                    (SlotRole::CentreBack, 270),
+                    (SlotRole::FullBack, 820),
+                ],
+                5 => vec![
+                    (SlotRole::FullBack, -860),
+                    (SlotRole::CentreBack, -420),
+                    (SlotRole::CentreBack, 0),
+                    (SlotRole::CentreBack, 420),
+                    (SlotRole::FullBack, 860),
+                ],
+                c => spread_y(c, 440).into_iter().map(|y| (SlotRole::CentreBack, y)).collect(),
+            }
+        } else if is_front {
+            match count {
+                1 => vec![(SlotRole::Striker, 0)],
+                2 => vec![(SlotRole::Striker, -260), (SlotRole::Striker, 260)],
+                3 => vec![(SlotRole::Winger, -720), (SlotRole::Striker, 0), (SlotRole::Winger, 720)],
+                c => spread_y(c, 720).into_iter().map(|y| (SlotRole::Striker, y)).collect(),
+            }
+        } else {
+            let first_mid = r == 1;
+            let more_mid_after = r + 2 < n_rows;
+            match count {
+                1 if first_mid => vec![(SlotRole::Holding, 0)],
+                1 => vec![(SlotRole::CentralMid, 0)],
+                2 if first_mid && more_mid_after => {
+                    vec![(SlotRole::Holding, -300), (SlotRole::Holding, 300)]
+                }
+                2 => vec![(SlotRole::CentralMid, -300), (SlotRole::CentralMid, 300)],
+                3 if first_mid && !more_mid_after => vec![
+                    (SlotRole::CentralMid, -420),
+                    (SlotRole::Holding, 0),
+                    (SlotRole::CentralMid, 420),
+                ],
+                3 => vec![(SlotRole::Winger, -700), (SlotRole::CentralMid, 0), (SlotRole::Winger, 700)],
+                4 => vec![
+                    (SlotRole::WideMid, -800),
+                    (SlotRole::CentralMid, -250),
+                    (SlotRole::CentralMid, 250),
+                    (SlotRole::WideMid, 800),
+                ],
+                c => {
+                    let ys = spread_y(c, 840);
+                    ys.into_iter()
+                        .enumerate()
+                        .map(|(i, y)| {
+                            let role = if i == 0 || i + 1 == c {
+                                SlotRole::WideMid
+                            } else if i == c / 2 {
+                                SlotRole::Holding
+                            } else {
+                                SlotRole::CentralMid
+                            };
+                            (role, y)
+                        })
+                        .collect()
+                }
+            }
+        };
+        for (role, y) in roles_y {
+            out.push(shape_slot(role, base_depth, y));
+        }
+    }
+    out.truncate(outfield);
+    while out.len() < outfield {
+        out.push(shape_slot(SlotRole::CentralMid, 500, 0));
+    }
+    out
+}
+
+/// [`formation_anchors`] mapped onto starters by ROLE instead of list order, so a squad listed as
+/// `GK, DEF, MID, MID, FWD, DEF, ...` does not put its forward at right-back. Slots of each role band
+/// (defence / midfield / attack, taken from [`formation_shape`]) go to players of the same band in
+/// starter order; any surplus players fill the remaining slots in order. `roles[0]` is the keeper.
+pub fn role_aware_formation_anchors(
+    formation: &str,
+    players_per_side: usize,
+    roles: &[crate::snapshot::PlayerRole],
+) -> Vec<(i64, i64)> {
+    use crate::snapshot::PlayerRole;
+    let anchors = formation_anchors(formation, players_per_side);
+    let shape = formation_shape(formation, players_per_side);
+    let n = roles.len().min(anchors.len());
+    if n <= 1 || shape.len() + 1 < n {
+        return anchors;
+    }
+    let player_band = |r: PlayerRole| -> i64 {
+        match r {
+            PlayerRole::Goalkeeper => 0,
+            PlayerRole::Defender => 1,
+            PlayerRole::Midfielder => 2,
+            PlayerRole::Forward => 3,
+        }
+    };
+    let mut out = anchors.clone();
+    let mut slot_used = vec![false; n];
+    let mut player_done = vec![false; n];
+    slot_used[0] = true;
+    player_done[0] = true;
+    for band in 1..=3 {
+        for pi in 1..n {
+            if player_done[pi] || player_band(roles[pi]) != band {
+                continue;
+            }
+            if let Some(si) = (1..n).find(|&si| !slot_used[si] && shape[si - 1].role.band() == band) {
+                slot_used[si] = true;
+                player_done[pi] = true;
+                out[pi] = anchors[si];
+            }
+        }
+    }
+    for pi in 1..n {
+        if !player_done[pi] {
+            if let Some(si) = (1..n).find(|&si| !slot_used[si]) {
+                slot_used[si] = true;
+                out[pi] = anchors[si];
+            }
+        }
+    }
+    out
+}
+
 /// Returns `(x_permille, y_permille)` tactical base anchors in `[-1000, 1000]`
 /// assuming the team defends `-X` (`x = -1000`) and attacks `+X` (`x = +1000`).
 /// Index `0` is always the Goalkeeper.

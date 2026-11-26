@@ -404,6 +404,116 @@ impl BufferedAction {
     }
 }
 
+/// Team-shape phase driving which formation shape the AI holds (see `docs/team-shape-ai.md`).
+pub const AI_PHASE_ATTACK: u8 = 0;
+pub const AI_PHASE_DEFEND: u8 = 1;
+pub const AI_PHASE_COUNTER_PRESS: u8 = 2;
+pub const AI_PHASE_RETREAT: u8 = 3;
+pub const AI_PHASE_COUNTER_ATTACK: u8 = 4;
+/// Sentinel for "no player / no opponent" in [`TeamAiMemory`] index fields.
+pub const AI_NONE: u8 = u8::MAX;
+
+/// Per-team outfield AI commitments carried tick to tick so assignments have hysteresis instead of
+/// being re-derived (and flipping) every tick. Serialized and hashed: it changes the simulation.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TeamAiMemory {
+    /// `tick + 1` of the last team plan (`0` = never planned).
+    pub plan_tick: u32,
+    pub phase: u8,
+    pub phase_ticks: u16,
+    /// Ball position when the current transition phase began.
+    pub phase_origin: Vec2,
+    /// Reaction-delayed ball reference the shape follows (low-passed by difficulty & positioning).
+    pub ref_ball: Vec2,
+    pub presser: u8,
+    pub presser_ticks: u16,
+    pub second_presser: u8,
+    pub cover: u8,
+    pub cover_ticks: u16,
+    /// Formation slot index per player index (`AI_NONE` for the goalkeeper / unassigned).
+    pub slot_of: Vec<u8>,
+    pub slot_ticks: u16,
+    /// Opponent index each player is marking (`AI_NONE` = zonal), and how long it has been held.
+    pub mark_of: Vec<u8>,
+    pub mark_ticks: Vec<u16>,
+    /// Committed (low-passed) movement target per player and the tick it was last refreshed.
+    pub target: Vec<Vec2>,
+    pub target_tick: Vec<u32>,
+    /// Bit `0` = sprinting, bit `1` = jockeying (decision hysteresis).
+    pub flags: Vec<u8>,
+    /// Low-passed velocity command per player (movement-model jerk filter) and its last tick.
+    #[serde(default)]
+    pub cmd_vel: Vec<Vec2>,
+    #[serde(default)]
+    pub cmd_tick: Vec<u32>,
+}
+
+impl TeamAiMemory {
+    pub(crate) fn ensure_len(&mut self, n: usize) {
+        if self.slot_of.len() != n {
+            self.slot_of = vec![AI_NONE; n];
+            self.slot_ticks = 0;
+        }
+        if self.mark_of.len() != n {
+            self.mark_of = vec![AI_NONE; n];
+            self.mark_ticks = vec![0; n];
+        }
+        if self.mark_ticks.len() != n {
+            self.mark_ticks = vec![0; n];
+        }
+        if self.target.len() != n {
+            self.target = vec![Vec2::ZERO; n];
+            self.target_tick = vec![0; n];
+        }
+        if self.target_tick.len() != n {
+            self.target_tick = vec![0; n];
+        }
+        if self.flags.len() != n {
+            self.flags = vec![0; n];
+        }
+        if self.cmd_vel.len() != n || self.cmd_tick.len() != n {
+            self.cmd_vel = vec![Vec2::ZERO; n];
+            self.cmd_tick = vec![0; n];
+        }
+    }
+
+    fn hash_into(&self, h: &mut CanonicalHasher) {
+        h.u32(self.plan_tick);
+        h.u8(self.phase);
+        h.u16(self.phase_ticks);
+        h.i64(self.phase_origin.x.raw());
+        h.i64(self.phase_origin.y.raw());
+        h.i64(self.ref_ball.x.raw());
+        h.i64(self.ref_ball.y.raw());
+        h.u8(self.presser);
+        h.u16(self.presser_ticks);
+        h.u8(self.second_presser);
+        h.u8(self.cover);
+        h.u16(self.cover_ticks);
+        h.u32(self.slot_of.len() as u32);
+        h.bytes(&self.slot_of);
+        h.u16(self.slot_ticks);
+        h.u32(self.mark_of.len() as u32);
+        h.bytes(&self.mark_of);
+        for t in &self.mark_ticks {
+            h.u16(*t);
+        }
+        h.u32(self.target.len() as u32);
+        for (t, tt) in self.target.iter().zip(self.target_tick.iter()) {
+            h.i64(t.x.raw());
+            h.i64(t.y.raw());
+            h.u32(*tt);
+        }
+        h.bytes(&self.flags);
+        h.u32(self.cmd_vel.len() as u32);
+        for (v, t) in self.cmd_vel.iter().zip(self.cmd_tick.iter()) {
+            h.i64(v.x.raw());
+            h.i64(v.y.raw());
+            h.u32(*t);
+        }
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MatchState {
     pub fixture_id: String,
@@ -479,6 +589,10 @@ pub struct MatchState {
     /// Per-side goalkeeper scenario brain (`[home, away]`).
     #[serde(default)]
     pub gk_brain: [GoalkeeperBrain; 2],
+    /// Outfield AI team-shape commitments (`[home, away]`). Interior-mutable because the AI plans
+    /// from `&MatchState` mid-tick; it is serialized and included in [`Self::compute_hash`].
+    #[serde(default)]
+    pub ai_memory: core::cell::RefCell<[TeamAiMemory; 2]>,
     #[serde(skip)]
     pub pending_events: Vec<MatchEvent>,
     pub recorded_events: Vec<MatchEvent>,
@@ -723,6 +837,10 @@ impl MatchState {
 
         for w in self.rng.state_words() {
             h.u64(w);
+        }
+
+        for mem in self.ai_memory.borrow().iter() {
+            mem.hash_into(&mut h);
         }
 
         // Phase
