@@ -3,7 +3,7 @@
 //! Zero `unsafe` blocks and zero external JS bundler requirements: host environments
 //! (browsers and Node.js CI) read/write linear memory buffers via exported pointers.
 
-use psfc_sim::ai::generate_cpu_input;
+use psfc_sim::ai::suggest_cpu_input;
 use psfc_sim::input::{BTN_LOB, BTN_PASS, BTN_SHOOT, BTN_THROUGH};
 use psfc_sim::{
     CpuDifficulty, FixtureSnapshot, Fp, InputFrame, MatchPhase, MatchSimulation, PlayerActionState,
@@ -273,13 +273,13 @@ pub extern "C" fn sim_auto_step(steps: u32) -> u32 {
             }
             let h_in = match sess.snapshot.rules.home_controller {
                 SideController::Human => {
-                    generate_cpu_input(sess.sim.state(), TeamSide::Home, CpuDifficulty::Hard)
+                    suggest_cpu_input(sess.sim.state(), TeamSide::Home, CpuDifficulty::Hard)
                 }
                 SideController::Cpu(_) => InputFrame::IDLE,
             };
             let a_in = match sess.snapshot.rules.away_controller {
                 SideController::Human => {
-                    generate_cpu_input(sess.sim.state(), TeamSide::Away, CpuDifficulty::Hard)
+                    suggest_cpu_input(sess.sim.state(), TeamSide::Away, CpuDifficulty::Hard)
                 }
                 SideController::Cpu(_) => InputFrame::IDLE,
             };
@@ -694,3 +694,4 @@ pub extern "C" fn sim_export_summary_json() -> usize {
         set_output_bytes(json)
     })
 }
+

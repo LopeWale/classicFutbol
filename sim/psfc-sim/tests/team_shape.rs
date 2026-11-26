@@ -477,13 +477,21 @@ fn team_shape_11v11_normal_vs_normal() {
     check(s.facing_rev_per_k < 25.0, "facing reversals < 25/1000", s.facing_rev_per_k, &mut fails);
     check(s.facing_p95_deg < 16.5, "facing change p95 < 16.5 deg/tick", s.facing_p95_deg, &mut fails);
     check(s.idle_twitch_pct < 1.5, "idle facing twitch < 1.5%", s.idle_twitch_pct, &mut fails);
-    // Shape (baseline: 68% goal-side, 65 mm/tick line jitter).
+    // Shape (round-2 baseline: 68% goal-side, 65 mm/tick line jitter).
+    // Round 3 (exclusivity layer + avoidance / two-regime motion model) re-baselined three bounds.
+    // The round-2 bounds (jitter < 58, settled DEF < 4 m, settled FWD < 6 m) were already inside
+    // seed noise before round 3: on 6 seeds the pre-round-3 base measured 58.3 / 4.14 / 6.14. After
+    // round 3, 6 seeds measure 61.0 / 4.15 / 7.05: the line jitter and settled DEF distance are
+    // unchanged within noise, and forwards settle ~0.9 m further from their defensive slot because
+    // uninvolved players now cruise at 70% of top speed (the FIFA cruise-speed rule) instead of
+    // sprinting back. Full-match shape metrics improved (docs/match-analytics-round3.md: 11v11
+    // defending anchor distance FWD 27.0 -> 24.3 m, swarming 1.07% -> 0.13%, goal-side 67.6% -> 69.3%).
     check(s.behind_ball_pct > 65.0, "outfielders goal-side of ball > 65%", s.behind_ball_pct, &mut fails);
-    check(s.line_jitter_mm_per_tick < 58.0, "line-height jitter < 58 mm/tick", s.line_jitter_mm_per_tick, &mut fails);
+    check(s.line_jitter_mm_per_tick < 66.0, "line-height jitter < 66 mm/tick", s.line_jitter_mm_per_tick, &mut fails);
     check(s.swarm_pct < 2.0, "swarming < 2%", s.swarm_pct, &mut fails);
-    check(s.settled_anchor_m[1] < 4.0, "settled DEF anchor dist < 4 m", s.settled_anchor_m[1], &mut fails);
+    check(s.settled_anchor_m[1] < 4.75, "settled DEF anchor dist < 4.75 m", s.settled_anchor_m[1], &mut fails);
     check(s.settled_anchor_m[2] < 5.0, "settled MID anchor dist < 5 m", s.settled_anchor_m[2], &mut fails);
-    check(s.settled_anchor_m[3] < 6.0, "settled FWD anchor dist < 6 m", s.settled_anchor_m[3], &mut fails);
+    check(s.settled_anchor_m[3] < 7.75, "settled FWD anchor dist < 7.75 m", s.settled_anchor_m[3], &mut fails);
     check(s.presser_changes_per_min < 3.0, "presser changes / defending-min < 3", s.presser_changes_per_min, &mut fails);
     // Play is not broken.
     check(s.goals_per_match > 0.3, "goals / match > 0.3", s.goals_per_match, &mut fails);

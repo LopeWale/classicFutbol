@@ -113,6 +113,7 @@ impl MatchSimulation {
                     skill_chain_count: 0,
                     skill_chain_decay_ticks: 0,
                     jump_recover_ticks: 0,
+                    overlap_ticks: 0,
                     yellow_cards: 0,
                     sent_off: false,
                 });
@@ -2856,6 +2857,9 @@ impl MatchSimulation {
         let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
         let half_len = self.state.format.half_length() + Fp::from_milli(1_500);
         let half_wid = self.state.format.half_width() + Fp::from_milli(1_500);
+        // Avoidance snapshot of every player (positions, velocities, priority classes) taken before
+        // anyone moves, so the velocity stage is independent of the stepping order.
+        let avoid_frame = crate::avoidance::build_frame(&self.state);
 
         for side in [TeamSide::Home, TeamSide::Away] {
             let s_idx = side.index();
@@ -3802,10 +3806,26 @@ impl MatchSimulation {
                         PlayerActionState::Stumbled { .. } => p.vel.scale(Fp::from_milli(820)),
                         _ => move_dir.scale(top_speed),
                     };
+                    let human_driven = is_controlled && !side_is_cpu;
+                    // Predictive local avoidance on the DESIRED velocity, before any motion limit:
+                    // AI outfielders get the full sampled reciprocal selection, human-controlled
+                    // players only a bounded lateral adjustment, the ball carrier is never steered.
+                    let desired_vel = if !is_gk
+                        && !has_ball
+                        && matches!(p.action, PlayerActionState::Normal | PlayerActionState::Cooldown { .. })
+                    {
+                        let a_id = avoid_frame.id(s_idx, idx);
+                        if human_driven {
+                            crate::avoidance::human_adjust(&avoid_frame, a_id, desired_vel, top_speed)
+                        } else {
+                            crate::avoidance::select_velocity(&avoid_frame, a_id, desired_vel, top_speed)
+                        }
+                    } else {
+                        desired_vel
+                    };
                     // Movement model (outfield): low-pass the velocity COMMAND of AI/CPU-driven
                     // players so it cannot flip sign tick to tick. Human-controlled players and
                     // ball carriers are never filtered (input latency unchanged).
-                    let human_driven = is_controlled && !side_is_cpu;
                     let desired_vel = if !is_gk
                         && !human_driven
                         && !has_ball
@@ -3859,7 +3879,12 @@ impl MatchSimulation {
                         && my_pass_target.is_none()
                         && matches!(p.action, PlayerActionState::Normal);
                     p.vel = if realistic_accel {
-                        crate::ai::realistic_velocity_step(vel_before, desired_vel, &p.attributes, is_5v5)
+                        crate::avoidance::motion_step(
+                            vel_before,
+                            desired_vel,
+                            &p.attributes,
+                            (jockey || contain_held) && !has_ball,
+                        )
                     } else if dv.len() <= max_dv {
                         desired_vel
                     } else {
@@ -3869,6 +3894,16 @@ impl MatchSimulation {
                     // blend over several ticks; braking and the first tick from rest are unaffected.
                     if !is_gk && !realistic_accel && matches!(p.action, PlayerActionState::Normal) {
                         p.vel = crate::ai::limit_turn_rate(vel_before, p.vel, &p.attributes, human_driven);
+                    }
+                    // Non-penetration contact constraint (bodies already touching cannot be driven
+                    // into; tangential sliding stays free). Scripted lunges, slides and dives skip it.
+                    if matches!(
+                        p.action,
+                        PlayerActionState::Normal
+                            | PlayerActionState::Cooldown { .. }
+                            | PlayerActionState::Charging { .. }
+                    ) {
+                        p.vel = crate::avoidance::contact_constrain(&avoid_frame, avoid_frame.id(s_idx, idx), p.vel);
                     }
 
                     p.pos += p.vel.scale(dt);
@@ -5182,8 +5217,14 @@ impl MatchSimulation {
                         def_fwd
                     }
                 };
+                // Stumble gate (FC 27 off-balance rule): a heavy crash only floors a carrier whose
+                // Balance (agility/strength proxy) does not out-class the tackler's Strength.
                 let heavy_crash = clipped_man
-                    && (def_vel - carrier_vel).len() > Fp::from_milli(6_800);
+                    && (def_vel - carrier_vel).len() > Fp::from_milli(6_800)
+                    && !carrier_keeps_balance(
+                        &self.state.players[c_s_idx][carrier_idx].attributes,
+                        &self.state.players[d_s_idx][d_idx].attributes,
+                    );
                 // EA FC 26 Anti-Tackleback: pronounced post-tackle reaction + physical separation!
                 self.state.players[c_s_idx][carrier_idx].action = if heavy_crash {
                     PlayerActionState::Stumbled { ticks_left: 22 }
@@ -5219,7 +5260,17 @@ impl MatchSimulation {
                 self.state.players[d_s_idx][d_idx].action = PlayerActionState::Cooldown {
                     ticks_left: if is_slide { 14 } else { 9 },
                 };
-                self.state.players[c_s_idx][carrier_idx].action = if is_slide && clipped_man {
+                // Stumble only in "appropriate situations": a slide that clips the man from behind,
+                // or at a real speed differential against a carrier who cannot keep his balance.
+                let slide_floors = is_slide
+                    && clipped_man
+                    && (from_behind
+                        || ((def_vel - carrier_vel).len() > Fp::from_milli(4_000)
+                            && !carrier_keeps_balance(
+                                &self.state.players[c_s_idx][carrier_idx].attributes,
+                                &self.state.players[d_s_idx][d_idx].attributes,
+                            )));
+                self.state.players[c_s_idx][carrier_idx].action = if slide_floors {
                     PlayerActionState::Stumbled { ticks_left: 22 }
                 } else {
                     PlayerActionState::Cooldown { ticks_left: 28 }
@@ -6619,112 +6670,142 @@ impl MatchSimulation {
         }
     }
 
+    /// Body-radius push-out (position only) plus gated body-contact rules. Never writes velocity.
     fn resolve_player_separation(&mut self) {
-        let min_sep = Fp::from_milli(800);
-        // Flatten indices (side_idx, player_idx)
-        let mut refs: Vec<(usize, usize)> = Vec::with_capacity(22);
-        for (s, side_players) in self.state.players.iter().enumerate() {
-            for (i, p) in side_players.iter().enumerate() {
-                if !p.sent_off {
-                    refs.push((s, i));
-                }
+        let frame = crate::avoidance::build_frame(&self.state);
+        let stride = frame.stride;
+        let mut bodies: Vec<crate::avoidance::Body> = Vec::with_capacity(stride * 2);
+        let mut slots: Vec<Option<(usize, usize)>> = Vec::with_capacity(stride * 2);
+        for s in 0..2 {
+            for i in 0..stride {
+                let Some(p) = self.state.players[s].get(i) else {
+                    slots.push(None);
+                    bodies.push(crate::avoidance::Body {
+                        pos: Vec2::ZERO,
+                        vel: Vec2::ZERO,
+                        class: 0,
+                        mass: 1,
+                        active: false,
+                        stuck_ticks: 0,
+                    });
+                    continue;
+                };
+                let owns = self.state.ball.owner.map(|(os, oi)| (os.index(), oi)) == Some((s, i));
+                let shield = if owns {
+                    is_pace_control_bits(self.state.prev_buttons[s], self.state.dual_map_controls[s])
+                } else {
+                    (self.state.prev_buttons[s] & BTN_JOCKEY) != 0
+                };
+                let shield_bonus = if shield { 8 + (p.stamina_permille as i64 * 8) / 1_000 } else { 0 };
+                slots.push(Some((s, i)));
+                bodies.push(crate::avoidance::Body {
+                    pos: p.pos,
+                    vel: p.vel,
+                    class: frame.agents[frame.id(s, i)].class,
+                    mass: 68 + (p.attributes.strength as i64) * 3 / 10 + shield_bonus,
+                    active: !p.sent_off,
+                    stuck_ticks: p.overlap_ticks,
+                });
             }
         }
-        for a in 0..refs.len() {
-            for b in (a + 1)..refs.len() {
-                let (sa, ia) = refs[a];
-                let (sb, ib) = refs[b];
-                let pa = self.state.players[sa][ia].pos;
-                let pb = self.state.players[sb][ib].pos;
-                let delta = pb - pa;
+
+        if self.resolve_body_contacts(&bodies, &slots) {
+            // A foul stopped play and repositioned everyone: nothing left to push out.
+            return;
+        }
+
+        crate::avoidance::resolve_overlaps(&mut bodies);
+        for (b, slot) in bodies.iter().zip(&slots) {
+            if let Some((s, i)) = *slot {
+                let p = &mut self.state.players[s][i];
+                p.pos = b.pos;
+                p.overlap_ticks = b.stuck_ticks;
+            }
+        }
+    }
+
+    /// Gated contact rules for opponent pairs in body contact (rules, not impulses):
+    /// - any hard contact (closing > 4.8 m/s) costs both players a little stamina;
+    /// - shoulder challenge on the carrier only side-by-side (bearing within 50 deg of square) and at
+    ///   speed (both > 3 m/s): the clearly stronger defender (Strength + shielding, >= 8) costs the
+    ///   carrier speed (off-balance, keeps the ball);
+    /// - contact from behind (defender behind the carrier, >= 1.5 m/s faster, closing > 2.5 m/s) on
+    ///   its first tick routes to the existing foul path.
+    fn resolve_body_contacts(&mut self, bodies: &[crate::avoidance::Body], slots: &[Option<(usize, usize)>]) -> bool {
+        let contact_r = Fp::from_milli(2 * crate::avoidance::BODY_RADIUS_MM);
+        let n = bodies.len();
+        let mut foul: Option<(usize, usize, usize, usize)> = None;
+        for a in 0..n {
+            for b in (a + 1)..n {
+                let (Some((sa, ia)), Some((sb, ib))) = (slots[a], slots[b]) else {
+                    continue;
+                };
+                if sa == sb || !bodies[a].active || !bodies[b].active {
+                    continue;
+                }
+                let delta = bodies[b].pos - bodies[a].pos;
                 let dist = delta.len();
-                if dist < min_sep {
-                    let push_dir = if dist > Fp::from_milli(10) {
-                        delta.normalize_or_zero()
-                    } else {
-                        Vec2::new(Fp::ONE, Fp::ZERO)
-                    };
-                    let overlap = min_sep - dist;
-
-                    // Physical mass + low-center-of-gravity shielding brace (Attack: Pace Control; Defense: Jockey; FC 25 short-term fatigue weakens shielding)
-                    let a_owns = self.state.ball.owner.map(|(s, i)| (s.index(), i)) == Some((sa, ia));
-                    let b_owns = self.state.ball.owner.map(|(s, i)| (s.index(), i)) == Some((sb, ib));
-                    let a_shield = if a_owns {
-                        is_pace_control_bits(
-                            self.state.prev_buttons[sa],
-                            self.state.dual_map_controls[sa],
-                        )
-                    } else {
-                        (self.state.prev_buttons[sa] & BTN_JOCKEY) != 0
-                    };
-                    let b_shield = if b_owns {
-                        is_pace_control_bits(
-                            self.state.prev_buttons[sb],
-                            self.state.dual_map_controls[sb],
-                        )
-                    } else {
-                        (self.state.prev_buttons[sb] & BTN_JOCKEY) != 0
-                    };
-                    let shield_bonus_a = if a_shield {
-                        8 + (self.state.players[sa][ia].stamina_permille as i64 * 8) / 1_000
-                    } else {
-                        0
-                    };
-                    let shield_bonus_b = if b_shield {
-                        8 + (self.state.players[sb][ib].stamina_permille as i64 * 8) / 1_000
-                    } else {
-                        0
-                    };
-                    let mass_a = (68 + (self.state.players[sa][ia].attributes.strength as i64) * 3 / 10)
-                        + shield_bonus_a;
-                    let mass_b = (68 + (self.state.players[sb][ib].attributes.strength as i64) * 3 / 10)
-                        + shield_bonus_b;
-                    let total_mass = (mass_a + mass_b).max(1);
-                    let share_a = Fp::from_ratio(mass_b, total_mass);
-                    let share_b = Fp::from_ratio(mass_a, total_mass);
-
-                    self.state.players[sa][ia].pos -= push_dir.scale(overlap.mul(share_a));
-                    self.state.players[sb][ib].pos += push_dir.scale(overlap.mul(share_b));
-
-                    // EA FC 26 Tangential "Slippery" Collision Separation + EA FC 27 Off-Balance Dribbling:
-                    // Players slide tangentially past each other so they NEVER stick together, and shoulder bumps
-                    // unbalance carrier speed without stripping `ball.owner` or stun-locking input!
-                    let rel_v = self.state.players[sb][ib].vel - self.state.players[sa][ia].vel;
-                    let closing = rel_v.dot(push_dir);
-                    let tangent = Vec2::new(-push_dir.y, push_dir.x);
-                    if sa != sb {
-                        let tang_dot = rel_v.dot(tangent);
-                        let slip_sign = if tang_dot >= Fp::ZERO { Fp::ONE } else { Fp::NEG_ONE };
-                        let slip_step = tangent.scale(slip_sign.mul(Fp::from_milli(320)));
-                        self.state.players[sa][ia].vel -= slip_step.scale(share_a);
-                        self.state.players[sb][ib].vel += slip_step.scale(share_b);
+                if dist >= contact_r {
+                    continue;
+                }
+                let n_ab = if dist > Fp::from_milli(10) { delta.normalize_or_zero() } else { Vec2::new(Fp::ONE, Fp::ZERO) };
+                let closing = -(bodies[b].vel - bodies[a].vel).dot(n_ab);
+                if closing > Fp::from_milli(4_800) {
+                    let min_stam = if self.state.format.players_per_side <= 6 { 580 } else { 150 };
+                    for (s, i) in [(sa, ia), (sb, ib)] {
+                        let p = &mut self.state.players[s][i];
+                        p.stamina_permille = (p.stamina_permille - 2).max(min_stam);
                     }
-                    if closing < Fp::ZERO {
-                        let impulse = (-closing).mul(Fp::from_milli(1_260));
-                        self.state.players[sa][ia].vel -= push_dir.scale(impulse.mul(share_a));
-                        self.state.players[sb][ib].vel += push_dir.scale(impulse.mul(share_b));
-
-                        if sa != sb && closing < Fp::from_milli(-4_800) {
-                            let min_stam = if self.state.format.players_per_side <= 6 { 580 } else { 150 };
-                            self.state.players[sa][ia].stamina_permille =
-                                (self.state.players[sa][ia].stamina_permille - 2).max(min_stam);
-                            self.state.players[sb][ib].stamina_permille =
-                                (self.state.players[sb][ib].stamina_permille - 2).max(min_stam);
-
-                            if a_owns && mass_b - mass_a >= 10 && !a_shield {
-                                let drib_mit = self.state.players[sa][ia].attributes.dribbling / 14;
-                                self.state.push_pull_slow_ticks[sa] =
-                                    self.state.push_pull_slow_ticks[sa].max(14_u8.saturating_sub(drib_mit));
-                            } else if b_owns && mass_a - mass_b >= 10 && !b_shield {
-                                let drib_mit = self.state.players[sb][ib].attributes.dribbling / 14;
-                                self.state.push_pull_slow_ticks[sb] =
-                                    self.state.push_pull_slow_ticks[sb].max(14_u8.saturating_sub(drib_mit));
-                            }
-                        }
+                }
+                let owner = self.state.ball.owner.map(|(os, oi)| (os.index(), oi));
+                let (c, d, ci, di) = if owner == Some((sa, ia)) {
+                    ((sa, ia), (sb, ib), a, b)
+                } else if owner == Some((sb, ib)) {
+                    ((sb, ib), (sa, ia), b, a)
+                } else {
+                    continue;
+                };
+                let carrier = &self.state.players[c.0][c.1];
+                let def = &self.state.players[d.0][d.1];
+                let c_fwd = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
+                let d_to_c = (bodies[ci].pos - bodies[di].pos).normalize_or_zero();
+                let bearing = d_to_c.dot(c_fwd);
+                let c_speed = bodies[ci].vel.len();
+                let d_speed = bodies[di].vel.len();
+                let side_by_side = bearing.abs() < Fp::from_milli(643);
+                let shielding = is_pace_control_bits(self.state.prev_buttons[c.0], self.state.dual_map_controls[c.0]);
+                if side_by_side && c_speed > Fp::from_milli(3_000) && d_speed > Fp::from_milli(3_000) {
+                    let c_str = carrier.attributes.strength as i64
+                        + if shielding { 8 + (carrier.stamina_permille as i64 * 8) / 1_000 } else { 0 };
+                    let d_str = def.attributes.strength as i64;
+                    if d_str - c_str >= 8 {
+                        let drib_mit = carrier.attributes.dribbling / 14;
+                        self.state.push_pull_slow_ticks[c.0] =
+                            self.state.push_pull_slow_ticks[c.0].max(14_u8.saturating_sub(drib_mit));
+                    }
+                } else if bearing > Fp::from_milli(480)
+                    && d_speed > c_speed + Fp::from_milli(1_500)
+                    && closing > Fp::from_milli(2_500)
+                    && bodies[di].stuck_ticks == 0
+                    && foul.is_none()
+                    && d.1 != 0
+                    && matches!(self.state.phase, MatchPhase::OpenPlay)
+                    && self.state.ball.possession_grace_ticks == 0
+                {
+                    let chance = 30_u32.saturating_sub(def.attributes.tackling as u32 / 5);
+                    if self.state.rules.fouls_enabled && self.state.rng.chance_percent(chance) {
+                        foul = Some((d.0, d.1, c.0, c.1));
                     }
                 }
             }
         }
+        if let Some((ds, di, cs, ci)) = foul {
+            let fs = if ds == 0 { TeamSide::Home } else { TeamSide::Away };
+            let vs = if cs == 0 { TeamSide::Home } else { TeamSide::Away };
+            self.handle_foul(fs, di, vs, ci, false, true);
+            return true;
+        }
+        false
     }
 
     fn check_boundaries_and_goals(&mut self) {
@@ -7429,6 +7510,13 @@ pub(crate) fn step_free_ball_kinematics(
 }
 
 #[inline]
+/// Contact outcome gate: the carrier keeps his feet when his Balance (mean of agility and strength;
+/// the attribute set has no Balance stat) beats the challenger's Strength by 10 or more.
+fn carrier_keeps_balance(carrier: &crate::snapshot::PlayerAttributes, challenger: &crate::snapshot::PlayerAttributes) -> bool {
+    let balance = (crate::ai::agility(carrier) + carrier.strength as i64) / 2;
+    balance >= challenger.strength as i64 + 10
+}
+
 fn def_pos_ahead(pos: Vec2, fwd: Vec2, dist_mm: i64) -> Vec2 {
     pos + fwd.scale(Fp::from_milli(dist_mm))
 }

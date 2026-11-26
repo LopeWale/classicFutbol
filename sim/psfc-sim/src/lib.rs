@@ -7,6 +7,7 @@
 //! `56m × 36m` outdoor pitch, parameterized via [`config::MatchFormat`] to expand cleanly to `11v11`.
 
 pub mod ai;
+pub mod avoidance;
 pub mod config;
 pub mod events;
 pub mod input;
