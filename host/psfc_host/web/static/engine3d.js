@@ -2839,7 +2839,22 @@ function createPitchPbrMaps(pitchLen, pitchWid, fmt, maxAnisotropy) {
   ctx.lineTo(pxX(0), pTop + pH);
   ctx.stroke();
 
-  const circleR = (fmt.center_circle_radius_mm || 6000) / 1000;
+  if (pitchLen < 80) {
+    // EA SPORTS FC 25 *5v5 Rush*: dotted Attacking-Third Offside lines at ±1/3 pitch length (±halfL / 3)!
+    ctx.save();
+    ctx.strokeStyle = "rgba(248, 250, 252, 0.74)";
+    ctx.lineWidth = linePx * 0.78;
+    ctx.setLineDash([Math.max(8, linePx * 2.2), Math.max(7, linePx * 2.0)]);
+    for (const offX of [-halfL / 3, halfL / 3]) {
+      ctx.beginPath();
+      ctx.moveTo(pxX(offX), pTop);
+      ctx.lineTo(pxX(offX), pTop + pH);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  const circleR = (fmt.center_circle_radius_mm || 6500) / 1000;
   ctx.beginPath();
   ctx.ellipse(pxX(0), pxZ(0), circleR * scaleX, circleR * scaleZ, 0, 0, Math.PI * 2);
   ctx.stroke();
@@ -2847,9 +2862,9 @@ function createPitchPbrMaps(pitchLen, pitchWid, fmt, maxAnisotropy) {
   ctx.ellipse(pxX(0), pxZ(0), linePx * 1.45, linePx * 1.45, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  const boxD = (fmt.penalty_box_depth_mm || 9000) / 1000;
-  const boxHW = (fmt.penalty_box_width_mm || 18000) / 2000;
-  const goalHW = (fmt.goal_width_mm || 4000) / 2000;
+  const boxD = (fmt.penalty_box_depth_mm || 11500) / 1000;
+  const boxHW = (fmt.penalty_box_width_mm || 26000) / 2000;
+  const goalHW = (fmt.goal_width_mm || 7320) / 2000;
   const sixD = Math.min(boxD * 0.42, 5.5);
   const sixHW = goalHW + (pitchLen > 80 ? 5.5 : 2.2);
 
@@ -6970,10 +6985,15 @@ export class ClassicFifa3DEngine {
     this.goalExcitement = 0;
     this.attractAngle = 0;
     this.prevBallZ = 0;
+    this.inputBasis = { rightX: 1, rightZ: 0, fwdX: 0, fwdZ: -1, basisKey: "rail" };
     this.lastTime = performance.now();
 
     this.resize();
     window.addEventListener("resize", () => this.resize());
+  }
+
+  getInputBasis() {
+    return this.inputBasis;
   }
 
   resize() {
@@ -8040,10 +8060,10 @@ export class ClassicFifa3DEngine {
           0.52,
           ballY - ySign * (is11 ? 5.2 : 4.0),
         ];
-      } else if (phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
-        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg` — taker framed cleanly above radar!)
+      } else if (is11 && phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
+        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg` — 11v11 corners; 5v5 Rush keeps live gameplay camera!)
         setPieceCamKey = 3;
-        const penSpotX = Math.sign(ballX) * (halfL - (is11 ? 11.0 : 6.2));
+        const penSpotX = Math.sign(ballX) * (halfL - 11.0);
         const dx = penSpotX - ballX;
         const dz = -ballY;
         const inv = 1.0 / Math.max(0.1, Math.hypot(dx, dz));
@@ -8059,8 +8079,8 @@ export class ClassicFifa3DEngine {
           Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 5.2 * zScale + pz * 0.95)),
         ];
         targetLook = [ballX + ux * 7.6, 0.55, ballY + uz * 7.6];
-      } else if (phase === 6 || (phase === 5 && distToAttGoal < halfL * 0.92)) {
-        // Authentic Behind-the-Free-Kick / Penalty-Taker Camera (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
+      } else if (phase === 6 || (is11 && phase === 5 && distToAttGoal < halfL * 0.92)) {
+        // Authentic Behind-the-Penalty / 11v11 Direct-FK Camera (in 5v5 Rush, Indirect FKs stay on live gameplay camera!)
         setPieceCamKey = phase;
         const dx = targetGoalX - ballX;
         const dz = -ballY;
@@ -8088,7 +8108,7 @@ export class ClassicFifa3DEngine {
           targetPos = [leadX, heightY, fz * 0.35 + distZ];
           targetLook = [fx * 0.76, 0.55, fz * 0.35 + 0.45];
         } else if (this.cameraMode === "pro") {
-          // Authentic EA FIFA 10–12 "Be A Pro" Behind-the-Runner Horizon Camera (`IMG_0345.jpeg`!),
+          // Authentic EA FIFA "Be A Pro" / Rush End-to-End Behind-the-Runner Horizon Camera,
           // oriented dynamically along `humanAttackSign` across halftime side swaps and P1 Home/Away selection!
           desiredFov = 36;
           const proSide = this.proSide === 1 ? 1 : 0;
@@ -8111,20 +8131,48 @@ export class ClassicFifa3DEngine {
             fz * 0.42,
           ];
         } else if (this.cameraMode === "wide") {
-          // Classic FIFA Co-Op Tactical (full goal-to-goal tactical overview!)
+          // Classic FIFA Co-Op / Rush Tactical (full goal-to-goal tactical overview!)
           desiredFov = 30;
           const heightY = (is11 ? 35.5 : 28.2) * zScale;
           const distZ = (is11 ? 47.5 : 37.8) * zScale;
           targetPos = [leadX * 0.40, heightY, distZ];
           targetLook = [leadX * 0.44, 0.40, 0.55];
         } else {
-          // Authentic EA FIFA 10–12 Tele Broadcast Gantry (`IMG_0350.webp` — pitch fills 92% of screen, crisp diagonal shadows, full box + 3D net in frame!)
+          // Authentic EA FIFA Tele / Rush Broadcast Gantry
           desiredFov = 28.5;
           const heightY = (is11 ? 29.5 : 23.2) * zScale;
           const distZ = (is11 ? 39.5 : 31.2) * zScale;
           targetPos = [leadX * 0.90, heightY, fz * 0.24 + distZ];
           targetLook = [leadX * 0.95, 0.42, fz * 0.26 + 0.85];
         }
+      }
+
+      // Rail-stabilized horizontal camera basis (`sim X = world X`, `sim Y = world Z`) for 360° stick projection!
+      if (setPieceCamKey !== 0) {
+        const bDx = targetLook[0] - targetPos[0];
+        const bDz = targetLook[2] - targetPos[2];
+        const bInv = 1.0 / Math.max(1e-4, Math.hypot(bDx, bDz));
+        const fwdX = bDx * bInv;
+        const fwdZ = bDz * bInv;
+        this.inputBasis = {
+          rightX: -fwdZ,
+          rightZ: fwdX,
+          fwdX,
+          fwdZ,
+          basisKey: `sp:${setPieceCamKey}:${Math.round(fwdX * 10)}:${Math.round(fwdZ * 10)}`,
+        };
+      } else if (this.cameraMode === "pro") {
+        const proSide = this.proSide === 1 ? 1 : 0;
+        const proSign = proSide === 0 ? Math.sign(gk1X - gk0X || 1) : Math.sign(gk0X - gk1X || -1);
+        this.inputBasis = {
+          rightX: 0,
+          rightZ: proSign,
+          fwdX: proSign,
+          fwdZ: 0,
+          basisKey: `pro:${proSign}`,
+        };
+      } else {
+        this.inputBasis = { rightX: 1, rightZ: 0, fwdX: 0, fwdZ: -1, basisKey: "rail" };
       }
     }
 

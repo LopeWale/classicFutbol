@@ -99,13 +99,13 @@ def match_format_preset(format_name: str = "5v5") -> dict[str, Any]:
     return {
         "name": "5v5",
         "players_per_side": 5,
-        "pitch_length_mm": 56_000,
-        "pitch_width_mm": 36_000,
-        "goal_width_mm": 4_000,
-        "goal_height_mm": 2_100,
-        "penalty_box_depth_mm": 9_000,
-        "penalty_box_width_mm": 18_000,
-        "center_circle_radius_mm": 5_500,
+        "pitch_length_mm": 63_700,
+        "pitch_width_mm": 46_600,
+        "goal_width_mm": 7_320,
+        "goal_height_mm": 2_440,
+        "penalty_box_depth_mm": 11_500,
+        "penalty_box_width_mm": 26_000,
+        "center_circle_radius_mm": 6_500,
     }
 
 
@@ -119,7 +119,7 @@ def default_ruleset(
     is_11 = format_name == "11v11"
     return {
         "half_duration_ticks": half_duration_ticks or (14_400 if is_11 else 7_200),
-        "offsides_enabled": is_11,
+        "offsides_enabled": True,
         "fouls_enabled": True,
         "extra_time_enabled": extra_time_enabled,
         "home_controller": home_controller or {"kind": "Human"},

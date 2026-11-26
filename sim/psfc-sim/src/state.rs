@@ -41,6 +41,10 @@ pub enum PlayerActionState {
     },
 }
 
+const fn default_contain_stamina() -> u8 {
+    100
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlayerState {
     pub team: TeamSide,
@@ -68,6 +72,18 @@ pub struct PlayerState {
     /// Visual kick category (`1=Pass, 2=Through, 3=Lob, 4=Shot, 5=Chip`) during `recent_kick_ticks`.
     #[serde(default)]
     pub recent_kick_kind: u8,
+    /// FIFA 22 Teammate Contain (`RB / R1`) stamina pool (`0..=100`).
+    #[serde(default = "default_contain_stamina")]
+    pub contain_stamina: u8,
+    /// FIFA 22 Teammate Contain cooldown ticks (`0..=150`) after contain stamina depletes.
+    #[serde(default)]
+    pub contain_cooldown: u8,
+    /// FIFA 21 chained skill-move counter (`> 3` chained moves within decay window triggers heavy-touch error).
+    #[serde(default)]
+    pub skill_chain_count: u8,
+    /// Decay timer (`0..=180` ticks) resetting `skill_chain_count` once dribbler settles.
+    #[serde(default)]
+    pub skill_chain_decay_ticks: u8,
     pub yellow_cards: u8,
     pub sent_off: bool,
 }
@@ -92,7 +108,7 @@ impl PlayerState {
     #[inline]
     pub fn charge_ratio_permille(&self) -> u16 {
         match self.action {
-            PlayerActionState::Charging { ticks, .. } => ((ticks as u32 * 1000) / 28).min(1000) as u16,
+            PlayerActionState::Charging { ticks, .. } => ((ticks as u32 * 1000) / 22).min(1000) as u16,
             _ => 0,
         }
     }
@@ -187,6 +203,18 @@ pub struct BallState {
     /// Shooter credited with a tentative on-target shot so outfield blocks or woodwork misses roll it back accurately.
     #[serde(default)]
     pub pending_shot_on_target: Option<(TeamSide, String)>,
+    /// Post-kick re-touch lockout `(TeamSide, player_index, ticks_left)` preventing self-pass traps and Goal-Kick double-touch fouls until another player or woodwork touches the ball.
+    #[serde(default)]
+    pub kicker_lockout: Option<(TeamSide, usize, u8)>,
+    /// EA FC 26 anti-tackleback grace window (`0..=12` ticks) protecting a newly won tackle from immediate passive re-dispossession.
+    #[serde(default)]
+    pub possession_grace_ticks: u8,
+    /// Exact 60 Hz tick when the active shot was struck (for EA SEED human-like GK reaction latency).
+    #[serde(default)]
+    pub shot_launched_tick: u32,
+    /// Pitch coordinates `(x, y)` where the active shot was struck (for FIFA 23 GK Line-of-Sight screening checks).
+    #[serde(default)]
+    pub shot_origin: Vec2,
     pub pass_in_flight: Option<PassInFlight>,
     pub assist_candidate: Option<AssistCandidate>,
 }
@@ -273,7 +301,10 @@ pub struct BufferedAction {
     pub button: u16,
     pub aim: Vec2,
     pub finesse: bool,
-    /// Accumulated charge ticks (`1..=28`) recorded while holding the kick button pre-contact.
+    /// EA FC 26 Low Driven modifier (`double-tap BTN_SHOOT` before foot contact).
+    #[serde(default)]
+    pub low_driven: bool,
+    /// Accumulated charge ticks (`1..=22`) recorded while holding the kick button pre-contact.
     #[serde(default)]
     pub charge_ticks: u16,
     /// True while the player is still holding the kick button down pre-contact.
@@ -285,7 +316,7 @@ pub struct BufferedAction {
 impl BufferedAction {
     #[inline]
     pub fn charge_ratio_permille(&self) -> u16 {
-        ((self.charge_ticks as u32 * 1000) / 28).min(1000) as u16
+        ((self.charge_ticks as u32 * 1000) / 22).min(1000) as u16
     }
 }
 
@@ -440,7 +471,7 @@ impl MatchState {
                 let us_ticks = self.fastest_outfield_intercept_ticks(side);
                 let opp_ticks = self.fastest_outfield_intercept_ticks(side.opponent());
                 if own_pass_in_flight {
-                    return us_ticks <= opp_ticks + 18;
+                    return us_ticks <= opp_ticks + 2;
                 }
                 us_ticks + 2 <= opp_ticks
             }
@@ -584,6 +615,7 @@ impl MatchState {
                     h.i64(buf.aim.x.raw());
                     h.i64(buf.aim.y.raw());
                     h.u8(u8::from(buf.finesse));
+                    h.u8(u8::from(buf.low_driven));
                     h.u16(buf.charge_ticks);
                     h.u8(u8::from(buf.charging));
                     h.u8(buf.ttl_ticks);
@@ -658,6 +690,19 @@ impl MatchState {
         }
         h.u16(self.ball.gk_hold_ticks);
         h.u8(self.ball.dribble_touch_cd);
+        match self.ball.kicker_lockout {
+            Some((ts, idx, left)) => {
+                h.u8(1);
+                h.u8(ts.index() as u8);
+                h.u32(idx as u32);
+                h.u8(left);
+            }
+            None => h.u8(0),
+        }
+        h.u8(self.ball.possession_grace_ticks);
+        h.u32(self.ball.shot_launched_tick);
+        h.i64(self.ball.shot_origin.x.raw());
+        h.i64(self.ball.shot_origin.y.raw());
         match self.ball.last_touch_team {
             Some(ts) => {
                 h.u8(1);
@@ -753,6 +798,10 @@ impl MatchState {
                 h.u16(p.run_boost_ticks);
                 h.u8(p.recent_kick_ticks);
                 h.u8(p.recent_kick_kind);
+                h.u8(p.contain_stamina);
+                h.u8(p.contain_cooldown);
+                h.u8(p.skill_chain_count);
+                h.u8(p.skill_chain_decay_ticks);
                 h.u8(p.yellow_cards);
                 h.u8(u8::from(p.sent_off));
                 match p.action {

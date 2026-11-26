@@ -19,14 +19,14 @@ pub struct AiMoveIntent {
     pub trigger_dive: Option<(Vec2, i64)>,
 }
 
-/// Computes exact desired charge ticks (`1..=28`) matching `execute_kick`'s `pref_dist` curve
+/// Computes exact desired charge ticks (`1..=22`) matching `execute_kick`'s `pref_dist` curve
 /// so CPU passes/lobs arrive crisp at the intended teammate instead of falling short.
 pub fn desired_pass_charge_ticks(dist: Fp, is_5v5: bool, is_lob: bool) -> u8 {
     let base_mm = if is_5v5 { 3_800 } else { 4_500 };
-    let span_mm = if is_5v5 { 20_500 } else { 28_500 };
-    let raw = (((dist.to_milli() - base_mm).max(0) * 28) / span_mm).clamp(5, 25) as u8;
+    let span_mm = if is_5v5 { 22_500 } else { 28_500 };
+    let raw = (((dist.to_milli() - base_mm).max(0) * 22) / span_mm).clamp(4, 20) as u8;
     if is_lob {
-        raw.clamp(11, 24)
+        raw.clamp(9, 19)
     } else {
         raw
     }
@@ -75,7 +75,9 @@ pub fn predict_ball_xy_at_ticks(state: &MatchState, ticks_ahead: u32) -> Vec2 {
     predict_ball_3d_at_ticks(state, ticks_ahead).xy()
 }
 
-/// Computes goalkeeper movement, angle-bisector arc, 1v1 rush, high-cross command & 3D shot-stopping dive intent.
+/// EA SEED (`arXiv:2510.23216v4`) Two-Stage Goalkeeper Architecture:
+/// - Stage 1: Continuous Angle-Bisector Positioning + EA FC 25 *GK Rush to Contain* (`1.45m` stand-off; jump on ball only when loose).
+/// - Stage 2: Human-Like Save Execution gated by `GK Reflexes` reaction latency + *FIFA 23 GK Line of Sight* screen occlusion.
 pub fn compute_goalkeeper_intent(
     state: &MatchState,
     side: TeamSide,
@@ -97,8 +99,8 @@ pub fn compute_goalkeeper_intent(
     if state.ball.owner == Some((side, 0)) {
         let (_, _, safe_aim) = choose_safe_gk_distribution(state, side);
         let target = Vec2::new(
-            own_goal_x + into_pitch_sign.mul(Fp::from_milli(if is_5v5 { 3_400 } else { 4_600 })),
-            safe_aim.y.mul(Fp::from_milli(1_400)).clamp(-goal_half_w, goal_half_w),
+            own_goal_x + into_pitch_sign.mul(Fp::from_milli(if is_5v5 { 3_800 } else { 4_600 })),
+            safe_aim.y.mul(Fp::from_milli(1_600)).clamp(-goal_half_w, goal_half_w),
         );
         let delta = target - p.pos;
         if delta.len() > Fp::from_milli(320) {
@@ -127,12 +129,12 @@ pub fn compute_goalkeeper_intent(
     {
         if team != side {
             let y_bias = if spot.y >= Fp::ZERO {
-                Fp::from_milli(360)
+                Fp::from_milli(420)
             } else {
-                Fp::from_milli(-360)
+                Fp::from_milli(-420)
             };
             let ck_target = Vec2::new(
-                own_goal_x + into_pitch_sign.mul(Fp::from_milli(if is_5v5 { 1_300 } else { 1_650 })),
+                own_goal_x + into_pitch_sign.mul(Fp::from_milli(if is_5v5 { 1_450 } else { 1_650 })),
                 y_bias,
             );
             let d = ck_target - p.pos;
@@ -152,14 +154,14 @@ pub fn compute_goalkeeper_intent(
     let ball_xy = state.ball.pos.xy();
     let ball_vel_xy = state.ball.vel.xy();
 
-    // Check incoming shot threat toward own goal using exact 3D trajectory rollout!
+    // --- STAGE 2: EA SEED SHOT-STOPPING SAVE EXECUTION + FIFA 23 GK LINE OF SIGHT ---
     let vel_toward_goal = if attack_sign > 0 {
         -ball_vel_xy.x
     } else {
         ball_vel_xy.x
     };
     let dist_ball_to_goal_x = (ball_xy.x - own_goal_x).abs();
-    let max_shot_react_dist = Fp::from_milli(if is_5v5 { 24_500 } else { 31_000 });
+    let max_shot_react_dist = Fp::from_milli(if is_5v5 { 26_500 } else { 31_000 });
 
     if state.ball.owner.is_none()
         && matches!(p.action, PlayerActionState::Normal)
@@ -167,26 +169,68 @@ pub fn compute_goalkeeper_intent(
         && dist_ball_to_goal_x < max_shot_react_dist
         && dist_ball_to_goal_x > Fp::from_milli(220)
     {
+        let gk_skill = p.attributes.goalkeeping as i64;
+        // Human GK neuromuscular reflex latency (~133ms elite .. ~200ms standard) + FIFA 23 Line-of-Sight screen penalty (+50ms)
+        let base_react = (13 - gk_skill / 20).clamp(7, 12) as u32;
+        let mut screened = false;
+        if state.ball.shot_launched_tick > 0 {
+            let ray = p.pos - state.ball.shot_origin;
+            let ray_len = ray.len();
+            if ray_len > Fp::from_milli(1_500) {
+                let ray_dir = ray.normalize_or_zero();
+                for (t_i, team_arr) in state.players.iter().enumerate() {
+                    for (p_i, other) in team_arr.iter().enumerate() {
+                        if other.sent_off || (t_i == side.index() && p_i == 0) {
+                            continue;
+                        }
+                        let rel = other.pos - state.ball.shot_origin;
+                        let along = rel.dot(ray_dir);
+                        if along > Fp::from_milli(700) && along < ray_len - Fp::from_milli(700) {
+                            let perp = (rel - ray_dir.scale(along)).len();
+                            if perp <= Fp::from_milli(850) {
+                                screened = true;
+                                break;
+                            }
+                        }
+                    }
+                    if screened {
+                        break;
+                    }
+                }
+            }
+        }
+        let react_ticks = base_react + if screened { 3 } else { 0 };
+        if state.ball.shot_launched_tick > 0
+            && state.tick.saturating_sub(state.ball.shot_launched_tick) < react_ticks
+        {
+            // Still inside human reflex latency window: hold balanced pre-shot set stance!
+            return AiMoveIntent {
+                move_dir: Vec2::ZERO,
+                sprint: false,
+                jockey: true,
+                trigger_dive: None,
+            };
+        }
+
         let dist_to_gk_x = (ball_xy.x - p.pos.x).abs();
         let t_to_gk = dist_to_gk_x.div(vel_toward_goal);
         let pred_ticks = ((t_to_gk.to_milli() * 60 + 500) / 1_000).clamp(1, 60) as u32;
         let proj_3d = predict_ball_3d_at_ticks(state, pred_ticks);
         let projected_y = proj_3d.y;
         let projected_z = proj_3d.z.max(Fp::ZERO);
-        let max_guard_y = goal_half_w + Fp::from_milli(1_050);
+        let max_guard_y = goal_half_w + Fp::from_milli(950);
 
         if projected_y.abs() <= max_guard_y {
             let lateral_gap = projected_y - p.pos.y;
-            let gk_skill = p.attributes.goalkeeping as i64;
-            let dive_reach = Fp::from_milli(1_650 + gk_skill * 12);
+            let dive_reach = Fp::from_milli(1_850 + gk_skill * 12);
             let close_enough_in_time =
-                t_to_gk <= Fp::from_milli(460) || dist_to_gk_x <= Fp::from_milli(9_800);
+                t_to_gk <= Fp::from_milli(440) || dist_to_gk_x <= Fp::from_milli(9_500);
             if close_enough_in_time
-                && lateral_gap.abs() > Fp::from_milli(460)
+                && lateral_gap.abs() > Fp::from_milli(480)
                 && lateral_gap.abs() <= dive_reach
             {
                 let dive_dir = Vec2::new(
-                    into_pitch_sign.mul(Fp::from_milli(190)),
+                    into_pitch_sign.mul(Fp::from_milli(180)),
                     Fp::from_int(lateral_gap.signum_int()),
                 )
                 .normalize_or_zero();
@@ -202,11 +246,11 @@ pub fn compute_goalkeeper_intent(
                     jockey: false,
                     trigger_dive: Some((dive_dir, dive_vz_mm)),
                 };
-            } else {
+            } else if lateral_gap.abs() <= dive_reach + Fp::from_milli(650) {
                 let intercept = Vec2::new(p.pos.x, projected_y.clamp(-goal_half_w, goal_half_w));
                 return AiMoveIntent {
                     move_dir: (intercept - p.pos).normalize_or_zero(),
-                    sprint: true,
+                    sprint: lateral_gap.abs() > Fp::from_milli(900),
                     jockey: true,
                     trigger_dive: None,
                 };
@@ -215,7 +259,7 @@ pub fn compute_goalkeeper_intent(
     }
 
     // High Aerial Cross / Corner Command Zone: step out to pluck/punch high balls in the 6-yard area!
-    let cross_cmd_depth = Fp::from_milli(if is_5v5 { 5_800 } else { 7_600 });
+    let cross_cmd_depth = Fp::from_milli(if is_5v5 { 6_200 } else { 7_600 });
     if state.ball.owner.is_none()
         && matches!(state.phase, MatchPhase::OpenPlay)
         && state.ball.pos.z > Fp::from_milli(1_200)
@@ -241,15 +285,15 @@ pub fn compute_goalkeeper_intent(
         };
     }
 
-    // Rush out on loose ball inside box, explicit human GK rush, OR automatic 1v1 breakaway angle-narrowing!
+    // --- STAGE 1: CONTINUOUS POSITIONING & EA FC 25 *GK RUSH TO CONTAIN* ---
     let ball_in_own_box = dist_ball_to_goal_x <= box_depth && ball_xy.y.abs() <= box_half_w;
-    let close_loose_ball = state.ball.owner.is_none()
-        && ball_in_own_box
-        && p.pos.dist(ball_xy) < Fp::from_milli(7_200);
-
-    if (close_loose_ball || (human_gk_rush && dist_ball_to_goal_x < box_depth + Fp::from_milli(4_500)))
+    // Jump directly onto the ball ONLY when it is loose from the attacker's feet!
+    let rush_loose_ball = state.ball.owner.is_none()
         && matches!(state.phase, MatchPhase::OpenPlay)
-    {
+        && ((ball_in_own_box && p.pos.dist(ball_xy) < Fp::from_milli(7_200))
+            || (human_gk_rush && dist_ball_to_goal_x < box_depth + Fp::from_milli(4_500)));
+
+    if rush_loose_ball {
         return AiMoveIntent {
             move_dir: (ball_xy - p.pos).normalize_or_zero(),
             sprint: true,
@@ -258,66 +302,83 @@ pub fn compute_goalkeeper_intent(
         };
     }
 
-    // Automatic 1v1 Breakaway Containment: step off the line along goal-to-ball ray to cut shooting angle!
-    let goal_center = Vec2::new(own_goal_x, Fp::ZERO);
-    if matches!(state.phase, MatchPhase::OpenPlay)
-        && state.ball.owner.map(|(s, _)| s) == Some(side.opponent())
-        && ball_in_own_box
-        && dist_ball_to_goal_x >= Fp::from_milli(2_200)
-    {
-        let mut defender_covering = false;
-        for mate in state.players[side.index()].iter().skip(1) {
-            if mate.sent_off {
-                continue;
+    // True Post-to-Post Angle-Bisector Anchor on the Goal Line (`own_goal_x, bisect_goal_y`)
+    let post_neg = Vec2::new(own_goal_x, -goal_half_w);
+    let post_pos = Vec2::new(own_goal_x, goal_half_w);
+    let d_neg = ball_xy.dist(post_neg);
+    let d_pos = ball_xy.dist(post_pos);
+    let d_sum = (d_neg + d_pos).max(Fp::ONE);
+    let bisect_goal_y = goal_half_w
+        .mul(d_neg - d_pos)
+        .div(d_sum)
+        .clamp(-(goal_half_w - Fp::from_milli(250)), goal_half_w - Fp::from_milli(250));
+    let bisect_anchor = Vec2::new(own_goal_x, bisect_goal_y);
+
+    // EA FC 25 *GK Rush to Contain*: when opponent controls the ball on a 1v1 (or human holds Y/Triangle GK Rush),
+    // steal ground along the angle bisector and hold a balanced `1.45m` contain stand-off instead of running past the ball!
+    let opp_owns_ball = state.ball.owner.map(|(s, _)| s) == Some(side.opponent());
+    if matches!(state.phase, MatchPhase::OpenPlay) && opp_owns_ball {
+        let mut trigger_contain_rush =
+            human_gk_rush && dist_ball_to_goal_x < box_depth + Fp::from_milli(5_500);
+        if !trigger_contain_rush && ball_in_own_box && dist_ball_to_goal_x >= Fp::from_milli(2_000) {
+            let mut defender_covering = false;
+            for mate in state.players[side.index()].iter().skip(1) {
+                if mate.sent_off {
+                    continue;
+                }
+                let d_carrier = mate.pos.dist(ball_xy);
+                let goal_side = (mate.pos.x - ball_xy.x).mul(Fp::from_int(-attack_sign as i32))
+                    > Fp::from_milli(-400);
+                if d_carrier <= Fp::from_milli(2_650) && goal_side {
+                    defender_covering = true;
+                    break;
+                }
             }
-            let d_carrier = mate.pos.dist(ball_xy);
-            let goal_side = (mate.pos.x - ball_xy.x).mul(Fp::from_int(-attack_sign as i32))
-                > Fp::from_milli(-400);
-            if d_carrier <= Fp::from_milli(2_650) && goal_side {
-                defender_covering = true;
-                break;
-            }
+            trigger_contain_rush = !defender_covering;
         }
-        if !defender_covering {
-            let to_ball = ball_xy - goal_center;
-            let dist_gb = to_ball.len().max(Fp::ONE);
-            let rush_r = (dist_gb.mul(Fp::from_milli(520))).clamp(
-                Fp::from_milli(1_600),
-                (dist_gb - Fp::from_milli(1_150)).max(Fp::from_milli(1_600)),
-            );
-            let contain_pt = goal_center + to_ball.normalize_or_zero().scale(rush_r);
+
+        if trigger_contain_rush {
+            let to_ball = ball_xy - bisect_anchor;
+            let dist_ab = to_ball.len().max(Fp::ONE);
+            let max_step = (dist_ab - Fp::from_milli(1_450)).max(Fp::from_milli(1_100));
+            let rush_r = if human_gk_rush {
+                max_step
+            } else {
+                (dist_ab.mul(Fp::from_milli(580))).clamp(Fp::from_milli(1_550), max_step)
+            };
+            let contain_pt = bisect_anchor + to_ball.normalize_or_zero().scale(rush_r);
             let delta = contain_pt - p.pos;
             return AiMoveIntent {
-                move_dir: if delta.len() > Fp::from_milli(200) {
+                move_dir: if delta.len() > Fp::from_milli(180) {
                     delta.normalize_or_zero()
                 } else {
                     Vec2::ZERO
                 },
-                sprint: delta.len() > Fp::from_milli(1_100),
-                jockey: delta.len() <= Fp::from_milli(1_400),
+                sprint: delta.len() > Fp::from_milli(1_150),
+                jockey: delta.len() <= Fp::from_milli(1_800),
                 trigger_dive: None,
             };
         }
     }
 
-    // True Angle-Bisector Arc Positioning between `(own_goal_x, 0)` and `ball_xy`!
-    let to_ball = ball_xy - goal_center;
-    let dist_gb = to_ball.len().max(Fp::ONE);
-    let dir_gb = to_ball.normalize_or_zero();
-    let max_arc_r_mm = if is_5v5 { 3_250 } else { 4_250 };
-    let min_arc_r_mm = if is_5v5 { 1_280 } else { 1_450 };
+    // Standard Continuous Angle-Bisector Arc Positioning across the 7.32m regulation goal!
+    let to_ball = ball_xy - bisect_anchor;
+    let dist_ab = to_ball.len().max(Fp::ONE);
+    let dir_ab = to_ball.normalize_or_zero();
+    let max_arc_r_mm = if is_5v5 { 3_800 } else { 4_250 };
+    let min_arc_r_mm = if is_5v5 { 1_380 } else { 1_450 };
     let scaled_r_mm = min_arc_r_mm
-        + ((dist_gb.to_milli().clamp(4_000, 34_000) - 4_000) * (max_arc_r_mm - min_arc_r_mm))
+        + ((dist_ab.to_milli().clamp(4_000, 34_000) - 4_000) * (max_arc_r_mm - min_arc_r_mm))
             / 30_000;
-    let raw_arc = goal_center + dir_gb.scale(Fp::from_milli(scaled_r_mm));
+    let raw_arc = bisect_anchor + dir_ab.scale(Fp::from_milli(scaled_r_mm));
 
-    let min_line_clear = Fp::from_milli(if is_5v5 { 820 } else { 950 });
+    let min_line_clear = Fp::from_milli(if is_5v5 { 880 } else { 950 });
     let target_x = if attack_sign > 0 {
         raw_arc.x.max(own_goal_x + min_line_clear)
     } else {
         raw_arc.x.min(own_goal_x - min_line_clear)
     };
-    let max_y = (goal_half_w - Fp::from_milli(180)).max(Fp::from_milli(850));
+    let max_y = (goal_half_w - Fp::from_milli(220)).max(Fp::from_milli(850));
     let target_y = raw_arc.y.clamp(-max_y, max_y);
     let target = Vec2::new(target_x, target_y);
 
@@ -333,8 +394,8 @@ pub fn compute_goalkeeper_intent(
     } else {
         AiMoveIntent {
             move_dir: delta.normalize_or_zero(),
-            sprint: dist > Fp::from_milli(1_450),
-            jockey: dist < Fp::from_milli(1_150),
+            sprint: dist > Fp::from_milli(1_550),
+            jockey: dist < Fp::from_milli(1_250),
             trigger_dive: None,
         }
     }
@@ -380,7 +441,7 @@ pub fn choose_safe_gk_distribution(state: &MatchState, side: TeamSide) -> (u16, 
         }
 
         let fwd_gain = (mate.pos.x - gk_pos.x).mul(Fp::from_int(attack_sign as i32));
-        let short_max = Fp::from_milli(if is_5v5 { 24_000 } else { 32_000 });
+        let short_max = Fp::from_milli(if is_5v5 { 26_000 } else { 32_000 });
         if dist <= short_max
             && lane_clear >= Fp::from_milli(2_400)
             && opp_clear >= Fp::from_milli(3_100)
@@ -402,12 +463,12 @@ pub fn choose_safe_gk_distribution(state: &MatchState, side: TeamSide) -> (u16, 
 
     if let Some((dir, dist, _)) = best_short {
         let charge = desired_pass_charge_ticks(dist, is_5v5, false) as u16;
-        return (BTN_PASS, charge.clamp(7, 22), dir);
+        return (BTN_PASS, charge.clamp(6, 18), dir);
     }
 
     if let Some((dir, dist, _)) = best_long {
         let charge = desired_pass_charge_ticks(dist, is_5v5, true) as u16;
-        return (BTN_LOB, charge.clamp(14, 24), dir);
+        return (BTN_LOB, charge.clamp(11, 19), dir);
     }
 
     let flank_y = if gk_pos.y >= Fp::ZERO {
@@ -417,7 +478,7 @@ pub fn choose_safe_gk_distribution(state: &MatchState, side: TeamSide) -> (u16, 
     };
     (
         BTN_LOB,
-        18,
+        14,
         Vec2::new(forward_vec.x, flank_y).normalize_or_zero(),
     )
 }
@@ -762,7 +823,8 @@ pub fn compute_outfield_ai_intent(
         };
     }
 
-    // 2b. FIFA 12 Teammate Contain / Second-Man Press (`RB / R1` held by human on defense)
+    // 2b. FIFA 22 / EA FC 27 Teammate Contain (`RB / R1` held by human on defense):
+    //     Conservative `1.48m` contain gap in Tactical mode so user must switch & time manual Stand Tackle!
     if state.teammate_contain_idx[side.index()] == Some(idx)
         && state.ball.owner.map(|(s, _)| s) != Some(side)
     {
@@ -770,7 +832,7 @@ pub fn compute_outfield_ai_intent(
         let pred_ball = predict_ball_xy_at_ticks(state, 5);
         let is_legacy = state.control_settings[side.index()].defending_mode
             == crate::input::DefendingMode::Legacy;
-        let hold_gap = Fp::from_milli(if is_legacy { 650 } else { 1_250 });
+        let hold_gap = Fp::from_milli(if is_legacy { 650 } else { 1_480 });
         let contain_pt = pred_ball + (own_goal - pred_ball).normalize_or_zero().scale(hold_gap);
         let delta = contain_pt - p.pos;
         let dist = delta.len();
@@ -829,96 +891,171 @@ pub fn compute_outfield_ai_intent(
         .div(half_len)
         .clamp(Fp::NEG_ONE, Fp::ONE);
 
-    // --- Tier 1 Defensive Target: Compact Zonal Block + 1 Primary Presser + Goal-Side Man-Marking / Lane Shadow ---
+    // --- Without-Ball FC IQ Defensive Shape + EA FC 25/26 *Inside-Box Cutback Zone Marking* ---
     let def_shift = ball_attack_norm.mul(Fp::from_milli(340)) - Fp::from_milli(175);
     let mut def_target = dynamically_assigned_anchor(state, side, idx, def_shift);
-    def_target.y = def_target.y.lerp(ball_xy.y, Fp::from_milli(310));
-    let own_goal = Vec2::new(Fp::from_milli(-attack_sign * half_len.to_milli()), Fp::ZERO);
+    def_target.y = def_target.y.lerp(ball_xy.y, Fp::from_milli(280));
+    let own_goal_x = Fp::from_milli(-attack_sign * half_len.to_milli());
+    let own_goal = Vec2::new(own_goal_x, Fp::ZERO);
+    let goal_half_w = state.format.goal_half_width();
     let my_dist = p.pos.dist(ball_xy);
 
+    let opp_wide_cutback_threat = state.ball.owner.is_some_and(|(os, _)| os != side)
+        && (ball_xy.x - own_goal_x).abs() <= Fp::from_milli(if is_5v5 { 13_500 } else { 18_000 })
+        && ball_xy.y.abs() > goal_half_w + Fp::from_milli(1_600);
+
     if signed_bal < 150 && designated_ai_presser_idx(state, side) == Some(idx) {
-        // Strictly ONE AI presser steps up to contain goal-side!
+        // Strictly ONE AI presser shadows goal-side at a disciplined contain gap (`1.55m`) without auto-tackling!
         let goal_side_offset = (own_goal - ball_xy)
             .normalize_or_zero()
-            .scale(Fp::from_milli(1_500));
+            .scale(Fp::from_milli(1_550));
         def_target = ball_xy + goal_side_offset;
     } else if signed_bal < 200 {
-        // Remaining defenders mark nearest dangerous off-ball attacker in their zone & shadow passing lane!
-        let opp_carrier = state.ball.owner.and_then(|(os, oi)| {
-            if os != side {
-                Some(oi)
-            } else {
-                None
+        let opp_carrier = state.ball.owner.and_then(|(os, oi)| (os != side).then_some(oi));
+        if opp_wide_cutback_threat {
+            // EA FC 25/26 *Inside-Box Cutback Zone Marking* & *Defensive Awareness When Beat*:
+            // Do NOT swarm the byline carrier — drop centrally into the penalty-spot cutback lane and mark box receivers!
+            let cutback_hub = Vec2::new(
+                own_goal_x + Fp::from_milli(attack_sign * (if is_5v5 { 5_800 } else { 7_800 })),
+                ball_xy.y.mul(Fp::from_milli(220)),
+            );
+            let mut cutback_mark: Option<Vec2> = None;
+            let mut best_d = Fp::from_milli(11_000);
+            for (o_idx, opp) in state.players[side.opponent().index()].iter().enumerate().skip(1) {
+                if Some(o_idx) == opp_carrier || opp.sent_off {
+                    continue;
+                }
+                if (opp.pos.x - own_goal_x).abs() <= Fp::from_milli(15_000)
+                    && opp.pos.y.abs() <= state.format.penalty_box_half_width()
+                {
+                    let d = p.pos.dist(opp.pos);
+                    if d < best_d {
+                        best_d = d;
+                        let pass_lane = (ball_xy - opp.pos).normalize_or_zero();
+                        let goal_side = (own_goal - opp.pos).normalize_or_zero();
+                        let intercept_shade = (pass_lane.scale(Fp::from_milli(580))
+                            + goal_side.scale(Fp::from_milli(420)))
+                        .normalize_or_zero();
+                        cutback_mark = Some(opp.pos + intercept_shade.scale(Fp::from_milli(1_100)));
+                    }
+                }
             }
-        });
-        let mut mark_target: Option<Vec2> = None;
-        let mut best_mark_d = Fp::from_milli(if is_5v5 { 6_800 } else { 8_500 });
-        for (o_idx, opp) in state.players[side.opponent().index()].iter().enumerate().skip(1) {
-            if Some(o_idx) == opp_carrier || opp.sent_off {
-                continue;
+            def_target = cutback_mark.unwrap_or(cutback_hub);
+        } else {
+            let mut mark_target: Option<Vec2> = None;
+            let mut best_mark_d = Fp::from_milli(if is_5v5 { 8_200 } else { 8_500 });
+            for (o_idx, opp) in state.players[side.opponent().index()].iter().enumerate().skip(1) {
+                if Some(o_idx) == opp_carrier || opp.sent_off {
+                    continue;
+                }
+                if opp.pos.x.mul(Fp::from_int(attack_sign as i32)) > half_len.mul(Fp::from_milli(260)) {
+                    continue;
+                }
+                let d_zone = def_target.dist(opp.pos);
+                if d_zone < best_mark_d {
+                    best_mark_d = d_zone;
+                    let to_goal = (own_goal - opp.pos).normalize_or_zero();
+                    let to_ball = (ball_xy - opp.pos).normalize_or_zero();
+                    let shadow_dir = (to_goal.scale(Fp::from_milli(650))
+                        + to_ball.scale(Fp::from_milli(350)))
+                    .normalize_or_zero();
+                    mark_target = Some(opp.pos + shadow_dir.scale(Fp::from_milli(1_350)));
+                }
             }
-            // Only mark attackers in dangerous territory (our half or central progression)
-            if opp.pos.x.mul(Fp::from_int(attack_sign as i32)) > half_len.mul(Fp::from_milli(220)) {
-                continue;
+            if let Some(mt) = mark_target {
+                def_target = def_target.lerp(mt, Fp::from_milli(560));
             }
-            let d_zone = def_target.dist(opp.pos);
-            if d_zone < best_mark_d {
-                best_mark_d = d_zone;
-                let to_goal = (own_goal - opp.pos).normalize_or_zero();
-                let to_ball = (ball_xy - opp.pos).normalize_or_zero();
-                let shadow_dir = (to_goal.scale(Fp::from_milli(650))
-                    + to_ball.scale(Fp::from_milli(350)))
-                .normalize_or_zero();
-                mark_target = Some(opp.pos + shadow_dir.scale(Fp::from_milli(1_350)));
-            }
-        }
-        if let Some(mt) = mark_target {
-            def_target = def_target.lerp(mt, Fp::from_milli(520));
         }
     }
 
-    // --- Tier 1 Attacking Target: Dynamic Slot + Triangle Support + Shadow-Evading Pocket + Onside Runs ---
+    // --- With-Ball FC IQ Role Activity Maps + 5v5 Rush Fluid Positioning & Curved Spatial Runs ---
     let att_shift = if is_5v5 {
-        ball_attack_norm.mul(Fp::from_milli(460)) + Fp::from_milli(210)
+        ball_attack_norm.mul(Fp::from_milli(470)) + Fp::from_milli(220)
     } else {
         ball_attack_norm.mul(Fp::from_milli(440)) + Fp::from_milli(200)
     };
     let mut att_target = dynamically_assigned_anchor(state, side, idx, att_shift);
     let lateral_pull = if is_5v5 {
-        Fp::from_milli(210)
+        Fp::from_milli(180)
     } else {
         Fp::from_milli(240)
     };
     att_target.y = att_target.y.lerp(ball_xy.y, lateral_pull);
 
-    // Designated short-support triangle player checks to an open 8.5–12.5m angle from the ball carrier!
+    // In 5v5 Rush, keep the deepest non-carrier outfielder as a fluid Rest-Defense Pivot/Fixo behind the ball,
+    // while pulling an off-ball attacker into vacated central cutback box space (*EA FC 26 Role Flexibility*)!
+    if is_5v5 && signed_bal > 80 {
+        let carrier_opt = state.ball.owner.and_then(|(os, oi)| (os == side).then_some(oi));
+        let mut deepest_idx: Option<usize> = None;
+        let mut min_prog = i64::MAX;
+        let mut central_box_occupied = false;
+        let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
+        for (m_i, mate) in state.players[side.index()].iter().enumerate().skip(1) {
+            if Some(m_i) == carrier_opt || mate.sent_off {
+                continue;
+            }
+            let mp = mate.pos.x.to_milli() * attack_sign;
+            if mp < min_prog {
+                min_prog = mp;
+                deepest_idx = Some(m_i);
+            }
+            if m_i != idx
+                && (mate.pos.x - opp_goal_x).abs() <= Fp::from_milli(11_500)
+                && mate.pos.y.abs() <= Fp::from_milli(4_800)
+            {
+                central_box_occupied = true;
+            }
+        }
+        if deepest_idx == Some(idx) && p.run_boost_ticks == 0 {
+            let pivot_proj = (ball_xy.x.to_milli() * attack_sign - 8_800)
+                .clamp(-(half_len.to_milli() - 7_500), 6_500);
+            att_target = Vec2::new(
+                Fp::from_milli(attack_sign * pivot_proj),
+                ball_xy.y.mul(Fp::from_milli(340)),
+            );
+        } else if !central_box_occupied
+            && ball_xy.x.to_milli() * attack_sign > half_len.to_milli() / 3
+            && ball_xy.y.abs() > goal_half_w + Fp::from_milli(1_500)
+            && designated_support_triangle_idx(state, side) != Some(idx)
+        {
+            // Vacated central penalty-spot cutback target!
+            att_target = Vec2::new(
+                opp_goal_x - Fp::from_milli(attack_sign * 6_800),
+                -ball_xy.y.clamp(Fp::from_milli(-6_000), Fp::from_milli(6_000)).mul(Fp::from_milli(220)),
+            );
+        }
+    }
+
+    // Designated short-support triangle player checks to an open 8.5–12.0m angle from the ball carrier!
     if signed_bal > 100 && designated_support_triangle_idx(state, side) == Some(idx) {
         let to_me = att_target - ball_xy;
         let dist_b = to_me.len();
-        if dist_b > Fp::from_milli(13_500) {
+        if dist_b > Fp::from_milli(if is_5v5 { 13_800 } else { 14_500 }) {
             let check_dir = if dist_b > Fp::from_milli(100) {
                 to_me.normalize_or_zero()
             } else {
                 Vec2::new(Fp::from_int(attack_sign as i32), Fp::from_milli(500)).normalize_or_zero()
             };
-            att_target = ball_xy + check_dir.scale(Fp::from_milli(if is_5v5 { 8_800 } else { 11_800 }));
+            att_target = ball_xy + check_dir.scale(Fp::from_milli(if is_5v5 { 9_500 } else { 11_800 }));
         }
     }
 
-    // Force-Field Pocket Search: step out from behind opposing cover shadows AND maintain teammate spacing!
+    // EA FC 27 *Attacking Spatial Awareness* Pocket & Curved-Run Search:
+    // Bend around opposing defenders & cover shadows while preserving wide Rush spacing (`>= 6.5m`)!
     let mut best_pocket = att_target;
     let mut best_pocket_score = Fp::from_int(-999);
     let cand_offsets = [
         Vec2::ZERO,
-        Vec2::from_milli(attack_sign * 2_600, 2_200),
-        Vec2::from_milli(attack_sign * 2_600, -2_200),
-        Vec2::from_milli(-attack_sign * 1_800, if idx.is_multiple_of(2) { 3_000 } else { -3_000 }),
-        Vec2::from_milli(attack_sign * 3_400, 0),
+        Vec2::from_milli(attack_sign * 2_800, 2_600),
+        Vec2::from_milli(attack_sign * 2_800, -2_600),
+        Vec2::from_milli(-attack_sign * 1_800, if idx.is_multiple_of(2) { 3_400 } else { -3_400 }),
+        Vec2::from_milli(attack_sign * 3_600, 0),
     ];
+    let min_mate_sep = Fp::from_milli(if is_5v5 { 6_600 } else { 5_500 });
     for (c_i, off) in cand_offsets.iter().enumerate() {
         let cand = att_target + *off;
         let d_ball = cand.dist(ball_xy);
-        if d_ball < Fp::from_milli(4_800) {
+        if d_ball < Fp::from_milli(5_000) {
             continue;
         }
         let lane_dir = (cand - ball_xy).normalize_or_zero();
@@ -931,8 +1068,8 @@ pub fn compute_outfield_ai_intent(
                 let proj = rel.dot(lane_dir);
                 if proj > Fp::from_milli(800) && proj < d_ball - Fp::from_milli(600) {
                     let perp = (rel - lane_dir.scale(proj)).len();
-                    if perp < Fp::from_milli(1_800) {
-                        lane_shadow_pen = lane_shadow_pen.max(Fp::from_milli(2_800) - perp);
+                    if perp < Fp::from_milli(1_850) {
+                        lane_shadow_pen = lane_shadow_pen.max(Fp::from_milli(2_850) - perp);
                     }
                 }
             }
@@ -941,8 +1078,8 @@ pub fn compute_outfield_ai_intent(
         for (m_i, mate) in state.players[side.index()].iter().enumerate().skip(1) {
             if m_i != idx && !mate.sent_off {
                 let dm = cand.dist(mate.pos);
-                if dm < Fp::from_milli(5_500) {
-                    mate_crowd_pen += Fp::from_milli(5_500) - dm;
+                if dm < min_mate_sep {
+                    mate_crowd_pen += min_mate_sep - dm;
                 }
             }
         }
@@ -955,19 +1092,29 @@ pub fn compute_outfield_ai_intent(
     }
     att_target = best_pocket;
 
-    // Timed Onside Channel Runs for Forwards AND attacking/wide Midfielders so 11v11 attacks penetrate the box!
+    // FIFA 21 *"Passer Readiness"* + FIFA 23/FC 27 Onside Channel Runs:
+    // Time forward darts when our carrier is facing forward (`passer_ready`) or when `run_boost_ticks > 0`,
+    // and hold/bend along `onside_limit_x` (`±1/3` Rush attacking-third line in 5v5)!
+    let passer_ready = match state.ball.owner {
+        Some((o_side, o_idx)) if o_side == side => {
+            let carrier = &state.players[o_side.index()][o_idx];
+            let c_fwd = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
+            c_fwd.x.mul(Fp::from_int(attack_sign as i32)) > Fp::from_milli(-150)
+        }
+        _ => true,
+    };
     let is_runner_role = p.role == PlayerRole::Forward
         || (p.role == PlayerRole::Midfielder
             && ball_attack_norm > Fp::from_milli(-80)
-            && (p.base_anchor_permille.0 >= -50 || p.base_anchor_permille.1.abs() >= 350));
-    if p.run_boost_ticks > 0 || (is_runner_role && signed_bal > 120) {
+            && (p.base_anchor_permille.0 >= -140 || p.base_anchor_permille.1.abs() >= 350));
+    if p.run_boost_ticks > 0 || (is_runner_role && signed_bal > 120 && passer_ready) {
         let onside_limit_x = compute_onside_limit_x(state, side);
         let run_push = Fp::from_milli(if p.run_boost_ticks > 0 {
-            if is_5v5 { 8_200 } else { 11_500 }
+            if is_5v5 { 7_800 } else { 11_500 }
         } else if p.role == PlayerRole::Forward {
-            if is_5v5 { 5_400 } else { 7_800 }
+            if is_5v5 { 5_600 } else { 7_800 }
         } else {
-            if is_5v5 { 3_600 } else { 5_600 }
+            if is_5v5 { 3_800 } else { 5_600 }
         });
         let desired_x = att_target.x + Fp::from_int(attack_sign as i32).mul(run_push);
         att_target.x = if attack_sign > 0 {
@@ -988,6 +1135,37 @@ pub fn compute_outfield_ai_intent(
     );
 
     let delta = target - p.pos;
+    let mut move_vec = if delta.len() > Fp::from_milli(300) {
+        delta.normalize_or_zero()
+    } else {
+        Vec2::ZERO
+    };
+    // EA FC 27 Curved Run Around Blockers: bend off-ball run laterally around an opponent standing directly in path!
+    if signed_bal > 80 && move_vec.len() > Fp::from_milli(500) {
+        for opp in state.players[side.opponent().index()].iter().skip(1) {
+            if opp.sent_off {
+                continue;
+            }
+            let rel = opp.pos - p.pos;
+            let along = rel.dot(move_vec);
+            if along > Fp::from_milli(150) && along < Fp::from_milli(2_200) {
+                let perp_vec = rel - move_vec.scale(along);
+                if perp_vec.len() < Fp::from_milli(1_050) {
+                    let bend = Vec2::new(-move_vec.y, move_vec.x);
+                    let bend_sign = if perp_vec.dot(bend) >= Fp::ZERO {
+                        Fp::NEG_ONE
+                    } else {
+                        Fp::ONE
+                    };
+                    move_vec = (move_vec.scale(Fp::from_milli(700))
+                        + bend.scale(bend_sign.mul(Fp::from_milli(520))))
+                    .normalize_or_zero();
+                    break;
+                }
+            }
+        }
+    }
+
     let dist = delta.len();
     let sprint_thresh = if is_5v5 {
         Fp::from_milli(3_900)
@@ -995,18 +1173,14 @@ pub fn compute_outfield_ai_intent(
         Fp::from_milli(5_200)
     };
     AiMoveIntent {
-        move_dir: if dist > Fp::from_milli(300) {
-            delta.normalize_or_zero()
-        } else {
-            Vec2::ZERO
-        },
+        move_dir: move_vec,
         sprint: (p.run_boost_ticks > 0 && signed_bal >= 0) || dist > sprint_thresh,
         jockey: signed_bal < -150 && my_dist < Fp::from_milli(2_600),
         trigger_dive: None,
     }
 }
 
-/// Checks if an opposing outfielder stands directly in the shooting corridor near the shooter.
+/// Checks if an opposing outfielder stands (or will step) directly in the shooting corridor between shooter and goal mouth.
 fn is_shot_corridor_blocked(
     state: &MatchState,
     side: TeamSide,
@@ -1019,16 +1193,20 @@ fn is_shot_corridor_blocked(
         return false;
     }
     let dir = ray.normalize_or_zero();
-    let check_len = dist.min(Fp::from_milli(5_200));
+    let check_len = (dist - Fp::from_milli(1_400)).max(Fp::from_milli(3_500)).min(dist);
     for opp in state.players[side.opponent().index()].iter().skip(1) {
         if opp.sent_off {
             continue;
         }
-        let rel = opp.pos - shooter_pos;
-        let along = rel.dot(dir);
-        if along > Fp::from_milli(180) && along < check_len {
+        let rel_now = opp.pos - shooter_pos;
+        let along_now = rel_now.dot(dir);
+        if along_now > Fp::from_milli(180) && along_now < check_len {
+            let ball_t = along_now.div(Fp::from_milli(22_500)).min(Fp::from_milli(450));
+            let pred_opp = opp.pos + opp.vel.scale(ball_t);
+            let rel = pred_opp - shooter_pos;
+            let along = rel.dot(dir).clamp(Fp::ZERO, dist);
             let perp = (rel - dir.scale(along)).len();
-            let block_r = Fp::from_milli(560) + along.mul(Fp::from_milli(65));
+            let block_r = Fp::from_milli(640) + along.mul(Fp::from_milli(55));
             if perp < block_r {
                 return true;
             }
@@ -1109,17 +1287,17 @@ pub fn generate_cpu_input(
             } = taker.action
             {
                 let target_charge: u16 = match kind {
-                    RestartKind::PenaltyKick => 13,
+                    RestartKind::PenaltyKick => 11,
                     RestartKind::CornerKick => {
                         if (button & BTN_PASS) != 0 {
-                            9
+                            7
                         } else {
-                            15 + ((state.tick % 5) as u16)
+                            12 + ((state.tick % 4) as u16)
                         }
                     }
-                    RestartKind::GoalKick => 16,
-                    RestartKind::ThrowIn => 11,
-                    RestartKind::FreeKick => 14,
+                    RestartKind::GoalKick => 13,
+                    RestartKind::ThrowIn => 9,
+                    RestartKind::FreeKick => 11,
                 };
                 let hold_aim = if stored_aim.len() > Fp::from_milli(120) {
                     stored_aim.normalize_or_zero()
@@ -1176,7 +1354,7 @@ pub fn generate_cpu_input(
                                 continue;
                             }
                             let d = spot.dist(mate.pos);
-                            if d < Fp::from_milli(2_500) || d > Fp::from_milli(19_000) {
+                            if d < Fp::from_milli(2_500) || d > Fp::from_milli(21_000) {
                                 continue;
                             }
                             let mut opp_clr = Fp::from_milli(9_000);
@@ -1199,12 +1377,39 @@ pub fn generate_cpu_input(
                         (gk_btn, gk_aim)
                     }
                     RestartKind::FreeKick => {
+                        // EA SPORTS FC 25 *5v5 Rush*: all 5v5 Free Kicks (and any IFAB indirect FK) MUST be passed to a teammate!
+                        let is_indirect_fk =
+                            is_5v5 || state.restart_touch_state.is_some_and(|rt| rt.indirect);
                         let goal_vec = Vec2::new(opp_goal_x, Fp::ZERO) - spot;
-                        let shoot_r = Fp::from_milli(if is_5v5 { 16_500 } else { 25_000 });
-                        if goal_vec.len() <= shoot_r {
+                        if !is_indirect_fk && goal_vec.len() <= Fp::from_milli(25_000) {
                             (BTN_SHOOT | BTN_FINESSE, goal_vec.normalize_or_zero())
                         } else {
-                            (BTN_PASS, Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO))
+                            let mut best_dir =
+                                Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO);
+                            let mut best_sc = Fp::from_int(-999_999);
+                            for (m_idx, mate) in state.players[side_idx].iter().enumerate().skip(1) {
+                                if m_idx == taker_idx || mate.sent_off {
+                                    continue;
+                                }
+                                let d = spot.dist(mate.pos);
+                                if d < Fp::from_milli(2_200) || d > Fp::from_milli(24_000) {
+                                    continue;
+                                }
+                                let mut opp_clr = Fp::from_milli(9_000);
+                                for opp in &state.players[side.opponent().index()] {
+                                    if !opp.sent_off {
+                                        opp_clr = opp_clr.min(opp.pos.dist(mate.pos));
+                                    }
+                                }
+                                let sc = opp_clr.mul(Fp::from_int(2))
+                                    + (mate.pos.x - spot.x).mul(Fp::from_milli(attack_sign * 220))
+                                    - d.mul(Fp::from_milli(120));
+                                if sc > best_sc {
+                                    best_sc = sc;
+                                    best_dir = (mate.pos - spot).normalize_or_zero();
+                                }
+                            }
+                            (BTN_PASS, best_dir)
                         }
                     }
                 };
@@ -1216,7 +1421,6 @@ pub fn generate_cpu_input(
         _ => return InputFrame::IDLE,
     }
 
-    // GK possession distribution (both hand catches after brief scan AND immediate foot back-passes!)
     if state.ball.owner == Some((side, 0)) && state.ball.gk_hold_ticks < 88 {
         let gk = &state.players[side_idx][0];
         if let PlayerActionState::Charging {
@@ -1294,7 +1498,6 @@ pub fn generate_cpu_input(
         }
     };
 
-    // Active Charging: release at exact distance-matched `cpu_target_charge` (or briskly if point-blank pressured!)
     if let PlayerActionState::Charging {
         button,
         ticks,
@@ -1305,11 +1508,11 @@ pub fn generate_cpu_input(
         let planned = state.cpu_target_charge[side_idx] as u16;
         let point_blank_press = nearest_opp_dist < Fp::from_milli(1_550);
         let target_charge: u16 = if (button & BTN_SHOOT) != 0 {
-            let base = if planned >= 4 { planned } else { 14 };
-            if point_blank_press { base.min(10) } else { base }
-        } else {
             let base = if planned >= 4 { planned } else { 11 };
             if point_blank_press { base.min(7) } else { base }
+        } else {
+            let base = if planned >= 4 { planned } else { 9 };
+            if point_blank_press { base.min(6) } else { base }
         };
         let hold_aim = if stored_aim.len() > Fp::from_milli(120) {
             stored_aim.normalize_or_zero()
@@ -1330,47 +1533,67 @@ pub fn generate_cpu_input(
         }
     }
 
-    // --- ON-BALL CPU DECISION BRAIN (`xG` Finishing + Crossing + Progressive Carry + `TTI` Passing) ---
+    // --- ON-BALL CPU DECISION BRAIN (FIFA Space-Based Attacking: Angle-Gated Finishing + Byline Cutback + TTI Passing) ---
     if state.ball.owner == Some((side, ctrl_idx)) {
         let opp_gk = &state.players[side.opponent().index()][0];
         let opp_gk_y = opp_gk.pos.y;
-        let corner_y = if opp_gk_y >= Fp::ZERO {
-            -goal_half_w.mul(Fp::from_milli(680))
+        let primary_corner_y = if opp_gk_y >= Fp::ZERO {
+            -goal_half_w.mul(Fp::from_milli(780))
         } else {
-            goal_half_w.mul(Fp::from_milli(680))
+            goal_half_w.mul(Fp::from_milli(780))
         };
-        let shot_target = Vec2::new(opp_goal_x, corner_y);
+        let alt_corner_y = -primary_corner_y;
+        let primary_target = Vec2::new(opp_goal_x, primary_corner_y);
+        let alt_target = Vec2::new(opp_goal_x, alt_corner_y);
         let goal_center = Vec2::new(opp_goal_x, Fp::ZERO);
         let dist_to_goal = me.pos.dist(goal_center).max(Fp::ONE);
         let dx_goal = (opp_goal_x - me.pos.x).abs();
         let cos_goal_angle = dx_goal.div(dist_to_goal);
-        let max_shoot_dist = match difficulty {
-            CpuDifficulty::Easy => Fp::from_milli(if is_5v5 { 12_500 } else { 18_500 }),
-            CpuDifficulty::Normal => Fp::from_milli(if is_5v5 { 14_800 } else { 21_500 }),
-            CpuDifficulty::Hard => Fp::from_milli(if is_5v5 { 17_200 } else { 25_800 }),
+        let box_finish_dist = match difficulty {
+            CpuDifficulty::Easy => Fp::from_milli(if is_5v5 { 12_500 } else { 16_500 }),
+            CpuDifficulty::Normal => Fp::from_milli(if is_5v5 { 14_200 } else { 19_000 }),
+            CpuDifficulty::Hard => Fp::from_milli(if is_5v5 { 15_000 } else { 20_500 }),
         };
+        let long_shot_ok = me.attributes.shooting >= 80
+            && nearest_opp_dist >= Fp::from_milli(2_500)
+            && dist_to_goal <= Fp::from_milli(if is_5v5 { 18_200 } else { 24_500 });
 
         let urgent_press = difficulty != CpuDifficulty::Easy
             && nearest_opp_dist < Fp::from_milli(1_850)
             && cadence_tick.is_multiple_of(3);
         let on_decision_beat = cadence_tick.is_multiple_of(decision_cadence) || urgent_press;
 
-        // 1. xG & Corridor-Gated Finishing (never shoot from dead touchline angles or straight into a blocker!)
-        let good_shot_angle = cos_goal_angle >= Fp::from_milli(360) || dist_to_goal <= Fp::from_milli(6_500);
-        let shot_clear = !is_shot_corridor_blocked(state, side, me.pos, shot_target);
-        if on_decision_beat && dist_to_goal <= max_shoot_dist && good_shot_angle && shot_clear {
+        // 1. Strict Angle-Gated Dual-Corner Finishing: NEVER shoot from `79°` dead byline angles outside the posts!
+        let central_six_yard =
+            dist_to_goal <= Fp::from_milli(5_800) && me.pos.y.abs() <= goal_half_w + Fp::from_milli(700);
+        let good_shot_angle = cos_goal_angle >= Fp::from_milli(440)
+            || (central_six_yard && cos_goal_angle >= Fp::from_milli(350));
+        let chosen_shot_target = if !is_shot_corridor_blocked(state, side, me.pos, primary_target) {
+            Some(primary_target)
+        } else if (opp_gk_y - alt_corner_y).abs() >= Fp::from_milli(1_450)
+            && !is_shot_corridor_blocked(state, side, me.pos, alt_target)
+        {
+            Some(alt_target)
+        } else {
+            None
+        };
+        if on_decision_beat
+            && (dist_to_goal <= box_finish_dist || long_shot_ok)
+            && good_shot_angle
+            && chosen_shot_target.is_some()
+        {
+            let shot_target = chosen_shot_target.unwrap_or(primary_target);
             let aim = (shot_target - me.pos).normalize_or_zero();
             let gk_off_line = (opp_gk.pos.x - opp_goal_x).abs();
-            // 1v1 Chip Shot if GK rushed far off line; Finesse Curler on angled strikes; Driven Laces otherwise!
             let shot_btns = if difficulty == CpuDifficulty::Hard
-                && gk_off_line > Fp::from_milli(if is_5v5 { 4_200 } else { 5_800 })
+                && gk_off_line > Fp::from_milli(if is_5v5 { 4_400 } else { 5_800 })
                 && dist_to_goal > Fp::from_milli(7_500)
                 && nearest_opp_dist > Fp::from_milli(1_800)
             {
                 BTN_SHOOT | BTN_LOB
             } else if difficulty != CpuDifficulty::Easy
                 && me.pos.y.abs() > Fp::from_milli(2_200)
-                && dist_to_goal >= Fp::from_milli(8_500)
+                && dist_to_goal >= Fp::from_milli(7_800)
             {
                 BTN_SHOOT | BTN_FINESSE
             } else {
@@ -1379,20 +1602,63 @@ pub fn generate_cpu_input(
             return vec_and_buttons_to_input(aim, aim, shot_btns);
         }
 
-        // 2. Wing Crossing Zone: whip aerial cross (`BTN_LOB`) or driven cutback when wide in final third!
+        // 2. Byline Cutback Pass & Wing Crossing Zone:
+        //    When wide near the endline/box (`!good_shot_angle`), look FIRST for a crisp ground cutback to a central box teammate!
         let prog_x = me.pos.x.mul(Fp::from_int(attack_sign as i32));
+        let in_byline_cutback_zone = prog_x > half_len - Fp::from_milli(if is_5v5 { 11_500 } else { 15_500 })
+            && me.pos.y.abs() > goal_half_w + Fp::from_milli(700);
+        if on_decision_beat && in_byline_cutback_zone && difficulty != CpuDifficulty::Easy {
+            let mut best_cutback: Option<(Vec2, Fp)> = None;
+            for (m_idx, mate) in state.players[side_idx].iter().enumerate().skip(1) {
+                if m_idx == ctrl_idx || mate.sent_off {
+                    continue;
+                }
+                let mate_dx_g = (opp_goal_x - mate.pos.x).abs();
+                if mate_dx_g > Fp::from_milli(if is_5v5 { 14_000 } else { 18_500 })
+                    || mate.pos.y.abs() > state.format.penalty_box_half_width()
+                {
+                    continue;
+                }
+                let d_mate = me.pos.dist(mate.pos);
+                if d_mate < Fp::from_milli(2_400) || d_mate > Fp::from_milli(20_000) {
+                    continue;
+                }
+                let mut opp_clr = Fp::from_milli(10_000);
+                for opp in state.players[side.opponent().index()].iter().skip(1) {
+                    if !opp.sent_off {
+                        opp_clr = opp_clr.min(opp.pos.dist(mate.pos));
+                    }
+                }
+                if opp_clr >= Fp::from_milli(2_100) {
+                    let sc = opp_clr.mul(Fp::from_int(2)) - mate.pos.y.abs().mul(Fp::from_milli(350));
+                    if best_cutback.is_none_or(|(_, bs)| sc > bs) {
+                        let target_pt = mate.pos + mate.vel.scale(Fp::from_milli(180));
+                        best_cutback = Some(((target_pt - me.pos).normalize_or_zero(), sc));
+                    }
+                }
+            }
+            if let Some((cb_dir, _)) = best_cutback {
+                let cb_btn = if difficulty == CpuDifficulty::Hard {
+                    BTN_PASS | BTN_FINESSE
+                } else {
+                    BTN_PASS
+                };
+                return vec_and_buttons_to_input(cb_dir, cb_dir, cb_btn);
+            }
+        }
+
         let in_wing_cross_zone = prog_x > half_len.mul(Fp::from_milli(440))
             && me.pos.y.abs() > state.format.penalty_box_half_width().mul(Fp::from_milli(700));
         if on_decision_beat && in_wing_cross_zone && difficulty != CpuDifficulty::Easy {
             let box_spot = Vec2::new(
-                Fp::from_milli(attack_sign * (half_len.to_milli() - if is_5v5 { 5_600 } else { 9_600 })),
+                Fp::from_milli(attack_sign * (half_len.to_milli() - if is_5v5 { 6_200 } else { 9_600 })),
                 Fp::ZERO,
             );
             let mut has_box_runner = false;
             for (m_idx, mate) in state.players[side_idx].iter().enumerate().skip(1) {
                 if m_idx != ctrl_idx
                     && !mate.sent_off
-                    && (mate.pos.x - opp_goal_x).abs() <= Fp::from_milli(if is_5v5 { 12_500 } else { 20_000 })
+                    && (mate.pos.x - opp_goal_x).abs() <= Fp::from_milli(if is_5v5 { 13_500 } else { 20_000 })
                     && mate.pos.y.abs() <= state.format.penalty_box_half_width()
                 {
                     has_box_runner = true;
@@ -1405,14 +1671,14 @@ pub fn generate_cpu_input(
             }
         }
 
-        // Measure open grass ahead along progressive drive corridor!
         let goal_drive = (goal_center - me.pos).normalize_or_zero();
         let drive_corridor = evade_stride(goal_drive);
         let free_space_ahead = measure_free_space_ahead(state, side, me.pos, drive_corridor);
 
-        // 3. Time-To-Intercept (`TTI`) & Offside-Aware Pass / Through-Ball / Switch Evaluation!
+        // 3. Time-To-Intercept (`TTI`) & Rush Offside-Aware Pass / Through-Ball / Switch Evaluation!
         if on_decision_beat {
             let in_own_half = prog_x < Fp::ZERO;
+            let offside_zone_mm = if is_5v5 { half_len.to_milli() / 3 } else { 0 };
             let onside_limit_proj = compute_onside_limit_x(state, side).to_milli() * attack_sign;
             let recent_passer_id = state
                 .ball
@@ -1427,7 +1693,7 @@ pub fn generate_cpu_input(
                 CpuDifficulty::Hard => 5,
             };
 
-            let mut best_pass: Option<(Vec2, Fp, u16)> = None; // (aim_dir, score, buttons)
+            let mut best_pass: Option<(Vec2, Fp, u16)> = None;
 
             for (m_idx, mate) in state.players[side_idx].iter().enumerate() {
                 if m_idx == ctrl_idx || mate.sent_off {
@@ -1435,7 +1701,6 @@ pub fn generate_cpu_input(
                 }
                 let dist_feet = me.pos.dist(mate.pos);
                 if m_idx == 0 {
-                    // Recycle to GK (played on feet!) only under heavy press in own half with clean lane
                     if !in_own_half
                         || nearest_opp_dist > Fp::from_milli(1_850)
                         || dist_feet < Fp::from_milli(5_500)
@@ -1444,27 +1709,25 @@ pub fn generate_cpu_input(
                         continue;
                     }
                 } else if dist_feet < Fp::from_milli(2_600)
-                    || dist_feet > Fp::from_milli(if is_5v5 { 27_000 } else { 36_000 })
+                    || dist_feet > Fp::from_milli(if is_5v5 { 31_000 } else { 36_000 })
                 {
                     continue;
                 }
 
-                // Never pass to an offside teammate!
+                // Never pass to an offside teammate (respecting 5v5 Rush `1/3` offside line)!
                 let mate_proj = mate.pos.x.to_milli() * attack_sign;
                 let my_proj = me.pos.x.to_milli() * attack_sign;
                 if state.rules.offsides_enabled
                     && m_idx != 0
-                    && mate_proj > 0
+                    && mate_proj > offside_zone_mm
                     && mate_proj > my_proj + 100
                     && mate_proj > onside_limit_proj + 100
                 {
                     continue;
                 }
 
-                // Candidate A: Crisp pass to teammate's stride (`feet_target`)
-                // Candidate B: Space-splitting Through-Ball ahead of runner (`through_target`)
                 let feet_target = mate.pos + mate.vel.scale(Fp::from_milli(200));
-                let lead_step = Fp::from_milli(if is_5v5 { 3_400 } else { 5_200 });
+                let lead_step = Fp::from_milli(if is_5v5 { 3_600 } else { 5_200 });
                 let run_dir = if mate.vel.len() > Fp::from_milli(1_100) {
                     mate.vel.normalize_or_zero()
                 } else {
@@ -1473,12 +1736,10 @@ pub fn generate_cpu_input(
                 let raw_through = mate.pos + run_dir.scale(lead_step);
                 let through_in_bounds = raw_through.x.abs() < half_len - Fp::from_milli(2_600)
                     && raw_through.y.abs() < half_wid - Fp::from_milli(1_600);
-                let through_proj = raw_through.x.to_milli() * attack_sign;
                 let through_onside = !state.rules.offsides_enabled
-                    || mate_proj <= 0
+                    || mate_proj <= offside_zone_mm
                     || mate_proj <= my_proj + 100
                     || mate_proj <= onside_limit_proj + 100;
-                let _ = through_proj;
                 let can_try_through = m_idx != 0
                     && difficulty != CpuDifficulty::Easy
                     && through_in_bounds
@@ -1500,11 +1761,10 @@ pub fn generate_cpu_input(
                     let lane_dir = lane_vec.normalize_or_zero();
                     let will_drive = !is_through_cand
                         && difficulty == CpuDifficulty::Hard
-                        && d_cand >= Fp::from_milli(10_500)
+                        && d_cand >= Fp::from_milli(11_000)
                         && m_idx != 0;
 
-                    // Physics Time-To-Intercept (`TTI`) check along the entire pass segment!
-                    let avg_ball_spd_mm_s: i64 = if will_drive { 18_400 } else { 15_200 };
+                    let avg_ball_spd_mm_s: i64 = if will_drive { 18_400 } else { 15_400 };
                     let mate_arrive_ticks = estimate_ticks_to_point(mate, cand_pt, is_5v5) as i32;
                     let total_ball_ticks = ((d_cand.to_milli() * 60) / avg_ball_spd_mm_s).max(4) as i32;
                     let recv_ready_ticks = mate_arrive_ticks.max(total_ball_ticks);
@@ -1546,13 +1806,12 @@ pub fn generate_cpu_input(
                         tti_safety_ticks
                     };
                     let ground_safe = !point_blank_blocked && worst_margin_ticks >= req_safety;
-                    // Reserve aerial `BTN_LOB` strictly for wide cross-field switches to an unguarded winger!
                     let can_loft_switch = !ground_safe
                         && !is_through_cand
                         && m_idx != 0
                         && difficulty != CpuDifficulty::Easy
-                        && d_cand >= Fp::from_milli(if is_5v5 { 19_000 } else { 26_000 })
-                        && (cand_pt.y - me.pos.y).abs() >= Fp::from_milli(10_500)
+                        && d_cand >= Fp::from_milli(if is_5v5 { 21_000 } else { 26_000 })
+                        && (cand_pt.y - me.pos.y).abs() >= Fp::from_milli(12_000)
                         && receiver_space >= Fp::from_milli(6_800);
 
                     if !ground_safe && !can_loft_switch {
@@ -1617,8 +1876,6 @@ pub fn generate_cpu_input(
                 free_space_ahead >= Fp::from_milli(7_400) && nearest_opp_dist >= Fp::from_milli(3_400);
 
             if let Some((aim_dir, score, btn)) = best_pass {
-                // Combine crisply through midfield before the press closes (`4.6` threshold), while still
-                // surging forward on the dribble when `7.4m+` of wide-open grass opens ahead (`8.2`)!
                 let killer_ball = score > Fp::from_milli(if open_carry_lane { 8_200 } else { 4_600 });
                 let pressured_progression = moderate_pressure && score > Fp::from_milli(2_200);
                 let safe_recycle = tight_pressure && score > Fp::from_milli(-1_800);
@@ -1628,9 +1885,12 @@ pub fn generate_cpu_input(
             }
 
             // Deep defensive-third safety clearance ONLY when heavily swarmed with zero safe pass outlets!
-            if prog_x < -half_len.mul(Fp::from_milli(550))
-                && nearest_opp_dist < Fp::from_milli(1_550)
-            {
+            let clear_line = if is_5v5 {
+                -half_len.div(Fp::from_int(3))
+            } else {
+                -half_len.mul(Fp::from_milli(550))
+            };
+            if prog_x < clear_line && nearest_opp_dist < Fp::from_milli(1_550) {
                 let clear_y = if me.pos.y >= Fp::ZERO {
                     Fp::from_milli(380)
                 } else {
@@ -1642,12 +1902,14 @@ pub fn generate_cpu_input(
             }
         }
 
-        // 4. Progressive 360° Ball Carrying: scale sprint decisiveness & 1v1 feints cleanly up the difficulty ladder!
+        // 4. Progressive 360° Ball Carrying (single unchained skill feint when `skill_chain_count == 0`, zero double-roulette spam!)
         let try_skill = difficulty == CpuDifficulty::Hard
-            && nearest_opp_dist >= Fp::from_milli(1_250)
-            && nearest_opp_dist <= Fp::from_milli(1_950)
-            && nearest_opp_vec.normalize_or_zero().dot(goal_drive) > Fp::from_milli(520)
-            && cadence_tick.is_multiple_of(19);
+            && me.skill_chain_count == 0
+            && me.attributes.dribbling >= 82
+            && nearest_opp_dist >= Fp::from_milli(1_300)
+            && nearest_opp_dist <= Fp::from_milli(1_900)
+            && nearest_opp_vec.normalize_or_zero().dot(goal_drive) > Fp::from_milli(580)
+            && cadence_tick.is_multiple_of(43);
         let sprint_carry = match difficulty {
             CpuDifficulty::Hard => {
                 free_space_ahead >= Fp::from_milli(3_600) && nearest_opp_dist > Fp::from_milli(2_000)
@@ -1669,16 +1931,16 @@ pub fn generate_cpu_input(
         return vec_and_buttons_to_input(drive_corridor, Vec2::ZERO, btns);
     }
 
-    // --- OFF-BALL CPU DEFENDING (`auto_switch_player` handles switching without 75-tick manual locks!) ---
+    // --- OFF-BALL CPU DEFENDING ---
     let ball_xy = state.ball.pos.xy();
     let my_dist = me.pos.dist(ball_xy);
     let (my_intercept, _) = best_ball_intercept_for_player(state, side, ctrl_idx);
 
     let goal_side_pt = if state.ball.owner.is_some() {
         let hold_dist = match difficulty {
-            CpuDifficulty::Easy => Fp::from_milli(1_300),
-            CpuDifficulty::Normal => Fp::from_milli(920),
-            CpuDifficulty::Hard => Fp::from_milli(620),
+            CpuDifficulty::Easy => Fp::from_milli(1_350),
+            CpuDifficulty::Normal => Fp::from_milli(1_020),
+            CpuDifficulty::Hard => Fp::from_milli(780),
         };
         let to_own_goal = (Vec2::new(own_goal_x, Fp::ZERO) - my_intercept)
             .normalize_or_zero()
@@ -1693,7 +1955,7 @@ pub fn generate_cpu_input(
     let sprint_close_dist = match difficulty {
         CpuDifficulty::Easy => Fp::from_milli(3_200),
         CpuDifficulty::Normal => Fp::from_milli(2_550),
-        CpuDifficulty::Hard => Fp::from_milli(1_850),
+        CpuDifficulty::Hard => Fp::from_milli(1_950),
     };
     if my_dist > sprint_close_dist || state.ball.owner.is_none() {
         buttons |= BTN_SPRINT;
@@ -1702,16 +1964,16 @@ pub fn generate_cpu_input(
     }
 
     let (tackle_cadence, tackle_reach_mm): (u32, i64) = match difficulty {
-        CpuDifficulty::Easy => (28, 1_040),
-        CpuDifficulty::Normal => (18, 1_120),
-        CpuDifficulty::Hard => (8, 1_220),
+        CpuDifficulty::Easy => (30, 1_020),
+        CpuDifficulty::Normal => (20, 1_100),
+        CpuDifficulty::Hard => (12, 1_180),
     };
     if let Some((o_side, o_idx)) = state.ball.owner {
-        if o_side != side {
+        if o_side != side && state.ball.possession_grace_ticks == 0 {
             let carrier = &state.players[o_side.index()][o_idx];
             let c_fwd = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
             let def_to_c = (carrier.pos - me.pos).normalize_or_zero();
-            let front_or_side = def_to_c.dot(c_fwd) < Fp::from_milli(520);
+            let front_or_side = def_to_c.dot(c_fwd) < Fp::from_milli(480);
             if front_or_side
                 && my_dist <= Fp::from_milli(tackle_reach_mm)
                 && cadence_tick.is_multiple_of(tackle_cadence)
@@ -1754,6 +2016,11 @@ pub(crate) fn compute_onside_limit_x(state: &MatchState, attacking_side: TeamSid
     if !state.rules.offsides_enabled {
         return Fp::from_milli(attack_sign * (half_len.to_milli() - 1_800));
     }
+    let min_offside_zone = if state.format.players_per_side <= 6 {
+        half_len.to_milli() / 3
+    } else {
+        0
+    };
     let opp_side = attacking_side.opponent();
     let mut opp_proj: Vec<i64> = state.players[opp_side.index()]
         .iter()
@@ -1767,7 +2034,7 @@ pub(crate) fn compute_onside_limit_x(state: &MatchState, attacking_side: TeamSid
         half_len.to_milli()
     };
     let ball_proj_mm = state.ball.pos.x.to_milli() * attack_sign;
-    let line_mm = second_last_mm.max(ball_proj_mm).max(0) - 450;
+    let line_mm = second_last_mm.max(ball_proj_mm).max(min_offside_zone) - 350;
     Fp::from_milli(attack_sign * line_mm)
 }
 
