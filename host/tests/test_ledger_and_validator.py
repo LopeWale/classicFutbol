@@ -82,9 +82,11 @@ def test_five_a_side_default_and_eleven_a_side_parameterization_in_catalogue() -
     cat = ClubCatalogue()
     snap_5 = cat.build_fixture_snapshot("fx-5", "man-utd", "arsenal", seed=42, format_name="5v5")
     assert snap_5["format"]["players_per_side"] == 5
-    assert snap_5["format"]["pitch_length_mm"] == 56_000
-    assert snap_5["format"]["pitch_width_mm"] == 36_000
-    assert snap_5["rules"]["offsides_enabled"] is False
+    assert snap_5["format"]["pitch_length_mm"] == 63_700
+    assert snap_5["format"]["pitch_width_mm"] == 46_600
+    assert snap_5["format"]["goal_width_mm"] == 7_320
+    assert snap_5["format"]["goal_height_mm"] == 2_440
+    assert snap_5["rules"]["offsides_enabled"] is True
     assert len(snap_5["home"]["starters"]) == 5
     assert snap_5["home"]["starters"][0]["role"] == "Goalkeeper"
     assert sum(1 for p in snap_5["home"]["starters"] if p["role"] != "Goalkeeper") == 4

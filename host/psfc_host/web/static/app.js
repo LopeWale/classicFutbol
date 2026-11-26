@@ -1960,9 +1960,8 @@ function samplePrimaryHumanInput(allowArrows, isAttacking = true) {
   // Route P1 keyboard through Layer 2 ControlProfile so Classic / Alternate / Two-Button / Custom
   // presets immediately govern keyboard controls too!
   const mapped = mapPhysicalToSimInput(samplePhysicalKeyboardP1(allowArrows), controlProfile, isAttacking);
-  // Preserve optional direct keyboard convenience keys without interfering with preset bindings
+  // Preserve optional direct keyboard convenience key without interfering with preset bindings
   if (keysDown.has("KeyC")) mapped.btns |= BTN_SLIDE;
-  if (keysDown.has("KeyR")) mapped.btns |= BTN_TEAMMATE_CONTAIN | BTN_CALL_RUN;
   return mapped;
 }
 
@@ -2108,7 +2107,7 @@ function updateControllerVisualizer() {
   const ltPct = Math.round(((activeGp && activeGp.ltValue) || (keysDown.has("KeyF") ? 1 : 0)) * 100);
   const rtPct = Math.round(((activeGp && activeGp.rtValue) || (keysDown.has("ShiftLeft") || keysDown.has("ShiftRight") ? 1 : 0)) * 100);
   if (l1El) l1El.classList.toggle("lit", Boolean((activeGp && activeGp.l1) || keysDown.has("KeyQ")));
-  if (r1El) r1El.classList.toggle("lit", Boolean((activeGp && activeGp.r1) || keysDown.has("KeyE") || keysDown.has("KeyR")));
+  if (r1El) r1El.classList.toggle("lit", Boolean((activeGp && activeGp.r1) || keysDown.has("KeyE")));
   if (l2El) l2El.classList.toggle("lit", ltPct > 10);
   if (r2El) r2El.classList.toggle("lit", rtPct > 10);
   if (ltFill) ltFill.style.width = `${ltPct}%`;
@@ -2565,17 +2564,17 @@ function buildOffline2026Snapshot(formatName, seed, halfTicks, homeCtrl, awayCtr
       : {
           name: "5v5",
           players_per_side: 5,
-          pitch_length_mm: 56000,
-          pitch_width_mm: 36000,
-          goal_width_mm: 4000,
-          goal_height_mm: 2100,
-          penalty_box_depth_mm: 9000,
-          penalty_box_width_mm: 18000,
-          center_circle_radius_mm: 5500,
+          pitch_length_mm: 63700,
+          pitch_width_mm: 46600,
+          goal_width_mm: 7320,
+          goal_height_mm: 2440,
+          penalty_box_depth_mm: 11500,
+          penalty_box_width_mm: 26000,
+          center_circle_radius_mm: 6500,
         },
     rules: {
       half_duration_ticks: halfTicks,
-      offsides_enabled: is11,
+      offsides_enabled: true,
       fouls_enabled: true,
       extra_time_enabled: false,
       home_controller: homeCtrl,
@@ -3729,13 +3728,30 @@ function drawPitchRadar(packed) {
   radarCtx.stroke();
 
   // Penalty boxes on radar
-  const boxW = (W - 8) * 0.16;
-  const boxH = (H - 8) * 0.54;
+  const boxW =
+    ((currentSnapshot.format.penalty_box_depth_mm || 11500) / Math.max(1, halfL * 2000)) * (W - 8);
+  const boxH =
+    ((currentSnapshot.format.penalty_box_width_mm || 26000) / Math.max(1, halfW * 2000)) * (H - 8);
   radarCtx.strokeRect(4, (H - boxH) * 0.5, boxW, boxH);
   radarCtx.strokeRect(W - 4 - boxW, (H - boxH) * 0.5, boxW, boxH);
 
   const mapX = (wx) => 4 + ((wx + halfL) / (halfL * 2)) * (W - 8);
   const mapY = (wy) => 4 + ((wy + halfW) / (halfW * 2)) * (H - 8);
+
+  if ((currentSnapshot.format.players_per_side || 5) <= 6) {
+    radarCtx.save();
+    radarCtx.strokeStyle = "rgba(248, 250, 252, 0.52)";
+    radarCtx.lineWidth = 1.0;
+    radarCtx.setLineDash([3, 3]);
+    for (const offX of [-halfL / 3, halfL / 3]) {
+      const rx = mapX(offX);
+      radarCtx.beginPath();
+      radarCtx.moveTo(rx, 4);
+      radarCtx.lineTo(rx, H - 4);
+      radarCtx.stroke();
+    }
+    radarCtx.restore();
+  }
 
   const kits = engine3d.stadiumData ? engine3d.stadiumData.kits : null;
   const homeCol = kits ? kits.homeOutfield.shirt : "#ef4444";
@@ -3799,8 +3815,76 @@ let prevSimPacked = null;
 let currSimPacked = null;
 const SIM_STEP_MS = 1000 / 60;
 
+const camBasisLatch = [
+  { prevKey: "rail", prevBasis: null, latchedBasis: null, ticksLeft: 0, refX: 0, refY: 0 },
+  { prevKey: "rail", prevBasis: null, latchedBasis: null, ticksLeft: 0, refX: 0, refY: 0 },
+];
+
+function projectStickAxes(sx, sy, basis) {
+  if (!basis || (basis.rightX === 1 && basis.rightZ === 0 && basis.fwdX === 0 && basis.fwdZ === -1)) {
+    return [sx, sy];
+  }
+  const wx = Math.max(-127, Math.min(127, Math.round(sx * basis.rightX - sy * basis.fwdX)));
+  const wy = Math.max(-127, Math.min(127, Math.round(sx * basis.rightZ - sy * basis.fwdZ)));
+  return [wx, wy];
+}
+
+function projectInputToCameraBasis(inObj, slotIdx) {
+  if (!inObj || !engine3d || typeof engine3d.getInputBasis !== "function") return inObj;
+  const liveBasis = engine3d.getInputBasis() || {
+    rightX: 1,
+    rightZ: 0,
+    fwdX: 0,
+    fwdZ: -1,
+    basisKey: "rail",
+  };
+  const st = camBasisLatch[slotIdx] || camBasisLatch[0];
+  const lMag = Math.hypot(inObj.mx || 0, inObj.my || 0);
+
+  if (liveBasis.basisKey !== st.prevKey) {
+    if (lMag > 32 && st.prevBasis) {
+      st.latchedBasis = st.prevBasis;
+      st.ticksLeft = 18;
+      st.refX = inObj.mx / lMag;
+      st.refY = inObj.my / lMag;
+    } else {
+      st.latchedBasis = null;
+      st.ticksLeft = 0;
+    }
+    st.prevKey = liveBasis.basisKey;
+  }
+
+  let moveBasis = liveBasis;
+  if (st.ticksLeft > 0 && st.latchedBasis) {
+    if (lMag <= 24) {
+      st.ticksLeft = 0;
+      st.latchedBasis = null;
+    } else {
+      const cos = (inObj.mx / lMag) * st.refX + (inObj.my / lMag) * st.refY;
+      if (cos < 0.88) {
+        st.ticksLeft = 0;
+        st.latchedBasis = null;
+      } else {
+        moveBasis = st.latchedBasis;
+        st.ticksLeft--;
+      }
+    }
+  }
+  st.prevBasis = liveBasis;
+
+  const [mx, my] = projectStickAxes(inObj.mx || 0, inObj.my || 0, moveBasis);
+  const [ax, ay] = projectStickAxes(inObj.ax || 0, inObj.ay || 0, liveBasis);
+  return { ...inObj, mx, my, ax, ay };
+}
+
 function resetSimInterpState() {
   simAccumMs = 0;
+  for (const st of camBasisLatch) {
+    st.prevKey = "rail";
+    st.prevBasis = null;
+    st.latchedBasis = null;
+    st.ticksLeft = 0;
+  }
   const p = readPackedState();
   if (p) {
     currSimPacked = new Int32Array(p);
@@ -3875,35 +3959,37 @@ function mainLoop(nowMs) {
     } else {
       if (!paused && currentScreen === "match" && steps > 0) {
         const sideMode = SIDE_MODES[pmSideIdx].id;
-        const ownerNow = currSimPacked ? currSimPacked[15] : -1;
-        const effOwner = ownerNow === 0 || ownerNow === 1 ? ownerNow : lastKnownOwnerSide;
-        const ppsNow = currSimPacked ? currSimPacked[6] : 0;
-        const holdWordIdx = 18 + ppsNow * 20 + 6;
-        const holdWord =
-          currSimPacked && currSimPacked.length > holdWordIdx ? currSimPacked[holdWordIdx] >>> 0 : 0;
-        const hasAuthoritativeCtx = (holdWord & 0x04000000) !== 0;
-        const homeAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 24)) !== 0 : effOwner === 0;
-        const awayAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 25)) !== 0 : effOwner === 1;
-        let hIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
-        let aIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
-
-        if (sideMode === "local_2p") {
-          hIn = samplePrimaryHumanInput(false, homeAttacking);
-          aIn = sampleSecondaryHumanInput(awayAttacking);
-        } else if (sideMode === "away_vs_cpu") {
-          aIn = samplePrimaryHumanInput(true, awayAttacking);
-        } else if (sideMode === "home_vs_cpu") {
-          hIn = samplePrimaryHumanInput(true, homeAttacking);
-        }
-
         const homeHuman = sideMode === "home_vs_cpu" || sideMode === "local_2p";
         const awayHuman = sideMode === "away_vs_cpu" || sideMode === "local_2p";
         const swBits = ((AUTO_SWITCH_OPTIONS[autoSwitchIdx]?.code ?? 0) & 0x3) << 12;
         const dualMapBit = 0x0800;
-        const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
-        const aSprintBits = (aIn.sprintAnalog || 0) & 0x7f;
+
         for (let s = 0; s < steps; s++) {
           if (currSimPacked) prevSimPacked = currSimPacked;
+          const ownerNow = currSimPacked ? currSimPacked[15] : -1;
+          const effOwner = ownerNow === 0 || ownerNow === 1 ? ownerNow : lastKnownOwnerSide;
+          const ppsNow = currSimPacked ? currSimPacked[6] : 0;
+          const holdWordIdx = 18 + ppsNow * 20 + 6;
+          const holdWord =
+            currSimPacked && currSimPacked.length > holdWordIdx ? currSimPacked[holdWordIdx] >>> 0 : 0;
+          const hasAuthoritativeCtx = (holdWord & 0x04000000) !== 0;
+          const homeAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 24)) !== 0 : effOwner === 0;
+          const awayAttacking = hasAuthoritativeCtx ? (holdWord & (1 << 25)) !== 0 : effOwner === 1;
+
+          engine3d.proSide = sideMode === "away_vs_cpu" ? 1 : 0;
+          let hIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
+          let aIn = { mx: 0, my: 0, ax: 0, ay: 0, btns: 0 };
+          if (sideMode === "local_2p") {
+            hIn = projectInputToCameraBasis(samplePrimaryHumanInput(false, homeAttacking), 0);
+            aIn = projectInputToCameraBasis(sampleSecondaryHumanInput(awayAttacking), 1);
+          } else if (sideMode === "away_vs_cpu") {
+            aIn = projectInputToCameraBasis(samplePrimaryHumanInput(true, awayAttacking), 1);
+          } else if (sideMode === "home_vs_cpu") {
+            hIn = projectInputToCameraBasis(samplePrimaryHumanInput(true, homeAttacking), 0);
+          }
+
+          const hSprintBits = (hIn.sprintAnalog || 0) & 0x7f;
+          const aSprintBits = (aIn.sprintAnalog || 0) & 0x7f;
           const hQueued = queuedReservedQueue[0].length > 0 ? queuedReservedQueue[0].shift() : 0;
           const aQueued = queuedReservedQueue[1].length > 0 ? queuedReservedQueue[1].shift() : 0;
           const hReserved =
@@ -3933,10 +4019,10 @@ function mainLoop(nowMs) {
             if (replayBuffer.length >= REPLAY_CAPACITY) replayBuffer.shift();
             replayBuffer.push(new Int32Array(subPacked));
             if (subPacked[15] === 0) {
-              homePossTicks++;
+              if (subPacked[3] === 1) homePossTicks++;
               lastKnownOwnerSide = 0;
             } else if (subPacked[15] === 1) {
-              awayPossTicks++;
+              if (subPacked[3] === 1) awayPossTicks++;
               lastKnownOwnerSide = 1;
             }
           }
@@ -3980,6 +4066,7 @@ function mainLoop(nowMs) {
           }
         }
 
+        engine3d.proSide = SIDE_MODES[pmSideIdx]?.id === "away_vs_cpu" ? 1 : 0;
         engine3d.renderFrame(packed, null, prevSimPacked || packed, interpAlpha);
       }
     }

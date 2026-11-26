@@ -55,18 +55,20 @@ pub struct MatchFormat {
 }
 
 impl MatchFormat {
-    /// Phase 1 default: 5v5 (4 outfield players + 1 goalkeeper per side) on a 56m x 36m outdoor pitch.
+    /// Authentic EA SPORTS FC 25/26 *5v5 Rush* pitch & regulation goal dimensions:
+    /// 4 outfield players + 1 goalkeeper per side on a 63.7m x 46.6m pitch (`41.5%` of 11v11 area,
+    /// `1.37:1` lateral passing ratio) with full regulation 7.32m x 2.44m goals.
     pub fn five_a_side() -> Self {
         Self {
             name: "5v5".to_string(),
             players_per_side: 5,
-            pitch_length_mm: 56_000,
-            pitch_width_mm: 36_000,
-            goal_width_mm: 4_000,
-            goal_height_mm: 2_100,
-            penalty_box_depth_mm: 9_000,
-            penalty_box_width_mm: 18_000,
-            center_circle_radius_mm: 5_500,
+            pitch_length_mm: 63_700,
+            pitch_width_mm: 46_600,
+            goal_width_mm: 7_320,
+            goal_height_mm: 2_440,
+            penalty_box_depth_mm: 11_500,
+            penalty_box_width_mm: 26_000,
+            center_circle_radius_mm: 6_500,
         }
     }
 
@@ -162,7 +164,7 @@ impl SideController {
 pub struct RuleSet {
     /// Duration of one half in 60 Hz ticks (`7200` = 2 min half / 4 min match).
     pub half_duration_ticks: u32,
-    /// Disabled by default for 5v5, enabled by default for 11v11 (ADR-0003).
+    /// Enabled by default for both 5v5 Rush (Attacking-Third Offside at `±1/3` pitch length) and 11v11 (halfway line).
     pub offsides_enabled: bool,
     pub fouls_enabled: bool,
     #[serde(default)]
@@ -175,7 +177,7 @@ impl RuleSet {
     pub fn default_five_a_side() -> Self {
         Self {
             half_duration_ticks: 2 * 60 * TICKS_PER_SECOND,
-            offsides_enabled: false,
+            offsides_enabled: true,
             fouls_enabled: true,
             extra_time_enabled: false,
             home_controller: SideController::Human,

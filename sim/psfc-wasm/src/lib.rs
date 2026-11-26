@@ -563,12 +563,37 @@ pub extern "C" fn sim_pack_render_state() -> usize {
                             }
                         }
                     };
-                    let cue = (kick_kind & 0x7)
+                     let cue = (kick_kind & 0x7)
                         | ((finesse & 0x1) << 3)
                         | ((action_ticks & 0xFF) << 4)
                         | ((dir_bam & 0xFFFF) << 12)
                         | ((has_dir & 0x1) << 28);
                     out.push(cue);
+                }
+            }
+            // Trailing per-player elevation, vertical velocity, skill kind, and kick-strike trigger word:
+            // - bits `0..=11`: `z_mm` (`0..=4095`, smooth 1mm precision without 60mm staircase spikes)
+            // - bits `12..=25`: `vz_mm + 8192` (`0..=16383`, signed `-8.0..+8.0 m/s` vertical velocity)
+            // - bits `26..=28`: `skill_kind` (`0..=4`: 1=Roulette, 2=StepOver, 3=BallRoll, 4=FakeShot)
+            // - bits `29..=31`: `recent_kick_kind` (`0` idle, `1..=5` when `p.recent_kick_ticks > 0`)
+            for side_players in &st.players {
+                for p in side_players {
+                    let z_mm = p.z.to_milli().clamp(0, 4095) as i32;
+                    let vz_biased = (p.vz.to_milli().clamp(-8000, 8000) + 8192) as i32;
+                    let skill_kind = match p.action {
+                        PlayerActionState::SkillMove { kind, .. } => i32::from(kind) & 0x7,
+                        _ => 0,
+                    };
+                    let recent_kick = if p.recent_kick_ticks > 0 {
+                        i32::from(p.recent_kick_kind) & 0x7
+                    } else {
+                        0
+                    };
+                    let elev_word = (z_mm & 0xFFF)
+                        | ((vz_biased & 0x3FFF) << 12)
+                        | (skill_kind << 26)
+                        | (recent_kick << 29);
+                    out.push(elev_word);
                 }
             }
             out.len()

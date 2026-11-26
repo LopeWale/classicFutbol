@@ -2839,7 +2839,22 @@ function createPitchPbrMaps(pitchLen, pitchWid, fmt, maxAnisotropy) {
   ctx.lineTo(pxX(0), pTop + pH);
   ctx.stroke();
 
-  const circleR = (fmt.center_circle_radius_mm || 6000) / 1000;
+  if (pitchLen < 80) {
+    // EA SPORTS FC 25 *5v5 Rush*: dotted Attacking-Third Offside lines at ±1/3 pitch length (±halfL / 3)!
+    ctx.save();
+    ctx.strokeStyle = "rgba(248, 250, 252, 0.74)";
+    ctx.lineWidth = linePx * 0.78;
+    ctx.setLineDash([Math.max(8, linePx * 2.2), Math.max(7, linePx * 2.0)]);
+    for (const offX of [-halfL / 3, halfL / 3]) {
+      ctx.beginPath();
+      ctx.moveTo(pxX(offX), pTop);
+      ctx.lineTo(pxX(offX), pTop + pH);
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
+  const circleR = (fmt.center_circle_radius_mm || 6500) / 1000;
   ctx.beginPath();
   ctx.ellipse(pxX(0), pxZ(0), circleR * scaleX, circleR * scaleZ, 0, 0, Math.PI * 2);
   ctx.stroke();
@@ -2847,9 +2862,9 @@ function createPitchPbrMaps(pitchLen, pitchWid, fmt, maxAnisotropy) {
   ctx.ellipse(pxX(0), pxZ(0), linePx * 1.45, linePx * 1.45, 0, 0, Math.PI * 2);
   ctx.fill();
 
-  const boxD = (fmt.penalty_box_depth_mm || 9000) / 1000;
-  const boxHW = (fmt.penalty_box_width_mm || 18000) / 2000;
-  const goalHW = (fmt.goal_width_mm || 4000) / 2000;
+  const boxD = (fmt.penalty_box_depth_mm || 11500) / 1000;
+  const boxHW = (fmt.penalty_box_width_mm || 26000) / 2000;
+  const goalHW = (fmt.goal_width_mm || 7320) / 2000;
   const sixD = Math.min(boxD * 0.42, 5.5);
   const sixHW = goalHW + (pitchLen > 80 ? 5.5 : 2.2);
 
@@ -4295,6 +4310,9 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     dribbleTouchCd = 0,
     kickKind = 0,
     kickFinesse = false,
+    skillKind = 0,
+    recentKickKind = 0,
+    hasAuthoritativeKickCue = false,
     actionTicks = 0,
     actionDirRad = null,
     ballX,
@@ -4334,7 +4352,29 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     ? 0
     : wrapAngleRad(actor.smoothYaw - prevYaw) / Math.max(0.004, dt);
 
-  const spinExtra = action === 7 ? (nowSec * 14.0) % (Math.PI * 2) : 0;
+  // Skill-move choreography: finite single-turn Maradona Roulette (`skillKind === 1`) vs lateral body feints (`2..4`)!
+  const skillProgress =
+    action === 7 && actionTicks > 0 ? Math.max(0, Math.min(1, 1.0 - actionTicks / 16.0)) : 0;
+  let spinExtra = 0;
+  let skillRollExtra = 0;
+  if (action === 7) {
+    const feintSign = actor.activeKickFoot || 1;
+    if (skillKind === 1) {
+      spinExtra = feintSign * smoothstep(0.0, 1.0, skillProgress) * Math.PI * 2;
+    } else if (skillKind === 2) {
+      // Step-over / scissors double shoulder dip without spinning 360°
+      spinExtra = Math.sin(skillProgress * Math.PI * 2) * 0.28 * feintSign;
+      skillRollExtra = Math.sin(skillProgress * Math.PI * 2) * 0.12 * feintSign;
+    } else if (skillKind === 3) {
+      // Sole ball-roll lateral glide
+      spinExtra = Math.sin(skillProgress * Math.PI) * 0.18 * feintSign;
+      skillRollExtra = -Math.sin(skillProgress * Math.PI) * 0.09 * feintSign;
+    } else {
+      // Fake Shot / Fake Cross chop feint (`skillKind === 4`)
+      spinExtra = -Math.sin(skillProgress * Math.PI) * 0.34 * feintSign;
+      skillRollExtra = Math.sin(skillProgress * Math.PI) * 0.11 * feintSign;
+    }
+  }
   actor.root.rotation.y = actor.smoothYaw + spinExtra;
 
   // Athlete local horizontal basis (`+Z` = forward, `+X` = athlete left)
@@ -4388,11 +4428,12 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     action === 3 || action === 4 || action === 5
       ? 0
       : Math.max(
-          -0.16,
+          -0.20,
           Math.min(
-            0.16,
+            0.20,
             (-actor.smoothAccelLat * 0.0085 - yawRate * 0.018) * locoWeight -
-              oppSideSign * jostleWeight * 0.062
+              oppSideSign * jostleWeight * 0.062 +
+              skillRollExtra
           )
         );
   damp(actor, "smoothBankRoll", goalBankRoll, 0.072, dt);
@@ -4463,8 +4504,15 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     actor.lastKickBallY = Math.max(SOLE_HEIGHT + 0.02, Math.min(0.74, ballZ + 0.075));
   }
 
-  // Detect kick strike release for BOTH charged human kicks AND 1-tick AI passes/shots/clearances!
-  const oneTouchKick =
+  // Authoritative kick strike trigger from `psfc-sim` `recent_kick_kind` (`hasAuthoritativeKickCue`),
+  // preventing nearby bystanders from ghost-swinging their leg while keeping legacy replay fallback!
+  const authoritativeStrike =
+    !discontinuousMove &&
+    hasAuthoritativeKickCue &&
+    recentKickKind > 0 &&
+    (actor.prevRecentKickKind || 0) === 0;
+  const legacyOneTouchKick =
+    !hasAuthoritativeKickCue &&
     !discontinuousMove &&
     !actor.isGk &&
     !actor.isReferee &&
@@ -4472,19 +4520,23 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
     action !== 2 &&
     action !== 3 &&
     action !== 5 &&
+    action !== 7 &&
     ballDistHoriz < 0.96 &&
     ballSpeedHoriz - actor.prevBallSpeed > 4.2 &&
     actor.kickSwingTimer <= 0.05;
+  const chargeReleasedStrike =
+    !hasAuthoritativeKickCue && actor.prevAction === 1 && action !== 1 && action !== 7;
 
-  if ((actor.prevAction === 1 && action !== 1) || oneTouchKick) {
+  if (authoritativeStrike || chargeReleasedStrike || legacyOneTouchKick) {
     if (isThrowInTaker || actor.throwFollowTimer > 0.01) {
       actor.throwFollowTimer = 0.25;
     } else {
-      if (oneTouchKick && actor.prevAction !== 1) {
+      if (authoritativeStrike || actor.prevAction !== 1) {
         const bVelLocX = ballVx * leftX + ballVy * leftZ;
         const bVelLocZ = ballVx * fwdX + ballVy * fwdZ;
         actor.activeKickFoot = ballLocalX >= 0.03 ? 1 : -1;
-        actor.lastKickKind = ballVz > 3.2 || ballSpeedHoriz > 17.5 ? 4 : 1;
+        actor.lastKickKind =
+          recentKickKind > 0 ? recentKickKind : ballVz > 3.2 || ballSpeedHoriz > 17.5 ? 4 : 1;
         actor.lastKickRelYaw = Math.max(
           -0.92,
           Math.min(0.92, Math.atan2(bVelLocX, Math.max(0.15, bVelLocZ)))
@@ -4506,6 +4558,7 @@ function animateFootballerActor(actor, state, dt, nowSec, particleSystem) {
       }
     }
   }
+  actor.prevRecentKickKind = recentKickKind;
   if (isThrowInTaker && charge > 0.02) {
     actor.throwFollowTimer = 0.02;
   }
@@ -6932,10 +6985,15 @@ export class ClassicFifa3DEngine {
     this.goalExcitement = 0;
     this.attractAngle = 0;
     this.prevBallZ = 0;
+    this.inputBasis = { rightX: 1, rightZ: 0, fwdX: 0, fwdZ: -1, basisKey: "rail" };
     this.lastTime = performance.now();
 
     this.resize();
     window.addEventListener("resize", () => this.resize());
+  }
+
+  getInputBasis() {
+    return this.inputBasis;
   }
 
   resize() {
@@ -7570,6 +7628,9 @@ export class ClassicFifa3DEngine {
       const gkHoldTicks = (holdTouchWord >>> 8) & 0xffff;
       const cueBase = spinBase + 7;
       const hasPlayerCueWords = currPacked.length >= cueBase + pps * 2;
+      const elevBase = cueBase + pps * 2;
+      const hasPlayerElevWords = currPacked.length >= elevBase + pps * 2;
+      const prevHasElevWords = p0.length >= elevBase + pps * 2;
 
       this.ballMesh.position.set(ballX, this.ballRadius + Math.max(0, ballZ), ballY);
       const bSpeed = Math.hypot(ballVx, ballVy);
@@ -7636,10 +7697,20 @@ export class ClassicFifa3DEngine {
         const action = flags & 0xf;
         const charge = ((flags >>> 15) & 0x7ff) / 1000;
         const sentOff = ((flags >>> 26) & 1) === 1;
-        const jz0 = ((flags0 >>> 28) & 0xf) * 0.06;
-        const jz1 = ((flags >>> 28) & 0xf) * 0.06;
+        const elev0 = prevHasElevWords ? p0[elevBase + n] >>> 0 : 0;
+        const elev1 = hasPlayerElevWords ? currPacked[elevBase + n] >>> 0 : 0;
+        const jz0 = prevHasElevWords ? (elev0 & 0xfff) / 1000 : ((flags0 >>> 28) & 0xf) * 0.06;
+        const jz1 = hasPlayerElevWords ? (elev1 & 0xfff) / 1000 : ((flags >>> 28) & 0xf) * 0.06;
         const jumpZ = teleported ? jz1 : jz0 + (jz1 - jz0) * tInterp;
-        const jumpVel = teleported ? 0 : (jz1 - jz0) * 60;
+        const vz0 = prevHasElevWords ? (((elev0 >>> 12) & 0x3fff) - 8192) / 1000 : 0;
+        const vz1 = hasPlayerElevWords ? (((elev1 >>> 12) & 0x3fff) - 8192) / 1000 : 0;
+        const jumpVel = teleported
+          ? 0
+          : hasPlayerElevWords && prevHasElevWords
+            ? vz0 + (vz1 - vz0) * tInterp
+            : (jz1 - jz0) * 60;
+        const skillKind = hasPlayerElevWords ? (elev1 >>> 26) & 0x7 : 0;
+        const recentKickKind = hasPlayerElevWords ? (elev1 >>> 29) & 0x7 : 0;
 
         const cueWord = hasPlayerCueWords ? currPacked[cueBase + n] >>> 0 : 0;
         const kickKind = cueWord & 0x7;
@@ -7719,6 +7790,9 @@ export class ClassicFifa3DEngine {
             dribbleTouchCd,
             kickKind,
             kickFinesse,
+            skillKind,
+            recentKickKind,
+            hasAuthoritativeKickCue: hasPlayerElevWords,
             actionTicks,
             actionDirRad,
             ballX,
@@ -7986,10 +8060,10 @@ export class ClassicFifa3DEngine {
           0.52,
           ballY - ySign * (is11 ? 5.2 : 4.0),
         ];
-      } else if (phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
-        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg` — taker framed cleanly above radar!)
+      } else if (is11 && phase === 3 && Math.abs(ballX) > halfL * 0.72 && Math.abs(ballY) > halfW * 0.65) {
+        // Authentic Behind-the-Corner-Taker Set-Piece Camera (`IMG_0351.jpeg` — 11v11 corners; 5v5 Rush keeps live gameplay camera!)
         setPieceCamKey = 3;
-        const penSpotX = Math.sign(ballX) * (halfL - (is11 ? 11.0 : 6.2));
+        const penSpotX = Math.sign(ballX) * (halfL - 11.0);
         const dx = penSpotX - ballX;
         const dz = -ballY;
         const inv = 1.0 / Math.max(0.1, Math.hypot(dx, dz));
@@ -8005,8 +8079,8 @@ export class ClassicFifa3DEngine {
           Math.max(-maxBowlZNorth, Math.min(maxBowlZSouth, ballY - uz * 5.2 * zScale + pz * 0.95)),
         ];
         targetLook = [ballX + ux * 7.6, 0.55, ballY + uz * 7.6];
-      } else if (phase === 6 || (phase === 5 && distToAttGoal < halfL * 0.92)) {
-        // Authentic Behind-the-Free-Kick / Penalty-Taker Camera (`IMG_0352.jpeg`, `IMG_0359.jpeg`!)
+      } else if (phase === 6 || (is11 && phase === 5 && distToAttGoal < halfL * 0.92)) {
+        // Authentic Behind-the-Penalty / 11v11 Direct-FK Camera (in 5v5 Rush, Indirect FKs stay on live gameplay camera!)
         setPieceCamKey = phase;
         const dx = targetGoalX - ballX;
         const dz = -ballY;
@@ -8034,36 +8108,71 @@ export class ClassicFifa3DEngine {
           targetPos = [leadX, heightY, fz * 0.35 + distZ];
           targetLook = [fx * 0.76, 0.55, fz * 0.35 + 0.45];
         } else if (this.cameraMode === "pro") {
-          // Authentic EA FIFA 10–12 "Be A Pro" Behind-the-Runner Horizon Camera (`IMG_0345.jpeg`!),
-          // clamped pitch-side clear of the West Stand wall (`-(halfL + 7.15)`) with smooth end-line elevation!
+          // Authentic EA FIFA "Be A Pro" / Rush End-to-End Behind-the-Runner Horizon Camera,
+          // oriented dynamically along `humanAttackSign` across halftime side swaps and P1 Home/Away selection!
           desiredFov = 36;
-          const rawProX = fx - (is11 ? 15.2 : 11.8) * zScale;
-          const minProX = -maxBowlX;
-          const proX = Math.max(minProX, Math.min(maxBowlX, rawProX));
-          const westWallBlend = Math.min(1, Math.max(0, (minProX - rawProX) / 10.0));
-          const proY = Math.min(9.6, (is11 ? 4.85 : 3.95) * zScale + westWallBlend * 2.15);
+          const proSide = this.proSide === 1 ? 1 : 0;
+          const humanAttackSign =
+            proSide === 0 ? Math.sign(gk1X - gk0X || 1) : Math.sign(gk0X - gk1X || -1);
+          const rawProX = fx - humanAttackSign * (is11 ? 15.2 : 11.8) * zScale;
+          const proX = Math.max(-maxBowlX, Math.min(maxBowlX, rawProX));
+          const endWallDist = humanAttackSign > 0 ? -maxBowlX - rawProX : rawProX - maxBowlX;
+          const endWallBlend = Math.min(1, Math.max(0, endWallDist / 10.0));
+          const proY = Math.min(9.6, (is11 ? 4.85 : 3.95) * zScale + endWallBlend * 2.15);
           const proZ = Math.max(-(halfW + 4.8), Math.min(halfW + 4.8, fz * 0.68));
+          const lookLeadX =
+            humanAttackSign > 0
+              ? Math.max(proX + 5.5, fx + (is11 ? 16.0 : 12.0))
+              : Math.min(proX - 5.5, fx - (is11 ? 16.0 : 12.0));
           targetPos = [proX, proY, proZ];
           targetLook = [
-            Math.max(proX + 5.5, fx + (is11 ? 16.0 : 12.0)),
-            1.32 - westWallBlend * 0.28,
+            lookLeadX,
+            1.32 - endWallBlend * 0.28,
             fz * 0.42,
           ];
         } else if (this.cameraMode === "wide") {
-          // Classic FIFA Co-Op Tactical (full goal-to-goal tactical overview!)
+          // Classic FIFA Co-Op / Rush Tactical (full goal-to-goal tactical overview!)
           desiredFov = 30;
           const heightY = (is11 ? 35.5 : 28.2) * zScale;
           const distZ = (is11 ? 47.5 : 37.8) * zScale;
           targetPos = [leadX * 0.40, heightY, distZ];
           targetLook = [leadX * 0.44, 0.40, 0.55];
         } else {
-          // Authentic EA FIFA 10–12 Tele Broadcast Gantry (`IMG_0350.webp` — pitch fills 92% of screen, crisp diagonal shadows, full box + 3D net in frame!)
+          // Authentic EA FIFA Tele / Rush Broadcast Gantry
           desiredFov = 28.5;
           const heightY = (is11 ? 29.5 : 23.2) * zScale;
           const distZ = (is11 ? 39.5 : 31.2) * zScale;
           targetPos = [leadX * 0.90, heightY, fz * 0.24 + distZ];
           targetLook = [leadX * 0.95, 0.42, fz * 0.26 + 0.85];
         }
+      }
+
+      // Rail-stabilized horizontal camera basis (`sim X = world X`, `sim Y = world Z`) for 360° stick projection!
+      if (setPieceCamKey !== 0) {
+        const bDx = targetLook[0] - targetPos[0];
+        const bDz = targetLook[2] - targetPos[2];
+        const bInv = 1.0 / Math.max(1e-4, Math.hypot(bDx, bDz));
+        const fwdX = bDx * bInv;
+        const fwdZ = bDz * bInv;
+        this.inputBasis = {
+          rightX: -fwdZ,
+          rightZ: fwdX,
+          fwdX,
+          fwdZ,
+          basisKey: `sp:${setPieceCamKey}:${Math.round(fwdX * 10)}:${Math.round(fwdZ * 10)}`,
+        };
+      } else if (this.cameraMode === "pro") {
+        const proSide = this.proSide === 1 ? 1 : 0;
+        const proSign = proSide === 0 ? Math.sign(gk1X - gk0X || 1) : Math.sign(gk0X - gk1X || -1);
+        this.inputBasis = {
+          rightX: 0,
+          rightZ: proSign,
+          fwdX: proSign,
+          fwdZ: 0,
+          basisKey: `pro:${proSign}`,
+        };
+      } else {
+        this.inputBasis = { rightX: 1, rightZ: 0, fwdX: 0, fwdZ: -1, basisKey: "rail" };
       }
     }
 

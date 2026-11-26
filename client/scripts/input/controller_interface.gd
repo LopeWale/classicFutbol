@@ -96,7 +96,7 @@ const CONTROL_PRESETS: Dictionary = {
 class DeviceCalibration:
 	var dead_zone: float = 0.12
 	var invert_x: bool = false
-	var invert_y: bool = true # Godot screen +Y is down; pitch +Y is up/far touchline
+	var invert_y: bool = false # Godot camera at +Z looks -Z: stick UP (-1) -> move_y < 0 -> -Z (up-screen)
 
 # Maps side (0 = Home, 1 = Away) -> bound joypad GUID ("" if keyboard or unbound)
 var bound_guid_by_side: Dictionary = {0: "", 1: ""}
@@ -405,9 +405,9 @@ func _sample_keyboard_p1(side: int, is_attacking: bool = false) -> Dictionary:
 	if Input.is_key_pressed(KEY_A) or Input.is_key_pressed(KEY_LEFT):
 		mx -= 1.0
 	if Input.is_key_pressed(KEY_W) or Input.is_key_pressed(KEY_UP):
-		my += 1.0
-	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):
 		my -= 1.0
+	if Input.is_key_pressed(KEY_S) or Input.is_key_pressed(KEY_DOWN):
+		my += 1.0
 	var v := Vector2(mx, my)
 	if v.length() > 1.0:
 		v = v.normalized()
