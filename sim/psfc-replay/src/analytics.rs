@@ -52,6 +52,88 @@ const CRUISE_BALL_RADIUS_M: f64 = 8.0;
 const CRUISE_FRACTION: f64 = 0.72;
 const HEADING_P95_MIN_SPEED: f64 = 3.0;
 
+// Round 4: defensive transition (`trans.*`), attacking support (`support.*`), flip detail.
+/// Max loose-ball gap (ticks) between the losing side's last ownership and the opponent's first.
+const TURNOVER_GAP_TICKS: u32 = 2 * TICKS_PER_SECOND;
+/// Transition episode horizon / `time_to_shape` cap (ticks).
+const TRANS_CAP_TICKS: u32 = 15 * TICKS_PER_SECOND;
+const TRANS_SHAPE_RADIUS_M: f64 = 5.0;
+const TRANS_RECOVERY_TICKS: u32 = 5 * TICKS_PER_SECOND;
+const TRANS_SPRINT_MPS: f64 = 6.0;
+const TRANS_COUNTERPRESS_TICKS: u32 = 6 * TICKS_PER_SECOND;
+const SUPPORT_MIN_M: f64 = 6.0;
+const SUPPORT_MAX_M: f64 = 30.0;
+const LANE_CLEAR_M: f64 = 1.5;
+const FORWARD_OPTION_M: f64 = 3.0;
+const RUN_BEHIND_MPS: f64 = 5.0;
+/// A runner who crossed the line must drop this far behind it again before a new run can count.
+const RUN_REARM_M: f64 = 1.0;
+const CLUSTER_PAIR_M: f64 = 4.0;
+const CLUSTER_CARRIER_M: f64 = 15.0;
+const SPEED_BAND_MPS: f64 = 3.0;
+const HEADING_FLIP_MIN_DEG: f64 = 1.0;
+/// A Pass event is attributed to the open-play carrier sampled at most this many ticks before it.
+const PASS_CARRIER_LOOKBACK_TICKS: u32 = 2;
+
+#[inline]
+fn dist(a: (f64, f64), b: (f64, f64)) -> f64 {
+    ((a.0 - b.0).powi(2) + (a.1 - b.1).powi(2)).sqrt()
+}
+
+/// Distance from `p` to the segment `a..b`.
+fn dist_to_segment(p: (f64, f64), a: (f64, f64), b: (f64, f64)) -> f64 {
+    let ab = (b.0 - a.0, b.1 - a.1);
+    let len2 = ab.0 * ab.0 + ab.1 * ab.1;
+    if len2 <= 1e-12 {
+        return dist(p, a);
+    }
+    let t = (((p.0 - a.0) * ab.0 + (p.1 - a.1) * ab.1) / len2).clamp(0.0, 1.0);
+    dist(p, (a.0 + t * ab.0, a.1 + t * ab.1))
+}
+
+/// Second-last on-pitch player of `defending` (GK included) projected on the attacking axis of
+/// the opponent (`x * sign`, sign = attacking side's attack_sign); `None` with fewer than 2.
+fn second_last_proj(st: &MatchState, defending: TeamSide, sign: f64) -> Option<f64> {
+    let mut v: Vec<f64> = st.players[defending.index()]
+        .iter()
+        .filter(|p| !p.sent_off)
+        .map(|p| f(p.pos.x) * sign)
+        .collect();
+    if v.len() < 2 {
+        return None;
+    }
+    v.sort_by(f64::total_cmp);
+    Some(v[v.len() - 2])
+}
+
+/// Offside position of `players[side][idx]`, mirroring the sim's `is_player_offside_at_pass`
+/// (offsides enabled, past the offside zone line: halfway in 11v11, +half_len/3 in 5v5; more than
+/// 0.15 m ahead of the ball and more than 0.2 m ahead of the second-last opponent). The GK is never
+/// offside.
+fn offside_position(st: &MatchState, side: TeamSide, idx: usize, sign: f64) -> bool {
+    if !st.rules.offsides_enabled || idx == 0 {
+        return false;
+    }
+    let recv = f(st.players[side.index()][idx].pos.x) * sign;
+    let zone = if st.format.players_per_side <= 6 {
+        f(st.format.half_length()) / 3.0
+    } else {
+        0.0
+    };
+    if recv <= zone || recv <= f(st.ball.pos.x) * sign + 0.15 {
+        return false;
+    }
+    second_last_proj(st, side.opponent(), sign).is_some_and(|sl| recv > sl + 0.2)
+}
+
+/// Is the lane from `from` to `to` clear (no on-pitch player of `opp` within 1.5 m of the segment)?
+fn lane_open(st: &MatchState, opp: TeamSide, from: (f64, f64), to: (f64, f64)) -> bool {
+    st.players[opp.index()]
+        .iter()
+        .filter(|p| !p.sent_off)
+        .all(|p| dist_to_segment(v2(p.pos), from, to) > LANE_CLEAR_M)
+}
+
 /// Sprint top speed (m/s) at full stamina, mirroring `step_all_players`:
 /// `(5450 + 26 * pace) mm/s * (1 + max_sprint_bonus)`, bonus 0.205 (5v5) / 0.220 (11v11).
 fn approx_top_speed(pace: u8, five_a_side: bool) -> f64 {
@@ -158,28 +240,46 @@ pub struct AnalyzeConfig {
     pub minutes: u32,
     pub home_difficulty: CpuDifficulty,
     pub away_difficulty: CpuDifficulty,
+    /// Round 4: the home side is `SideController::Human`, fed `ai::suggest_cpu_input` every tick.
+    #[serde(default)]
+    pub home_autopilot: bool,
+    #[serde(default)]
+    pub away_autopilot: bool,
 }
 
 impl AnalyzeConfig {
+    /// `hard` for a CPU side, `autopilot-hard` for an auto-piloted human side.
+    fn side_label(&self, side: TeamSide) -> String {
+        let (d, ap) = match side {
+            TeamSide::Home => (self.home_difficulty, self.home_autopilot),
+            TeamSide::Away => (self.away_difficulty, self.away_autopilot),
+        };
+        if ap {
+            format!("autopilot-{}", difficulty_label(d))
+        } else {
+            difficulty_label(d).to_string()
+        }
+    }
+
     pub fn label(&self) -> String {
         format!(
             "{} {} vs {} ({} min x {} seeds from {})",
             self.format.label(),
-            difficulty_label(self.home_difficulty),
-            difficulty_label(self.away_difficulty),
+            self.side_label(TeamSide::Home),
+            self.side_label(TeamSide::Away),
             self.minutes,
             self.seeds,
             self.seed_base
         )
     }
 
-    /// Stable id used by `--compare` to pair reports across runs.
+    /// Stable id used by `--compare` to pair reports across runs (unchanged for CPU-vs-CPU).
     pub fn id(&self) -> String {
         format!(
             "{}_{}_vs_{}_{}min_{}x{}",
             self.format.label(),
-            difficulty_label(self.home_difficulty),
-            difficulty_label(self.away_difficulty),
+            self.side_label(TeamSide::Home),
+            self.side_label(TeamSide::Away),
             self.minutes,
             self.seeds,
             self.seed_base
@@ -187,7 +287,7 @@ impl AnalyzeConfig {
     }
 
     pub fn command_line(&self) -> String {
-        format!(
+        let mut s = format!(
             "psfc-replay analyze --format {} --seeds {} --seed-base {} --minutes {} --home-difficulty {} --away-difficulty {}",
             self.format.label(),
             self.seeds,
@@ -195,7 +295,14 @@ impl AnalyzeConfig {
             self.minutes,
             difficulty_label(self.home_difficulty),
             difficulty_label(self.away_difficulty)
-        )
+        );
+        if self.home_autopilot {
+            s.push_str(" --home-controller autopilot");
+        }
+        if self.away_autopilot {
+            s.push_str(" --away-controller autopilot");
+        }
+        s
     }
 
     /// Half duration in ticks so that the full match clock is `minutes`.
@@ -365,6 +472,56 @@ struct SideAcc {
     engager3: u64,
     cruise_n: u64,
     cruise_over: u64,
+    // Round 4: defensive transition (this side lost the ball).
+    trans_count: u64,
+    trans_ep: Option<TransEp>,
+    trans_shape: Mean,
+    trans_shape_capped: u64,
+    trans_shape_excluded: u64,
+    trans_shape_at_t0: u64,
+    trans_shape_static: Mean,
+    trans_shape_static_capped: u64,
+    trans_shape_static_excluded: u64,
+    trans_behind3: Mean,
+    trans_behind6: Mean,
+    trans_fwd_speed: Mean,
+    trans_fwd_sprint: u64,
+    trans_mid_speed: Mean,
+    trans_mid_sprint: u64,
+    trans_fwd_high: Mean,
+    trans_counterpress: u64,
+    // Round 4: attacking support (this side has an outfield carrier).
+    sup_ticks: u64,
+    sup_open: Vec<f32>,
+    sup_le1: u64,
+    sup_nearest: Mean,
+    sup_fwd: Mean,
+    sup_cluster: u64,
+    sup_width: Mean,
+    sup_depth: Mean,
+    sup_runs: u64,
+    /// Per slot: 0 = not armed, 1 = armed (at/behind the line), 2 = crossed (re-arm 1 m behind).
+    run_state: Vec<u8>,
+    /// Last open-play outfield-carrier sample: (carrier idx, tick, open-lane mask of teammates).
+    last_carrier: Option<(usize, u32, u32)>,
+    /// Pass in progress: (passer idx, open-lane mask at the last carrier sample).
+    pending_pass: Option<(usize, u32)>,
+    passes_completed: u64,
+    passes_open: u64,
+    // Round 4: flip detail.
+    flips_class: [u64; 4],
+    ticks_class: [u64; 4],
+    flips_band: [u64; 2],
+    ticks_band: [u64; 2],
+    heading_flips: u64,
+}
+
+/// An active defensive-transition episode of the side that lost the ball.
+#[derive(Clone, Copy)]
+struct TransEp {
+    t0: u32,
+    shape_done: bool,
+    static_done: bool,
 }
 
 #[derive(Clone)]
@@ -380,6 +537,8 @@ struct PrevPlayer {
     recent_kick_ticks: u8,
     /// Signed lateral velocity component (m/s) of the last heading sample, if that tick had one.
     lat: Option<f64>,
+    /// Signed heading change (deg) of the last heading sample, if that tick had one.
+    theta: Option<f64>,
 }
 
 fn close_excursion(a: &mut SideAcc) {
@@ -471,8 +630,15 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         FormatKind::ElevenASide => FixtureSnapshot::sample_eleven_a_side(seed),
     };
     snapshot.rules.half_duration_ticks = cfg.half_duration_ticks();
-    snapshot.rules.home_controller = SideController::Cpu(cfg.home_difficulty);
-    snapshot.rules.away_controller = SideController::Cpu(cfg.away_difficulty);
+    let side_controller = |ap: bool, d: CpuDifficulty| {
+        if ap {
+            SideController::Human
+        } else {
+            SideController::Cpu(d)
+        }
+    };
+    snapshot.rules.home_controller = side_controller(cfg.home_autopilot, cfg.home_difficulty);
+    snapshot.rules.away_controller = side_controller(cfg.away_autopilot, cfg.away_difficulty);
 
     let mut sim = MatchSimulation::new(&snapshot).map_err(|e| e.to_string())?;
     let probe = ScenarioProbe::discover(sim.state());
@@ -507,9 +673,23 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         .half_duration_ticks()
         .saturating_mul(5)
         .saturating_add(6_000);
-    let idle = [InputFrame::IDLE, InputFrame::IDLE];
+    // Round 4: last open-play ball owner (side, tick), for turnover detection.
+    let mut last_owner: Option<(TeamSide, u32)> = None;
     while !sim.is_finished() && sim.state().tick < safety_cap {
-        sim.tick(&idle);
+        // Auto-piloted human sides get the side-effect-free CPU suggestion for the current state
+        // (computed outside `tick`, as `suggest_cpu_input` requires); CPU sides ignore the frame.
+        let input_for = |side: TeamSide, ap: bool, d: CpuDifficulty| {
+            if ap {
+                psfc_sim::ai::suggest_cpu_input(sim.state(), side, d)
+            } else {
+                InputFrame::IDLE
+            }
+        };
+        let inputs = [
+            input_for(TeamSide::Home, cfg.home_autopilot, cfg.home_difficulty),
+            input_for(TeamSide::Away, cfg.away_autopilot, cfg.away_difficulty),
+        ];
+        sim.tick(&inputs);
         let events = sim.drain_events();
         let st = sim.state();
         let open = matches!(st.phase, MatchPhase::OpenPlay);
@@ -529,6 +709,15 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
             match ev.event_type {
                 MatchEventType::Shot => last_shot_tick[s] = Some(ev.tick),
                 MatchEventType::Offside => acc[s].offsides += 1,
+                MatchEventType::Pass => {
+                    let a = &mut acc[s];
+                    a.pending_pass = a
+                        .last_carrier
+                        .filter(|&(_, t, _)| {
+                            ev.tick.saturating_sub(t) <= PASS_CARRIER_LOOKBACK_TICKS
+                        })
+                        .map(|(ci, _, mask)| (ci, mask));
+                }
                 MatchEventType::Save => {
                     if ev.detail.contains("catches") {
                         acc[s].gk_catches += 1;
@@ -591,7 +780,16 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     close_excursion(a);
                 }
                 prev[side.index()].iter_mut().for_each(|p| *p = None);
+                // Round 4: a stoppage ends (censors) a transition episode and any pass or run.
+                if let Some(ep) = a.trans_ep.take() {
+                    a.trans_shape_excluded += u64::from(!ep.shape_done);
+                    a.trans_shape_static_excluded += u64::from(!ep.static_done);
+                }
+                a.run_state.iter_mut().for_each(|r| *r = 0);
+                a.last_carrier = None;
+                a.pending_pass = None;
             }
+            last_owner = None;
             prev_gk_owner = [false, false];
             for a in 0..n_flat {
                 for b in (a + 1)..n_flat {
@@ -609,6 +807,231 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         let ball = (f(st.ball.pos.x), f(st.ball.pos.y));
         let poss_team = st.ball.owner.map(|(s, _)| s).or(st.ball.last_touch_team);
         let carrier = st.ball.owner;
+
+        // ---------------- Round 4: turnovers and defensive transition ----------------
+        if let Some((os, oi)) = carrier {
+            if let Some((ls, lt)) = last_owner {
+                if ls != os && st.tick.saturating_sub(lt) <= TURNOVER_GAP_TICKS {
+                    let a = &mut acc[ls.index()];
+                    a.trans_count += 1;
+                    // The losing side has no active episode: it would have ended when it regained.
+                    a.trans_ep = Some(TransEp {
+                        t0: st.tick,
+                        shape_done: false,
+                        static_done: false,
+                    });
+                }
+            }
+            last_owner = Some((os, st.tick));
+            // Completed pass: a teammate of the passer becomes the owner; any other owner
+            // (opponent, or the passer himself) ends the pass uncompleted.
+            for side in [TeamSide::Home, TeamSide::Away] {
+                let a = &mut acc[side.index()];
+                if let Some((passer, mask)) = a.pending_pass.take() {
+                    if os == side && oi != passer {
+                        a.passes_completed += 1;
+                        a.passes_open += u64::from(mask & (1 << oi) != 0);
+                    }
+                }
+            }
+        }
+        for side in [TeamSide::Home, TeamSide::Away] {
+            let s = side.index();
+            let a = &mut acc[s];
+            let Some(mut ep) = a.trans_ep else {
+                continue;
+            };
+            let e = st.tick.saturating_sub(ep.t0);
+            if carrier.is_some_and(|(cs, _)| cs == side) {
+                // Regained before the episode horizon.
+                if e <= TRANS_COUNTERPRESS_TICKS {
+                    a.trans_counterpress += 1;
+                }
+                a.trans_shape_excluded += u64::from(!ep.shape_done);
+                a.trans_shape_static_excluded += u64::from(!ep.static_done);
+                a.trans_ep = None;
+                continue;
+            }
+            let sign = side.attack_sign(swapped) as f64;
+            let players = &st.players[s];
+            let outfield: Vec<usize> = (1..players.len())
+                .filter(|&i| !players[i].sent_off)
+                .collect();
+            let n = outfield.len();
+            let ahead = |i: usize| (f(players[i].pos.x) - ball.0) * sign;
+            let secs = f64::from(e) / f64::from(TICKS_PER_SECOND);
+            if n > 0 && (!ep.shape_done || !ep.static_done) {
+                let (mut ok_dyn, mut ok_static) = (0_usize, 0_usize);
+                for &i in &outfield {
+                    let pos = v2(players[i].pos);
+                    let gs = ahead(i) < 0.0;
+                    if !ep.shape_done
+                        && (gs
+                            || dist(pos, v2(psfc_sim::ai::defensive_shape_anchor(st, side, i)))
+                                <= TRANS_SHAPE_RADIUS_M)
+                    {
+                        ok_dyn += 1;
+                    }
+                    if !ep.static_done
+                        && (gs
+                            || dist(
+                                pos,
+                                v2(psfc_sim::ai::world_anchor_for_player(st, side, i, Fp::ZERO)),
+                            ) <= TRANS_SHAPE_RADIUS_M)
+                    {
+                        ok_static += 1;
+                    }
+                }
+                if !ep.shape_done && ok_dyn * 5 >= n * 4 {
+                    a.trans_shape.add(secs);
+                    a.trans_shape_at_t0 += u64::from(e == 0);
+                    ep.shape_done = true;
+                }
+                if !ep.static_done && ok_static * 5 >= n * 4 {
+                    a.trans_shape_static.add(secs);
+                    ep.static_done = true;
+                }
+            }
+            if n > 0 && (e == 3 * TICKS_PER_SECOND || e == 6 * TICKS_PER_SECOND) {
+                let behind = outfield.iter().filter(|&&i| ahead(i) < 0.0).count() as f64 / n as f64;
+                if e == 3 * TICKS_PER_SECOND {
+                    a.trans_behind3.add(behind);
+                } else {
+                    a.trans_behind6.add(behind);
+                    let high = outfield
+                        .iter()
+                        .filter(|&&i| players[i].role == PlayerRole::Forward && ahead(i) > 0.0)
+                        .count();
+                    a.trans_fwd_high.add(high as f64);
+                }
+            }
+            if e < TRANS_RECOVERY_TICKS {
+                for &i in &outfield {
+                    let v = v2(players[i].vel);
+                    let sp = (v.0 * v.0 + v.1 * v.1).sqrt();
+                    let sprint = u64::from(sp > TRANS_SPRINT_MPS);
+                    match players[i].role {
+                        PlayerRole::Forward => {
+                            a.trans_fwd_speed.add(sp);
+                            a.trans_fwd_sprint += sprint;
+                        }
+                        PlayerRole::Midfielder => {
+                            a.trans_mid_speed.add(sp);
+                            a.trans_mid_sprint += sprint;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if e >= TRANS_CAP_TICKS {
+                let cap = f64::from(TRANS_CAP_TICKS) / f64::from(TICKS_PER_SECOND);
+                if !ep.shape_done {
+                    a.trans_shape.add(cap);
+                    a.trans_shape_capped += 1;
+                }
+                if !ep.static_done {
+                    a.trans_shape_static.add(cap);
+                    a.trans_shape_static_capped += 1;
+                }
+                a.trans_ep = None;
+            } else {
+                a.trans_ep = Some(ep);
+            }
+        }
+
+        // ---------------- Round 4: attacking support ----------------
+        for side in [TeamSide::Home, TeamSide::Away] {
+            let s = side.index();
+            let sign = side.attack_sign(swapped) as f64;
+            let opp = side.opponent();
+            let players = &st.players[s];
+            let a = &mut acc[s];
+            if a.run_state.len() != players.len() {
+                a.run_state = vec![0; players.len()];
+            }
+            let own_carrier = carrier.filter(|&(cs, _)| cs == side).map(|(_, ci)| ci);
+            // Runs in behind: while this side owns the ball (any player, GK included).
+            match (own_carrier, second_last_proj(st, opp, sign)) {
+                (Some(ci), Some(line)) => {
+                    for (j, p) in players.iter().enumerate() {
+                        if j == 0 || j == ci || p.sent_off {
+                            a.run_state[j] = 0;
+                            continue;
+                        }
+                        let proj = f(p.pos.x) * sign;
+                        let v = v2(p.vel);
+                        let sp = (v.0 * v.0 + v.1 * v.1).sqrt();
+                        match a.run_state[j] {
+                            0 if proj <= line => a.run_state[j] = 1,
+                            1 if proj > line => {
+                                if sp > RUN_BEHIND_MPS {
+                                    a.sup_runs += 1;
+                                }
+                                a.run_state[j] = 2;
+                            }
+                            2 if proj < line - RUN_REARM_M => a.run_state[j] = 1,
+                            _ => {}
+                        }
+                    }
+                }
+                _ => a.run_state.iter_mut().for_each(|r| *r = 0),
+            }
+            let Some(ci) = own_carrier.filter(|&ci| ci != 0) else {
+                continue;
+            };
+            let cpos = v2(players[ci].pos);
+            let mut mask = 0_u32;
+            let mut n_open = 0_u32;
+            let mut n_fwd = 0_u32;
+            let mut nearest = f64::INFINITY;
+            for (j, p) in players.iter().enumerate() {
+                if j == ci || p.sent_off {
+                    continue;
+                }
+                let q = v2(p.pos);
+                if !lane_open(st, opp, cpos, q) || offside_position(st, side, j, sign) {
+                    continue;
+                }
+                mask |= 1 << j;
+                let d = dist(cpos, q);
+                if j == 0 || !(SUPPORT_MIN_M..=SUPPORT_MAX_M).contains(&d) {
+                    continue;
+                }
+                n_open += 1;
+                nearest = nearest.min(d);
+                if (q.0 - cpos.0) * sign >= FORWARD_OPTION_M {
+                    n_fwd += 1;
+                }
+            }
+            a.sup_ticks += 1;
+            a.sup_open.push(n_open as f32);
+            a.sup_le1 += u64::from(n_open <= 1);
+            a.sup_fwd.add(f64::from(n_fwd));
+            if n_open > 0 {
+                a.sup_nearest.add(nearest);
+            }
+            a.last_carrier = Some((ci, st.tick, mask));
+            let near: Vec<(f64, f64)> = players
+                .iter()
+                .enumerate()
+                .filter(|&(j, p)| j != 0 && j != ci && !p.sent_off)
+                .map(|(_, p)| v2(p.pos))
+                .filter(|&q| dist(q, cpos) <= CLUSTER_CARRIER_M)
+                .collect();
+            let clustered = (0..near.len())
+                .any(|x| ((x + 1)..near.len()).any(|y| dist(near[x], near[y]) <= CLUSTER_PAIR_M));
+            a.sup_cluster += u64::from(clustered);
+            let (mut x0, mut x1, mut y0, mut y1) = (f64::MAX, f64::MIN, f64::MAX, f64::MIN);
+            for p in players.iter().skip(1).filter(|p| !p.sent_off) {
+                let q = v2(p.pos);
+                x0 = x0.min(q.0);
+                x1 = x1.max(q.0);
+                y0 = y0.min(q.1);
+                y1 = y1.max(q.1);
+            }
+            a.sup_width.add(y1 - y0);
+            a.sup_depth.add(x1 - x0);
+        }
 
         // ---------------- Collisions (all on-pitch pairs) ----------------
         {
@@ -902,6 +1325,7 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 let mut pos_vel = None;
                 let mut dspeed = None;
                 let mut lat = None;
+                let mut theta = None;
                 if i != 0 && z > AIRBORNE_Z {
                     airborne += 1;
                 }
@@ -909,6 +1333,10 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     a.player_ticks += 1;
                     let sp0 = (pp.vel.0.powi(2) + pp.vel.1.powi(2)).sqrt();
                     let sp1 = (vel.0.powi(2) + vel.1.powi(2)).sqrt();
+                    let class = usize::from(psfc_sim::ai::move_priority(st, side, i).min(3));
+                    let band = usize::from(sp1 >= SPEED_BAND_MPS);
+                    a.ticks_class[class] += 1;
+                    a.ticks_band[band] += 1;
                     let dv = ((vel.0 - pp.vel.0).powi(2) + (vel.1 - pp.vel.1).powi(2)).sqrt();
                     let acc_mps2 = dv * f64::from(TICKS_PER_SECOND);
                     a.accel.add(acc_mps2);
@@ -951,9 +1379,21 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                                 && pl.signum() != l.signum()
                             {
                                 a.side_flips += 1;
+                                a.flips_class[class] += 1;
+                                a.flips_band[band] += 1;
                             }
                         }
                         lat = Some(l);
+                        let th = cross.atan2(dot).to_degrees();
+                        if let Some(pth) = pp.theta {
+                            if pth.abs() > HEADING_FLIP_MIN_DEG
+                                && th.abs() > HEADING_FLIP_MIN_DEG
+                                && pth.signum() != th.signum()
+                            {
+                                a.heading_flips += 1;
+                            }
+                        }
+                        theta = Some(th);
                         a.turn_rate.add(deg * f64::from(TICKS_PER_SECOND));
                         // Component of the velocity change perpendicular to the previous heading.
                         a.lateral_accel
@@ -997,6 +1437,7 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     z,
                     recent_kick_ticks: p.recent_kick_ticks,
                     lat,
+                    theta,
                 });
             }
             a.max_airborne = a.max_airborne.max(airborne);
@@ -1322,6 +1763,150 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         m.insert("aerial.headers_shot".into(), a.headers_shot as f64);
         m.insert("aerial.headers_clear".into(), a.headers_clear as f64);
         m.insert("aerial.headers_pass".into(), a.headers_pass as f64);
+
+        // ---------------- Round 4 ----------------
+        // Conditional means are only emitted when they have samples (mean_maps skips missing keys).
+        let put_mean = |m: &mut Metrics, k: &str, v: Mean, scale: f64| {
+            if v.n > 0 {
+                m.insert(k.into(), v.get() * scale);
+            }
+        };
+        m.insert("trans.count_per_10min".into(), per10(a.trans_count));
+        let shape_n = a.trans_shape.n;
+        put_mean(m, "trans.time_to_shape_s", a.trans_shape, 1.0);
+        if shape_n > 0 {
+            m.insert(
+                "trans.time_to_shape_capped_pct".into(),
+                pct(a.trans_shape_capped, shape_n),
+            );
+            m.insert(
+                "trans.in_shape_at_turnover_pct".into(),
+                pct(a.trans_shape_at_t0, shape_n),
+            );
+        }
+        put_mean(m, "trans.time_to_shape_static_s", a.trans_shape_static, 1.0);
+        if a.trans_shape_static.n > 0 {
+            m.insert(
+                "trans.time_to_shape_static_capped_pct".into(),
+                pct(a.trans_shape_static_capped, a.trans_shape_static.n),
+            );
+        }
+        if a.trans_count > 0 {
+            m.insert(
+                "trans.time_to_shape_excluded_pct".into(),
+                pct(a.trans_shape_excluded, a.trans_count),
+            );
+            m.insert(
+                "trans.time_to_shape_static_excluded_pct".into(),
+                pct(a.trans_shape_static_excluded, a.trans_count),
+            );
+            m.insert(
+                "trans.counterpress_pct".into(),
+                pct(a.trans_counterpress, a.trans_count),
+            );
+        }
+        put_mean(
+            m,
+            "trans.pct_outfield_behind_ball_at_3s",
+            a.trans_behind3,
+            100.0,
+        );
+        put_mean(
+            m,
+            "trans.pct_outfield_behind_ball_at_6s",
+            a.trans_behind6,
+            100.0,
+        );
+        if a.trans_fwd_speed.n > 0 {
+            m.insert(
+                "trans.forward_recovery_speed_mps_0_5s".into(),
+                a.trans_fwd_speed.get(),
+            );
+            m.insert(
+                "trans.forward_sprint_share_0_5s".into(),
+                pct(a.trans_fwd_sprint, a.trans_fwd_speed.n),
+            );
+        }
+        if a.trans_mid_speed.n > 0 {
+            m.insert(
+                "trans.mid_recovery_speed_mps_0_5s".into(),
+                a.trans_mid_speed.get(),
+            );
+            m.insert(
+                "trans.mid_sprint_share_0_5s".into(),
+                pct(a.trans_mid_sprint, a.trans_mid_speed.n),
+            );
+        }
+        put_mean(m, "trans.forwards_staying_high_mean", a.trans_fwd_high, 1.0);
+
+        if a.sup_ticks > 0 {
+            let mut so = a.sup_open.clone();
+            let mean = so.iter().map(|&v| f64::from(v)).sum::<f64>() / so.len() as f64;
+            m.insert("support.open_options_mean".into(), mean);
+            m.insert("support.open_options_p10".into(), percentile(&mut so, 0.10));
+            m.insert(
+                "support.ticks_with_le1_option_pct".into(),
+                pct(a.sup_le1, a.sup_ticks),
+            );
+            m.insert("support.forward_options_mean".into(), a.sup_fwd.get());
+            m.insert(
+                "support.cluster_pct".into(),
+                pct(a.sup_cluster, a.sup_ticks),
+            );
+            m.insert("support.width_m".into(), a.sup_width.get());
+            m.insert("support.depth_m".into(), a.sup_depth.get());
+            m.insert(
+                "support.carrier_pct_of_open_play".into(),
+                pct(a.sup_ticks, a.open_ticks),
+            );
+        }
+        put_mean(m, "support.nearest_option_dist_m", a.sup_nearest, 1.0);
+        m.insert("support.runs_in_behind_per_10min".into(), per10(a.sup_runs));
+        m.insert(
+            "support.passes_completed_tracked".into(),
+            a.passes_completed as f64,
+        );
+        if a.passes_completed > 0 {
+            m.insert(
+                "support.pass_target_open_pct".into(),
+                pct(a.passes_open, a.passes_completed),
+            );
+        }
+
+        let per_pmin = |c: u64, t: u64| {
+            let mins = t as f64 / TICKS_PER_MIN;
+            if mins > 0.0 {
+                c as f64 / mins
+            } else {
+                0.0
+            }
+        };
+        for c in 0..4 {
+            m.insert(
+                format!("move.side_flips_by_class.{c}_per_player_min"),
+                per_pmin(a.flips_class[c], a.ticks_class[c]),
+            );
+            m.insert(
+                format!("move.side_flips_by_class.{c}_share_pct"),
+                pct(a.flips_class[c], a.side_flips),
+            );
+            m.insert(
+                format!("move.class_time_pct.{c}"),
+                pct(a.ticks_class[c], a.player_ticks),
+            );
+        }
+        m.insert(
+            "move.side_flips_speed_lt3_per_player_min".into(),
+            per_pmin(a.flips_band[0], a.ticks_band[0]),
+        );
+        m.insert(
+            "move.side_flips_speed_ge3_per_player_min".into(),
+            per_pmin(a.flips_band[1], a.ticks_band[1]),
+        );
+        m.insert(
+            "move.heading_sign_flips_per_player_min".into(),
+            per_pmin(a.heading_flips, a.player_ticks),
+        );
     }
 
     let mut match_metrics = Metrics::new();
@@ -1482,6 +2067,30 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ("shape.<phase>.nearest_mate_mean_m / nearest_mate_p10_m", "For every on-pitch outfielder and tick of the phase, distance to the nearest other outfielder of the same side; mean and 10th percentile (nearest rank)."),
         ("aerial.jumps_outfield / aerial.jumps_gk","Count of z going from <= 0 to > 0 between consecutive open-play ticks (outfielders / GK; GK dives that leave the ground count)."),
         ("aerial.max_airborne_outfield", "Max number of the side's outfielders with z > 0 on one open-play tick."),
+        ("general.autopilot", "Round 4. --home-controller / --away-controller autopilot sets that side to SideController::Human and, before every tick, feeds it psfc_sim::ai::suggest_cpu_input(sim.state(), side, difficulty) (the side-effect-free CPU input, computed from the state after the previous tick, i.e. one tick of input latency; the other side's frame is idle and ignored). This drives the human-side paths (auto-switch, controlled player, teammate contain) that CPU-vs-CPU never runs. Config ids/labels name such a side 'autopilot-<difficulty>'; CPU-only ids are unchanged. Final hashes are deterministic: the unit test autopilot_match_is_deterministic runs the same autopilot config twice and asserts identical state_hash."),
+        ("general.turnover", "Round 4. A turnover against side L happens on the open-play tick t0 on which the opponent O becomes ball.owner while the previous open-play owner was a player of L whose last owned tick is at most 120 ticks (2 s) earlier, with no stoppage in between (any non-open-play tick clears the last owner). So the ball goes from L to O directly (tackle, interception of a pass, keeper claim of a shot or cross) or after a loose spell of at most 2 s; a loose ball contested for longer, and restarts (throw-ins, goal kicks, free kicks), are not turnovers. A transition episode for L starts at t0 and ends at the first of: a stoppage, L owning the ball again, or t0 + 15 s. All trans.* metrics are in the losing side's map."),
+        ("trans.count_per_10min", "Turnovers suffered by the side (general.turnover) per 10 open-play minutes."),
+        ("trans.time_to_shape_s / time_to_shape_capped_pct / time_to_shape_excluded_pct", "Seconds from t0 to the first episode tick on which at least 80% of the side's on-pitch outfielders are either within 5 m of psfc_sim::ai::defensive_shape_anchor(state, side, idx) (the defensive-block slot the AI is assigned, ball-relative via the team memory's ref_ball; falls back to the static slot for unassigned players) or strictly goal-side of the ball ((x - ball.x) * attack_sign < 0). Episodes reaching 15 s without it score 15 s and count as capped (capped_pct = % of scored episodes). Episodes that end earlier by a stoppage or by the side regaining the ball, before reaching shape, are not scored (excluded_pct = % of all turnovers). The tick t0 itself is checked (0 s = already in shape)."),
+        ("trans.in_shape_at_turnover_pct", "% of scored time_to_shape episodes (defensive_shape_anchor variant) already in shape on the turnover tick t0 (time 0 s). A high value means the criterion is met by position at the moment of the loss (players already goal-side of the ball), not by a recovery run."),
+        ("trans.time_to_shape_static_s /_static_capped_pct / _static_excluded_pct", "Same with the static formation slot world_anchor_for_player(state, side, idx, 0) instead of defensive_shape_anchor: a reference that does not depend on the AI's own block logic, for before/after comparisons across AI changes."),
+        ("trans.pct_outfield_behind_ball_at_3s / _at_6s", "% of the side's on-pitch outfielders strictly goal-side of the ball at exactly t0 + 3 s (180 ticks) and t0 + 6 s (360 ticks), over episodes still running at that tick (no stoppage, not regained)."),
+        ("trans.forward_recovery_speed_mps_0_5s / forward_sprint_share_0_5s", "Over episode ticks t0 .. t0 + 5 s (exclusive) and the side's on-pitch players with PlayerRole::Forward: mean |vel| (m/s), and % of those player-ticks with |vel| > 6 m/s."),
+        ("trans.mid_recovery_speed_mps_0_5s / mid_sprint_share_0_5s", "Same for PlayerRole::Midfielder."),
+        ("trans.forwards_staying_high_mean", "Mean number of the side's on-pitch Forwards ahead of the ball ((x - ball.x) * attack_sign > 0) at t0 + 6 s, over episodes still running then (rest offence kept high)."),
+        ("trans.counterpress_pct", "% of turnovers after which the side owns the ball again within 6 s (t0 + 360 ticks) with no stoppage in between."),
+        ("general.support", "Round 4. Support metrics are sampled on open-play ticks where an outfielder (slot != 0) of the side is ball.owner (carrier ticks). Open lane to a teammate: no on-pitch opponent (GK included) within 1.5 m of the segment carrier -> teammate. Offside: mirrors the sim's is_player_offside_at_pass: offsides_enabled, teammate (not the GK) past the offside-zone line (halfway in 11v11, +half_length/3 in 5v5 Rush), more than 0.15 m ahead of the ball and more than 0.2 m ahead of the second-last on-pitch opponent (GK included), all along the attacking axis (this is the task's 'ahead of the second-last opponent' rule with the sim's own zone, ball and tolerance conditions, so it matches what the referee would flag). Open option: an outfield teammate 6-30 m from the carrier with an open lane and not offside."),
+        ("support.open_options_mean / open_options_p10 / ticks_with_le1_option_pct", "Number of open options per carrier tick: mean, 10th percentile (nearest rank) across carrier ticks, and % of carrier ticks with 0 or 1 open option."),
+        ("support.nearest_option_dist_m", "Mean distance carrier -> nearest open option, over carrier ticks with at least one open option."),
+        ("support.forward_options_mean", "Mean number of open options at least 3 m ahead of the carrier along the attacking axis ((x_mate - x_carrier) * attack_sign >= 3)."),
+        ("support.runs_in_behind_per_10min", "Per outfielder other than the owner, on open-play ticks while his side owns the ball (any owner incl. GK), against the line L = second-last opponent's x along the attacking axis on that tick: a run counts when the player was at or behind L on an earlier such tick (armed) and is now ahead of L with |vel| > 5 m/s. After crossing (counted or not) he must drop more than 1 m behind L to be armed again; losing possession or a stoppage disarms everyone. Count per 10 open-play minutes."),
+        ("support.cluster_pct", "% of carrier ticks where two outfield teammates other than the carrier are within 4 m of each other and both within 15 m of the carrier."),
+        ("support.width_m / support.depth_m", "y-extent / x-extent of the side's on-pitch outfielders (carrier included) on carrier ticks, mean."),
+        ("support.carrier_pct_of_open_play", "Carrier ticks as % of the side's open-play ticks (sample size of the support metrics)."),
+        ("support.pass_target_open_pct / passes_completed_tracked", "From the event stream plus owner transitions (the sim's Pass event carries no receiver): a MatchEventType::Pass of the side within 2 ticks after its last carrier tick starts a pass by that carrier, remembering which teammates (GK included, no distance band) had an open, non-offside lane on that last carrier tick. The pass is completed when the next open-play owner is a teammate other than the passer; any other next owner, or a stoppage, ends it. pass_target_open_pct = % of completed passes whose receiver had an open lane at the moment of the pass; passes_completed_tracked = their count per match (open-play passes only; Pass events also cover clearances, which count when a teammate collects them; set-piece passes are not tracked)."),
+        ("move.side_flips_by_class.<c>_per_player_min / _share_pct", "Round 4. Side flips (move.side_flips_per_player_min) split by psfc_sim::ai::move_priority(state, side, idx) on the tick of the flip (0 carrier / elected chaser / committed keeper, 1 engager or human-controlled, 2 tactical mover, 3 idle / cruising / yielding; outside a fresh plan everyone but the carrier reads 2). per_player_min = flips in class c / player-minutes spent in class c (all consecutive open-play player-tick pairs whose current tick is in class c); share_pct = % of all the side's flips that occurred in class c."),
+        ("move.class_time_pct.<c>", "% of consecutive open-play player-tick pairs whose current tick has move_priority c (the exposure behind the per-class rates)."),
+        ("move.side_flips_speed_lt3_per_player_min / _ge3_per_player_min", "Side flips split by the current tick's speed |vel_t| < 3 m/s or >= 3 m/s, each divided by the player-minutes spent in that speed band."),
+        ("move.heading_sign_flips_per_player_min", "Over the heading-histogram samples (speed > 1 m/s on both ticks): signed heading change theta_t = atan2(cross(vel_t-1, vel_t), dot(vel_t-1, vel_t)) in degrees. A heading sign flip is a sample where |theta_t| > 1 deg and the previous consecutive sample's |theta_t-1| > 1 deg with opposite signs (left-right-left steering wobble, independent of the 0.02 m/s lateral dead band of side flips). Count / player-minutes."),
         ("aerial.headers (+ _shot/_clear/_pass)", "Outfielder with z > 0.14 m whose recent_kick_ticks rose versus the previous tick (a new contact); split by recent_kick_kind: 4/5 shot, 3 clearance/lob, else pass/flick."),
     ];
     d.iter()
@@ -1503,10 +2112,12 @@ fn fmt_num(v: f64) -> String {
     }
 }
 
-const SECTIONS: [(&str, &str); 7] = [
+const SECTIONS: [(&str, &str); 9] = [
     ("match.", "Match"),
     ("gk.", "Goalkeeper"),
     ("shape.", "Defence and shape"),
+    ("trans.", "Defensive transition"),
+    ("support.", "Attacking support"),
     ("move.", "Movement smoothness"),
     ("collision.", "Collisions and push-out"),
     ("coord.", "Coordination"),
@@ -1704,7 +2315,8 @@ pub fn render_compare(before: &AnalysisReport, after: &AnalysisReport) -> String
 
 pub const USAGE: &str =
     "psfc-replay analyze [--format 5v5|11v11] [--seeds N=3] [--seed-base B=1] [--minutes M=10] \
-[--home-difficulty easy|normal|hard] [--away-difficulty easy|normal|hard] [--preset baseline] \
+[--home-difficulty easy|normal|hard] [--away-difficulty easy|normal|hard] \
+[--home-controller cpu|autopilot] [--away-controller cpu|autopilot] [--preset baseline] \
 [--json <path>] [--md <path>] [--per-seed] [--compare <baseline.json>]";
 
 pub fn run_analyze(args: &[String]) -> Result<(), String> {
@@ -1719,6 +2331,15 @@ pub fn run_analyze(args: &[String]) -> Result<(), String> {
     let mut compare_path: Option<String> = None;
     let mut per_seed = false;
     let mut preset: Option<String> = None;
+    let mut home_ap = false;
+    let mut away_ap = false;
+    let parse_controller = |v: &str| -> Result<bool, String> {
+        match v.to_ascii_lowercase().as_str() {
+            "cpu" => Ok(false),
+            "autopilot" => Ok(true),
+            o => Err(format!("invalid controller '{o}' (expected cpu|autopilot)")),
+        }
+    };
 
     let mut i = 0;
     let val = |i: usize, name: &str| -> Result<String, String> {
@@ -1752,6 +2373,14 @@ pub fn run_analyze(args: &[String]) -> Result<(), String> {
             "--away-difficulty" => {
                 i += 1;
                 away = parse_difficulty(&val(i, a)?)?;
+            }
+            "--home-controller" => {
+                i += 1;
+                home_ap = parse_controller(&val(i, a)?)?;
+            }
+            "--away-controller" => {
+                i += 1;
+                away_ap = parse_controller(&val(i, a)?)?;
             }
             "--json" => {
                 i += 1;
@@ -1790,6 +2419,8 @@ pub fn run_analyze(args: &[String]) -> Result<(), String> {
             minutes,
             home_difficulty: home,
             away_difficulty: away,
+            home_autopilot: home_ap,
+            away_autopilot: away_ap,
         }],
         Some("baseline") => vec![
             AnalyzeConfig {
@@ -1799,6 +2430,8 @@ pub fn run_analyze(args: &[String]) -> Result<(), String> {
                 minutes,
                 home_difficulty: CpuDifficulty::Hard,
                 away_difficulty: CpuDifficulty::Hard,
+                home_autopilot: false,
+                away_autopilot: false,
             },
             AnalyzeConfig {
                 format: FormatKind::FiveASide,
@@ -1807,6 +2440,8 @@ pub fn run_analyze(args: &[String]) -> Result<(), String> {
                 minutes,
                 home_difficulty: CpuDifficulty::Normal,
                 away_difficulty: CpuDifficulty::Normal,
+                home_autopilot: false,
+                away_autopilot: false,
             },
             AnalyzeConfig {
                 format: FormatKind::ElevenASide,
@@ -1815,6 +2450,29 @@ pub fn run_analyze(args: &[String]) -> Result<(), String> {
                 minutes,
                 home_difficulty: CpuDifficulty::Normal,
                 away_difficulty: CpuDifficulty::Normal,
+                home_autopilot: false,
+                away_autopilot: false,
+            },
+            // Round 4: human-side code paths (auto-switch, controlled player, teammate contain).
+            AnalyzeConfig {
+                format: FormatKind::FiveASide,
+                seeds,
+                seed_base,
+                minutes,
+                home_difficulty: CpuDifficulty::Hard,
+                away_difficulty: CpuDifficulty::Hard,
+                home_autopilot: true,
+                away_autopilot: false,
+            },
+            AnalyzeConfig {
+                format: FormatKind::ElevenASide,
+                seeds,
+                seed_base,
+                minutes,
+                home_difficulty: CpuDifficulty::Normal,
+                away_difficulty: CpuDifficulty::Normal,
+                home_autopilot: true,
+                away_autopilot: false,
             },
         ],
         Some(o) => return Err(format!("unknown --preset '{o}' (expected baseline)")),
@@ -1894,6 +2552,8 @@ mod tests {
             minutes: 1,
             home_difficulty: CpuDifficulty::Hard,
             away_difficulty: CpuDifficulty::Normal,
+            home_autopilot: false,
+            away_autopilot: false,
         };
         let a = analyze_seed(&cfg, 7).expect("run a");
         let b = analyze_seed(&cfg, 7).expect("run b");
@@ -2019,6 +2679,108 @@ mod tests {
     }
 
     #[test]
+    fn autopilot_match_is_deterministic() {
+        let cfg = AnalyzeConfig {
+            format: FormatKind::FiveASide,
+            seeds: 1,
+            seed_base: 3,
+            minutes: 2,
+            home_difficulty: CpuDifficulty::Hard,
+            away_difficulty: CpuDifficulty::Hard,
+            home_autopilot: true,
+            away_autopilot: false,
+        };
+        assert_eq!(cfg.id(), "5v5_autopilot-hard_vs_hard_2min_1x3");
+        let a = analyze_seed(&cfg, 3).expect("run a");
+        let b = analyze_seed(&cfg, 3).expect("run b");
+        assert!(a.finished);
+        assert_eq!(a.final_hash_hex, b.final_hash_hex);
+        assert_eq!(a.home, b.home);
+        assert_eq!(a.away, b.away);
+        // The auto-piloted side actually plays: it touches the ball and has carrier ticks.
+        assert!(
+            a.home["match.possession_pct"] > 5.0,
+            "{}",
+            a.home["match.possession_pct"]
+        );
+        assert!(a.home["support.carrier_pct_of_open_play"] > 0.0);
+        // And it differs from the CPU-vs-CPU match on the same seed.
+        let cpu = analyze_seed(
+            &AnalyzeConfig {
+                home_autopilot: false,
+                ..cfg.clone()
+            },
+            3,
+        )
+        .expect("cpu run");
+        assert_ne!(cpu.final_hash_hex, a.final_hash_hex);
+    }
+
+    #[test]
+    fn round4_metrics_are_present_and_sane() {
+        let cfg = AnalyzeConfig {
+            format: FormatKind::FiveASide,
+            seeds: 1,
+            seed_base: 1,
+            minutes: 3,
+            home_difficulty: CpuDifficulty::Hard,
+            away_difficulty: CpuDifficulty::Hard,
+            home_autopilot: false,
+            away_autopilot: false,
+        };
+        let r = analyze_seed(&cfg, 1).expect("run");
+        for side in [&r.home, &r.away] {
+            for k in [
+                "trans.count_per_10min",
+                "support.open_options_mean",
+                "support.open_options_p10",
+                "support.ticks_with_le1_option_pct",
+                "support.forward_options_mean",
+                "support.runs_in_behind_per_10min",
+                "support.cluster_pct",
+                "support.width_m",
+                "support.depth_m",
+                "move.side_flips_speed_lt3_per_player_min",
+                "move.side_flips_speed_ge3_per_player_min",
+                "move.heading_sign_flips_per_player_min",
+            ] {
+                let v = side.get(k).unwrap_or_else(|| panic!("missing {k}"));
+                assert!(v.is_finite() && *v >= 0.0, "{k} = {v}");
+            }
+            assert!(side["trans.count_per_10min"] > 0.0);
+            assert!(side["support.open_options_p10"] <= side["support.open_options_mean"] + 1e-9);
+            assert!(
+                side["support.forward_options_mean"] <= side["support.open_options_mean"] + 1e-9
+            );
+            let share: f64 = (0..4)
+                .map(|c| side[&format!("move.side_flips_by_class.{c}_share_pct")])
+                .sum();
+            let time: f64 = (0..4)
+                .map(|c| side[&format!("move.class_time_pct.{c}")])
+                .sum();
+            assert!((time - 100.0).abs() < 1e-6, "class time sums to {time}");
+            if side["move.side_flips_per_player_min"] > 0.0 {
+                assert!((share - 100.0).abs() < 1e-6, "flip shares sum to {share}");
+            }
+            if let Some(t) = side.get("trans.time_to_shape_s") {
+                assert!((0.0..=15.0).contains(t));
+            }
+            for k in ["trans.counterpress_pct", "support.pass_target_open_pct"] {
+                if let Some(v) = side.get(k) {
+                    assert!((0.0..=100.0).contains(v), "{k} = {v}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn segment_distance_and_lane() {
+        assert!((dist_to_segment((0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)) - 1.0).abs() < 1e-12);
+        assert!((dist_to_segment((3.0, 0.0), (-1.0, 0.0), (1.0, 0.0)) - 2.0).abs() < 1e-12);
+        assert!((dist_to_segment((1.0, 1.0), (0.0, 0.0), (0.0, 0.0)) - 2f64.sqrt()).abs() < 1e-12);
+    }
+
+    #[test]
     fn percentile_is_nearest_rank() {
         let mut v = vec![5.0_f32, 1.0, 4.0, 2.0, 3.0];
         assert_eq!(percentile(&mut v, 0.5), 3.0);
@@ -2037,6 +2799,8 @@ mod tests {
                 minutes: 1,
                 home_difficulty: CpuDifficulty::Normal,
                 away_difficulty: CpuDifficulty::Normal,
+                home_autopilot: false,
+                away_autopilot: false,
             };
             let m: Metrics = keys.iter().map(|(k, v)| ((*k).to_string(), *v)).collect();
             AnalysisReport {
