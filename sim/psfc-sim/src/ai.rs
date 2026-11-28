@@ -3818,6 +3818,9 @@ fn yield_target_sided(
 const RETARGET_DEADBAND: Fp = Fp::from_milli(400);
 /// Alpha-beta target filter beta (alpha is the role's low-pass gain, 0.12-0.32 for shape) [estimate].
 const TARGET_BETA: Fp = Fp::from_milli(20);
+/// A yielding player's filtered target is kept this far (m) beyond the yield radius, so the arrive
+/// dead zone does not leave him inside it [estimate].
+const YIELD_TARGET_MARGIN: Fp = Fp::from_milli(500);
 /// Cap of the filter's target velocity estimate (m per tick; 7.2 m/s) [estimate].
 const TARGET_VEL_CAP: Fp = Fp::from_milli(120);
 /// The curved-run bend side holds for this many ticks after it was last applied [estimate].
@@ -3936,8 +3939,11 @@ pub const SUP_RING_L_MM: (i64, i64) = (14_000, 9_000);
 /// sqrt 2 / 2 in permille (the diagonal components of a point at `L sqrt 2` are `L`).
 const HALF_SQRT2_PM: i64 = 707;
 /// Reject candidates within this distance (mm) of another teammate's reserved destination unless
-/// it is the player's own slot: 10 m [peer-reviewed]; 6 m in 5v5 [estimate, pitch-scaled].
-const SUP_RESERVE_EXCL_MM: (i64, i64) = (10_000, 6_000);
+/// it is the player's own slot: 10 m [peer-reviewed]; 7.5 m in 5v5 [estimate, pitch-scaled; 6 m let the 5v5 nearest-teammate < 4 m share reach 15%].
+const SUP_RESERVE_EXCL_MM: (i64, i64) = (10_000, 7_500);
+/// A candidate may also not lie this close (mm) to where another teammate stands now (a teammate
+/// whose target is elsewhere still occupies the space until he leaves) [estimate].
+const SUP_MATE_POS_SEP_MM: (i64, i64) = (5_000, 5_000);
 /// Formation leash (mm): a candidate farther than this from the player's slot is not considered
 /// (Konami US 9,180,371's base-position condition) [patent; distance estimate].
 const SUP_LEASH_MM: (i64, i64) = (18_000, 10_000);
@@ -4090,7 +4096,9 @@ fn sup_score(
             let tt = mate_target_ticks.get(j).copied().unwrap_or(0);
             let live = tt != 0 && state.tick.wrapping_sub(tt) <= 1;
             let reserved = if live { *mt } else { state.players[side.index()][j].pos };
-            if pt.dist(reserved) < excl {
+            if pt.dist(reserved) < excl
+                || pt.dist(state.players[side.index()][j].pos) < Fp::from_milli(fmt_pick(is_5v5, SUP_MATE_POS_SEP_MM))
+            {
                 return Fp::ZERO;
             }
         }
@@ -4743,8 +4751,8 @@ pub(crate) fn assign_called_run(state: &MatchState, side: TeamSide) -> Option<us
 
 // --- Near support: "players closest to the ball will come to support" (FIFA build-up [official]) ---
 
-/// Near-support candidate radii around the carrier (mm): 8-18 m in 11v11, 6-13 m in 5v5 [estimate].
-const NEAR_RADII_MM: [(i64, i64); 3] = [(9_000, 6_500), (13_000, 9_000), (17_000, 12_000)];
+/// Near-support candidate radii around the carrier (mm): 9-17 m in 11v11, 8-12.5 m in 5v5 (5v5 raised from 6.5 m so the pair and the carrier do not bunch) [estimate].
+const NEAR_RADII_MM: [(i64, i64); 3] = [(9_000, 8_000), (13_000, 10_000), (17_000, 12_500)];
 /// Bearings sampled around the carrier (30 degrees apart): `(cos, sin)` in permille.
 const NEAR_BEARINGS_PM: [(i64, i64); 12] = [
     (1_000, 0), (866, 500), (500, 866), (0, 1_000), (-500, 866), (-866, 500),
@@ -4767,8 +4775,8 @@ const NEAR_COMMIT_TICKS: u32 = 60;
 const NEAR_TRAVEL_SCALE: Fp = Fp::from_int(4);
 /// Only supporters within this distance of the carrier (mm) are recruited for near support [estimate].
 const NEAR_RECRUIT_MM: (i64, i64) = (24_000, 15_000);
-/// Keep near points this far (m) from teammates other than the pair [estimate].
-const NEAR_MATE_SEP: Fp = Fp::from_milli(5_000);
+/// Keep near points this far (mm) from the other teammates and from each other: 5 m in 11v11, 7 m in 5v5 [estimate].
+const NEAR_MATE_SEP_MM: (i64, i64) = (5_000, 7_000);
 
 /// The carrier support is organised around (round 4 second pass): our carrier at his position, or,
 /// while our pass is in flight, its intended receiver at the pass target (support anticipates the
@@ -4881,6 +4889,7 @@ fn update_near_support(state: &MatchState, side: TeamSide) {
     let goal = Vec2::new(Fp::from_milli(attack_sign * state.format.half_length().to_milli()), Fp::ZERO);
     // Candidate points with their lane (receiver-independent).
     let mut pts: Vec<(Vec2, Fp)> = Vec::new();
+    let mate_sep = Fp::from_milli(fmt_pick(is_5v5, NEAR_MATE_SEP_MM));
     for &(r11, r5) in &NEAR_RADII_MM {
         let r = if is_5v5 { r5 } else { r11 };
         for &(cx, sy) in &NEAR_BEARINGS_PM {
@@ -4895,7 +4904,7 @@ fn update_near_support(state: &MatchState, side: TeamSide) {
                 k != ci
                     && !pair.contains(&k)
                     && !mate.sent_off
-                    && (mate.pos.dist(q) < NEAR_MATE_SEP || m.target.get(k).is_some_and(|t| t.dist(q) < NEAR_MATE_SEP))
+                    && (mate.pos.dist(q) < mate_sep || m.target.get(k).is_some_and(|t| t.dist(q) < mate_sep))
             });
             if crowded {
                 continue;
@@ -4933,7 +4942,7 @@ fn update_near_support(state: &MatchState, side: TeamSide) {
         let mut best: Option<(Fp, Vec2)> = None;
         for &(q, lane) in &pts {
             if let (Some(fd), Some(fp)) = (first_dir, first_pt) {
-                if (q - c).normalize_or_zero().dot(fd) > NEAR_ANGLE_COS || q.dist(fp) < NEAR_MATE_SEP {
+                if (q - c).normalize_or_zero().dot(fd) > NEAR_ANGLE_COS || q.dist(fp) < mate_sep {
                     continue;
                 }
             }
@@ -5474,6 +5483,23 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         um.tgt_vel = Vec2::ZERO;
         raw
     };
+    // A yielder's filtered target may not cut back inside the yield radius: the low-pass follows a
+    // raw yield point that moves round the radius as he moves (a chord through the circle), so the
+    // filtered target is projected out to R + margin from the reserved path, and the filter's
+    // velocity is reset so it does not pull the target back in.
+    let mut target = target;
+    if let (true, Some((a, b))) = (yielding, path) {
+        let (r, _) = yield_radius(is_5v5);
+        let floor = r + YIELD_TARGET_MARGIN;
+        let cl = closest_on_segment(a, b, target);
+        let d = target.dist(cl);
+        if d < floor {
+            let out = if d > Fp::from_milli(5) { target - cl } else { p.pos - cl };
+            let out = if out.len() > Fp::from_milli(5) { out.normalize_or_zero() } else { Vec2::new(Fp::ZERO, Fp::ONE) };
+            target = cl + out.scale(floor);
+            um.tgt_vel = Vec2::ZERO;
+        }
+    }
 
     // Arrive: proportional speed inside the slow radius (braking-consistent, d_slow = v^2 / 2a),
     // dead-zone set by positioning (160-510 mm, already the report's 0.4-0.5 m target radius band
