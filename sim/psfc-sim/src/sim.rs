@@ -329,6 +329,14 @@ impl MatchSimulation {
             }
         }
 
+        // Avoidance snapshot of every player (positions, velocities, priority classes), taken once
+        // per tick BEFORE the CPU input generators run their team plans: `generate_cpu_input`
+        // resets a side's move classes to the plan baseline, so a frame built later would see the
+        // previous tick's refined classes on human sides but only baseline classes on CPU sides.
+        // Taken here, both sides are seen with the classes refined during the previous tick, and the
+        // velocity stage stays independent of the stepping order.
+        let avoid_frame = crate::avoidance::build_frame(&self.state);
+
         let home_in = match self.state.rules.home_controller {
             SideController::Human => external_inputs[0],
             SideController::Cpu(diff) => generate_cpu_input(&self.state, TeamSide::Home, diff),
@@ -872,7 +880,7 @@ impl MatchSimulation {
         }
 
         // 2. Step all players (movement, stamina, charging, tackles, GK dives)
-        self.step_all_players(&inputs);
+        self.step_all_players(&inputs, &avoid_frame);
 
         // 3. Resolve active tackles against ball / ball carrier
         self.resolve_tackles();
@@ -2853,14 +2861,10 @@ impl MatchSimulation {
         }
     }
 
-    fn step_all_players(&mut self, inputs: &[InputFrame; 2]) {
+    fn step_all_players(&mut self, inputs: &[InputFrame; 2], avoid_frame: &crate::avoidance::Frame) {
         let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
         let half_len = self.state.format.half_length() + Fp::from_milli(1_500);
         let half_wid = self.state.format.half_width() + Fp::from_milli(1_500);
-        // Avoidance snapshot of every player (positions, velocities, priority classes) taken before
-        // anyone moves, so the velocity stage is independent of the stepping order.
-        let avoid_frame = crate::avoidance::build_frame(&self.state);
-
         for side in [TeamSide::Home, TeamSide::Away] {
             let s_idx = side.index();
             let opp_s_idx = side.opponent().index();
@@ -3816,9 +3820,9 @@ impl MatchSimulation {
                     {
                         let a_id = avoid_frame.id(s_idx, idx);
                         if human_driven {
-                            crate::avoidance::human_adjust(&avoid_frame, a_id, desired_vel, top_speed)
+                            crate::avoidance::human_adjust(avoid_frame, a_id, desired_vel, top_speed)
                         } else {
-                            crate::avoidance::select_velocity(&avoid_frame, a_id, desired_vel, top_speed)
+                            crate::avoidance::select_velocity(avoid_frame, a_id, desired_vel, top_speed)
                         }
                     } else {
                         desired_vel
@@ -3903,7 +3907,7 @@ impl MatchSimulation {
                             | PlayerActionState::Cooldown { .. }
                             | PlayerActionState::Charging { .. }
                     ) {
-                        p.vel = crate::avoidance::contact_constrain(&avoid_frame, avoid_frame.id(s_idx, idx), p.vel);
+                        p.vel = crate::avoidance::contact_constrain(avoid_frame, avoid_frame.id(s_idx, idx), p.vel);
                     }
 
                     p.pos += p.vel.scale(dt);

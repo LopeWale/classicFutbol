@@ -25,9 +25,43 @@ pub struct PlayerAttributes {
     pub stamina: u8,
     pub strength: u8,
     pub goalkeeping: u8,
+    /// FIFA 11 "Personality+" attacking work rate (0..100, how often the player considers a forward
+    /// run and how high he stays). `WORK_RATE_UNSET` (255) means "derive from role and stamina"
+    /// (see [`PlayerAttributes::work_rates`]); older snapshots deserialize to that.
+    #[serde(default = "work_rate_unset")]
+    pub work_rate_att: u8,
+    /// FIFA 11 defensive work rate (0..100, the importance the player places on getting back after a
+    /// turnover and how deep his defensive slot sits). `WORK_RATE_UNSET` (255) = derive.
+    #[serde(default = "work_rate_unset")]
+    pub work_rate_def: u8,
+}
+
+/// Sentinel for a work rate the snapshot did not set: the sim derives it from role and stamina.
+pub const WORK_RATE_UNSET: u8 = 255;
+
+const fn work_rate_unset() -> u8 {
+    WORK_RATE_UNSET
 }
 
 impl PlayerAttributes {
+    /// Effective `(attacking, defensive)` work rates on a 0..100 scale. Set values are returned as
+    /// they are (clamped to 100); unset ones are derived from the role prior (FIFA's Low 25 /
+    /// Medium 50 / High 75 bands: forwards attack High and defend Low, defenders the reverse,
+    /// midfielders Medium/Medium, keepers Low/Low) shifted by stamina (+-10 for stamina 90 / 50).
+    pub fn work_rates(&self, role: PlayerRole) -> (u8, u8) {
+        let (att_prior, def_prior): (i32, i32) = match role {
+            PlayerRole::Goalkeeper => (25, 25),
+            PlayerRole::Defender => (30, 75),
+            PlayerRole::Midfielder => (50, 55),
+            PlayerRole::Forward => (75, 30),
+        };
+        let stamina_shift = (self.stamina as i32 - 70) / 2; // 90 -> +10, 50 -> -10
+        let derive = |prior: i32| (prior + stamina_shift).clamp(0, 100) as u8;
+        let att = if self.work_rate_att == WORK_RATE_UNSET { derive(att_prior) } else { self.work_rate_att.min(100) };
+        let def = if self.work_rate_def == WORK_RATE_UNSET { derive(def_prior) } else { self.work_rate_def.min(100) };
+        (att, def)
+    }
+
     pub const fn keeper(gk: u8, pos: u8, pass: u8) -> Self {
         Self {
             pace: 56,
@@ -40,6 +74,8 @@ impl PlayerAttributes {
             stamina: 78,
             strength: 76,
             goalkeeping: gk,
+            work_rate_att: WORK_RATE_UNSET,
+            work_rate_def: WORK_RATE_UNSET,
         }
     }
 
@@ -55,6 +91,8 @@ impl PlayerAttributes {
             stamina: 84,
             strength,
             goalkeeping: 15,
+            work_rate_att: WORK_RATE_UNSET,
+            work_rate_def: WORK_RATE_UNSET,
         }
     }
 
@@ -70,6 +108,8 @@ impl PlayerAttributes {
             stamina: 88,
             strength: 72,
             goalkeeping: 12,
+            work_rate_att: WORK_RATE_UNSET,
+            work_rate_def: WORK_RATE_UNSET,
         }
     }
 
@@ -85,6 +125,8 @@ impl PlayerAttributes {
             stamina: 82,
             strength,
             goalkeeping: 10,
+            work_rate_att: WORK_RATE_UNSET,
+            work_rate_def: WORK_RATE_UNSET,
         }
     }
 }
