@@ -489,9 +489,22 @@ fn team_shape_11v11_normal_vs_normal() {
     check(s.behind_ball_pct > 65.0, "outfielders goal-side of ball > 65%", s.behind_ball_pct, &mut fails);
     check(s.line_jitter_mm_per_tick < 66.0, "line-height jitter < 66 mm/tick", s.line_jitter_mm_per_tick, &mut fails);
     check(s.swarm_pct < 2.0, "swarming < 2%", s.swarm_pct, &mut fails);
-    check(s.settled_anchor_m[1] < 4.75, "settled DEF anchor dist < 4.75 m", s.settled_anchor_m[1], &mut fails);
+    // Round 4 merge (area T + S + U): "settled" (opponent >= 3 s on the ball) now includes long
+    // counter dribbles at 8-9 m/s, since the 11v11 stamina fix keeps carriers fast. During them,
+    // full-backs caught upfield are latched in an uncapped recovery sprint (9 m/s) 10-30 m ahead of
+    // their slot. That is 12.5% of settled DEF samples at a mean of 21 m (diagnosed on 3 seeds);
+    // zonal defenders average 3.5 m. Measured 4.87-5.30 m (3 seeds) and 4.99 m (6 seeds), so the bound
+    // follows the intended sprint-back behaviour.
+    check(s.settled_anchor_m[1] < 5.6, "settled DEF anchor dist < 5.6 m", s.settled_anchor_m[1], &mut fails);
     check(s.settled_anchor_m[2] < 5.0, "settled MID anchor dist < 5 m", s.settled_anchor_m[2], &mut fails);
-    check(s.settled_anchor_m[3] < 7.75, "settled FWD anchor dist < 7.75 m", s.settled_anchor_m[3], &mut fails);
+    // Round 4, area T (docs/transition-and-defending.md) moved the forwards' defensive anchor: only
+    // the one Low-work-rate rest offence keeps the outlet slot 6 m beyond the ball; every other
+    // striker / winger now anchors on a work-rate holding line 4-10 m goal-side of the ball. With a
+    // carrier dribbling at our goal the "settled" ticks then measure forwards sprinting back from
+    // behind a ball-relative anchor that moves away at ball speed (the old outlet anchor sat where
+    // they lagged), so the settled FWD distance rose from ~7 m to 10.5 m (3 seeds). The bound
+    // follows the intended behaviour change.
+    check(s.settled_anchor_m[3] < 11.5, "settled FWD anchor dist < 11.5 m", s.settled_anchor_m[3], &mut fails);
     check(s.presser_changes_per_min < 3.0, "presser changes / defending-min < 3", s.presser_changes_per_min, &mut fails);
     // Play is not broken.
     check(s.goals_per_match > 0.3, "goals / match > 0.3", s.goals_per_match, &mut fails);

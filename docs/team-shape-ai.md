@@ -16,22 +16,26 @@ from `&MatchState` in the middle of a tick. A state saved before this field exis
 | Phase | Attack, Defend, Counter-press, Retreat or Counter-attack (below) | Ownership must change to leave a phase, and each transition has a timer |
 | Slots | Player → formation slot. Uses the exact 24-permutation optimum for 4 outfielders, and 2-opt from the previous assignment otherwise | A switch costs ~3 m (900 dm²) per moved player, an assignment is held for ≥ 30 ticks, and a role-band mismatch costs (band diff)² × 60 000 dm² |
 | Presser | The AI outfielder with the best time-to-ball, adjusted by style | The current presser is kept unless a challenger is better by `margin` ticks (Easy 10, Normal 8, Hard 6), or by 3 ticks once the presser has been held for `hold` ticks (40 / 28 / 20). He hands over to the CPU-controlled player only when that player is clearly faster |
-| Second presser | Counter-press only. This player cuts the carrier's nearest passing lane, so he does not double up on the ball | — |
+| Lane-closers / second man | Counter-press: two lane-closers (`second_presser`, `third_presser`) on the two best receiver lanes; never back-liners. Outside it, on a press trigger (heavy touch, back to goal, touchline), a second man shadows 3.5 m behind-side of the presser (round 4, area T; `docs/transition-and-defending.md`) | Incumbent lanes keep a 3 m bonus |
 | Cover | The player nearest the cover point: half-way between the ball and the presser, plus 4.5 m (5v5) or 6.5 m (11v11) toward our goal. CB, holding mid and fixo are preferred | The current cover gets a 3 m bonus |
-| Marks | Goal-side zonal marking within 7 m (5v5) or 9 m (11v11) of the player's defend anchor. The back line picks first. Forwards do not mark | A mark is held until the opponent leaves 1.35 × the zone, or until (after `hold` ticks) a candidate is 3 m closer |
+| Marks | One arbiter (round 4): incumbents first, then free opponents in danger order to the nearest free defender within 7 m (5v5) or 9 m (11v11) of his defend anchor. The rest offence and Low-work-rate front slots do not mark; in counter-press only the back line and holding slot mark. A back-liner keeps a runner in behind until a deeper teammate covers his line to goal | Incumbent kept while within 1.35 × the zone; after a 24-tick dwell he may switch to a free opponent 3 m closer |
 
 ### Phases
 
 ```
             we win it                 timer (Counter 150 / Press 100 / Possession 60 ticks)
  DEFEND ─────────────────► COUNTER-ATTACK ───────────────────────────────► ATTACK
-   ▲  ▲                                                                       │ we lose it
-   │  │ timer 75 t        ours-near-ball >= theirs, ball beyond 35% of pitch,  │
-   │  └──── RETREAT ◄──── team work-rate > 450 ? no ───────────────────────────┤
-   │            ▲  ball escapes 9 m (5v5) / 14 m (11v11)                        │ yes
-   └── timer ── COUNTER-PRESS ◄──────────────────────────────────────────────────┘
-       (Press 150 / Possession 110 / Counter 55 ticks × team work-rate, min 40)
+   ▲                                                                          │ we lose it
+   │ shape reached (80%) or 570 t                                             ▼
+   └──── RETREAT ◄── decision after 6/9/12 t: own >= theirs within 10 m (7 m), ── COUNTER-PRESS
+            ▲        >= 4 (2) behind the ball, ball beyond 35%, work-rate > 450? no   (reacting)
+            │                                                                    │ yes
+            └── window 300 t × style (1.2/1.0/0.6) × work rate, floor 180; ── COUNTER-PRESS
+                stoppage; pass > 16 m; ball escapes 9 m (5v5) / 14 m (11v11)
 ```
+
+Round 4, area T (`docs/transition-and-defending.md`) replaced the 40-150 tick counter-press and the
+75-tick RETREAT with the measured football windows above.
 
 ## 2. Shapes per formation and phase
 
@@ -54,7 +58,7 @@ transforms are:
 | CM | depth ≥ 400 | depth ≥ 540 |
 | Wide mid | depth 420, y × 0.96 (holds width) | depth 720, y × 1.12 |
 | Winger | depth 640, y × 0.86 | depth 900, y × 1.08 |
-| Striker | depth 1000 (leads the line). In 11v11 he stays an outlet: up to 6 m beyond the ball, never past halfway | depth 1000, pinned to the opponents' offside line − 0.4 m |
+| Striker | depth 1000 (leads the line). The rest offence (one Low-work-rate striker/pivo) stays an outlet in 11v11: up to 6 m beyond the ball, never past halfway. Every other striker, pivo and winger drops to a work-rate holding line goal-side of the ball (Low 4 / Medium 7 / High 10 m; 5v5 2 / 3.5 / 5 m), no deeper than 55% / 35% / 15% of the block (round 4) | depth 1000, pinned to the opponents' offside line − 0.4 m |
 | Fixo (5v5) | depth 0 | depth 0, and always ≥ 8.8 m behind the ball (rest defence) |
 | Ala (5v5) | depth 430 | depth 660, y × 1.15 |
 | Pivo (5v5) | depth 1000 | pinned to the offside line |
@@ -103,17 +107,44 @@ Examples (attacking → right, `G` = goal; defend is compact and narrow, attack 
 - **Cover** sits behind the presser, never more than 2 m higher than the back line.
 - **Inside-box cutback marking** is kept from the old AI, but only the back-line and holding slots use
   it. The forwards no longer collapse into the box.
-- **Anti-swarm spacing:** a defender who is neither the presser nor the second presser keeps at least
-  2.2 m from the carrier (3 m for the cover).
-- **Recovery runs:** a goal-wrong-side player sprints when he is more than
-  `1 m (5v5) / 2.5 m (11v11) + 2.5 m × recovery` behind his target. Slower players therefore start
-  their recovery earlier.
-- **Attack:** the 5v5 vacated-cutback run, the support triangle, pocket search, onside channel runs
-  and curved runs are kept. The pocket search now favours the pocket the player is already heading
-  to. In counter-attacks, forwards and wide players run in behind without waiting for the passer.
+- **Anti-swarm spacing:** every defender other than the presser keeps at least 2.9 m from the carrier
+  (3 m for the cover, the lane-closers and the second man), outside the 2.5 m engager radius (round 4;
+  2.2 m before).
+- **Recovery runs (round 4):** in every defensive phase, the counter-press included, a player more
+  than 1 m ahead of the ball who is more than 30 ticks from his target (or any such player while the
+  ball travels at our goal faster than 4 m/s) latches a recovery sprint until 3 m goal-side. Bursts
+  are capped at 180 / 210 / 240 ticks by defensive work rate (back-liners uncapped), then the
+  high-speed band (<= 7 m/s). He is class 2, never class 3. This replaces the old
+  `1 m / 2.5 m + 2.5 m × recovery` deficit, which made faster players wait longer. Details in
+  `docs/transition-and-defending.md`.
+- **Shared line (round 4):** back-liners stand on one lag-tracked team line value (`line_prog`)
+  with one team-wide judgement error. Marking may move a back-liner at most 2.5 m deep or 1.2 m high
+  from it, unless he is tracking a runner in behind. The line tracks runs by style: Counter = Deep,
+  Possession = Balanced, Press = High.
+- **Attack (round 4, see [attacking-support-and-runs.md](attacking-support-and-runs.md)):** the
+  5v5 vacated-cutback run and the support triangle are kept; the triangle pick is now committed
+  (18-tick dwell, a challenger must be 2 m closer to the 9.5 m target). The five fixed pockets are
+  replaced by scored support candidates (the slot, a PES ring at 14 m / 20 m around the carrier,
+  the nearest opponent Voronoi vertex and the offside-line point, scored Control x Value x
+  LaneOpen, re-scored every 20 ticks, switched only at 1.15x after a 60-tick commitment), with
+  GRF spacing as the fallback for players without a scored candidate and a final-lane nudge after
+  spacing, reservation and run push. Runs come from one arbiter per team (one penetrate runner,
+  one support-from-behind runner, up to three box runners on a cross, one decoy): the penetrate
+  runner gets an end-point beyond the offside line, holds at the onside limit (stutter, never
+  reversing while onside) and is released by our pass toward him or by the CPU pass decision that
+  selects him. `passer_ready` is a Schmitt trigger (on above -0.10, off below -0.30, 12-tick
+  hold). In counter-attacks, forwards and wide players without a scored candidate or a run role
+  still push to the onside line without waiting for the passer.
+- **Decision hysteresis (round 4):** `reserve_destination` remembers who yielded last tick (1.5 m
+  margin to swap), the teammate-yield and keeper-corridor side signs and the curved-run bend sign
+  are sticky for the episode, and the committed target passes a 0.4 m re-target deadband and an
+  alpha-beta filter (the role's alpha, beta 0.02). Every intent path that bypasses the shape
+  (receive, chase, contain, non-open-play) now writes the target memory, so returning to shape
+  continues the filter instead of snapping.
 - **Judgement error:** the anchor's depth gets smooth deterministic noise (no RNG is consumed). Its
   amplitude is `noise × (100 − positioning) × 30 mm × err` (Easy 1.6, Normal 1.0, Hard 0.55), and
-  60% of that for non-back-line players. It drifts over a 150-tick period.
+  60% of that for non-back-line players. It drifts over a 150-tick period. Since round 4 the back
+  line shares one term, keyed by side and using the team's average positioning.
 
 ## 3. Style derivation
 
@@ -242,3 +273,8 @@ The 11v11 "after" column was run before the final striker-outlet tweak. The comm
 | Accelerate / brake / lateral caps (AI, off the ball) | 6 + 0.03 × acc / 9 + 0.03 × acc / 8 + 0.06 × agility m/s² |
 | Command filter k | 0.25 + 0.002 × agility |
 | Facing rate | 20 → 9 °/tick × (0.8 + 0.004 × agility); 3.5 °/tick and 4° deadband while idle |
+| Support re-score / commit / switch margin (round 4) | 20 ticks / 60 ticks / 1.15× |
+| Support Range L (11v11 / 5v5), reservation exclusion, leash | 14 / 9 m (diagonals × √2), 10 / 6 m, 18 / 10 m |
+| Run arbiter cadence / commit / expiry / called-run commit | 20 / 60 / 240 / 90 ticks |
+| `passer_ready` Schmitt | on > −0.10, off < −0.30, 12-tick hold |
+| Target deadband / alpha-beta beta | 0.4 m / 0.02 |

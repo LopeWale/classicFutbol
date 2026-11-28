@@ -15,6 +15,7 @@ pub mod math;
 pub mod rng;
 pub mod sim;
 pub mod snapshot;
+pub mod space;
 pub mod state;
 
 pub use config::{CpuDifficulty, MatchFormat, RuleSet, SideController, TeamSide, TICKS_PER_SECOND};

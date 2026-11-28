@@ -60,18 +60,31 @@ const TRANS_CAP_TICKS: u32 = 15 * TICKS_PER_SECOND;
 const TRANS_SHAPE_RADIUS_M: f64 = 5.0;
 const TRANS_RECOVERY_TICKS: u32 = 5 * TICKS_PER_SECOND;
 const TRANS_SPRINT_MPS: f64 = 6.0;
+/// Round 4 (area T): sprint band 25.2 km/h = 7.0 m/s (Bortnik et al. 2022), above the sim's 70%
+/// cruise cap (~6.3 m/s), so capped jogging no longer reads as sprinting.
+const TRANS_SPRINT7_MPS: f64 = 7.0;
+/// Mark-steal window: a mark change counts while the old target is within 1.35x the marking zone.
+const MARK_STEAL_ZONE_X: f64 = 1.35;
 const TRANS_COUNTERPRESS_TICKS: u32 = 6 * TICKS_PER_SECOND;
 const SUPPORT_MIN_M: f64 = 6.0;
 const SUPPORT_MAX_M: f64 = 30.0;
 const LANE_CLEAR_M: f64 = 1.5;
 const FORWARD_OPTION_M: f64 = 3.0;
 const RUN_BEHIND_MPS: f64 = 5.0;
+/// Round 4: a committed run ended before this many ticks counts as abandoned (work area 5).
+const RUN_ABANDON_TICKS: u32 = 60;
 /// A runner who crossed the line must drop this far behind it again before a new run can count.
 const RUN_REARM_M: f64 = 1.0;
 const CLUSTER_PAIR_M: f64 = 4.0;
 const CLUSTER_CARRIER_M: f64 = 15.0;
 const SPEED_BAND_MPS: f64 = 3.0;
 const HEADING_FLIP_MIN_DEG: f64 = 1.0;
+/// Schmitt-band side flips (WA1 instrumentation): band on the lateral component (m/s) and the
+/// number of consecutive samples a new side must persist before the debounced side changes.
+const SIDE_FLIP_SCHMITT_EPS: f64 = 0.05;
+const SIDE_FLIP_SCHMITT_DWELL: u8 = 4;
+/// Side-flip cause buckets (`move.side_flips_cause.<name>`), in pipeline order.
+const FLIP_CAUSES: [&str; 4] = ["desired", "sampler", "filter", "limiter"];
 /// A Pass event is attributed to the open-play carrier sampled at most this many ticks before it.
 const PASS_CARRIER_LOOKBACK_TICKS: u32 = 2;
 
@@ -488,7 +501,16 @@ struct SideAcc {
     trans_fwd_sprint: u64,
     trans_mid_speed: Mean,
     trans_mid_sprint: u64,
+    trans_fwd_sprint7: u64,
+    trans_mid_sprint7: u64,
     trans_fwd_high: Mean,
+    /// Mean outfield stamina (permille) on the last open-play tick of the match.
+    stamina_end: Option<f64>,
+    /// Mark changes while the previous target is still within 1.35x the zone, and the
+    /// outfielder-ticks of defending (opponent owns the ball) they are counted over.
+    mark_steals: u64,
+    mark_def_ticks: u64,
+    prev_marks: Vec<u8>,
     trans_counterpress: u64,
     // Round 4: attacking support (this side has an outfield carrier).
     sup_ticks: u64,
@@ -502,6 +524,20 @@ struct SideAcc {
     sup_runs: u64,
     /// Per slot: 0 = not armed, 1 = armed (at/behind the line), 2 = crossed (re-arm 1 m behind).
     run_state: Vec<u8>,
+    /// Round 4 (work area 3): committed runs seen last open-play tick, per slot `(role, since)`
+    /// from the sim's `TeamAiMemory::run_role` / `run_since`, and abandoned runs counted.
+    run_prev: Vec<(u8, u32)>,
+    sup_run_abandon: u64,
+    /// Intended receiver of this side's pass in flight on the previous open-play tick.
+    prev_pass_to: Option<usize>,
+    /// Releases of committed runners (CPU pass decision or a pass launched toward the runner),
+    /// the last CPU release stamp seen, and the release passes pending / launched / completed.
+    sup_releases: u64,
+    rel_last_stamp: u32,
+    rel_last_cpu: Option<(usize, u32)>,
+    rel_pending: Option<usize>,
+    rel_passes: u64,
+    rel_completed: u64,
     /// Last open-play outfield-carrier sample: (carrier idx, tick, open-lane mask of teammates).
     last_carrier: Option<(usize, u32, u32)>,
     /// Pass in progress: (passer idx, open-lane mask at the last carrier sample).
@@ -514,6 +550,9 @@ struct SideAcc {
     flips_band: [u64; 2],
     ticks_band: [u64; 2],
     heading_flips: u64,
+    // WA1 instrumentation: Schmitt-band side flips and the raw side flips split by cause.
+    flips_schmitt: u64,
+    flips_cause: [u64; 4],
 }
 
 /// An active defensive-transition episode of the side that lost the ball.
@@ -539,6 +578,14 @@ struct PrevPlayer {
     lat: Option<f64>,
     /// Signed heading change (deg) of the last heading sample, if that tick had one.
     theta: Option<f64>,
+    /// Signed lateral component (m/s, versus the previous tick's velocity) of the steering stages
+    /// `[desired, selected, filtered]` on the last heading sample (psfc_sim `steer_debug`).
+    lat_stage: [Option<f64>; 3],
+    /// Schmitt-band side detector: debounced side (`-1`, `0`, `1`), the side currently trying to
+    /// take over and for how many consecutive samples.
+    sch_side: i8,
+    sch_cand: i8,
+    sch_run: u8,
 }
 
 fn close_excursion(a: &mut SideAcc) {
@@ -786,6 +833,13 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     a.trans_shape_static_excluded += u64::from(!ep.static_done);
                 }
                 a.run_state.iter_mut().for_each(|r| *r = 0);
+                // A stoppage ends committed runs without counting them as abandoned.
+                a.run_prev.iter_mut().for_each(|r| *r = (0, 0));
+                // A release pass ended by a stoppage (offside, out of play) is not completed.
+                if a.rel_pending.take().is_some() {
+                    a.rel_passes += 1;
+                }
+                a.prev_pass_to = None;
                 a.last_carrier = None;
                 a.pending_pass = None;
             }
@@ -910,14 +964,17 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     let v = v2(players[i].vel);
                     let sp = (v.0 * v.0 + v.1 * v.1).sqrt();
                     let sprint = u64::from(sp > TRANS_SPRINT_MPS);
+                    let sprint7 = u64::from(sp > TRANS_SPRINT7_MPS);
                     match players[i].role {
                         PlayerRole::Forward => {
                             a.trans_fwd_speed.add(sp);
                             a.trans_fwd_sprint += sprint;
+                            a.trans_fwd_sprint7 += sprint7;
                         }
                         PlayerRole::Midfielder => {
                             a.trans_mid_speed.add(sp);
                             a.trans_mid_sprint += sprint;
+                            a.trans_mid_sprint7 += sprint7;
                         }
                         _ => {}
                     }
@@ -950,17 +1007,88 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 a.run_state = vec![0; players.len()];
             }
             let own_carrier = carrier.filter(|&(cs, _)| cs == side).map(|(_, ci)| ci);
-            // Runs in behind: while this side owns the ball (any player, GK included).
-            match (own_carrier, second_last_proj(st, opp, sign)) {
-                (Some(ci), Some(line)) => {
+            // Run abandon (round 4): a committed run (sim run role) that ends, or is replaced,
+            // within RUN_ABANDON_TICKS of its start while the opponent does not own the ball and
+            // the runner neither owns the ball nor is the receiver of our pass in flight.
+            {
+                let mems = st.ai_memory.borrow();
+                let m = &mems[s];
+                if a.run_prev.len() != players.len() {
+                    a.run_prev = vec![(0, 0); players.len()];
+                }
+                // A loose ball with no pass of ours in flight counts as possession lost.
+                let opp_owns = carrier.is_some_and(|(cs, _)| cs != side)
+                    || (carrier.is_none() && st.ball.pass_in_flight.as_ref().is_none_or(|pf| pf.team != side));
+                let pass_to = st.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side).map(|pf| pf.intended_receiver_idx);
+                for j in 0..players.len() {
+                    let now = (m.run_role.get(j).copied().unwrap_or(0), m.run_since.get(j).copied().unwrap_or(0));
+                    let (prole, psince) = a.run_prev[j];
+                    if prole != 0 && now != (prole, psince) {
+                        let age = st.tick.wrapping_add(1).wrapping_sub(psince);
+                        let received = own_carrier == Some(j) || pass_to == Some(j);
+                        if age < RUN_ABANDON_TICKS && !opp_owns && !received {
+                            a.sup_run_abandon += 1;
+                        }
+                    }
+                    a.run_prev[j] = now;
+                }
+            }
+            let pass_to = st.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side).map(|pf| pf.intended_receiver_idx);
+            // Releases (work area 3): a CPU pass decision selecting a committed runner, or a pass
+            // launched toward a penetrate / called runner that no CPU release preceded.
+            {
+                let mems = st.ai_memory.borrow();
+                let m = &mems[s];
+                if m.run_release != 0 && m.run_release_tick != a.rel_last_stamp {
+                    a.rel_last_stamp = m.run_release_tick;
+                    a.rel_last_cpu = Some((m.run_release as usize, st.tick));
+                    a.sup_releases += 1;
+                }
+                if let Some(pf) = st.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side && a.prev_pass_to != Some(pf.intended_receiver_idx)) {
+                    let r = pf.intended_receiver_idx;
+                    let role = m.run_role.get(r).copied().unwrap_or(0);
+                    let cpu_released = a.rel_last_cpu.is_some_and(|(ri, t)| ri == r && st.tick.saturating_sub(t) <= 60);
+                    // A ground or through pass (recent_kick_kind 1 / 2): a lofted switch that
+                    // happens to find a committed runner does not release a held run.
+                    let kind = players.get(pf.passer_idx).map_or(0, |k| k.recent_kick_kind);
+                    if cpu_released || ((role == 1 || role == 5) && (kind == 1 || kind == 2)) {
+                        if !cpu_released {
+                            a.sup_releases += 1;
+                        }
+                        a.rel_pending = Some(r);
+                    }
+                }
+            }
+            if let Some(r) = a.rel_pending {
+                if let Some((cs, ci)) = carrier {
+                    a.rel_passes += 1;
+                    a.rel_completed += u64::from(cs == side && ci == r);
+                    a.rel_pending = None;
+                }
+            }
+            // Runs in behind: while this side owns the ball (any player, GK included), and while
+            // our pass is in flight for its intended receiver, whose reception tick also counts.
+            match (own_carrier.is_some() || pass_to.is_some(), second_last_proj(st, opp, sign)) {
+                (true, Some(line)) => {
                     for (j, p) in players.iter().enumerate() {
-                        if j == 0 || j == ci || p.sent_off {
+                        if j == 0 || p.sent_off {
                             a.run_state[j] = 0;
+                            continue;
+                        }
+                        if own_carrier.is_none() && pass_to != Some(j) {
                             continue;
                         }
                         let proj = f(p.pos.x) * sign;
                         let v = v2(p.vel);
                         let sp = (v.0 * v.0 + v.1 * v.1).sqrt();
+                        if own_carrier == Some(j) {
+                            // Reception tick of the pass he was running onto.
+                            if a.prev_pass_to == Some(j) && a.run_state[j] == 1 && proj > line && sp > RUN_BEHIND_MPS {
+                                a.sup_runs += 1;
+                            }
+                            a.run_state[j] = 0;
+                            continue;
+                        }
                         match a.run_state[j] {
                             0 if proj <= line => a.run_state[j] = 1,
                             1 if proj > line => {
@@ -976,6 +1104,7 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 }
                 _ => a.run_state.iter_mut().for_each(|r| *r = 0),
             }
+            a.prev_pass_to = pass_to;
             let Some(ci) = own_carrier.filter(|&ci| ci != 0) else {
                 continue;
             };
@@ -1129,6 +1258,41 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                         a.engager3 += 1;
                     }
                 }
+            }
+            // Round 4 (area T): mark steals and end-of-match stamina.
+            {
+                let outfield_stam: Vec<f64> = players
+                    .iter()
+                    .skip(1)
+                    .filter(|p| !p.sent_off)
+                    .map(|p| f64::from(p.stamina_permille))
+                    .collect();
+                if !outfield_stam.is_empty() {
+                    a.stamina_end = Some(outfield_stam.iter().sum::<f64>() / outfield_stam.len() as f64);
+                }
+                let marks: Vec<u8> = st.ai_memory.borrow()[s].mark_of.clone();
+                if let Some((cs, _)) = carrier.filter(|&(cs, _)| cs != side) {
+                    let opps = &st.players[cs.index()];
+                    let zone = if five { 7.0 } else { 9.0 } * MARK_STEAL_ZONE_X;
+                    for (i, p) in players.iter().enumerate().skip(1) {
+                        if p.sent_off {
+                            continue;
+                        }
+                        a.mark_def_ticks += 1;
+                        let (old, new) = (
+                            a.prev_marks.get(i).copied().unwrap_or(u8::MAX),
+                            marks.get(i).copied().unwrap_or(u8::MAX),
+                        );
+                        if old != u8::MAX && new != u8::MAX && old != new {
+                            if let Some(o) = opps.get(old as usize).filter(|o| !o.sent_off) {
+                                if dist(v2(p.pos), v2(o.pos)) <= zone {
+                                    a.mark_steals += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                a.prev_marks = marks;
             }
             // Cruise compliance: outfielders not carrying, > 8 m from the ball and not among the
             // side's two outfielders closest to the ball.
@@ -1326,6 +1490,8 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 let mut dspeed = None;
                 let mut lat = None;
                 let mut theta = None;
+                let mut lat_stage = [None; 3];
+                let (mut sch_side, mut sch_cand, mut sch_run) = (0_i8, 0_i8, 0_u8);
                 if i != 0 && z > AIRBORNE_Z {
                     airborne += 1;
                 }
@@ -1373,17 +1539,60 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                         }
                         // Side flip: the signed lateral component flips versus the previous sample.
                         let l = cross / sp0;
-                        if let Some(pl) = pp.lat {
-                            if pl.abs() > SIDE_FLIP_EPS
-                                && l.abs() > SIDE_FLIP_EPS
-                                && pl.signum() != l.signum()
+                        // Steering-stage laterals versus the same reference (previous velocity).
+                        let dbg = p.steer_debug;
+                        if dbg.tick == st.tick {
+                            for (k, v) in [dbg.desired, dbg.selected, dbg.filtered]
+                                .into_iter()
+                                .enumerate()
                             {
-                                a.side_flips += 1;
-                                a.flips_class[class] += 1;
-                                a.flips_band[band] += 1;
+                                let v = v2(v);
+                                lat_stage[k] = Some((pp.vel.0 * v.1 - pp.vel.1 * v.0) / sp0);
                             }
                         }
+                        let flipped = |a: Option<f64>, b: Option<f64>| match (a, b) {
+                            (Some(a), Some(b)) => {
+                                a.abs() > SIDE_FLIP_EPS
+                                    && b.abs() > SIDE_FLIP_EPS
+                                    && a.signum() != b.signum()
+                            }
+                            _ => false,
+                        };
+                        if flipped(pp.lat, Some(l)) {
+                            a.side_flips += 1;
+                            a.flips_class[class] += 1;
+                            a.flips_band[band] += 1;
+                            // Cause: the earliest steering stage whose own lateral flipped too;
+                            // none of them (or no fresh diagnostics) = the motion limits/contact.
+                            let cause = (0..3)
+                                .find(|&k| flipped(pp.lat_stage[k], lat_stage[k]))
+                                .unwrap_or(3);
+                            a.flips_cause[cause] += 1;
+                        }
                         lat = Some(l);
+                        // Schmitt variant: the debounced side changes only after the lateral has
+                        // stayed beyond the opposite +-0.05 m/s band for 4 consecutive samples.
+                        sch_side = pp.sch_side;
+                        let sgn = if l > SIDE_FLIP_SCHMITT_EPS {
+                            1
+                        } else if l < -SIDE_FLIP_SCHMITT_EPS {
+                            -1
+                        } else {
+                            0
+                        };
+                        // Any sample not beyond the opposite band breaks the run.
+                        if sgn != 0 && sgn != sch_side {
+                            sch_run = if pp.sch_cand == sgn { pp.sch_run.saturating_add(1) } else { 1 };
+                            sch_cand = sgn;
+                            if sch_run >= SIDE_FLIP_SCHMITT_DWELL {
+                                if sch_side != 0 {
+                                    a.flips_schmitt += 1;
+                                }
+                                sch_side = sgn;
+                                sch_cand = 0;
+                                sch_run = 0;
+                            }
+                        }
                         let th = cross.atan2(dot).to_degrees();
                         if let Some(pth) = pp.theta {
                             if pth.abs() > HEADING_FLIP_MIN_DEG
@@ -1438,6 +1647,10 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     recent_kick_ticks: p.recent_kick_ticks,
                     lat,
                     theta,
+                    lat_stage,
+                    sch_side,
+                    sch_cand,
+                    sch_run,
                 });
             }
             a.max_airborne = a.max_airborne.max(airborne);
@@ -1723,6 +1936,12 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
             "coord.cruise_over72_pct".into(),
             pct(a.cruise_over, a.cruise_n),
         );
+        if a.mark_def_ticks > 0 {
+            m.insert(
+                "coord.mark_steal_per_defender_min".into(),
+                a.mark_steals as f64 * f64::from(TICKS_PER_SECOND) * 60.0 / a.mark_def_ticks as f64,
+            );
+        }
 
         m.insert(
             "move.side_flips_per_player_min".into(),
@@ -1826,6 +2045,10 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 "trans.forward_sprint_share_0_5s".into(),
                 pct(a.trans_fwd_sprint, a.trans_fwd_speed.n),
             );
+            m.insert(
+                "trans.forward_sprint_share_0_5s_7mps".into(),
+                pct(a.trans_fwd_sprint7, a.trans_fwd_speed.n),
+            );
         }
         if a.trans_mid_speed.n > 0 {
             m.insert(
@@ -1836,6 +2059,13 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 "trans.mid_sprint_share_0_5s".into(),
                 pct(a.trans_mid_sprint, a.trans_mid_speed.n),
             );
+            m.insert(
+                "trans.mid_sprint_share_0_5s_7mps".into(),
+                pct(a.trans_mid_sprint7, a.trans_mid_speed.n),
+            );
+        }
+        if let Some(v) = a.stamina_end {
+            m.insert("trans.outfield_stamina_end_permille".into(), v);
         }
         put_mean(m, "trans.forwards_staying_high_mean", a.trans_fwd_high, 1.0);
 
@@ -1862,6 +2092,11 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         }
         put_mean(m, "support.nearest_option_dist_m", a.sup_nearest, 1.0);
         m.insert("support.runs_in_behind_per_10min".into(), per10(a.sup_runs));
+        m.insert("support.run_abandon_per_10min".into(), per10(a.sup_run_abandon));
+        m.insert("support.releases_per_10min".into(), per10(a.sup_releases));
+        if a.rel_passes > 0 {
+            m.insert("support.release_pass_completed_pct".into(), pct(a.rel_completed, a.rel_passes));
+        }
         m.insert(
             "support.passes_completed_tracked".into(),
             a.passes_completed as f64,
@@ -1907,6 +2142,16 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
             "move.heading_sign_flips_per_player_min".into(),
             per_pmin(a.heading_flips, a.player_ticks),
         );
+        m.insert(
+            "move.side_flips_schmitt_per_player_min".into(),
+            per_pmin(a.flips_schmitt, a.player_ticks),
+        );
+        for (c, name) in FLIP_CAUSES.iter().enumerate() {
+            m.insert(
+                format!("move.side_flips_cause.{name}_per_player_min"),
+                per_pmin(a.flips_cause[c], a.player_ticks),
+            );
+        }
     }
 
     let mut match_metrics = Metrics::new();
@@ -2076,13 +2321,19 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ("trans.pct_outfield_behind_ball_at_3s / _at_6s", "% of the side's on-pitch outfielders strictly goal-side of the ball at exactly t0 + 3 s (180 ticks) and t0 + 6 s (360 ticks), over episodes still running at that tick (no stoppage, not regained)."),
         ("trans.forward_recovery_speed_mps_0_5s / forward_sprint_share_0_5s", "Over episode ticks t0 .. t0 + 5 s (exclusive) and the side's on-pitch players with PlayerRole::Forward: mean |vel| (m/s), and % of those player-ticks with |vel| > 6 m/s."),
         ("trans.mid_recovery_speed_mps_0_5s / mid_sprint_share_0_5s", "Same for PlayerRole::Midfielder."),
+        ("trans.forward_sprint_share_0_5s_7mps / mid_sprint_share_0_5s_7mps", "Round 4 (area T). Same as forward_sprint_share_0_5s / mid_sprint_share_0_5s with the threshold at 7.0 m/s (25.2 km/h, the literature's sprint band) instead of 6 m/s, which coincides with the sim's 70% class-3 cruise cap and so counted capped jogging as sprinting."),
+        ("trans.outfield_stamina_end_permille", "Round 4 (area T). Mean stamina_permille of the side's on-pitch outfielders on the last open-play tick of the match (the cost guard for pressing / recovery-sprint urgency)."),
+        ("coord.mark_steal_per_defender_min", "Round 4 (area T). Changes of a defender's mark target (TeamAiMemory::mark_of goes from opponent A to a different opponent B, both not AI_NONE) while A is still within 1.35 x the marking zone (9 m in 11v11, 7 m in 5v5) of the defender's position, per defender-minute; defender-minutes count on-pitch outfielder ticks of open play while the opponent owns the ball. The FIFA 12 'steal' failure mode."),
         ("trans.forwards_staying_high_mean", "Mean number of the side's on-pitch Forwards ahead of the ball ((x - ball.x) * attack_sign > 0) at t0 + 6 s, over episodes still running then (rest offence kept high)."),
         ("trans.counterpress_pct", "% of turnovers after which the side owns the ball again within 6 s (t0 + 360 ticks) with no stoppage in between."),
         ("general.support", "Round 4. Support metrics are sampled on open-play ticks where an outfielder (slot != 0) of the side is ball.owner (carrier ticks). Open lane to a teammate: no on-pitch opponent (GK included) within 1.5 m of the segment carrier -> teammate. Offside: mirrors the sim's is_player_offside_at_pass: offsides_enabled, teammate (not the GK) past the offside-zone line (halfway in 11v11, +half_length/3 in 5v5 Rush), more than 0.15 m ahead of the ball and more than 0.2 m ahead of the second-last on-pitch opponent (GK included), all along the attacking axis (this is the task's 'ahead of the second-last opponent' rule with the sim's own zone, ball and tolerance conditions, so it matches what the referee would flag). Open option: an outfield teammate 6-30 m from the carrier with an open lane and not offside."),
         ("support.open_options_mean / open_options_p10 / ticks_with_le1_option_pct", "Number of open options per carrier tick: mean, 10th percentile (nearest rank) across carrier ticks, and % of carrier ticks with 0 or 1 open option."),
         ("support.nearest_option_dist_m", "Mean distance carrier -> nearest open option, over carrier ticks with at least one open option."),
         ("support.forward_options_mean", "Mean number of open options at least 3 m ahead of the carrier along the attacking axis ((x_mate - x_carrier) * attack_sign >= 3)."),
-        ("support.runs_in_behind_per_10min", "Per outfielder other than the owner, on open-play ticks while his side owns the ball (any owner incl. GK), against the line L = second-last opponent's x along the attacking axis on that tick: a run counts when the player was at or behind L on an earlier such tick (armed) and is now ahead of L with |vel| > 5 m/s. After crossing (counted or not) he must drop more than 1 m behind L to be armed again; losing possession or a stoppage disarms everyone. Count per 10 open-play minutes."),
+        ("support.runs_in_behind_per_10min", "Per outfielder other than the owner, on open-play ticks while his side owns the ball (any owner incl. GK), against the line L = second-last opponent's x along the attacking axis on that tick: a run counts when the player was at or behind L on an earlier such tick (armed) and is now ahead of L with |vel| > 5 m/s. Since the work-area-3 second pass, the ticks of the side's own pass in flight also count for the pass's intended receiver (the other players' states are held), and so does the reception tick on which that receiver becomes the owner. After crossing (counted or not) he must drop more than 1 m behind L to be armed again; losing possession or a stoppage disarms everyone. Count per 10 open-play minutes."),
+        ("support.run_abandon_per_10min", "Round 4 (work area 3). Committed runs abandoned per 10 open-play minutes: a run role in the sim's TeamAiMemory (run_role / run_since: penetrate, support-from-behind, box, decoy, called) that ends or is replaced fewer than 60 ticks after it began, on an open-play tick on which the opponent does not own the ball, the ball is not loose (no owner and no pass of the side in flight), and the runner neither owns it nor is the intended receiver of the side's pass in flight. Runs ended by a stoppage (non-open-play tick), by possession loss, or by receiving the ball are not abandons (FIFA 12's 'change their minds three or four times' failure)."),
+        ("support.releases_per_10min", "Round 4 (work area 3). Releases of committed runners per 10 open-play minutes: a CPU pass decision selecting a committed runner (TeamAiMemory::run_release with a new run_release_tick), or a ground or through pass of the side (the passer's recent_kick_kind 1 or 2; lofted switches excluded) launched toward a penetrate or called runner (run_role 1 or 5) that no CPU release of the same runner preceded within 60 ticks."),
+        ("support.release_pass_completed_pct", "% of passes launched toward a released / committed runner (as counted for releases_per_10min) whose next open-play owner is that runner; an opponent owning it, another teammate collecting it, or a stoppage (offside, out of play) before any owner is a failure."),
         ("support.cluster_pct", "% of carrier ticks where two outfield teammates other than the carrier are within 4 m of each other and both within 15 m of the carrier."),
         ("support.width_m / support.depth_m", "y-extent / x-extent of the side's on-pitch outfielders (carrier included) on carrier ticks, mean."),
         ("support.carrier_pct_of_open_play", "Carrier ticks as % of the side's open-play ticks (sample size of the support metrics)."),
@@ -2090,6 +2341,8 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ("move.side_flips_by_class.<c>_per_player_min / _share_pct", "Round 4. Side flips (move.side_flips_per_player_min) split by psfc_sim::ai::move_priority(state, side, idx) on the tick of the flip (0 carrier / elected chaser / committed keeper, 1 engager or human-controlled, 2 tactical mover, 3 idle / cruising / yielding; outside a fresh plan everyone but the carrier reads 2). per_player_min = flips in class c / player-minutes spent in class c (all consecutive open-play player-tick pairs whose current tick is in class c); share_pct = % of all the side's flips that occurred in class c."),
         ("move.class_time_pct.<c>", "% of consecutive open-play player-tick pairs whose current tick has move_priority c (the exposure behind the per-class rates)."),
         ("move.side_flips_speed_lt3_per_player_min / _ge3_per_player_min", "Side flips split by the current tick's speed |vel_t| < 3 m/s or >= 3 m/s, each divided by the player-minutes spent in that speed band."),
+        ("move.side_flips_schmitt_per_player_min", "Round 5 (WA1). Schmitt-band variant of move.side_flips_per_player_min over the same samples: a per-player debounced side (left/right of the previous heading) changes only after the lateral component l_t has stayed beyond the opposite +-0.05 m/s band for 4 consecutive samples; each change from one side to the other counts one flip (the first side taken after a gap does not count; the state resets when a tick has no heading sample). Ignores sub-quantum tick-to-tick noise and counts weaving whose half-period is >= 4 ticks. Count / player-minutes."),
+        ("move.side_flips_cause.<cause>_per_player_min", "Round 5 (WA1). Raw side flips (move.side_flips_per_player_min) split by the earliest steering stage whose own lateral component (versus the same previous-tick velocity) flipped sign with the same 0.02 m/s dead band on the same tick pair: desired = the desired velocity before local avoidance flipped (decision side: intent, target, input); sampler = the avoidance-selected velocity flipped while the desired one did not; filter = only the filtered command flipped; limiter = none of the three flipped (motion limits, turn limiter, contact constraint; also flips without fresh psfc_sim PlayerState::steer_debug diagnostics, e.g. scripted actions). Each divided by all player-minutes, so the four sum to the raw rate."),
         ("move.heading_sign_flips_per_player_min", "Over the heading-histogram samples (speed > 1 m/s on both ticks): signed heading change theta_t = atan2(cross(vel_t-1, vel_t), dot(vel_t-1, vel_t)) in degrees. A heading sign flip is a sample where |theta_t| > 1 deg and the previous consecutive sample's |theta_t-1| > 1 deg with opposite signs (left-right-left steering wobble, independent of the 0.02 m/s lateral dead band of side flips). Count / player-minutes."),
         ("aerial.headers (+ _shot/_clear/_pass)", "Outfielder with z > 0.14 m whose recent_kick_ticks rose versus the previous tick (a new contact); split by recent_kick_kind: 4/5 shot, 3 clearance/lob, else pass/flick."),
     ];

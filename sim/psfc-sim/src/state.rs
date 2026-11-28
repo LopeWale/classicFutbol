@@ -93,7 +93,31 @@ pub struct PlayerState {
     pub overlap_ticks: u8,
     pub yellow_cards: u8,
     pub sent_off: bool,
+    /// Steering diagnostics for `psfc-replay analyze` (side-flip cause split). DIAGNOSTICS ONLY:
+    /// never serialized, never hashed, never read by the simulation, ignored by `PartialEq`.
+    #[serde(skip)]
+    pub steer_debug: SteerDebug,
 }
+
+/// Per-tick steering pipeline values of one player (diagnostics only, see
+/// [`PlayerState::steer_debug`]): the desired velocity before local avoidance, the velocity the
+/// avoidance stage selected, and the command after the steering filter, all on tick `tick`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SteerDebug {
+    /// Tick these values were written on (`0` = never); stale values must be ignored.
+    pub tick: u32,
+    pub desired: Vec2,
+    pub selected: Vec2,
+    pub filtered: Vec2,
+}
+
+impl PartialEq for SteerDebug {
+    /// Diagnostics never take part in state equality.
+    fn eq(&self, _other: &Self) -> bool {
+        true
+    }
+}
+impl Eq for SteerDebug {}
 
 impl PlayerState {
     #[inline]
@@ -450,6 +474,30 @@ pub struct TeamAiMemory {
     pub cmd_vel: Vec<Vec2>,
     #[serde(default)]
     pub cmd_tick: Vec<u32>,
+    /// Rate state of the second-order steering filter (`cmd_vel` holds its direction), per player.
+    #[serde(default)]
+    pub steer_cmd_rate: Vec<Vec2>,
+    /// Chaser intercept anti-dither: accepted intercept point per player, the tick it was accepted
+    /// and whether it came from the attack-the-ball (near) predictor.
+    #[serde(default)]
+    pub steer_chase_pt: Vec<Vec2>,
+    #[serde(default)]
+    pub steer_chase_tick: Vec<u32>,
+    #[serde(default)]
+    pub steer_chase_near: Vec<u8>,
+    /// CPU carrier evade-side hysteresis: side (`1` / `-1`, `0` none), carrier index, last tick
+    /// used and the tick the side was chosen.
+    #[serde(default)]
+    pub steer_evade_sign: i8,
+    #[serde(default)]
+    pub steer_evade_idx: u8,
+    #[serde(default)]
+    pub steer_evade_tick: u32,
+    #[serde(default)]
+    pub steer_evade_since: u32,
+    /// Low-passed speed of the steering command, per player.
+    #[serde(default)]
+    pub steer_cmd_speed: Vec<Fp>,
     /// Exclusivity layer (`docs/exclusivity-layer.md`): the one outfielder elected to chase a loose
     /// ball. `0` = none (the keeper index is never an elected outfield chaser).
     #[serde(default)]
@@ -469,6 +517,139 @@ pub struct TeamAiMemory {
     /// Movement priority class per player for this tick (`0` carrier/chaser .. `3` idle/cruise/yield).
     #[serde(default)]
     pub move_class: Vec<u8>,
+
+    // --- Attacking support and runs (round 4 work area 3, `docs/attacking-support-and-runs.md`) ---
+    /// Committed support candidate kind per player (`AI_NONE` = none; see `ai::SUP_*`).
+    #[serde(default)]
+    pub sup_kind: Vec<u8>,
+    /// `tick + 1` when the current support candidate was adopted (dwell / incumbent bonus).
+    #[serde(default)]
+    pub sup_since: Vec<u32>,
+    /// `tick + 1` of the player's last support re-score (15-30 tick cadence).
+    #[serde(default)]
+    pub sup_eval: Vec<u32>,
+    /// The committed support point (absolute; refreshed each tick from the candidate's geometry).
+    #[serde(default)]
+    pub sup_pt: Vec<Vec2>,
+    /// Carrier index the support choice was made for (`AI_NONE` = none): a new carrier re-scores.
+    #[serde(default)]
+    pub sup_carrier: Vec<u8>,
+    /// Sticky lateral nudge of the final target to reopen its lane (units of 2 m, signed).
+    #[serde(default)]
+    pub sup_nudge: Vec<i8>,
+    /// Sticky side sign of the teammate yield (`yield_target`) for the current episode (0 = none).
+    #[serde(default)]
+    pub yield_sign: Vec<i8>,
+    /// Sticky side sign of the keeper-corridor yield for the current episode (0 = none).
+    #[serde(default)]
+    pub gk_yield_sign: Vec<i8>,
+    /// Sticky bend sign of the curved run around a blocker, and the tick it was last applied.
+    #[serde(default)]
+    pub bend_sign: Vec<i8>,
+    #[serde(default)]
+    pub bend_tick: Vec<u32>,
+    /// Teammate this player yielded his destination to last tick (`AI_NONE` = none).
+    #[serde(default)]
+    pub res_yield: Vec<u8>,
+    /// Alpha-beta target filter: estimated target velocity (m per tick) per player.
+    #[serde(default)]
+    pub tgt_vel: Vec<Vec2>,
+    /// Last raw target accepted through the 0.4 m re-target deadband.
+    #[serde(default)]
+    pub tgt_raw: Vec<Vec2>,
+    /// Committed run role per player (`0` none; see `ai::RUN_*`), when it began (`tick + 1`) and
+    /// its end-point beyond the offside line.
+    #[serde(default)]
+    pub run_role: Vec<u8>,
+    #[serde(default)]
+    pub run_since: Vec<u32>,
+    #[serde(default)]
+    pub run_end: Vec<Vec2>,
+    /// Support-triangle incumbent (`0` = none), the tick (`+ 1`) he took the role, and `tick + 1`
+    /// of the last pick.
+    #[serde(default)]
+    pub tri_idx: u8,
+    #[serde(default)]
+    pub tri_since: u32,
+    #[serde(default)]
+    pub tri_eval: u32,
+    /// `passer_ready` Schmitt state, the tick (`+ 1`) of its last toggle, `tick + 1` of the last
+    /// evaluation and the carrier it was evaluated for.
+    #[serde(default)]
+    pub pr_on: bool,
+    #[serde(default)]
+    pub pr_since: u32,
+    #[serde(default)]
+    pub pr_eval: u32,
+    #[serde(default)]
+    pub pr_carrier: u8,
+    /// Run arbiter: `tick + 1` of its last pass, and the number of re-score rounds so far (work-rate
+    /// cadence).
+    #[serde(default)]
+    pub run_eval: u32,
+    #[serde(default)]
+    pub run_round: u32,
+    /// Runner released by the CPU carrier's pass decision (`0` = none) and the tick (`+ 1`).
+    #[serde(default)]
+    pub run_release: u8,
+    #[serde(default)]
+    pub run_release_tick: u32,
+    /// Near support ("players closest to the ball come to support"): `tick + 1` of the last
+    /// evaluation, of the assignment, the carrier it was made for, the (up to two) assigned
+    /// supporters (`AI_NONE` = none) and their support points as offsets from the carrier.
+    #[serde(default)]
+    pub near_eval: u32,
+    #[serde(default)]
+    pub near_since: u32,
+    #[serde(default)]
+    pub near_carrier: u8,
+    #[serde(default)]
+    pub near_idx: Vec<u8>,
+    #[serde(default)]
+    pub near_off: Vec<Vec2>,
+    // ---- Round 4, area T (transition urgency and off-ball defending, `docs/transition-and-defending.md`).
+    /// The press-or-fall-back decision for the current counter-press has been taken (it is made
+    /// after a 6-12 tick reaction; until then the team reacts as if counter-pressing).
+    #[serde(default)]
+    pub cp_decided: bool,
+    /// Second counter-press lane-closer (`second_presser` is the first); `AI_NONE` = none.
+    #[serde(default = "ai_none_u8")]
+    pub third_presser: u8,
+    /// Opponent receiver whose lane each closer shuts (`[second_presser, third_presser]`).
+    #[serde(default = "ai_none_pair")]
+    pub closer_lane: [u8; 2],
+    /// The human's teammate-contain mate registered as the second engager (`AI_NONE` = none).
+    #[serde(default = "ai_none_u8")]
+    pub contain_mate: u8,
+    /// The one Low-defensive-work-rate forward kept high as the rest offence (`AI_NONE` = none).
+    #[serde(default = "ai_none_u8")]
+    pub rest_offence: u8,
+    /// Shared back-line height (mm of progress from our goal line) the back-liners lag-track;
+    /// `0` = not yet set.
+    #[serde(default)]
+    pub line_prog: i64,
+    /// Ticks left of an active press trigger (heavy touch, carrier facing his own goal, carrier
+    /// pinned on the touchline): the presser sprints and a second man shadows him.
+    #[serde(default)]
+    pub press_trigger_ticks: u16,
+    /// Per player: bit 0 = recovery sprint latched (ahead of the ball, running goal-side).
+    #[serde(default)]
+    pub rec_flags: Vec<u8>,
+    /// Per player: ticks of the current recovery burst (sprint capped at 180-240 ticks).
+    #[serde(default)]
+    pub burst_ticks: Vec<u16>,
+    /// Per player: recent high-intensity distance (mm), a leaky integrator with a 60 s time
+    /// constant over ticks above 5.5 m/s (the fatigue multiplier's input).
+    #[serde(default)]
+    pub hi_dist_mm: Vec<u32>,
+}
+
+const fn ai_none_u8() -> u8 {
+    AI_NONE
+}
+
+const fn ai_none_pair() -> [u8; 2] {
+    [AI_NONE; 2]
 }
 
 impl TeamAiMemory {
@@ -494,12 +675,73 @@ impl TeamAiMemory {
         if self.flags.len() != n {
             self.flags = vec![0; n];
         }
-        if self.cmd_vel.len() != n || self.cmd_tick.len() != n {
+        if self.cmd_vel.len() != n
+            || self.cmd_tick.len() != n
+            || self.steer_cmd_rate.len() != n
+            || self.steer_cmd_speed.len() != n
+        {
             self.cmd_vel = vec![Vec2::ZERO; n];
             self.cmd_tick = vec![0; n];
+            self.steer_cmd_rate = vec![Vec2::ZERO; n];
+            self.steer_cmd_speed = vec![Fp::ZERO; n];
+        }
+        if self.steer_chase_pt.len() != n
+            || self.steer_chase_tick.len() != n
+            || self.steer_chase_near.len() != n
+        {
+            self.steer_chase_pt = vec![Vec2::ZERO; n];
+            self.steer_chase_tick = vec![0; n];
+            self.steer_chase_near = vec![0; n];
         }
         if self.move_class.len() != n {
             self.move_class = vec![2; n];
+        }
+        // Attacking support and runs (round 4 work area 3).
+        if self.sup_kind.len() != n {
+            self.sup_kind = vec![AI_NONE; n];
+            self.sup_since = vec![0; n];
+            self.sup_eval = vec![0; n];
+            self.sup_pt = vec![Vec2::ZERO; n];
+            self.sup_carrier = vec![AI_NONE; n];
+            self.sup_nudge = vec![0; n];
+        }
+        if self.sup_since.len() != n || self.sup_eval.len() != n || self.sup_pt.len() != n || self.sup_carrier.len() != n || self.sup_nudge.len() != n {
+            self.sup_since = vec![0; n];
+            self.sup_eval = vec![0; n];
+            self.sup_pt = vec![Vec2::ZERO; n];
+            self.sup_carrier = vec![AI_NONE; n];
+            self.sup_nudge = vec![0; n];
+        }
+        if self.yield_sign.len() != n || self.gk_yield_sign.len() != n || self.bend_sign.len() != n || self.bend_tick.len() != n {
+            self.yield_sign = vec![0; n];
+            self.gk_yield_sign = vec![0; n];
+            self.bend_sign = vec![0; n];
+            self.bend_tick = vec![0; n];
+        }
+        if self.res_yield.len() != n {
+            self.res_yield = vec![AI_NONE; n];
+        }
+        if self.tgt_vel.len() != n || self.tgt_raw.len() != n {
+            self.tgt_vel = vec![Vec2::ZERO; n];
+            self.tgt_raw = vec![Vec2::ZERO; n];
+        }
+        if self.near_idx.len() != 2 || self.near_off.len() != 2 {
+            self.near_idx = vec![AI_NONE; 2];
+            self.near_off = vec![Vec2::ZERO; 2];
+        }
+        if self.run_role.len() != n || self.run_since.len() != n || self.run_end.len() != n {
+            self.run_role = vec![0; n];
+            self.run_since = vec![0; n];
+            self.run_end = vec![Vec2::ZERO; n];
+        }
+        if self.rec_flags.len() != n {
+            self.rec_flags = vec![0; n];
+        }
+        if self.burst_ticks.len() != n {
+            self.burst_ticks = vec![0; n];
+        }
+        if self.hi_dist_mm.len() != n {
+            self.hi_dist_mm = vec![0; n];
         }
     }
 
@@ -537,6 +779,28 @@ impl TeamAiMemory {
             h.i64(v.y.raw());
             h.u32(*t);
         }
+        h.u32(self.steer_cmd_rate.len() as u32);
+        for (r, sp) in self.steer_cmd_rate.iter().zip(self.steer_cmd_speed.iter()) {
+            h.i64(r.x.raw());
+            h.i64(r.y.raw());
+            h.i64(sp.raw());
+        }
+        h.u32(self.steer_chase_pt.len() as u32);
+        for ((pt, t), nr) in self
+            .steer_chase_pt
+            .iter()
+            .zip(self.steer_chase_tick.iter())
+            .zip(self.steer_chase_near.iter())
+        {
+            h.i64(pt.x.raw());
+            h.i64(pt.y.raw());
+            h.u32(*t);
+            h.u8(*nr);
+        }
+        h.u8(self.steer_evade_sign as u8);
+        h.u8(self.steer_evade_idx);
+        h.u32(self.steer_evade_tick);
+        h.u32(self.steer_evade_since);
         h.u8(self.chaser);
         h.u16(self.chaser_ticks);
         h.u32(self.chaser_eval_tick);
@@ -545,6 +809,154 @@ impl TeamAiMemory {
         h.u8(u8::from(self.keeper_claim));
         h.u32(self.move_class.len() as u32);
         h.bytes(&self.move_class);
+        // Attacking support and runs (round 4 work area 3).
+        h.u32(self.sup_kind.len() as u32);
+        h.bytes(&self.sup_kind);
+        for (((s, e), pt), c) in self.sup_since.iter().zip(&self.sup_eval).zip(&self.sup_pt).zip(&self.sup_carrier) {
+            h.u32(*s);
+            h.u32(*e);
+            h.i64(pt.x.raw());
+            h.i64(pt.y.raw());
+            h.u8(*c);
+        }
+        let signs = |h: &mut CanonicalHasher, v: &[i8]| {
+            h.u32(v.len() as u32);
+            for x in v {
+                h.u8(*x as u8);
+            }
+        };
+        signs(h, &self.sup_nudge);
+        signs(h, &self.yield_sign);
+        signs(h, &self.gk_yield_sign);
+        signs(h, &self.bend_sign);
+        for t in &self.bend_tick {
+            h.u32(*t);
+        }
+        h.u32(self.res_yield.len() as u32);
+        h.bytes(&self.res_yield);
+        h.u32(self.tgt_vel.len() as u32);
+        for (v, r) in self.tgt_vel.iter().zip(&self.tgt_raw) {
+            h.i64(v.x.raw());
+            h.i64(v.y.raw());
+            h.i64(r.x.raw());
+            h.i64(r.y.raw());
+        }
+        h.u32(self.run_role.len() as u32);
+        h.bytes(&self.run_role);
+        for (s, e) in self.run_since.iter().zip(&self.run_end) {
+            h.u32(*s);
+            h.i64(e.x.raw());
+            h.i64(e.y.raw());
+        }
+        h.u8(self.tri_idx);
+        h.u32(self.tri_since);
+        h.u32(self.tri_eval);
+        h.u8(u8::from(self.pr_on));
+        h.u32(self.pr_since);
+        h.u32(self.pr_eval);
+        h.u8(self.pr_carrier);
+        h.u32(self.run_eval);
+        h.u32(self.run_round);
+        h.u8(self.run_release);
+        h.u32(self.run_release_tick);
+        h.u32(self.near_eval);
+        h.u32(self.near_since);
+        h.u8(self.near_carrier);
+        h.u32(self.near_idx.len() as u32);
+        h.bytes(&self.near_idx);
+        for o in &self.near_off {
+            h.i64(o.x.raw());
+            h.i64(o.y.raw());
+        }
+        h.u8(u8::from(self.cp_decided));
+        h.u8(self.third_presser);
+        h.bytes(&self.closer_lane);
+        h.u8(self.contain_mate);
+        h.u8(self.rest_offence);
+        h.i64(self.line_prog);
+        h.u16(self.press_trigger_ticks);
+        h.u32(self.rec_flags.len() as u32);
+        h.bytes(&self.rec_flags);
+        for t in &self.burst_ticks {
+            h.u16(*t);
+        }
+        for d in &self.hi_dist_mm {
+            h.u32(*d);
+        }
+    }
+}
+
+/// Velocity-stage memory of the local avoidance (`avoidance::select_velocity_mem`), indexed by the
+/// avoidance frame id `side * stride + idx` (`n` = `2 * stride` agents). Sized by
+/// [`SteerMemory::ensure_len`] at the start of every tick; a size change clears it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SteerMemory {
+    /// Agent count the tables are sized for.
+    #[serde(default)]
+    pub n: u16,
+    /// `tick` of the agent's last velocity selection (`0` = none; continuity = last tick).
+    #[serde(default)]
+    pub sel_tick: Vec<u32>,
+    /// Last selected (avoidance output) velocity per agent: tie-break reference.
+    #[serde(default)]
+    pub prev_sel: Vec<Vec2>,
+    /// Lateral sign (`-1`, `0`, `1`) of the last selected velocity versus the agent's heading.
+    #[serde(default)]
+    pub lat_sign: Vec<i8>,
+    /// Committed lateral sign and the ticks it is still held (dwell).
+    #[serde(default)]
+    pub dwell_sign: Vec<i8>,
+    #[serde(default)]
+    pub dwell_left: Vec<u8>,
+    /// Per ordered pair `me * n + other`: bits `0..2` remembered passing side (`0` none, `1` the
+    /// HRVO determinant was positive at first contact, `2` negative), bits `2..8` ticks since the
+    /// pair last interacted (cleared at 60).
+    #[serde(default)]
+    pub pair: Vec<u8>,
+}
+
+impl SteerMemory {
+    /// Size the tables for `n` agents (a size change resets everything).
+    pub fn ensure_len(&mut self, n: usize) {
+        if self.n as usize != n
+            || self.sel_tick.len() != n
+            || self.prev_sel.len() != n
+            || self.lat_sign.len() != n
+            || self.dwell_sign.len() != n
+            || self.dwell_left.len() != n
+            || self.pair.len() != n * n
+        {
+            *self = Self {
+                n: n as u16,
+                sel_tick: vec![0; n],
+                prev_sel: vec![Vec2::ZERO; n],
+                lat_sign: vec![0; n],
+                dwell_sign: vec![0; n],
+                dwell_left: vec![0; n],
+                pair: vec![0; n * n],
+            };
+        }
+    }
+
+    fn hash_into(&self, h: &mut CanonicalHasher) {
+        h.u16(self.n);
+        h.u32(self.sel_tick.len() as u32);
+        for (((t, v), l), (ds, dl)) in self
+            .sel_tick
+            .iter()
+            .zip(self.prev_sel.iter())
+            .zip(self.lat_sign.iter())
+            .zip(self.dwell_sign.iter().zip(self.dwell_left.iter()))
+        {
+            h.u32(*t);
+            h.i64(v.x.raw());
+            h.i64(v.y.raw());
+            h.u8(*l as u8);
+            h.u8(*ds as u8);
+            h.u8(*dl);
+        }
+        h.u32(self.pair.len() as u32);
+        h.bytes(&self.pair);
     }
 }
 
@@ -627,6 +1039,10 @@ pub struct MatchState {
     /// from `&MatchState` mid-tick; it is serialized and included in [`Self::compute_hash`].
     #[serde(default)]
     pub ai_memory: core::cell::RefCell<[TeamAiMemory; 2]>,
+    /// Local-avoidance steering memory (WA1: committed lateral sign, dwell, per-pair passing side).
+    /// Serialized and hashed: it changes the simulation.
+    #[serde(default)]
+    pub steer_memory: SteerMemory,
     #[serde(skip)]
     pub pending_events: Vec<MatchEvent>,
     pub recorded_events: Vec<MatchEvent>,
@@ -876,6 +1292,7 @@ impl MatchState {
         for mem in self.ai_memory.borrow().iter() {
             mem.hash_into(&mut h);
         }
+        self.steer_memory.hash_into(&mut h);
 
         // Phase
         match self.phase {

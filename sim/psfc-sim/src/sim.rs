@@ -116,6 +116,7 @@ impl MatchSimulation {
                     overlap_ticks: 0,
                     yellow_cards: 0,
                     sent_off: false,
+                    steer_debug: crate::state::SteerDebug::default(),
                 });
                 stats.push(PlayerMatchStats {
                     footballer_id: p.footballer_id.clone(),
@@ -196,6 +197,7 @@ impl MatchSimulation {
                 shootout_score: None,
                 gk_brain: [crate::state::GoalkeeperBrain::default(); 2],
                 ai_memory: Default::default(),
+                steer_memory: Default::default(),
                 pending_events: Vec::new(),
                 recorded_events: Vec::new(),
             },
@@ -328,6 +330,16 @@ impl MatchSimulation {
                 }
             }
         }
+
+        // Avoidance snapshot of every player (positions, velocities, priority classes), taken once
+        // per tick BEFORE the CPU input generators run their team plans: `generate_cpu_input`
+        // resets a side's move classes to the plan baseline, so a frame built later would see the
+        // previous tick's refined classes on human sides but only baseline classes on CPU sides.
+        // Taken here, both sides are seen with the classes refined during the previous tick, and the
+        // velocity stage stays independent of the stepping order.
+        let avoid_frame = crate::avoidance::build_frame(&self.state);
+        // Steering memory (WA1): size it for this frame and age the per-pair passing sides.
+        crate::avoidance::begin_tick(&mut self.state.steer_memory, &avoid_frame);
 
         let home_in = match self.state.rules.home_controller {
             SideController::Human => external_inputs[0],
@@ -842,6 +854,10 @@ impl MatchSimulation {
                     if idx == current_ctrl || p.sent_off || p.contain_cooldown > 0 || p.contain_stamina == 0 {
                         continue;
                     }
+                    // Round 4, area T: never pull a back-liner who owns a runner in behind.
+                    if crate::ai::owns_runner(&self.state, side, idx) {
+                        continue;
+                    }
                     let u = self.defensive_switch_utility(side, idx);
                     if u > best_u {
                         best_u = u;
@@ -872,7 +888,7 @@ impl MatchSimulation {
         }
 
         // 2. Step all players (movement, stamina, charging, tackles, GK dives)
-        self.step_all_players(&inputs);
+        self.step_all_players(&inputs, &avoid_frame);
 
         // 3. Resolve active tackles against ball / ball carrier
         self.resolve_tackles();
@@ -2829,38 +2845,22 @@ impl MatchSimulation {
         aerial_contest || through_first_time || rebound_shot_first_time
     }
 
+    /// `BTN_CALL_RUN` (round 4, `docs/attacking-support-and-runs.md`): the teammate the carrier is
+    /// facing with the best 1 s look-ahead Control gets a committed run with an end-point beyond
+    /// the offside line and the arbiter's hold-and-release (`ai::assign_called_run`), plus the
+    /// existing 90-tick burst.
     fn trigger_teammate_run(&mut self, side: TeamSide) {
         let s_idx = side.index();
-        let ctrl = self.state.controlled_idx[s_idx];
-        let attack_sign = side.attack_sign(self.state.second_half_swapped());
-        let mut best_idx: Option<usize> = None;
-        let mut best_prog = i64::MIN;
-
-        for (idx, p) in self.state.players[s_idx].iter().enumerate() {
-            if idx == 0 || idx == ctrl || p.sent_off {
-                continue;
-            }
-            let prog = p.pos.x.to_milli() * attack_sign
-                + if p.role == PlayerRole::Forward { 6_000 } else { 0 };
-            if prog > best_prog {
-                best_prog = prog;
-                best_idx = Some(idx);
-            }
-        }
-        if let Some(target_idx) = best_idx {
+        if let Some(target_idx) = crate::ai::assign_called_run(&self.state, side) {
             // EA FC 27 Limited Distance for Triggered Runs (`90` ticks = `1.5s` burst before returning to FC IQ shape)
             self.state.players[s_idx][target_idx].run_boost_ticks = 90;
         }
     }
 
-    fn step_all_players(&mut self, inputs: &[InputFrame; 2]) {
+    fn step_all_players(&mut self, inputs: &[InputFrame; 2], avoid_frame: &crate::avoidance::Frame) {
         let dt = Fp::from_ratio(1, TICKS_PER_SECOND as i64);
         let half_len = self.state.format.half_length() + Fp::from_milli(1_500);
         let half_wid = self.state.format.half_width() + Fp::from_milli(1_500);
-        // Avoidance snapshot of every player (positions, velocities, priority classes) taken before
-        // anyone moves, so the velocity stage is independent of the stepping order.
-        let avoid_frame = crate::avoidance::build_frame(&self.state);
-
         for side in [TeamSide::Home, TeamSide::Away] {
             let s_idx = side.index();
             let opp_s_idx = side.opponent().index();
@@ -2920,6 +2920,8 @@ impl MatchSimulation {
                     None
                 };
 
+                // Round 4, area T: pressing engagers drain stamina x2.5 while counter-pressing.
+                let press_drain_pm = crate::ai::stamina_drain_mult_pm(&self.state, side, idx);
                 let my_intercept_ticks = if is_controlled && !is_gk && self.state.ball.owner.is_none() {
                     best_ball_intercept_for_player(&self.state, side, idx).1
                 } else {
@@ -3710,11 +3712,34 @@ impl MatchSimulation {
                     // No long-term stamina depletion in 5v5 (`min 580`), rapid recovery when jogging/walking!
                     let moving = move_dir.len() > Fp::from_milli(120);
                     let min_stamina = if is_5v5 { 580 } else { 150 };
-                    if eff_sprint_throttle > 200 && moving {
+                    if eff_sprint_throttle > 200 && moving && is_5v5 {
                         let base_drain = (125_u32.saturating_sub(p.attributes.stamina as u32)).max(25);
-                        let drain_mod =
-                            ((base_drain as i64 * eff_sprint_throttle) / 1_000).max(8) as u32;
+                        let drain_mod = ((base_drain as i64 * eff_sprint_throttle) / 1_000 * press_drain_pm / 1_000)
+                            .max(8) as u32;
                         if (current_tick * drain_mod) % 420 < drain_mod {
+                            p.stamina_permille = (p.stamina_permille - 1).max(min_stamina);
+                        }
+                    } else if eff_sprint_throttle > 200 && moving {
+                        // 11v11 long-term stamina (round 4, area T fix). The 5v5 rate above (one
+                        // permille per ~10 sprint ticks) has 5v5's fast jog recovery to balance it;
+                        // 11v11 recovers only when standing, so the same rate emptied outfielders to
+                        // the 150 floor within ten minutes. The 11v11 rate is that rate x
+                        // STAM11_RATE_PM / 1000, scaled by the stamina left above the 150 floor, so it
+                        // decays like FIFA's long-term stamina: outfielders end a 10-minute match near
+                        // 890 permille and a High-work-rate midfielder a 90-minute one near 450
+                        // (measured; docs/transition-and-defending.md section 9). Rate resolution:
+                        // one permille per 42 000 / drain_mod ticks.
+                        const STAM11_RATE_PM: i64 = 66;
+                        const STAM11_FLOOR: i64 = 150;
+                        let base_drain = (125_u32.saturating_sub(p.attributes.stamina as u32)).max(25) as i64;
+                        let left_pm = ((p.stamina_permille as i64 - STAM11_FLOOR) * 1_000 / (1_000 - STAM11_FLOOR)).max(0);
+                        let drain_mod = (base_drain * eff_sprint_throttle / 1_000 * press_drain_pm / 1_000 * 100
+                            * STAM11_RATE_PM
+                            / 1_000
+                            * left_pm
+                            / 1_000)
+                            .max(1) as u32;
+                        if (current_tick.wrapping_mul(drain_mod)) % 42_000 < drain_mod {
                             p.stamina_permille = (p.stamina_permille - 1).max(min_stamina);
                         }
                     } else if is_5v5 {
@@ -3807,6 +3832,7 @@ impl MatchSimulation {
                         _ => move_dir.scale(top_speed),
                     };
                     let human_driven = is_controlled && !side_is_cpu;
+                    let dbg_desired = desired_vel;
                     // Predictive local avoidance on the DESIRED velocity, before any motion limit:
                     // AI outfielders get the full sampled reciprocal selection, human-controlled
                     // players only a bounded lateral adjustment, the ball carrier is never steered.
@@ -3816,19 +3842,33 @@ impl MatchSimulation {
                     {
                         let a_id = avoid_frame.id(s_idx, idx);
                         if human_driven {
-                            crate::avoidance::human_adjust(&avoid_frame, a_id, desired_vel, top_speed)
+                            crate::avoidance::human_adjust(avoid_frame, a_id, desired_vel, top_speed)
                         } else {
-                            crate::avoidance::select_velocity(&avoid_frame, a_id, desired_vel, top_speed)
+                            crate::avoidance::select_velocity_mem(
+                                avoid_frame,
+                                &mut self.state.steer_memory,
+                                current_tick,
+                                a_id,
+                                desired_vel,
+                                top_speed,
+                            )
                         }
                     } else {
                         desired_vel
                     };
-                    // Movement model (outfield): low-pass the velocity COMMAND of AI/CPU-driven
-                    // players so it cannot flip sign tick to tick. Human-controlled players and
-                    // ball carriers are never filtered (input latency unchanged).
+                    let dbg_selected = desired_vel;
+                    // Movement model (outfield): second-order steering filter on the velocity COMMAND
+                    // of AI/CPU-driven players (the CPU ball carrier with the shorter smoothing
+                    // time), so it cannot flip sign tick to tick. Human-controlled players are
+                    // never filtered (input latency unchanged). The intended receiver of a pass in
+                    // flight is filtered with the short time while the ball is still far, and not
+                    // at all within ai::RECEIVER_UNFILTERED_MM of the ball, where he must meet the ball's line
+                    // exactly (filtering him there cost 5v5 pass completion).
+                    let receiver_close = my_pass_target.is_some()
+                        && p.pos.dist(ball_xy_now) < Fp::from_milli(crate::ai::RECEIVER_UNFILTERED_MM);
                     let desired_vel = if !is_gk
                         && !human_driven
-                        && !has_ball
+                        && !receiver_close
                         && matches!(p.action, PlayerActionState::Normal)
                     {
                         let mut mems = self.state.ai_memory.borrow_mut();
@@ -3838,10 +3878,20 @@ impl MatchSimulation {
                             idx,
                             current_tick,
                             &p.attributes,
+                            // Short lag while the avoidance stage is steering (it changed the
+                            // command): the dodge must not be delayed into contact.
+                            has_ball || my_pass_target.is_some() || dbg_selected != dbg_desired,
                             desired_vel,
                         )
                     } else {
                         desired_vel
+                    };
+                    // Diagnostics only (never hashed or read back): the side-flip cause split.
+                    p.steer_debug = crate::state::SteerDebug {
+                        tick: current_tick,
+                        desired: dbg_desired,
+                        selected: dbg_selected,
+                        filtered: desired_vel,
                     };
                     let vel_before = p.vel;
 
@@ -3903,7 +3953,7 @@ impl MatchSimulation {
                             | PlayerActionState::Cooldown { .. }
                             | PlayerActionState::Charging { .. }
                     ) {
-                        p.vel = crate::avoidance::contact_constrain(&avoid_frame, avoid_frame.id(s_idx, idx), p.vel);
+                        p.vel = crate::avoidance::contact_constrain(avoid_frame, avoid_frame.id(s_idx, idx), p.vel);
                     }
 
                     p.pos += p.vel.scale(dt);
@@ -4643,6 +4693,20 @@ impl MatchSimulation {
             }
         }
 
+        // Round 4 (work area 3, `docs/attacking-support-and-runs.md`): a through pass, or a ground
+        // pass with the run modifier, goes to a committed penetrate / called runner inside the aim
+        // cone, led to his post-release look-ahead, instead of the cone's default pick.
+        if assist_level != AssistLevel::Manual
+            && !is_lob
+            && !in_attacking_wing
+            && (is_through || (button & BTN_CALL_RUN) != 0)
+        {
+            if let Some((r_idx, lead)) =
+                crate::ai::released_runner_target(&self.state, side, kicker_idx, kicker_pos, aim_norm, min_cone_align)
+            {
+                best_receiver = Some((r_idx, lead.clamp_box(half_len - Fp::from_milli(1_150), half_wid - Fp::from_milli(1_150))));
+            }
+        }
         let locked_teammate = best_receiver.is_some();
         let (receiver_idx, mut target_pos) = match (assist_level, best_receiver) {
             (AssistLevel::Assisted, Some((r_idx, snapped_pos))) => (r_idx, snapped_pos),
