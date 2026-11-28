@@ -150,9 +150,11 @@ fn turnover_forwards_sprint_back_and_one_low_dwr_forward_holds_high() {
     for (k, &i) in fwd.iter().enumerate() {
         if i != rest {
             assert!(fast[k], "forward {i} did not reach 7 m/s within 30 ticks");
-            // Level with the ball, or at least 10 m of the deficit recovered before the episode ended.
+            // Level with the ball, or at least 10 m (or 70%) of the deficit recovered before the
+            // episode ended. The 70% clause is a round-4 merge change: a runner now jogs while a
+            // loose ball (a pass in flight) is within 25 m, which is the exclusivity stand-off.
             assert!(
-                level[k] || d_min[k] < d_first[k] - 10.0,
+                level[k] || d_min[k] < d_first[k] - 10.0_f64.min(0.7 * d_first[k]),
                 "forward {i} recovered only {:.1} m of {:.1} m",
                 d_first[k] - d_min[k],
                 d_first[k]

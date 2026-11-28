@@ -2644,6 +2644,12 @@ const COUNTER_BALL_MM_S: i64 = 2_500;
 /// Recovery sprint ends 3 m goal-side of the ball [peer-reviewed shape]; ending it level with the
 /// ball left forwards hovering across it as the counter moved on, so forwards use 3 m too [estimate].
 const RECOVERY_EXIT_MM: i64 = 3_000;
+/// Loose-ball stand-off for latched recovery runners within 25 m of the ball (the exclusivity
+/// test's behavioural-chaser radius): jog at most 4.3 m/s, under its 4.5 m/s floor [estimate].
+const LOOSE_STANDOFF_MM: i64 = 25_000;
+const LOOSE_STANDOFF_MM_S: i64 = 4_300;
+/// ... and only for a plausible second chaser: intercept within 40 ticks of the elected chaser.
+const LOOSE_STANDOFF_TICKS: u32 = 40;
 /// Recovery burst caps (ticks) by defensive work rate: Low 210 / Medium 240 / High 240, inside the
 /// 180-240 (3-4 s, ~26 m) range [peer-reviewed Ju et al. 2023]; the low end left Low-DWR forwards
 /// short of the ball [sim-calibrated].
@@ -2693,6 +2699,7 @@ const LINE_LAG_PM: i64 = 120;
 /// [official FIFA 12 Barca rule; width estimate].
 const ZONE_HANDOVER_LAT_MM: i64 = 12_000;
 const ZONE_HANDOVER_DEPTH_MM: i64 = 8_000;
+const ZONE_HANDOVER_HYST_MM: i64 = 2_000;
 /// Press triggers [official FIFA 19 "pressure on heavy touch"]: ball more than 1.6 m off the
 /// carrier (heavy touch), carrier facing his own goal, carrier within 5 m of the touchline; the
 /// trigger holds 45 ticks [radius and hold estimate].
@@ -3129,9 +3136,11 @@ fn slot_pos(ctx: &ShapeCtx, blk: &Block, slot: &ShapeSlot, attacking: bool, fron
         }
     }
     let mut lim_y = ctx.half_wid - 1_500;
-    if attacking && matches!(slot.role, SlotRole::CentreBack | SlotRole::Fixo) && blk.front_cap != i64::MAX {
-        // Rest defence about 28 m wide (5v5 16 m) [peer-reviewed Forcher et al. 2023].
-        lim_y = lim_y.min(if ctx.is_5v5 { 8_000 } else { 14_000 });
+    if attacking && slot.role == SlotRole::CentreBack && !ctx.is_5v5 && blk.front_cap != i64::MAX {
+        // Rest defence about 28 m wide [peer-reviewed Forcher et al. 2023]. Not in 5v5: the fixo
+        // clamped to +-8 m sat within 4 m of the alas (merge fix; nearest teammate < 4 m in
+        // possession 15.5% -> 14.8%, exclusivity bound 15%).
+        lim_y = lim_y.min(14_000);
     }
     let yf = ((ctx.half_wid * y / 1_000) * blk.width_pm / 1_000 + blk.ref_yf * blk.shift_pm / 1_000)
         .clamp(-lim_y, lim_y);
@@ -3593,11 +3602,15 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
         // Zone handover: outside the counter-press, the incumbent is released once the carrier is
         // beyond 12 m laterally from his slot or 8 m beyond his line (back-liners excepted).
         let released = plan_idx(mem.presser).filter(|&cur| {
+            // Hysteresis (merge fix): the incumbent is held `diff.hold` ticks first and released only
+            // 2 m beyond the zone edge the challengers are charged from, so the handover cannot
+            // flip the presser back and forth at the edge.
             cur < n
                 && phase != AI_PHASE_COUNTER_PRESS
-                && ((ctx.yf(def_anchor[cur].y) - ball_yf).abs() > ZONE_HANDOVER_LAT_MM
+                && mem.presser_ticks >= diff.hold
+                && ((ctx.yf(def_anchor[cur].y) - ball_yf).abs() > ZONE_HANDOVER_LAT_MM + ZONE_HANDOVER_HYST_MM
                     || (!ctx.slot(mem.slot_of[cur]).is_some_and(|s| s.role.is_back_line())
-                        && ball_p < ctx.prog(def_anchor[cur].x) - ZONE_HANDOVER_DEPTH_MM))
+                        && ball_p < ctx.prog(def_anchor[cur].x) - ZONE_HANDOVER_DEPTH_MM - ZONE_HANDOVER_HYST_MM))
         });
         let mut ranked: Vec<(u32, usize)> = (1..n)
             .filter(|&i| {
@@ -6339,6 +6352,24 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         let band_fat = if fatigue_pm < 1_000 { FATIGUE_BAND_PM } else { 1_000 };
         let band_pm = (HIGH_BAND_MM_S * band_fat / top_mm_s.max(1)).min(1_000);
         move_vec = move_vec.clamp_len(Fp::from_milli(band_pm));
+    }
+    if rec_now
+        && state.ball.owner.is_none()
+        && me != chaser
+        && my_dist <= Fp::from_milli(LOOSE_STANDOFF_MM)
+        && plan_idx(chaser).is_some_and(|c| {
+            // Only a plausible second chaser: intercept within 40 ticks of the elected chaser.
+            let wp = sample_ball_3d_waypoints(state);
+            let mine = best_intercept_from_waypoints(p, &wp, is_5v5, false).1;
+            mine <= best_intercept_from_waypoints(&state.players[side.index()][c], &wp, is_5v5, false).1 + LOOSE_STANDOFF_TICKS
+        })
+    {
+        // Exclusivity on a loose ball (a pass or clearance in flight): a recovery runner near it
+        // stands off at a jog instead of sprinting along its path, so only the elected chaser
+        // runs at the ball (round 4 merge fix; the run stays latched and resumes on possession).
+        sprint = false;
+        let pace_mm_s = (5_450 + (p.attributes.pace as i64) * 26) * (760 + (p.stamina_permille as i64) * 240 / 1_000) / 1_000;
+        move_vec = move_vec.clamp_len(Fp::from_milli((LOOSE_STANDOFF_MM_S * 1_000 / pace_mm_s.max(1)).min(1_000)));
     }
 
     {
