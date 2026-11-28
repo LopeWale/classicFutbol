@@ -108,9 +108,26 @@ Examples (attacking → right, `G` = goal; defend is compact and narrow, attack 
 - **Recovery runs:** a goal-wrong-side player sprints when he is more than
   `1 m (5v5) / 2.5 m (11v11) + 2.5 m × recovery` behind his target. Slower players therefore start
   their recovery earlier.
-- **Attack:** the 5v5 vacated-cutback run, the support triangle, pocket search, onside channel runs
-  and curved runs are kept. The pocket search now favours the pocket the player is already heading
-  to. In counter-attacks, forwards and wide players run in behind without waiting for the passer.
+- **Attack (round 4, see [attacking-support-and-runs.md](attacking-support-and-runs.md)):** the
+  5v5 vacated-cutback run and the support triangle are kept; the triangle pick is now committed
+  (18-tick dwell, a challenger must be 2 m closer to the 9.5 m target). The five fixed pockets are
+  replaced by scored support candidates (the slot, a PES ring at 14 m / 20 m around the carrier,
+  the nearest opponent Voronoi vertex and the offside-line point, scored Control x Value x
+  LaneOpen, re-scored every 20 ticks, switched only at 1.15x after a 60-tick commitment), with
+  GRF spacing as the fallback for players without a scored candidate and a final-lane nudge after
+  spacing, reservation and run push. Runs come from one arbiter per team (one penetrate runner,
+  one support-from-behind runner, up to three box runners on a cross, one decoy): the penetrate
+  runner gets an end-point beyond the offside line, holds at the onside limit (stutter, never
+  reversing while onside) and is released by our pass toward him or by the CPU pass decision that
+  selects him. `passer_ready` is a Schmitt trigger (on above -0.10, off below -0.30, 12-tick
+  hold). In counter-attacks, forwards and wide players without a scored candidate or a run role
+  still push to the onside line without waiting for the passer.
+- **Decision hysteresis (round 4):** `reserve_destination` remembers who yielded last tick (1.5 m
+  margin to swap), the teammate-yield and keeper-corridor side signs and the curved-run bend sign
+  are sticky for the episode, and the committed target passes a 0.4 m re-target deadband and an
+  alpha-beta filter (the role's alpha, beta 0.02). Every intent path that bypasses the shape
+  (receive, chase, contain, non-open-play) now writes the target memory, so returning to shape
+  continues the filter instead of snapping.
 - **Judgement error:** the anchor's depth gets smooth deterministic noise (no RNG is consumed). Its
   amplitude is `noise × (100 − positioning) × 30 mm × err` (Easy 1.6, Normal 1.0, Hard 0.55), and
   60% of that for non-back-line players. It drifts over a 150-tick period.
@@ -242,3 +259,8 @@ The 11v11 "after" column was run before the final striker-outlet tweak. The comm
 | Accelerate / brake / lateral caps (AI, off the ball) | 6 + 0.03 × acc / 9 + 0.03 × acc / 8 + 0.06 × agility m/s² |
 | Command filter k | 0.25 + 0.002 × agility |
 | Facing rate | 20 → 9 °/tick × (0.8 + 0.004 × agility); 3.5 °/tick and 4° deadband while idle |
+| Support re-score / commit / switch margin (round 4) | 20 ticks / 60 ticks / 1.15× |
+| Support Range L (11v11 / 5v5), reservation exclusion, leash | 14 / 9 m (diagonals × √2), 10 / 6 m, 18 / 10 m |
+| Run arbiter cadence / commit / expiry / called-run commit | 20 / 60 / 240 / 90 ticks |
+| `passer_ready` Schmitt | on > −0.10, off < −0.30, 12-tick hold |
+| Target deadband / alpha-beta beta | 0.4 m / 0.02 |

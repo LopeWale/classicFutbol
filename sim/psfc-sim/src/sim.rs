@@ -2841,25 +2841,13 @@ impl MatchSimulation {
         aerial_contest || through_first_time || rebound_shot_first_time
     }
 
+    /// `BTN_CALL_RUN` (round 4, `docs/attacking-support-and-runs.md`): the teammate the carrier is
+    /// facing with the best 1 s look-ahead Control gets a committed run with an end-point beyond
+    /// the offside line and the arbiter's hold-and-release (`ai::assign_called_run`), plus the
+    /// existing 90-tick burst.
     fn trigger_teammate_run(&mut self, side: TeamSide) {
         let s_idx = side.index();
-        let ctrl = self.state.controlled_idx[s_idx];
-        let attack_sign = side.attack_sign(self.state.second_half_swapped());
-        let mut best_idx: Option<usize> = None;
-        let mut best_prog = i64::MIN;
-
-        for (idx, p) in self.state.players[s_idx].iter().enumerate() {
-            if idx == 0 || idx == ctrl || p.sent_off {
-                continue;
-            }
-            let prog = p.pos.x.to_milli() * attack_sign
-                + if p.role == PlayerRole::Forward { 6_000 } else { 0 };
-            if prog > best_prog {
-                best_prog = prog;
-                best_idx = Some(idx);
-            }
-        }
-        if let Some(target_idx) = best_idx {
+        if let Some(target_idx) = crate::ai::assign_called_run(&self.state, side) {
             // EA FC 27 Limited Distance for Triggered Runs (`90` ticks = `1.5s` burst before returning to FC IQ shape)
             self.state.players[s_idx][target_idx].run_boost_ticks = 90;
         }
@@ -4676,6 +4664,20 @@ impl MatchSimulation {
             }
         }
 
+        // Round 4 (work area 3, `docs/attacking-support-and-runs.md`): a through pass, or a ground
+        // pass with the run modifier, goes to a committed penetrate / called runner inside the aim
+        // cone, led to his post-release look-ahead, instead of the cone's default pick.
+        if assist_level != AssistLevel::Manual
+            && !is_lob
+            && !in_attacking_wing
+            && (is_through || (button & BTN_CALL_RUN) != 0)
+        {
+            if let Some((r_idx, lead)) =
+                crate::ai::released_runner_target(&self.state, side, kicker_idx, kicker_pos, aim_norm, min_cone_align)
+            {
+                best_receiver = Some((r_idx, lead.clamp_box(half_len - Fp::from_milli(1_150), half_wid - Fp::from_milli(1_150))));
+            }
+        }
         let locked_teammate = best_receiver.is_some();
         let (receiver_idx, mut target_pos) = match (assist_level, best_receiver) {
             (AssistLevel::Assisted, Some((r_idx, snapped_pos))) => (r_idx, snapped_pos),

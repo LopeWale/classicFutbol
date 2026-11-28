@@ -517,6 +517,96 @@ pub struct TeamAiMemory {
     /// Movement priority class per player for this tick (`0` carrier/chaser .. `3` idle/cruise/yield).
     #[serde(default)]
     pub move_class: Vec<u8>,
+
+    // --- Attacking support and runs (round 4 work area 3, `docs/attacking-support-and-runs.md`) ---
+    /// Committed support candidate kind per player (`AI_NONE` = none; see `ai::SUP_*`).
+    #[serde(default)]
+    pub sup_kind: Vec<u8>,
+    /// `tick + 1` when the current support candidate was adopted (dwell / incumbent bonus).
+    #[serde(default)]
+    pub sup_since: Vec<u32>,
+    /// `tick + 1` of the player's last support re-score (15-30 tick cadence).
+    #[serde(default)]
+    pub sup_eval: Vec<u32>,
+    /// The committed support point (absolute; refreshed each tick from the candidate's geometry).
+    #[serde(default)]
+    pub sup_pt: Vec<Vec2>,
+    /// Carrier index the support choice was made for (`AI_NONE` = none): a new carrier re-scores.
+    #[serde(default)]
+    pub sup_carrier: Vec<u8>,
+    /// Sticky lateral nudge of the final target to reopen its lane (units of 2 m, signed).
+    #[serde(default)]
+    pub sup_nudge: Vec<i8>,
+    /// Sticky side sign of the teammate yield (`yield_target`) for the current episode (0 = none).
+    #[serde(default)]
+    pub yield_sign: Vec<i8>,
+    /// Sticky side sign of the keeper-corridor yield for the current episode (0 = none).
+    #[serde(default)]
+    pub gk_yield_sign: Vec<i8>,
+    /// Sticky bend sign of the curved run around a blocker, and the tick it was last applied.
+    #[serde(default)]
+    pub bend_sign: Vec<i8>,
+    #[serde(default)]
+    pub bend_tick: Vec<u32>,
+    /// Teammate this player yielded his destination to last tick (`AI_NONE` = none).
+    #[serde(default)]
+    pub res_yield: Vec<u8>,
+    /// Alpha-beta target filter: estimated target velocity (m per tick) per player.
+    #[serde(default)]
+    pub tgt_vel: Vec<Vec2>,
+    /// Last raw target accepted through the 0.4 m re-target deadband.
+    #[serde(default)]
+    pub tgt_raw: Vec<Vec2>,
+    /// Committed run role per player (`0` none; see `ai::RUN_*`), when it began (`tick + 1`) and
+    /// its end-point beyond the offside line.
+    #[serde(default)]
+    pub run_role: Vec<u8>,
+    #[serde(default)]
+    pub run_since: Vec<u32>,
+    #[serde(default)]
+    pub run_end: Vec<Vec2>,
+    /// Support-triangle incumbent (`0` = none), the tick (`+ 1`) he took the role, and `tick + 1`
+    /// of the last pick.
+    #[serde(default)]
+    pub tri_idx: u8,
+    #[serde(default)]
+    pub tri_since: u32,
+    #[serde(default)]
+    pub tri_eval: u32,
+    /// `passer_ready` Schmitt state, the tick (`+ 1`) of its last toggle, `tick + 1` of the last
+    /// evaluation and the carrier it was evaluated for.
+    #[serde(default)]
+    pub pr_on: bool,
+    #[serde(default)]
+    pub pr_since: u32,
+    #[serde(default)]
+    pub pr_eval: u32,
+    #[serde(default)]
+    pub pr_carrier: u8,
+    /// Run arbiter: `tick + 1` of its last pass, and the number of re-score rounds so far (work-rate
+    /// cadence).
+    #[serde(default)]
+    pub run_eval: u32,
+    #[serde(default)]
+    pub run_round: u32,
+    /// Runner released by the CPU carrier's pass decision (`0` = none) and the tick (`+ 1`).
+    #[serde(default)]
+    pub run_release: u8,
+    #[serde(default)]
+    pub run_release_tick: u32,
+    /// Near support ("players closest to the ball come to support"): `tick + 1` of the last
+    /// evaluation, of the assignment, the carrier it was made for, the (up to two) assigned
+    /// supporters (`AI_NONE` = none) and their support points as offsets from the carrier.
+    #[serde(default)]
+    pub near_eval: u32,
+    #[serde(default)]
+    pub near_since: u32,
+    #[serde(default)]
+    pub near_carrier: u8,
+    #[serde(default)]
+    pub near_idx: Vec<u8>,
+    #[serde(default)]
+    pub near_off: Vec<Vec2>,
 }
 
 impl TeamAiMemory {
@@ -562,6 +652,44 @@ impl TeamAiMemory {
         }
         if self.move_class.len() != n {
             self.move_class = vec![2; n];
+        }
+        // Attacking support and runs (round 4 work area 3).
+        if self.sup_kind.len() != n {
+            self.sup_kind = vec![AI_NONE; n];
+            self.sup_since = vec![0; n];
+            self.sup_eval = vec![0; n];
+            self.sup_pt = vec![Vec2::ZERO; n];
+            self.sup_carrier = vec![AI_NONE; n];
+            self.sup_nudge = vec![0; n];
+        }
+        if self.sup_since.len() != n || self.sup_eval.len() != n || self.sup_pt.len() != n || self.sup_carrier.len() != n || self.sup_nudge.len() != n {
+            self.sup_since = vec![0; n];
+            self.sup_eval = vec![0; n];
+            self.sup_pt = vec![Vec2::ZERO; n];
+            self.sup_carrier = vec![AI_NONE; n];
+            self.sup_nudge = vec![0; n];
+        }
+        if self.yield_sign.len() != n || self.gk_yield_sign.len() != n || self.bend_sign.len() != n || self.bend_tick.len() != n {
+            self.yield_sign = vec![0; n];
+            self.gk_yield_sign = vec![0; n];
+            self.bend_sign = vec![0; n];
+            self.bend_tick = vec![0; n];
+        }
+        if self.res_yield.len() != n {
+            self.res_yield = vec![AI_NONE; n];
+        }
+        if self.tgt_vel.len() != n || self.tgt_raw.len() != n {
+            self.tgt_vel = vec![Vec2::ZERO; n];
+            self.tgt_raw = vec![Vec2::ZERO; n];
+        }
+        if self.near_idx.len() != 2 || self.near_off.len() != 2 {
+            self.near_idx = vec![AI_NONE; 2];
+            self.near_off = vec![Vec2::ZERO; 2];
+        }
+        if self.run_role.len() != n || self.run_since.len() != n || self.run_end.len() != n {
+            self.run_role = vec![0; n];
+            self.run_since = vec![0; n];
+            self.run_end = vec![Vec2::ZERO; n];
         }
     }
 
@@ -629,6 +757,65 @@ impl TeamAiMemory {
         h.u8(u8::from(self.keeper_claim));
         h.u32(self.move_class.len() as u32);
         h.bytes(&self.move_class);
+        // Attacking support and runs (round 4 work area 3).
+        h.u32(self.sup_kind.len() as u32);
+        h.bytes(&self.sup_kind);
+        for (((s, e), pt), c) in self.sup_since.iter().zip(&self.sup_eval).zip(&self.sup_pt).zip(&self.sup_carrier) {
+            h.u32(*s);
+            h.u32(*e);
+            h.i64(pt.x.raw());
+            h.i64(pt.y.raw());
+            h.u8(*c);
+        }
+        let signs = |h: &mut CanonicalHasher, v: &[i8]| {
+            h.u32(v.len() as u32);
+            for x in v {
+                h.u8(*x as u8);
+            }
+        };
+        signs(h, &self.sup_nudge);
+        signs(h, &self.yield_sign);
+        signs(h, &self.gk_yield_sign);
+        signs(h, &self.bend_sign);
+        for t in &self.bend_tick {
+            h.u32(*t);
+        }
+        h.u32(self.res_yield.len() as u32);
+        h.bytes(&self.res_yield);
+        h.u32(self.tgt_vel.len() as u32);
+        for (v, r) in self.tgt_vel.iter().zip(&self.tgt_raw) {
+            h.i64(v.x.raw());
+            h.i64(v.y.raw());
+            h.i64(r.x.raw());
+            h.i64(r.y.raw());
+        }
+        h.u32(self.run_role.len() as u32);
+        h.bytes(&self.run_role);
+        for (s, e) in self.run_since.iter().zip(&self.run_end) {
+            h.u32(*s);
+            h.i64(e.x.raw());
+            h.i64(e.y.raw());
+        }
+        h.u8(self.tri_idx);
+        h.u32(self.tri_since);
+        h.u32(self.tri_eval);
+        h.u8(u8::from(self.pr_on));
+        h.u32(self.pr_since);
+        h.u32(self.pr_eval);
+        h.u8(self.pr_carrier);
+        h.u32(self.run_eval);
+        h.u32(self.run_round);
+        h.u8(self.run_release);
+        h.u32(self.run_release_tick);
+        h.u32(self.near_eval);
+        h.u32(self.near_since);
+        h.u8(self.near_carrier);
+        h.u32(self.near_idx.len() as u32);
+        h.bytes(&self.near_idx);
+        for o in &self.near_off {
+            h.i64(o.x.raw());
+            h.i64(o.y.raw());
+        }
     }
 }
 

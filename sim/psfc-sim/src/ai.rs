@@ -1294,27 +1294,116 @@ fn role_band(role: PlayerRole) -> i64 {
     }
 }
 
-/// Identifies one close teammate (`support_triangle_idx`) to check toward the ball carrier at an open passing angle.
+/// Incumbent dwell of a support decision (pocket / candidate, support triangle): 18 ticks (0.3 s)
+/// [community utility-AI practice; estimate].
+const INCUMBENT_DWELL_TICKS: u32 = 18;
+/// Incumbent score bonus of a support decision: a challenger must beat the incumbent by 1.15x
+/// [community utility-AI inertia; estimate].
+const INCUMBENT_BONUS_PM: i64 = 1_150;
+/// A support-triangle challenger must be 2 m closer to the 9.5 m check distance [estimate].
+const TRI_SWITCH_MARGIN_MM: i64 = 2_000;
+
+/// Identifies one close teammate (`support_triangle_idx`) to check toward the ball carrier at an
+/// open passing angle. Committed with hysteresis (round 4): the incumbent keeps the role for at
+/// least [`INCUMBENT_DWELL_TICKS`] and then until a challenger is [`TRI_SWITCH_MARGIN_MM`] closer to
+/// the 9.5 m target; evaluated once per tick per team (stamped like the team plan) so every
+/// player processed this tick sees the same pick.
 fn designated_support_triangle_idx(state: &MatchState, side: TeamSide) -> Option<usize> {
     let s_idx = side.index();
     let ball_xy = state.ball.pos.xy();
+    let stamp = state.tick.wrapping_add(1);
+    if let Ok(mems) = state.ai_memory.try_borrow() {
+        let m = &mems[s_idx];
+        if m.tri_eval == stamp {
+            return (m.tri_idx != 0).then_some(m.tri_idx as usize);
+        }
+    }
     let carrier_idx = match state.ball.owner {
         Some((o_side, o_idx)) if o_side == side => Some(o_idx),
         _ => None,
     };
-    let mut best: Option<(i64, usize)> = None;
-    for (idx, p) in state.players[s_idx].iter().enumerate().skip(1) {
-        if Some(idx) == carrier_idx || p.sent_off {
-            continue;
+    let players = &state.players[s_idx];
+    let cost_of = |idx: usize| -> Option<i64> {
+        let p = players.get(idx)?;
+        if idx == 0 || Some(idx) == carrier_idx || p.sent_off {
+            return None;
         }
         let d_mm = p.pos.dist(ball_xy).to_milli();
         let role_bonus = if p.role == PlayerRole::Midfielder { -2_500 } else { 0 };
-        let cost = (d_mm - 9_500).abs() + role_bonus;
-        if best.is_none_or(|(bc, _)| cost < bc) {
-            best = Some((cost, idx));
+        Some((d_mm - 9_500).abs() + role_bonus)
+    };
+    let mut best: Option<(i64, usize)> = None;
+    for idx in 1..players.len() {
+        if let Some(cost) = cost_of(idx) {
+            if best.is_none_or(|(bc, _)| cost < bc) {
+                best = Some((cost, idx));
+            }
         }
     }
-    best.map(|(_, i)| i)
+    let Ok(mut mems) = state.ai_memory.try_borrow_mut() else {
+        return best.map(|(_, i)| i);
+    };
+    let m = &mut mems[s_idx];
+    let inc = m.tri_idx as usize;
+    let pick = match (cost_of(inc), best) {
+        (Some(ic), Some((bc, bi))) => {
+            let held = stamp.wrapping_sub(m.tri_since);
+            if bi != inc && held >= INCUMBENT_DWELL_TICKS && bc + TRI_SWITCH_MARGIN_MM < ic {
+                Some(bi)
+            } else {
+                Some(inc)
+            }
+        }
+        (_, b) => b.map(|(_, i)| i),
+    };
+    let pick_u8 = pick.map_or(0, |i| i as u8);
+    if pick_u8 != m.tri_idx {
+        m.tri_idx = pick_u8;
+        m.tri_since = stamp;
+    }
+    m.tri_eval = stamp;
+    pick
+}
+
+/// `passer_ready` Schmitt trigger (round 4): the carrier counts as facing forward when
+/// `facing.x * attack_sign` rises above `-0.10` and stops when it falls below `-0.30`, with at
+/// least 12 ticks between toggles, so the run push and the runners' move class do not toggle while
+/// the carrier turns [estimate]. A new carrier starts from the old single threshold (`-0.15`).
+/// With no carrier of ours (pass in flight, loose ball) it is `true`, as before. Evaluated once
+/// per tick per team (stamped).
+const PASSER_READY_ON_PM: i64 = -100;
+const PASSER_READY_OFF_PM: i64 = -300;
+const PASSER_READY_HOLD_TICKS: u32 = 12;
+fn passer_ready_schmitt(state: &MatchState, side: TeamSide) -> bool {
+    let Some((_, ci)) = state.ball.owner.filter(|&(os, _)| os == side) else {
+        return true;
+    };
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let carrier = &state.players[side.index()][ci];
+    let f = Vec2::from_bam(carrier.facing_bam, Fp::ONE).x.mul(Fp::from_int(attack_sign as i32));
+    let stamp = state.tick.wrapping_add(1);
+    let Ok(mut mems) = state.ai_memory.try_borrow_mut() else {
+        return f > Fp::from_milli(-150);
+    };
+    let m = &mut mems[side.index()];
+    if m.pr_eval == stamp {
+        return m.pr_on;
+    }
+    if m.pr_carrier != ci as u8 || m.pr_eval.wrapping_add(1) != stamp {
+        m.pr_on = f > Fp::from_milli(-150);
+        m.pr_since = stamp;
+        m.pr_carrier = ci as u8;
+    } else if stamp.wrapping_sub(m.pr_since) >= PASSER_READY_HOLD_TICKS {
+        if m.pr_on && f < Fp::from_milli(PASSER_READY_OFF_PM) {
+            m.pr_on = false;
+            m.pr_since = stamp;
+        } else if !m.pr_on && f > Fp::from_milli(PASSER_READY_ON_PM) {
+            m.pr_on = true;
+            m.pr_since = stamp;
+        }
+    }
+    m.pr_eval = stamp;
+    m.pr_on
 }
 
 /// Computes tactical movement for a non-controlled outfield player `players[side][idx]`.
@@ -1340,6 +1429,7 @@ pub fn compute_outfield_ai_intent(
                     break;
                 }
             }
+            note_intent_target(state, side, idx, intercept_pt, false); // target memory (no snap on return)
             if delta_meet.len() <= Fp::from_milli(220) && !contested_close {
                 return AiMoveIntent {
                     move_dir: Vec2::ZERO,
@@ -1365,6 +1455,7 @@ pub fn compute_outfield_ai_intent(
     // 2. During non-OpenPlay phases, drift smoothly toward tactical home anchor.
     if !matches!(state.phase, MatchPhase::OpenPlay) {
         let anchor = world_anchor_for_player(state, side, idx, Fp::ZERO);
+        note_intent_target(state, side, idx, anchor, false); // target memory (no snap on return)
         let delta = anchor - p.pos;
         if delta.len() < Fp::from_milli(400) {
             return AiMoveIntent {
@@ -1393,6 +1484,7 @@ pub fn compute_outfield_ai_intent(
             == crate::input::DefendingMode::Legacy;
         let hold_gap = Fp::from_milli(if is_legacy { 650 } else { 1_480 });
         let contain_pt = pred_ball + (own_goal - pred_ball).normalize_or_zero().scale(hold_gap);
+        note_intent_target(state, side, idx, contain_pt, false); // target memory (no snap on return)
         let delta = contain_pt - p.pos;
         let dist = delta.len();
         return AiMoveIntent {
@@ -1412,7 +1504,10 @@ pub fn compute_outfield_ai_intent(
     if state.ball.owner.is_none() {
         update_team_plan(state, side);
         if elected_chaser(state, side) == Some(idx) {
-            return chase_intent(state, side, idx);
+            let ci = chase_intent(state, side, idx);
+            let chase_pt = state.ai_memory.borrow()[side.index()].chaser_pt;
+            note_intent_target(state, side, idx, chase_pt, true); // target memory (no snap on return)
+            return ci;
         }
     }
 
@@ -1950,7 +2045,18 @@ pub fn generate_cpu_input(
                 CpuDifficulty::Hard => 5,
             };
 
-            let mut best_pass: Option<(Vec2, Fp, u16)> = None;
+            let mut best_pass: Option<(Vec2, Fp, u16, usize)> = None;
+            // Committed runners (round 4): evaluated at their post-release look-ahead, so the pass
+            // choice and the run commit together; selecting one releases him.
+            let (run_roles, run_ends) = {
+                let mems = state.ai_memory.borrow();
+                (mems[side_idx].run_role.clone(), mems[side_idx].run_end.clone())
+            };
+            // Explicit through ball to a committed runner: safe by the runner's own control race
+            // (he is moving at the release, the generic margin assumes a standing receiver), and
+            // a killer ball when the carrier faces forward and is not tight-pressed.
+            let runner_pass_ok = passer_ready_schmitt(state, side) && nearest_opp_dist >= Fp::from_milli(1_950);
+            let opp_defs = opp_movers(state, side);
 
             for (m_idx, mate) in state.players[side_idx].iter().enumerate() {
                 if m_idx == ctrl_idx || mate.sent_off {
@@ -1985,12 +2091,20 @@ pub fn generate_cpu_input(
 
                 let feet_target = mate.pos + mate.vel.scale(Fp::from_milli(200));
                 let lead_step = Fp::from_milli(if is_5v5 { 3_600 } else { 5_200 });
-                let run_dir = if mate.vel.len() > Fp::from_milli(1_100) {
+                let committed_end = matches!(run_roles.get(m_idx).copied(), Some(RUN_PENETRATE | RUN_CALLED))
+                    .then(|| run_ends.get(m_idx).copied())
+                    .flatten();
+                let run_dir = if let Some(end) = committed_end {
+                    (end - mate.pos).normalize_or_zero()
+                } else if mate.vel.len() > Fp::from_milli(1_100) {
                     mate.vel.normalize_or_zero()
                 } else {
                     Vec2::new(Fp::from_int(attack_sign as i32), Fp::ZERO)
                 };
-                let raw_through = mate.pos + run_dir.scale(lead_step);
+                let raw_through = match committed_end {
+                    Some(end) => runner_release_point(mate, end),
+                    None => mate.pos + run_dir.scale(lead_step),
+                };
                 let through_in_bounds = raw_through.x.abs() < half_len - Fp::from_milli(2_600)
                     && raw_through.y.abs() < half_wid - Fp::from_milli(1_600);
                 let through_onside = !state.rules.offsides_enabled
@@ -2062,9 +2176,22 @@ pub fn generate_cpu_input(
                     } else {
                         tti_safety_ticks
                     };
-                    let ground_safe = !point_blank_blocked && worst_margin_ticks >= req_safety;
+                    let runner_cand = is_through_cand && m_idx != 0 && committed_end.is_some();
+                    let runner_safe = runner_cand && !point_blank_blocked && {
+                        let dir = (cand_pt - mate.pos).normalize_or_zero();
+                        let runner = crate::space::Mover::new(mate.pos, dir.scale(RUN_FORECAST_SPEED));
+                        let ball_t = Fp::from_milli(d_cand.to_milli() * 1_000 / avg_ball_spd_mm_s);
+                        crate::space::control(cand_pt, ball_t, &[runner], &opp_defs) > RUNNER_PASS_CONTROL_MIN
+                    };
+                    let ground_safe = if runner_cand {
+                        runner_safe
+                    } else {
+                        !point_blank_blocked && worst_margin_ticks >= req_safety
+                    };
                     let can_loft_switch = !ground_safe
                         && !is_through_cand
+                        // A committed runner is served on the ground into his run, not by a switch.
+                        && committed_end.is_none()
                         && m_idx != 0
                         && difficulty != CpuDifficulty::Easy
                         && d_cand >= Fp::from_milli(if is_5v5 { 21_000 } else { 26_000 })
@@ -2103,11 +2230,13 @@ pub fn generate_cpu_input(
                         Fp::ZERO
                     };
 
+                    let runner_bonus = if runner_safe && runner_pass_ok { RUNNER_KILLER_BONUS } else { Fp::ZERO };
                     let score = forward_gain.mul(Fp::from_milli(880))
                         + x_threat_gain
                         + space_bonus
                         + tti_bonus
                         + through_bonus
+                        + runner_bonus
                         - return_pen
                         - gk_pen;
 
@@ -2121,8 +2250,8 @@ pub fn generate_cpu_input(
                         BTN_PASS
                     };
 
-                    if best_pass.is_none_or(|(_, bs, _)| score > bs) {
-                        best_pass = Some((lane_dir, score, btn));
+                    if best_pass.is_none_or(|(_, bs, _, _)| score > bs) {
+                        best_pass = Some((lane_dir, score, btn, m_idx));
                     }
                 }
             }
@@ -2132,11 +2261,17 @@ pub fn generate_cpu_input(
             let open_carry_lane =
                 free_space_ahead >= Fp::from_milli(7_400) && nearest_opp_dist >= Fp::from_milli(3_400);
 
-            if let Some((aim_dir, score, btn)) = best_pass {
+            if let Some((aim_dir, score, btn, target_idx)) = best_pass {
                 let killer_ball = score > Fp::from_milli(if open_carry_lane { 8_200 } else { 4_600 });
                 let pressured_progression = moderate_pressure && score > Fp::from_milli(2_200);
                 let safe_recycle = tight_pressure && score > Fp::from_milli(-1_800);
                 if killer_ball || pressured_progression || safe_recycle {
+                    if matches!(run_roles.get(target_idx).copied(), Some(RUN_PENETRATE | RUN_CALLED)) {
+                        // The decision that selects a committed runner releases him.
+                        let mut mems = state.ai_memory.borrow_mut();
+                        mems[side_idx].run_release = target_idx as u8;
+                        mems[side_idx].run_release_tick = state.tick.wrapping_add(1);
+                    }
                     return vec_and_buttons_to_input(aim_dir, aim_dir, btn);
                 }
             }
@@ -3622,6 +3757,26 @@ fn closest_on_segment(a: Vec2, b: Vec2, pt: Vec2) -> Vec2 {
 /// perpendicular on the teammate's side is used instead (the patent's rotation by theta).
 #[allow(clippy::too_many_arguments)]
 pub fn yield_target(a: Vec2, b: Vec2, target: Vec2, mate_pos: Vec2, r: Fp, l: Fp, half_len: Fp, half_wid: Fp) -> Option<Vec2> {
+    yield_target_sided(a, b, target, mate_pos, r, l, half_len, half_wid, 0).map(|(t, _)| t)
+}
+
+/// [`yield_target`] with a sticky side (round 4): `sticky` (`+1` / `-1`, `0` = free) is the side of
+/// the path (sign of the left-hand perpendicular) chosen earlier in this yield episode; a radial
+/// that now points to the other side (the teammate crossed the path line) is replaced by the
+/// perpendicular on the sticky side, so the yield cannot flip sides mid-episode. Returns the target
+/// and the side used.
+#[allow(clippy::too_many_arguments)]
+fn yield_target_sided(
+    a: Vec2,
+    b: Vec2,
+    target: Vec2,
+    mate_pos: Vec2,
+    r: Fp,
+    l: Fp,
+    half_len: Fp,
+    half_wid: Fp,
+    sticky: i8,
+) -> Option<(Vec2, i8)> {
     let closest = closest_on_segment(a, b, target);
     let d = target.dist(closest);
     if d >= r {
@@ -3630,17 +3785,6 @@ pub fn yield_target(a: Vec2, b: Vec2, target: Vec2, mate_pos: Vec2, r: Fp, l: Fp
     let push = r + l.mul(Fp::ONE - d.div(r));
     let inside = |q: Vec2| q.x.abs() <= half_len - Fp::from_milli(1_500) && q.y.abs() <= half_wid - Fp::from_milli(1_500);
     let clear = |q: Vec2| closest_on_segment(a, b, q).dist(q) >= r - Fp::from_milli(2);
-    let mut radial = mate_pos - closest;
-    if radial.len() < Fp::from_milli(200) {
-        radial = target - closest;
-    }
-    if radial.len() >= Fp::from_milli(200) {
-        let cand = closest + radial.normalize_or_zero().scale(push);
-        if clear(cand) && inside(cand) {
-            return Some(cand);
-        }
-    }
-    // Perpendicular to the path, on the side the teammate is on (lateral fallback).
     let path = b - a;
     let path_dir = if path.len() > Fp::from_milli(5) {
         path.normalize_or_zero()
@@ -3648,13 +3792,1221 @@ pub fn yield_target(a: Vec2, b: Vec2, target: Vec2, mate_pos: Vec2, r: Fp, l: Fp
         (target - a).normalize_or_zero()
     };
     let perp = Vec2::new(-path_dir.y, path_dir.x);
+    let side_of = |v: Vec2| -> i8 { if perp.dot(v) >= Fp::ZERO { 1 } else { -1 } };
+    let mut radial = mate_pos - closest;
+    if radial.len() < Fp::from_milli(200) {
+        radial = target - closest;
+    }
+    if radial.len() >= Fp::from_milli(200) && (sticky == 0 || side_of(radial) == sticky) {
+        let cand = closest + radial.normalize_or_zero().scale(push);
+        if clear(cand) && inside(cand) {
+            return Some((cand, side_of(radial)));
+        }
+    }
+    // Perpendicular to the path, on the side the teammate is on (lateral fallback), or the sticky side.
     let side_ref = if (mate_pos - a).len() > Fp::from_milli(50) { mate_pos - a } else { target - a };
-    let sgn = if perp.dot(side_ref) >= Fp::ZERO { Fp::ONE } else { Fp::NEG_ONE };
+    let sg = if sticky != 0 { sticky } else { side_of(side_ref) };
+    let sgn = Fp::from_int(i32::from(sg));
     let c1 = closest + perp.scale(sgn.mul(push));
     if inside(c1) || perp == Vec2::ZERO {
-        return Some(c1);
+        return Some((c1, sg));
     }
-    Some(closest - perp.scale(sgn.mul(push)))
+    Some((closest - perp.scale(sgn.mul(push)), -sg))
+}
+
+/// Re-target deadband of the committed target (m): one body radius [estimate].
+const RETARGET_DEADBAND: Fp = Fp::from_milli(400);
+/// Alpha-beta target filter beta (alpha is the role's low-pass gain, 0.12-0.32 for shape) [estimate].
+const TARGET_BETA: Fp = Fp::from_milli(20);
+/// Cap of the filter's target velocity estimate (m per tick; 7.2 m/s) [estimate].
+const TARGET_VEL_CAP: Fp = Fp::from_milli(120);
+/// The curved-run bend side holds for this many ticks after it was last applied [estimate].
+const BEND_HOLD_TICKS: u32 = 30;
+
+/// Cross-cutting target memory (round 4): every intent path that bypasses the shape low-pass (pass
+/// receiver, non-open-play drift, teammate contain, loose-ball chase) records the point it moves
+/// toward as the player's committed target, so returning to `outfield_shape_intent` continues the
+/// low-pass from there instead of snapping, and `reserve_destination` sees a live reservation.
+fn note_intent_target(state: &MatchState, side: TeamSide, idx: usize, pt: Vec2, sprint: bool) {
+    let Ok(mut mems) = state.ai_memory.try_borrow_mut() else {
+        return;
+    };
+    let m = &mut mems[side.index()];
+    if idx < m.target.len() && idx < m.target_tick.len() && idx < m.flags.len() {
+        m.target[idx] = pt;
+        m.target_tick[idx] = state.tick;
+        m.flags[idx] = u8::from(sprint) * FLAG_SPRINT;
+    }
+}
+
+/// Per-player slice of the round-4 attacking-support memory (`TeamAiMemory::sup_*`, sticky side
+/// signs, the alpha-beta target filter), read at the start of `outfield_shape_intent` and written
+/// back together with the smoothed target. Run roles are written by the run arbiter only.
+#[derive(Clone, Copy, Debug)]
+struct UMem {
+    sup_kind: u8,
+    sup_since: u32,
+    sup_eval: u32,
+    sup_pt: Vec2,
+    sup_carrier: u8,
+    sup_nudge: i8,
+    yield_sign: i8,
+    gk_yield_sign: i8,
+    bend_sign: i8,
+    bend_tick: u32,
+    res_yield: u8,
+    tgt_vel: Vec2,
+    tgt_raw: Vec2,
+    /// The attacking branch ran this tick (otherwise the support commitment is dropped).
+    touched: bool,
+}
+
+impl UMem {
+    fn read(m: &TeamAiMemory, idx: usize) -> Self {
+        Self {
+            sup_kind: m.sup_kind.get(idx).copied().unwrap_or(AI_NONE),
+            sup_since: m.sup_since.get(idx).copied().unwrap_or(0),
+            sup_eval: m.sup_eval.get(idx).copied().unwrap_or(0),
+            sup_pt: m.sup_pt.get(idx).copied().unwrap_or(Vec2::ZERO),
+            sup_carrier: m.sup_carrier.get(idx).copied().unwrap_or(AI_NONE),
+            sup_nudge: m.sup_nudge.get(idx).copied().unwrap_or(0),
+            yield_sign: m.yield_sign.get(idx).copied().unwrap_or(0),
+            gk_yield_sign: m.gk_yield_sign.get(idx).copied().unwrap_or(0),
+            bend_sign: m.bend_sign.get(idx).copied().unwrap_or(0),
+            bend_tick: m.bend_tick.get(idx).copied().unwrap_or(0),
+            res_yield: m.res_yield.get(idx).copied().unwrap_or(AI_NONE),
+            tgt_vel: m.tgt_vel.get(idx).copied().unwrap_or(Vec2::ZERO),
+            tgt_raw: m.tgt_raw.get(idx).copied().unwrap_or(Vec2::ZERO),
+            touched: false,
+        }
+    }
+
+    /// Adopts support candidate `k` (restarting the dwell when it changes).
+    fn set_kind(&mut self, k: u8, tick: u32) {
+        self.touched = true;
+        if k != self.sup_kind {
+            self.sup_kind = k;
+            self.sup_since = tick.wrapping_add(1);
+        }
+    }
+
+    fn write(&self, m: &mut TeamAiMemory, idx: usize) {
+        if idx >= m.sup_kind.len() || idx >= m.tgt_raw.len() || idx >= m.res_yield.len() || idx >= m.bend_tick.len() {
+            return;
+        }
+        m.sup_kind[idx] = if self.touched { self.sup_kind } else { AI_NONE };
+        m.sup_since[idx] = self.sup_since;
+        m.sup_eval[idx] = self.sup_eval;
+        m.sup_pt[idx] = self.sup_pt;
+        m.sup_carrier[idx] = self.sup_carrier;
+        m.sup_nudge[idx] = if self.touched { self.sup_nudge } else { 0 };
+        m.yield_sign[idx] = self.yield_sign;
+        m.gk_yield_sign[idx] = self.gk_yield_sign;
+        m.bend_sign[idx] = self.bend_sign;
+        m.bend_tick[idx] = self.bend_tick;
+        m.res_yield[idx] = self.res_yield;
+        m.tgt_vel[idx] = self.tgt_vel;
+        m.tgt_raw[idx] = self.tgt_raw;
+    }
+}
+
+// --- Scored support candidates (round 4 work area 3, `docs/attacking-support-and-runs.md`) ---
+
+/// Candidate kinds stored in `TeamAiMemory::sup_kind`: the ball-attracted slot, eight PES ring
+/// points (ahead, left, right, behind at `L`; the four diagonals at `L sqrt 2`), the nearest opponent
+/// Voronoi vertex and the offside-line point.
+const SUP_SLOT: u8 = 0;
+const SUP_RING_FIRST: u8 = 1;
+const SUP_RING_COUNT: u8 = 8;
+const SUP_VORONOI: u8 = 9;
+const SUP_OFFSIDE: u8 = 10;
+/// A near-support point assigned by [`update_near_support`].
+const SUP_NEAR: u8 = 11;
+/// Ring points considered per supporter besides the incumbent: the four nearest his slot, so a
+/// supporter weighs 6-8 candidates (slot + 4-5 ring + vertex + line point) [estimate].
+const SUP_RING_PER_PLAYER: usize = 4;
+/// A support candidate, once adopted, is held at least this long unless it becomes invalid
+/// (rejected / zero score) [estimate; the report's 60-tick commitment].
+const SUP_COMMIT_TICKS: u32 = 60;
+/// Re-score cadence (ticks): half a lane lifetime of 0.9-1.3 s [peer-reviewed; 15-30 estimate].
+pub const SUP_RESCORE_TICKS: u32 = 20;
+/// Support Range `L` (mm): 14 m in 11v11 (the 13-24 m support band [peer-reviewed]); 9 m in 5v5
+/// on the 56 x 36 m pitch [estimate, pitch-scaled]. Diagonals sit at `L sqrt 2`.
+pub const SUP_RING_L_MM: (i64, i64) = (14_000, 9_000);
+/// sqrt 2 / 2 in permille (the diagonal components of a point at `L sqrt 2` are `L`).
+const HALF_SQRT2_PM: i64 = 707;
+/// Reject candidates within this distance (mm) of another teammate's reserved destination unless
+/// it is the player's own slot: 10 m [peer-reviewed]; 6 m in 5v5 [estimate, pitch-scaled].
+const SUP_RESERVE_EXCL_MM: (i64, i64) = (10_000, 6_000);
+/// Formation leash (mm): a candidate farther than this from the player's slot is not considered
+/// (Konami US 9,180,371's base-position condition) [patent; distance estimate].
+const SUP_LEASH_MM: (i64, i64) = (18_000, 10_000);
+/// Voronoi vertex search radius around the slot (mm): 25 m [code: Gliders2d]; 15 m in 5v5 [estimate].
+const SUP_VORONOI_RANGE_MM: (i64, i64) = (25_000, 15_000);
+/// Pass-distance band of a ring / vertex / line candidate (mm): the analytics' option band 6-30 m.
+const SUP_BALL_BAND_MM: (i64, i64) = (6_000, 30_000);
+/// Average ground-pass speed for the ball's arrival time in the control race (m/s) [estimate; the
+/// CPU pass scorer's 15.4 m/s].
+const SUP_BALL_SPEED: Fp = Fp::from_int(15);
+/// "Chance Creation passing risk" weight: a safe-option bias added to Value before the product;
+/// lower values favour runs into dangerous space over safe options [official slider semantics;
+/// value estimate].
+pub const SUP_SAFE_BIAS: Fp = Fp::from_milli(50);
+/// Final-lane check: an opponent within this distance (m) of the carrier -> target segment blocks it
+/// (the analytics' open-lane test uses 1.5 m) [estimate].
+const SUP_LANE_CLEAR: Fp = Fp::from_milli(1_600);
+/// Score factor of a candidate whose straight lane from the carrier is blocked within
+/// [`SUP_LANE_CLEAR`] [estimate].
+const SUP_BLOCKED_LANE_FACTOR: Fp = Fp::from_milli(350);
+/// Lateral step of the final-lane nudge (m) and the largest nudge (steps).
+const SUP_NUDGE_STEP: Fp = Fp::from_milli(2_000);
+const SUP_NUDGE_MAX: i8 = 2;
+
+/// `(11v11, 5v5)` constant pair selection.
+#[inline]
+const fn fmt_pick(is_5v5: bool, v: (i64, i64)) -> i64 {
+    if is_5v5 {
+        v.1
+    } else {
+        v.0
+    }
+}
+
+/// The opponents of `side` as space-race movers (keeper included).
+fn opp_movers(state: &MatchState, side: TeamSide) -> Vec<crate::space::Mover> {
+    state.players[side.opponent().index()]
+        .iter()
+        .filter(|o| !o.sent_off)
+        .map(|o| crate::space::Mover::new(o.pos, o.vel))
+        .collect()
+}
+
+/// Is `pt` beyond the true offside line? (`onside_x` already includes the 0.35 m margin.)
+fn beyond_line(pt: Vec2, onside_x: Fp, attack_sign: i64) -> bool {
+    (pt.x - onside_x).mul(Fp::from_int(attack_sign as i32)) > Fp::from_milli(350)
+}
+
+/// Geometry of support candidate `kind` for a player whose (ball-attracted) slot is `slot`, with
+/// the carrier at `c`; `None` when the kind does not exist now or falls off the pitch. The Voronoi
+/// vertex is recomputed only on re-score ticks (`stored` in between), so its point cannot jump
+/// with the triangulation.
+#[allow(clippy::too_many_arguments)]
+fn sup_candidate_point(
+    state: &MatchState,
+    side: TeamSide,
+    kind: u8,
+    slot: Vec2,
+    c: Vec2,
+    stored: Vec2,
+    fresh_vertex: bool,
+    is_5v5: bool,
+) -> Option<Vec2> {
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let hl = state.format.half_length() - Fp::from_milli(2_000);
+    let hw = state.format.half_width() - Fp::from_milli(1_500);
+    let pt = match kind {
+        SUP_SLOT => slot,
+        k if (SUP_RING_FIRST..SUP_RING_FIRST + SUP_RING_COUNT).contains(&k) => {
+            let l = fmt_pick(is_5v5, SUP_RING_L_MM);
+            let s = attack_sign;
+            let dg = l * HALF_SQRT2_PM * 1_414 / 1_000_000;
+            let (dx, dy) = match k - SUP_RING_FIRST {
+                0 => (s * l, 0),
+                1 => (0, l),
+                2 => (0, -l),
+                3 => (-s * l, 0),
+                4 => (s * dg, dg),
+                5 => (s * dg, -dg),
+                6 => (-s * dg, dg),
+                _ => (-s * dg, -dg),
+            };
+            c + Vec2::from_milli(dx, dy)
+        }
+        SUP_VORONOI => {
+            if fresh_vertex {
+                let sites: Vec<Vec2> = state.players[side.opponent().index()]
+                    .iter()
+                    .filter(|o| !o.sent_off)
+                    .map(|o| o.pos)
+                    .collect();
+                let range = Fp::from_milli(fmt_pick(is_5v5, SUP_VORONOI_RANGE_MM));
+                crate::space::nearest_voronoi_vertex(&sites, slot, range, hl, hw)?
+            } else {
+                stored
+            }
+        }
+        SUP_OFFSIDE => {
+            if !state.rules.offsides_enabled {
+                return None;
+            }
+            crate::space::offside_line_point(compute_onside_limit_x(state, side), slot, hw)
+        }
+        _ => return None,
+    };
+    (pt.x.abs() <= hl && pt.y.abs() <= hw).then_some(pt)
+}
+
+/// Score of receiving at `pt` for supporter `idx` (0 = rejected): Control (his time-to-intercept
+/// race against every opponent, the ball arriving at 15 m/s from the carrier) x LaneOpen (5 x 5
+/// pass window) x (Value + safe bias) x pressure factor (4.6 m). Rejected: off the leash, outside
+/// the 6-30 m pass band (the slot excepted), within the reservation exclusion of a teammate's live
+/// destination (the slot excepted), or offside.
+#[allow(clippy::too_many_arguments)]
+fn sup_score(
+    state: &MatchState,
+    side: TeamSide,
+    idx: usize,
+    kind: u8,
+    pt: Vec2,
+    slot: Vec2,
+    c: Vec2,
+    defs: &[crate::space::Mover],
+    mate_targets: &[Vec2],
+    mate_target_ticks: &[u32],
+    chaser: u8,
+    is_5v5: bool,
+) -> Fp {
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let d_ball = pt.dist(c);
+    if kind == SUP_SLOT {
+        if d_ball < Fp::from_milli(3_000) {
+            return Fp::ZERO;
+        }
+    } else {
+        if pt.dist(slot) > Fp::from_milli(fmt_pick(is_5v5, SUP_LEASH_MM)) {
+            return Fp::ZERO;
+        }
+        if d_ball < Fp::from_milli(SUP_BALL_BAND_MM.0) || d_ball > Fp::from_milli(SUP_BALL_BAND_MM.1) {
+            return Fp::ZERO;
+        }
+        let excl = Fp::from_milli(fmt_pick(is_5v5, SUP_RESERVE_EXCL_MM));
+        let carrier = state.ball.owner.and_then(|(os, oi)| (os == side).then_some(oi));
+        for (j, mt) in mate_targets.iter().enumerate().skip(1) {
+            if j == idx || Some(j) == carrier || j as u8 == chaser || state.players[side.index()].get(j).is_none_or(|m| m.sent_off) {
+                continue;
+            }
+            // A teammate with no live reservation (the human-controlled player, a stale target)
+            // reserves where he stands.
+            let tt = mate_target_ticks.get(j).copied().unwrap_or(0);
+            let live = tt != 0 && state.tick.wrapping_sub(tt) <= 1;
+            let reserved = if live { *mt } else { state.players[side.index()][j].pos };
+            if pt.dist(reserved) < excl {
+                return Fp::ZERO;
+            }
+        }
+    }
+    if state.rules.offsides_enabled && beyond_line(pt, compute_onside_limit_x(state, side), attack_sign) {
+        return Fp::ZERO;
+    }
+    let p = &state.players[side.index()][idx];
+    let me = crate::space::Mover::new(p.pos, p.vel);
+    let ctl = crate::space::control(pt, d_ball.div(SUP_BALL_SPEED), &[me], defs);
+    if ctl <= Fp::from_milli(20) {
+        return Fp::ZERO;
+    }
+    let mut lane = crate::space::lane_open(c, pt, &crate::space::Mover::new(pt, Vec2::ZERO), defs);
+    if !segment_clear(state, side, c, pt) {
+        // A body in the straight lane: the pass needs a bend the window samples may not see.
+        lane = lane.mul(SUP_BLOCKED_LANE_FACTOR);
+    }
+    let goal = Vec2::new(Fp::from_milli(attack_sign * state.format.half_length().to_milli()), Fp::ZERO);
+    let value = crate::space::value_at(pt, goal) + SUP_SAFE_BIAS;
+    ctl.mul(lane).mul(value).mul(crate::space::pressure_factor(pt, defs))
+}
+
+/// Scored support target for supporter `idx` while his side owns the ball (round 4). Re-scores
+/// every [`SUP_RESCORE_TICKS`] (or at once when the carrier changes): the slot, the four ring
+/// points nearest the slot (plus the incumbent), the nearest opponent Voronoi vertex and the
+/// offside-line point; the incumbent stays for [`SUP_COMMIT_TICKS`] and then until a
+/// challenger scores 1.15x higher (or at once when the incumbent is rejected). Between re-scores the committed
+/// kind's geometry is followed. During our pass in flight the last committed point is held.
+/// Positions are read as they stand when the player is processed (players stepped earlier this
+/// tick have moved), which is fixed by the stepping order and therefore deterministic.
+/// `None`: no scored candidate (GRF spacing fallback).
+#[allow(clippy::too_many_arguments)]
+fn support_candidate_target(
+    state: &MatchState,
+    side: TeamSide,
+    idx: usize,
+    slot: Vec2,
+    um: &mut UMem,
+    mate_targets: &[Vec2],
+    mate_target_ticks: &[u32],
+    chaser: u8,
+    is_5v5: bool,
+) -> Option<Vec2> {
+    let stamp = state.tick.wrapping_add(1);
+    um.touched = true;
+    let Some((carrier, c)) = support_focus(state, side) else {
+        // Loose ball (or the keeper on the ball): hold the last committed point for a while.
+        let fresh = um.sup_kind != AI_NONE && stamp.wrapping_sub(um.sup_eval) <= 2 * SUP_RESCORE_TICKS;
+        return fresh.then_some(um.sup_pt);
+    };
+    if carrier == idx {
+        return None;
+    }
+    let due = um.sup_carrier != carrier as u8 || um.sup_kind == SUP_NEAR || stamp.wrapping_sub(um.sup_eval) >= SUP_RESCORE_TICKS;
+    if !due {
+        if um.sup_kind == AI_NONE {
+            return None;
+        }
+        let pt = sup_candidate_point(state, side, um.sup_kind, slot, c, um.sup_pt, false, is_5v5);
+        um.sup_pt = pt.unwrap_or(um.sup_pt);
+        return pt;
+    }
+    // Re-score.
+    let defs = opp_movers(state, side);
+    let mut ring: Vec<(Fp, u8)> = (SUP_RING_FIRST..SUP_RING_FIRST + SUP_RING_COUNT)
+        .filter_map(|k| sup_candidate_point(state, side, k, slot, c, Vec2::ZERO, false, is_5v5).map(|q| (q.dist(slot), k)))
+        .collect();
+    ring.sort_unstable();
+    let mut kinds: Vec<u8> = vec![SUP_SLOT];
+    kinds.extend(ring.iter().take(SUP_RING_PER_PLAYER).map(|&(_, k)| k));
+    if (SUP_RING_FIRST..SUP_RING_FIRST + SUP_RING_COUNT).contains(&um.sup_kind) && !kinds.contains(&um.sup_kind) {
+        kinds.push(um.sup_kind);
+    }
+    kinds.push(SUP_VORONOI);
+    kinds.push(SUP_OFFSIDE);
+    let same_carrier = um.sup_carrier == carrier as u8;
+    let score = |k: u8, pt: Vec2| sup_score(state, side, idx, k, pt, slot, c, &defs, mate_targets, mate_target_ticks, chaser, is_5v5);
+    let mut best: Option<(Fp, u8, Vec2)> = None;
+    let mut inc: Option<(Fp, Vec2)> = None;
+    for &k in &kinds {
+        let Some(pt) = sup_candidate_point(state, side, k, slot, c, um.sup_pt, true, is_5v5) else {
+            continue;
+        };
+        let sc = score(k, pt);
+        if same_carrier && k == um.sup_kind {
+            // The incumbent vertex is the stored one; the fresh vertex is its challenger.
+            inc = Some(if k == SUP_VORONOI { (score(k, um.sup_pt), um.sup_pt) } else { (sc, pt) });
+        }
+        if sc > Fp::ZERO && best.is_none_or(|(bs, _, _)| sc > bs) {
+            best = Some((sc, k, pt));
+        }
+    }
+    um.sup_eval = stamp;
+    um.sup_carrier = carrier as u8;
+    let held = stamp.wrapping_sub(um.sup_since);
+    let pick = match (inc, best) {
+        (Some((isc, ipt)), Some((bs, bk, bpt))) if isc > Fp::ZERO => {
+            let beats = bs > isc.mul(Fp::from_milli(INCUMBENT_BONUS_PM));
+            let may_switch = held >= SUP_COMMIT_TICKS || bk == um.sup_kind;
+            if may_switch && beats {
+                (bk, bpt)
+            } else {
+                (um.sup_kind, ipt)
+            }
+        }
+        (Some((isc, ipt)), None) if isc > Fp::ZERO => (um.sup_kind, ipt),
+        (_, Some((_, bk, bpt))) => (bk, bpt),
+        (_, None) => {
+            um.set_kind(AI_NONE, state.tick);
+            return None;
+        }
+    };
+    um.set_kind(pick.0, state.tick);
+    um.sup_pt = pick.1;
+    Some(pick.1)
+}
+
+/// No opponent of `side` within [`SUP_LANE_CLEAR`] of the segment `c -> q` (past the first 0.5 m).
+fn segment_clear(state: &MatchState, side: TeamSide, c: Vec2, q: Vec2) -> bool {
+    let d = q - c;
+    let len = d.len();
+    let dir = d.normalize_or_zero();
+    state.players[side.opponent().index()].iter().filter(|o| !o.sent_off).all(|o| {
+        let rel = o.pos - c;
+        let proj = rel.dot(dir);
+        let perp = if proj >= len { o.pos.dist(q) } else { (rel - dir.scale(proj)).len() };
+        proj <= Fp::from_milli(500) || perp >= SUP_LANE_CLEAR
+    })
+}
+
+/// Final-lane check (round 4): the lane from the carrier to the FINAL target (after spacing,
+/// reservation and run push) must be clear of opponents by [`SUP_LANE_CLEAR`]; on re-score ticks a
+/// blocked lane is reopened by a lateral nudge of up to 4 m (2 m steps; the current nudge is tried
+/// first, then none, then the others), and the nudge is held between re-scores (sticky).
+fn final_lane_nudge(state: &MatchState, side: TeamSide, t: Vec2, um: &mut UMem) -> Vec2 {
+    let Some((_, ci)) = state.ball.owner.filter(|&(os, _)| os == side) else {
+        return t;
+    };
+    let c = state.players[side.index()][ci].pos;
+    let lane = t - c;
+    if lane.len() < Fp::from_milli(3_000) {
+        um.sup_nudge = 0;
+        return t;
+    }
+    let u = lane.normalize_or_zero();
+    let perp = Vec2::new(-u.y, u.x);
+    let at = |n: i8| t + perp.scale(SUP_NUDGE_STEP.mul(Fp::from_int(i32::from(n))));
+    let hl = state.format.half_length() - Fp::from_milli(1_500);
+    let hw = state.format.half_width() - Fp::from_milli(1_500);
+    let clear = |q: Vec2| q.x.abs() <= hl && q.y.abs() <= hw && segment_clear(state, side, c, q);
+    // Only on re-score ticks (the scorer just ran) may the nudge change.
+    if um.sup_eval == state.tick.wrapping_add(1) {
+        let cur = um.sup_nudge;
+        let mut order: Vec<i8> = vec![cur, 0];
+        for n in 1..=SUP_NUDGE_MAX {
+            order.push(n);
+            order.push(-n);
+        }
+        um.sup_nudge = order.into_iter().find(|&n| clear(at(n))).unwrap_or(0);
+    }
+    at(um.sup_nudge)
+}
+
+// --- Runs: one arbiter per team (round 4 work area 3, `docs/attacking-support-and-runs.md`) ---
+
+/// Run roles stored in `TeamAiMemory::run_role` (`0` = none).
+pub const RUN_NONE: u8 = 0;
+/// The one run in behind (Queen in B-Human's role split): end-point beyond the offside line.
+pub const RUN_PENETRATE: u8 = 1;
+/// The one support-from-behind runner: arrives late a few metres behind the line.
+pub const RUN_SUPPORT: u8 = 2;
+/// Up to three box runners on a cross (near post, back post, centre).
+pub const RUN_BOX: u8 = 3;
+/// A decoy whose marker follows him and so frees space for a teammate.
+pub const RUN_DECOY: u8 = 4;
+/// A run called by the human carrier (`BTN_CALL_RUN`).
+pub const RUN_CALLED: u8 = 5;
+
+/// The through ball to a committed runner is safe when the runner's control of the landing point
+/// (he is moving toward it at the release) exceeds this [estimate].
+const RUNNER_PASS_CONTROL_MIN: Fp = Fp::from_milli(700);
+/// "Killer ball" bonus of a safe through ball to a committed runner when the carrier faces forward
+/// and is not tight-pressed, so it beats a sideways recycle [estimate; FIFA CC passing [official]].
+const RUNNER_KILLER_BONUS: Fp = Fp::from_milli(4_000);
+/// Arbiter re-score cadence (ticks) [estimate; the support cadence].
+const RUN_RESCORE_TICKS: u32 = 20;
+/// Minimum commitment of a new run (ticks) [estimate; FIFA 13 "he sticks with it" [official]].
+pub const RUN_COMMIT_TICKS: u32 = 60;
+/// A committed run that is never released expires after this many ticks [estimate].
+const RUN_MAX_TICKS: u32 = 240;
+/// Commitment of a called run (ticks): the existing 1.5 s `BTN_CALL_RUN` burst.
+pub const RUN_CALLED_TICKS: u32 = 90;
+/// Carrier pressure gate of the run trigger (m): no defender within 4.6 m [peer-reviewed]; for the
+/// CPU carrier the sim's 1.85 m "tight" radius [audit].
+const RUN_PRESSURE_RADIUS: Fp = Fp::from_milli(4_600);
+const RUN_PRESSURE_RADIUS_CPU: Fp = Fp::from_milli(1_850);
+/// Run trigger: the runner's 1 s look-ahead point must have Control above 0.5 [estimate].
+const RUN_CONTROL_MIN: Fp = Fp::HALF;
+/// Look-ahead horizon (s) and the speed above which it is used (m/s) [peer-reviewed].
+const LOOKAHEAD_S: Fp = Fp::ONE;
+const LOOKAHEAD_MIN_SPEED: Fp = Fp::from_int(2);
+/// A runner holding at the line "stutters" at no more than 3 m/s, as a fraction of the ~7 m/s top
+/// speed the move vector is scaled to [official FIFA 13; speed estimate].
+const RUN_STUTTER_FRAC: Fp = Fp::from_milli(430);
+/// Within this distance (m) of the onside limit the held runner stutters.
+const RUN_STUTTER_ZONE: Fp = Fp::from_milli(2_500);
+/// The held runner goes when the CPU carrier's remaining pass charge is at most this many ticks
+/// (offside is judged at the kick, so the runner may not cross the line before it) [estimate].
+const RUN_RELEASE_LEAD_TICKS: u32 = 3;
+/// A CPU release lasts this long (ticks) while the pass is charged [estimate].
+const RUN_RELEASE_TTL: u32 = 40;
+/// Forecast speed of a timed runner toward a candidate end-point (m/s): the run-up he has at the
+/// release [estimate; EA forecast sites [patent]].
+const RUN_FORECAST_SPEED: Fp = Fp::from_int(5);
+/// Sprint speed used for the post-release look-ahead (m/s) [estimate].
+const RUN_RELEASE_SPEED_MPS: i64 = 7;
+/// The support-from-behind runner aims this far (mm) behind the onside limit [estimate].
+const RUN_SUPPORT_DEPTH_MM: (i64, i64) = (6_000, 4_000);
+/// End-point search radius around the runner (mm) [code: Gliders2d 25 m; estimate for 5v5].
+const RUN_END_RANGE_MM: (i64, i64) = (25_000, 14_000);
+/// Grid fallback end-points: depth beyond the true line (mm) and lateral offsets (mm).
+const RUN_END_DEPTHS_MM: [i64; 2] = [5_000, 9_000];
+const RUN_END_LATERAL_MM: [i64; 3] = [-6_000, 0, 6_000];
+/// Decoy: a marker within 3 m moving with the runner; the decoy is worth it when removing that
+/// marker raises a teammate's Control by more than 0.1 [estimate].
+const DECOY_MARKER_RADIUS: Fp = Fp::from_milli(3_000);
+const DECOY_GAIN_MIN: Fp = Fp::from_milli(100);
+/// Cross situation: carrier beyond 60% of the half, wider than the box half-width minus 2 m.
+const CROSS_PROG_PM: i64 = 600;
+/// Box runner spots `(depth from the goal line, y toward the ball side)` (mm): near post, back
+/// post, centre (FIFA 09 Crossing slider [official]; positions estimate). 5v5 scaled.
+const BOX_SPOTS_MM: [(i64, i64); 3] = [(5_500, 2_000), (6_000, -3_500), (8_500, 0)];
+const BOX_SPOTS_5V5_MM: [(i64, i64); 3] = [(4_000, 1_500), (4_500, -2_500), (6_000, 0)];
+/// "Crossing" box-runner count (FIFA 09 slider: how many players get into the box) [official].
+pub const BOX_RUNNERS_MAX: usize = 3;
+
+/// `(rest_role, runner_role)` of the player in slot `slot_k`: the rest-defence player of the
+/// attacking shape (fixo, or the most defensive 5v5 slot) and the roles that make forward runs.
+fn attack_roles(ctx: &ShapeCtx, slot_k: u8, p: &PlayerState) -> (bool, bool) {
+    let slot = ctx.slot(slot_k);
+    let role = slot.map(|s| s.role);
+    let rest_role = match role {
+        Some(SlotRole::Fixo) => true,
+        Some(_) if ctx.is_5v5 => {
+            // Formations without a fixo: the most defensive slot keeps rest defence.
+            let min_depth = ctx.slots.iter().map(|s| s.attack_depth).min().unwrap_or(0);
+            slot.is_some_and(|s| s.attack_depth == min_depth)
+                && ctx.slots.iter().position(|s| s.attack_depth == min_depth) == Some(slot_k as usize)
+        }
+        _ => false,
+    };
+    let runner_role = matches!(
+        role,
+        Some(SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger | SlotRole::Ala | SlotRole::WideMid)
+    ) || p.role == PlayerRole::Forward;
+    (rest_role, runner_role)
+}
+
+/// Attacking work-rate cadence: a High (>= 67) work rate considers a run every arbiter round,
+/// Medium every second, Low (< 34) every fourth (FIFA's "how often the player considers making
+/// forward runs" [official]; cadence [estimate]).
+const fn work_rate_cadence(att: u8) -> u32 {
+    if att >= 67 {
+        1
+    } else if att >= 34 {
+        2
+    } else {
+        4
+    }
+}
+
+/// The 1 s look-ahead position of `p` (his position when he moves at 2 m/s or less).
+fn lookahead(p: &PlayerState) -> Vec2 {
+    if p.vel.len() > LOOKAHEAD_MIN_SPEED {
+        p.pos + p.vel.scale(LOOKAHEAD_S)
+    } else {
+        p.pos
+    }
+}
+
+/// The owned point beyond the offside line for runner `p` (EA US 7,588,493: the Voronoi vertex
+/// beyond the line the runner reaches first; Gliders2d grid points as a fallback): among the
+/// points he reaches before every opponent (time-to-intercept), the one maximising Control (the
+/// runner released, against every opponent) x Value. Returns `(point, control x value)`.
+fn run_end_point(state: &MatchState, side: TeamSide, p: &PlayerState, c: Vec2, defs: &[crate::space::Mover]) -> Option<(Vec2, Fp)> {
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let is_5v5 = state.format.players_per_side <= 6;
+    let s = Fp::from_int(attack_sign as i32);
+    let hl = state.format.half_length() - Fp::from_milli(3_000);
+    // End-points stay infield (6 m from the touchline, 3 m in 5v5): a through ball along the
+    // touchline runs out of play or away from the runner [estimate].
+    let hw = state.format.half_width() - Fp::from_milli(if is_5v5 { 3_000 } else { 6_000 });
+    let line = compute_onside_limit_x(state, side) + s.mul(Fp::from_milli(350));
+    let goal = Vec2::new(s.mul(state.format.half_length()), Fp::ZERO);
+    let range = Fp::from_milli(fmt_pick(is_5v5, RUN_END_RANGE_MM));
+    let sites: Vec<Vec2> = defs.iter().map(|d| d.pos).collect();
+    let mut cands = crate::space::opponent_voronoi_vertices(&sites, hl, hw);
+    for &dd in &RUN_END_DEPTHS_MM {
+        for &dy in &RUN_END_LATERAL_MM {
+            let depth = if is_5v5 { dd * 6 / 10 } else { dd };
+            let lat = if is_5v5 { dy * 6 / 10 } else { dy };
+            cands.push(Vec2::new(line + s.mul(Fp::from_milli(depth)), p.pos.y + Fp::from_milli(lat)));
+        }
+    }
+    let mut best: Option<(Vec2, Fp)> = None;
+    for q in cands {
+        let beyond = (q.x - line).mul(s);
+        if beyond < Fp::from_milli(1_500) || q.x.abs() > hl || q.y.abs() > hw || q.dist(p.pos) > range {
+            continue;
+        }
+        // The runner is forecast already moving toward the point at the timed-run speed (EA's
+        // forecast sites: "offsetting the player's position forward ... in the direction of
+        // motion, and in proportion to the player's speed" [patent]); defenders as they are.
+        let me = crate::space::Mover::new(p.pos, (q - p.pos).normalize_or_zero().scale(RUN_FORECAST_SPEED));
+        // The runner must reach the point first (EA's rule: "he can get to that piece of space
+        // before anyone else"); Control then weights how securely.
+        let t_me = crate::space::time_to_intercept(&me, q);
+        if defs.iter().any(|d| crate::space::time_to_intercept(d, q) <= t_me) {
+            continue;
+        }
+        let ctl = crate::space::control(q, q.dist(c).div(SUP_BALL_SPEED), &[me], defs);
+        let sc = ctl.mul(crate::space::value_at(q, goal));
+        if best.is_none_or(|(_, bs)| sc > bs) {
+            best = Some((q, sc));
+        }
+    }
+    best
+}
+
+/// Is the human or CPU carrier of `side` under no more than moderate pressure?
+fn carrier_unpressured(state: &MatchState, side: TeamSide, c: Vec2) -> bool {
+    let r = if side_is_cpu(state, side) { RUN_PRESSURE_RADIUS_CPU } else { RUN_PRESSURE_RADIUS };
+    state.players[side.opponent().index()]
+        .iter()
+        .filter(|o| !o.sent_off)
+        .all(|o| o.pos.dist(c) > r)
+}
+
+/// The team's run arbiter (round 4): one decision per team per tick, computed lazily by the first
+/// supporter processed this tick (stamped `run_eval`, idempotent like the team plan), on positions
+/// as they stand at that moment. Ends runs on possession loss or a stoppage, on expiry, and when a
+/// runner receives the ball; every [`RUN_RESCORE_TICKS`] it re-assigns at most one penetrate runner
+/// and one support-from-behind runner (highest and second score), up to three box runners on a
+/// cross and one decoy, with a [`RUN_COMMIT_TICKS`] commitment and the 1.15x incumbent margin.
+fn update_run_arbiter(state: &MatchState, side: TeamSide) {
+    let stamp = state.tick.wrapping_add(1);
+    {
+        let Ok(mems) = state.ai_memory.try_borrow() else {
+            return;
+        };
+        if mems[side.index()].run_eval == stamp {
+            return;
+        }
+    }
+    // Read-only inputs first (the Schmitt trigger and the plan borrow the memory themselves).
+    let passer_ready = passer_ready_schmitt(state, side);
+    let ctx = ShapeCtx::new(state, side);
+    let is_5v5 = ctx.is_5v5;
+    let attack_sign = ctx.sign;
+    let s = Fp::from_int(attack_sign as i32);
+    let players = &state.players[side.index()];
+    let n = players.len();
+    let open = matches!(state.phase, MatchPhase::OpenPlay);
+    let carrier = state.ball.owner.and_then(|(os, oi)| (os == side).then_some(oi));
+    let opp_owns = state.ball.owner.is_some_and(|(os, _)| os != side);
+    let our_pass_to = state.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side).map(|pf| pf.intended_receiver_idx);
+    let Ok(mut mems) = state.ai_memory.try_borrow_mut() else {
+        return;
+    };
+    let m = &mut mems[side.index()];
+    m.ensure_len(n);
+    m.run_eval = stamp;
+    // 1. Ends: stoppage, possession loss (everyone); receiving the ball, sent off, expiry (one).
+    for (j, pj) in players.iter().enumerate() {
+        let role = m.run_role[j];
+        if role == RUN_NONE {
+            continue;
+        }
+        let age = stamp.wrapping_sub(m.run_since[j]);
+        let limit = if role == RUN_CALLED { RUN_CALLED_TICKS } else { RUN_MAX_TICKS };
+        // A loose ball (no owner, no pass of ours in flight) ends every run but a box run: the
+        // pass to the runner failed or the carrier lost it; the chase and shape take over.
+        let loose = state.ball.owner.is_none() && our_pass_to.is_none();
+        let lost = !open || opp_owns || (loose && role != RUN_BOX);
+        let received = carrier == Some(j);
+        if lost || received || pj.sent_off || age >= limit {
+            m.run_role[j] = RUN_NONE;
+        }
+    }
+    if m.run_release != 0 && stamp.wrapping_sub(m.run_release_tick) > RUN_RELEASE_TTL {
+        m.run_release = 0;
+    }
+    let Some(ci) = carrier.filter(|_| open) else {
+        return;
+    };
+    // While our pass is in flight nothing is re-assigned (the receiver path owns the receiver).
+    if our_pass_to.is_some() {
+        return;
+    }
+    if !state.tick.is_multiple_of(RUN_RESCORE_TICKS) {
+        return;
+    }
+    m.run_round = m.run_round.wrapping_add(1);
+    let round = m.run_round;
+    let c = players[ci].pos;
+    let defs = opp_movers(state, side);
+    let onside_x = compute_onside_limit_x(state, side);
+    let half_len = state.format.half_length();
+    let half_wid = state.format.half_width();
+    let committed = |m: &TeamAiMemory, j: usize| m.run_role[j] != RUN_NONE && stamp.wrapping_sub(m.run_since[j]) < RUN_COMMIT_TICKS;
+    // 2. Box runners on a cross.
+    let cross = (c.x.mul(s)) > half_len.mul(Fp::from_milli(CROSS_PROG_PM))
+        && c.y.abs() > state.format.penalty_box_half_width() - Fp::from_milli(2_000);
+    for j in 0..n {
+        if m.run_role[j] == RUN_BOX && !cross && !committed(m, j) {
+            m.run_role[j] = RUN_NONE;
+        }
+    }
+    if cross {
+        let spots = if is_5v5 { BOX_SPOTS_5V5_MM } else { BOX_SPOTS_MM };
+        let ball_side = if c.y >= Fp::ZERO { 1 } else { -1 };
+        let goal_x = s.mul(half_len);
+        let mut taken: Vec<usize> = (0..n).filter(|&j| m.run_role[j] == RUN_BOX).collect();
+        for &(depth, lat) in spots.iter().take(BOX_RUNNERS_MAX) {
+            if taken.len() >= BOX_RUNNERS_MAX {
+                break;
+            }
+            let spot = Vec2::new(goal_x - s.mul(Fp::from_milli(depth)), Fp::from_milli(lat * ball_side));
+            let spot = Vec2::new(if attack_sign > 0 { spot.x.min(onside_x) } else { spot.x.max(onside_x) }, spot.y);
+            if taken.iter().any(|&j| m.run_end[j].dist(spot) < Fp::from_milli(1_000)) {
+                continue;
+            }
+            let mut best: Option<(Fp, usize)> = None;
+            for (j, p) in players.iter().enumerate().skip(1) {
+                if j == ci || p.sent_off || m.run_role[j] != RUN_NONE {
+                    continue;
+                }
+                let (rest, runner) = attack_roles(&ctx, m.slot_of.get(j).copied().unwrap_or(AI_NONE), p);
+                let mid = p.role == PlayerRole::Midfielder;
+                if rest || !(runner || mid) {
+                    continue;
+                }
+                let d = p.pos.dist(spot);
+                if best.is_none_or(|(bd, _)| d < bd) {
+                    best = Some((d, j));
+                }
+            }
+            if let Some((_, j)) = best {
+                m.run_role[j] = RUN_BOX;
+                m.run_since[j] = stamp;
+                m.run_end[j] = spot;
+                taken.push(j);
+            }
+        }
+        return;
+    }
+    // 3. Penetrate and support-from-behind runners.
+    let incumbent_pen = (0..n).find(|&j| m.run_role[j] == RUN_PENETRATE);
+    let incumbent_sup = (0..n).find(|&j| m.run_role[j] == RUN_SUPPORT);
+    let trigger = passer_ready && carrier_unpressured(state, side, c);
+    let mut scored: Vec<(Fp, usize, Vec2)> = Vec::new();
+    if trigger {
+        for (j, p) in players.iter().enumerate().skip(1) {
+            if j == ci || p.sent_off || matches!(m.run_role[j], RUN_BOX | RUN_CALLED | RUN_DECOY) {
+                continue;
+            }
+            let (rest, runner) = attack_roles(&ctx, m.slot_of.get(j).copied().unwrap_or(AI_NONE), p);
+            if rest || !runner {
+                continue;
+            }
+            let incumbent = Some(j) == incumbent_pen || Some(j) == incumbent_sup;
+            let cadence = work_rate_cadence(p.attributes.work_rates(p.role).0);
+            if !incumbent && !(round.wrapping_add(j as u32)).is_multiple_of(cadence) {
+                continue;
+            }
+            // Onside (judged against the true line), and Control > 0.5 at his 1 s look-ahead.
+            if state.rules.offsides_enabled && beyond_line(p.pos, onside_x, attack_sign) {
+                continue;
+            }
+            let la = lookahead(p);
+            let me = crate::space::Mover::new(p.pos, p.vel);
+            if crate::space::control(la, la.dist(c).div(SUP_BALL_SPEED), &[me], &defs) <= RUN_CONTROL_MIN {
+                continue;
+            }
+            if let Some((end, sc)) = run_end_point(state, side, p, c, &defs) {
+                scored.push((sc, j, end));
+            }
+        }
+    }
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let assign = |m: &mut TeamAiMemory, role: u8, incumbent: Option<usize>, pick: Option<(Fp, usize, Vec2)>| -> Option<usize> {
+        if let Some(ij) = incumbent {
+            let inc_sc = scored.iter().find(|e| e.1 == ij).map(|e| e.0);
+            let keep = committed(m, ij)
+                || match (inc_sc, pick) {
+                    (Some(isc), Some((bs, bj, _))) => bj == ij || bs <= isc.mul(Fp::from_milli(INCUMBENT_BONUS_PM)),
+                    (Some(_), None) => true,
+                    (None, _) => false,
+                };
+            if keep {
+                if let Some(e) = scored.iter().find(|e| e.1 == ij) {
+                    if role == RUN_PENETRATE {
+                        m.run_end[ij] = e.2;
+                    }
+                }
+                return Some(ij);
+            }
+            m.run_role[ij] = RUN_NONE;
+        }
+        let (_, j, end) = pick?;
+        m.run_role[j] = role;
+        m.run_since[j] = stamp;
+        m.run_end[j] = end;
+        Some(j)
+    };
+    let pen = assign(m, RUN_PENETRATE, incumbent_pen, scored.first().copied());
+    let sup_pick = scored.iter().find(|e| Some(e.1) != pen).copied().map(|(sc, j, end)| {
+        let depth = Fp::from_milli(fmt_pick(is_5v5, RUN_SUPPORT_DEPTH_MM));
+        (sc, j, Vec2::new(onside_x - s.mul(depth), end.y.mul(Fp::from_milli(600))))
+    });
+    let incumbent_sup = incumbent_sup.filter(|&j| Some(j) != pen && m.run_role[j] == RUN_SUPPORT);
+    let _sup = assign(m, RUN_SUPPORT, incumbent_sup, sup_pick);
+    // 4. Decoy: a forward whose marker moves with him and whose drag frees a teammate's target.
+    if !trigger || (0..n).any(|j| m.run_role[j] == RUN_DECOY) {
+        return;
+    }
+    let mut decoy: Option<(usize, Vec2)> = None;
+    'cand: for (j, p) in players.iter().enumerate().skip(1) {
+        if j == ci || p.sent_off || m.run_role[j] != RUN_NONE {
+            continue;
+        }
+        let (rest, runner) = attack_roles(&ctx, m.slot_of.get(j).copied().unwrap_or(AI_NONE), p);
+        if rest || !runner || (state.rules.offsides_enabled && beyond_line(p.pos, onside_x, attack_sign)) {
+            continue;
+        }
+        let Some(mk) = defs.iter().position(|d| d.pos.dist(p.pos) < DECOY_MARKER_RADIUS && d.vel.dot(p.vel) >= Fp::ZERO) else {
+            continue;
+        };
+        let end = Vec2::new(onside_x, (p.pos.y + s.mul(Fp::from_milli(2_000))).clamp(-half_wid, half_wid));
+        let mut dragged = defs.clone();
+        dragged[mk].pos += end - p.pos;
+        for (k, mate) in players.iter().enumerate().skip(1) {
+            if k == j || k == ci || mate.sent_off {
+                continue;
+            }
+            let tgt = m.target.get(k).copied().unwrap_or(mate.pos);
+            let mm = crate::space::Mover::new(mate.pos, mate.vel);
+            let bt = tgt.dist(c).div(SUP_BALL_SPEED);
+            let before = crate::space::control(tgt, bt, &[mm], &defs);
+            let after = crate::space::control(tgt, bt, &[mm], &dragged);
+            if after - before > DECOY_GAIN_MIN {
+                decoy = Some((j, end));
+                break 'cand;
+            }
+        }
+    }
+    if let Some((j, end)) = decoy {
+        m.run_role[j] = RUN_DECOY;
+        m.run_since[j] = stamp;
+        m.run_end[j] = end;
+    }
+}
+
+/// Is runner `idx` released? Our pass launched toward him (step 1 of the intent already meets it),
+/// or the CPU carrier's pass decision selected him and the pass charge is nearly complete.
+fn run_released(state: &MatchState, side: TeamSide, idx: usize, release: u8) -> bool {
+    if state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side && pf.intended_receiver_idx == idx) {
+        return true;
+    }
+    if release as usize != idx || idx == 0 {
+        return false;
+    }
+    let Some((_, ci)) = state.ball.owner.filter(|&(os, _)| os == side) else {
+        return false;
+    };
+    match state.players[side.index()][ci].action {
+        PlayerActionState::Charging { button, ticks, .. } => {
+            let planned = state.cpu_target_charge[side.index()] as u16;
+            let target = charge_units_to_ticks(if planned >= 4 { planned } else { 9 }, button);
+            u32::from(target.saturating_sub(ticks)) <= RUN_RELEASE_LEAD_TICKS
+        }
+        _ => false,
+    }
+}
+
+/// The carrier's facing cone for a called run: within 45 degrees of his facing (FIFA's L1 "the
+/// teammate you are facing" [official]; cone estimate).
+const CALL_RUN_CONE_COS: Fp = Fp::from_milli(707);
+
+/// `BTN_CALL_RUN` (round 4): among the outfielders other than the keeper and the controlled
+/// carrier, the teammate inside the carrier's facing cone with the best Control at his 1 s
+/// look-ahead (onside players first; if nobody is inside the cone, the one most in line with the
+/// facing) becomes a [`RUN_CALLED`] runner with an end-point beyond the offside line (or, with no
+/// owned point there, 9 m ahead of him toward goal), committed for [`RUN_CALLED_TICKS`] with the
+/// same hold-and-release as an arbiter run. Writes the run into the team memory and returns the
+/// runner, for the caller to set his `run_boost_ticks`.
+pub(crate) fn assign_called_run(state: &MatchState, side: TeamSide) -> Option<usize> {
+    let s_idx = side.index();
+    let ctrl = state.controlled_idx[s_idx];
+    let players = &state.players[s_idx];
+    let carrier = players.get(ctrl)?;
+    let facing = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let onside_x = compute_onside_limit_x(state, side);
+    let defs = opp_movers(state, side);
+    let c = carrier.pos;
+    // (in cone, onside, control or alignment) ordered lexicographically.
+    let mut best: Option<((bool, bool, Fp), usize)> = None;
+    for (j, p) in players.iter().enumerate() {
+        if j == 0 || j == ctrl || p.sent_off {
+            continue;
+        }
+        let dir = (p.pos - c).normalize_or_zero();
+        let align = dir.dot(facing);
+        let in_cone = align >= CALL_RUN_CONE_COS;
+        let onside = !state.rules.offsides_enabled || !beyond_line(p.pos, onside_x, attack_sign);
+        let la = lookahead(p);
+        let me = crate::space::Mover::new(p.pos, p.vel);
+        let ctl = crate::space::control(la, la.dist(c).div(SUP_BALL_SPEED), &[me], &defs);
+        let key = (in_cone, onside, if in_cone { ctl } else { align });
+        if best.is_none_or(|(bk, _)| key > bk) {
+            best = Some((key, j));
+        }
+    }
+    let (_, j) = best?;
+    let p = &players[j];
+    let s = Fp::from_int(attack_sign as i32);
+    let end = run_end_point(state, side, p, c, &defs).map_or_else(
+        || {
+            let hl = state.format.half_length() - Fp::from_milli(3_000);
+            let x = (p.pos.x + s.mul(Fp::from_int(9))).clamp(-hl, hl);
+            Vec2::new(x, p.pos.y.mul(Fp::from_milli(850)))
+        },
+        |(e, _)| e,
+    );
+    let mut mems = state.ai_memory.try_borrow_mut().ok()?;
+    let m = &mut mems[s_idx];
+    m.ensure_len(players.len());
+    for r in m.run_role.iter_mut() {
+        if *r == RUN_CALLED {
+            *r = RUN_NONE;
+        }
+    }
+    m.run_role[j] = RUN_CALLED;
+    m.run_since[j] = state.tick.wrapping_add(1);
+    m.run_end[j] = end;
+    Some(j)
+}
+
+// --- Near support: "players closest to the ball will come to support" (FIFA build-up [official]) ---
+
+/// Near-support candidate radii around the carrier (mm): 8-18 m in 11v11, 6-13 m in 5v5 [estimate].
+const NEAR_RADII_MM: [(i64, i64); 3] = [(9_000, 6_500), (13_000, 9_000), (17_000, 12_000)];
+/// Bearings sampled around the carrier (30 degrees apart): `(cos, sin)` in permille.
+const NEAR_BEARINGS_PM: [(i64, i64); 12] = [
+    (1_000, 0), (866, 500), (500, 866), (0, 1_000), (-500, 866), (-866, 500),
+    (-1_000, 0), (-866, -500), (-500, -866), (0, -1_000), (500, -866), (866, -500),
+];
+/// A near-support point needs LaneOpen of at least 0.6 [estimate].
+const NEAR_LANE_MIN: Fp = Fp::from_milli(600);
+/// The two near supporters' points are at least 30 degrees apart around the carrier (cos 30).
+const NEAR_ANGLE_COS: Fp = Fp::from_milli(866);
+/// Slot leash of a near supporter (mm): midfielders 25 m in 11v11 (13 m in 5v5), others the
+/// candidate leash [estimate].
+const NEAR_LEASH_MID_MM: (i64, i64) = (25_000, 13_000);
+/// The near-support assignment is made when the carrier has fewer than 2 open options, held at
+/// least 60 ticks, and dropped once he has 3 or more [estimate].
+const NEAR_NEED_BELOW: usize = 2;
+const NEAR_DROP_AT: usize = 3;
+const NEAR_COMMIT_TICKS: u32 = 60;
+/// Travel scale of the near-support score (m): the score falls as `1 / (1 + d / 4 m)^2` with the
+/// supporter's distance to the point [estimate].
+const NEAR_TRAVEL_SCALE: Fp = Fp::from_int(4);
+/// Only supporters within this distance of the carrier (mm) are recruited for near support [estimate].
+const NEAR_RECRUIT_MM: (i64, i64) = (24_000, 15_000);
+/// Keep near points this far (m) from teammates other than the pair [estimate].
+const NEAR_MATE_SEP: Fp = Fp::from_milli(5_000);
+
+/// The carrier support is organised around (round 4 second pass): our carrier at his position, or,
+/// while our pass is in flight, its intended receiver at the pass target (support anticipates the
+/// reception instead of waiting for it). `None` for the keeper or without either.
+fn support_focus(state: &MatchState, side: TeamSide) -> Option<(usize, Vec2)> {
+    if let Some((os, oi)) = state.ball.owner {
+        return (os == side && oi != 0).then(|| (oi, state.players[side.index()][oi].pos));
+    }
+    let pf = state.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side && pf.intended_receiver_idx != 0)?;
+    Some((pf.intended_receiver_idx, pf.target_pos))
+}
+
+/// Open options of `side`'s carrier as the analytics count them: an outfielder 6-30 m away, no
+/// opponent within 1.5 m of the straight lane, not beyond the second-last defender and the ball.
+fn carrier_open_options(state: &MatchState, side: TeamSide, ci: usize, c: Vec2) -> usize {
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let onside_x = compute_onside_limit_x(state, side);
+    let mut n = 0;
+    for (j, p) in state.players[side.index()].iter().enumerate().skip(1) {
+        if j == ci || p.sent_off {
+            continue;
+        }
+        let d = p.pos.dist(c);
+        if d < Fp::from_int(6) || d > Fp::from_int(30) {
+            continue;
+        }
+        if state.rules.offsides_enabled && beyond_line(p.pos, onside_x, attack_sign) {
+            continue;
+        }
+        let dir = (p.pos - c).normalize_or_zero();
+        let blocked = state.players[side.opponent().index()].iter().filter(|o| !o.sent_off).any(|o| {
+            let rel = o.pos - c;
+            let proj = rel.dot(dir).clamp(Fp::ZERO, d);
+            (rel - dir.scale(proj)).len() < Fp::from_milli(1_500)
+        });
+        if !blocked {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Near-support assignment of the team (lazy, stamped `near_eval`, once per tick): when the
+/// carrier has fewer than [`NEAR_NEED_BELOW`] open options, the two outfielders nearest him (no
+/// run role, not the rest-defence player) get support points 8-18 m from him with LaneOpen >= 0.6,
+/// at least 30 degrees apart, scored Control x LaneOpen^2 x (Value + safe bias) (the lane weighted
+/// over value); re-scored every [`SUP_RESCORE_TICKS`], held [`NEAR_COMMIT_TICKS`], dropped when the
+/// carrier changes or has [`NEAR_DROP_AT`] or more open options.
+fn update_near_support(state: &MatchState, side: TeamSide) {
+    let stamp = state.tick.wrapping_add(1);
+    {
+        let Ok(mems) = state.ai_memory.try_borrow() else {
+            return;
+        };
+        if mems[side.index()].near_eval == stamp {
+            return;
+        }
+    }
+    let focus = support_focus(state, side);
+    let carrier = focus.map(|(ci, _)| ci);
+    let n_open = focus.map_or(0, |(ci, c)| carrier_open_options(state, side, ci, c));
+    let ctx = ShapeCtx::new(state, side);
+    let is_5v5 = ctx.is_5v5;
+    let Ok(mut mems) = state.ai_memory.try_borrow_mut() else {
+        return;
+    };
+    let m = &mut mems[side.index()];
+    m.ensure_len(state.players[side.index()].len());
+    m.near_eval = stamp;
+    let Some(ci) = carrier.filter(|_| matches!(state.phase, MatchPhase::OpenPlay)) else {
+        m.near_idx = vec![AI_NONE; 2];
+        return;
+    };
+    let active = m.near_idx.iter().any(|&j| j != AI_NONE) && m.near_carrier == ci as u8;
+    let held = stamp.wrapping_sub(m.near_since);
+    if active && held >= NEAR_COMMIT_TICKS && n_open >= NEAR_DROP_AT {
+        m.near_idx = vec![AI_NONE; 2];
+        return;
+    }
+    if !active && n_open >= NEAR_NEED_BELOW {
+        m.near_idx = vec![AI_NONE; 2];
+        return;
+    }
+    if active && !held.is_multiple_of(SUP_RESCORE_TICKS) {
+        return;
+    }
+    // (Re-)assign: the two nearest eligible supporters.
+    let players = &state.players[side.index()];
+    let c = focus.map_or(players[ci].pos, |(_, c)| c);
+    let mut near: Vec<(Fp, usize)> = players
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|&(j, p)| {
+            j != ci
+                && !p.sent_off
+                && m.run_role.get(j).copied().unwrap_or(RUN_NONE) == RUN_NONE
+                && !attack_roles(&ctx, m.slot_of.get(j).copied().unwrap_or(AI_NONE), p).0
+        })
+        .map(|(j, p)| (p.pos.dist(c), j))
+        .filter(|&(d, _)| d <= Fp::from_milli(fmt_pick(is_5v5, NEAR_RECRUIT_MM)))
+        .collect();
+    near.sort_unstable();
+    let pair: Vec<usize> = near.iter().take(2).map(|&(_, j)| j).collect();
+    let defs = opp_movers(state, side);
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let onside_x = compute_onside_limit_x(state, side);
+    let hl = state.format.half_length() - Fp::from_milli(2_000);
+    let hw = state.format.half_width() - Fp::from_milli(1_500);
+    let goal = Vec2::new(Fp::from_milli(attack_sign * state.format.half_length().to_milli()), Fp::ZERO);
+    // Candidate points with their lane (receiver-independent).
+    let mut pts: Vec<(Vec2, Fp)> = Vec::new();
+    for &(r11, r5) in &NEAR_RADII_MM {
+        let r = if is_5v5 { r5 } else { r11 };
+        for &(cx, sy) in &NEAR_BEARINGS_PM {
+            let q = c + Vec2::from_milli(r * cx / 1_000, r * sy / 1_000);
+            if q.x.abs() > hl || q.y.abs() > hw {
+                continue;
+            }
+            if state.rules.offsides_enabled && beyond_line(q, onside_x, attack_sign) {
+                continue;
+            }
+            let crowded = players.iter().enumerate().skip(1).any(|(k, mate)| {
+                k != ci
+                    && !pair.contains(&k)
+                    && !mate.sent_off
+                    && (mate.pos.dist(q) < NEAR_MATE_SEP || m.target.get(k).is_some_and(|t| t.dist(q) < NEAR_MATE_SEP))
+            });
+            if crowded {
+                continue;
+            }
+            let lane = crate::space::lane_open(c, q, &crate::space::Mover::new(q, Vec2::ZERO), &defs);
+            if lane >= NEAR_LANE_MIN && segment_clear(state, side, c, q) {
+                pts.push((q, lane));
+            }
+        }
+    }
+    let score = |j: usize, q: Vec2, lane: Fp| -> Fp {
+        let p = &players[j];
+        let leash = if p.role == PlayerRole::Midfielder {
+            fmt_pick(is_5v5, NEAR_LEASH_MID_MM)
+        } else {
+            fmt_pick(is_5v5, SUP_LEASH_MM)
+        };
+        let home = m.target.get(j).copied().unwrap_or(p.pos);
+        if q.dist(home) > Fp::from_milli(leash) {
+            return Fp::ZERO;
+        }
+        let me = crate::space::Mover::new(p.pos, p.vel);
+        let ctl = crate::space::control(q, q.dist(c).div(SUP_BALL_SPEED), &[me], &defs);
+        // The nearest open lane wins unless a farther one is much better: possessions are short,
+        // so a point the supporter reaches in time beats a better one he does not (EA's "teammates
+        // move towards these lines" [patent]).
+        let travel = Fp::ONE + lookahead(p).dist(q).div(NEAR_TRAVEL_SCALE);
+        ctl.mul(lane).mul(lane).mul(crate::space::value_at(q, goal) + SUP_SAFE_BIAS).div(travel.mul(travel))
+    };
+    let mut idx_out = vec![AI_NONE; 2];
+    let mut off_out = vec![Vec2::ZERO; 2];
+    let mut first_dir: Option<Vec2> = None;
+    let mut first_pt: Option<Vec2> = None;
+    for (slot, &j) in pair.iter().enumerate() {
+        let mut best: Option<(Fp, Vec2)> = None;
+        for &(q, lane) in &pts {
+            if let (Some(fd), Some(fp)) = (first_dir, first_pt) {
+                if (q - c).normalize_or_zero().dot(fd) > NEAR_ANGLE_COS || q.dist(fp) < NEAR_MATE_SEP {
+                    continue;
+                }
+            }
+            let sc = score(j, q, lane);
+            if sc > Fp::ZERO && best.is_none_or(|(bs, _)| sc > bs) {
+                best = Some((sc, q));
+            }
+        }
+        if let Some((_, q)) = best {
+            idx_out[slot] = j as u8;
+            off_out[slot] = q - c;
+            first_dir.get_or_insert((q - c).normalize_or_zero());
+            first_pt.get_or_insert(q);
+        }
+    }
+    if !active || m.near_idx != idx_out {
+        m.near_since = stamp;
+    }
+    m.near_carrier = ci as u8;
+    m.near_idx = idx_out;
+    m.near_off = off_out;
+}
+
+/// Assisted pass receiver override (round 4): the called runner of `side`, or the penetrate runner
+/// the CPU pass decision released (other than the kicker), onside now, whose post-release look-ahead lies inside the kick's aim
+/// cone (`aim . dir >= min_align`); the best-aligned one with that lead point. Offside is judged
+/// at the kick from his current position, so leading him beyond the line is legal.
+pub(crate) fn released_runner_target(
+    state: &MatchState,
+    side: TeamSide,
+    kicker_idx: usize,
+    kicker_pos: Vec2,
+    aim: Vec2,
+    min_align: Fp,
+) -> Option<(usize, Vec2)> {
+    let mems = state.ai_memory.try_borrow().ok()?;
+    let m = &mems[side.index()];
+    let attack_sign = side.attack_sign(state.second_half_swapped());
+    let onside_x = compute_onside_limit_x(state, side);
+    let mut best: Option<(Fp, usize, Vec2)> = None;
+    for (j, p) in state.players[side.index()].iter().enumerate().skip(1) {
+        let role = m.run_role.get(j).copied().unwrap_or(RUN_NONE);
+        // A called run is the human's own request; a penetrate runner only once the CPU pass
+        // decision released him (every other pass keeps the cone's default pick).
+        let released = role == RUN_CALLED
+            || (role == RUN_PENETRATE
+                && m.run_release as usize == j
+                && state.tick.wrapping_add(1).wrapping_sub(m.run_release_tick) <= RUN_RELEASE_TTL);
+        if j == kicker_idx || p.sent_off || !released {
+            continue;
+        }
+        if state.rules.offsides_enabled && beyond_line(p.pos, onside_x, attack_sign) {
+            continue;
+        }
+        let lead = runner_release_point(p, m.run_end.get(j).copied().unwrap_or(p.pos));
+        let to = lead - kicker_pos;
+        if to.len() < Fp::from_milli(4_000) {
+            continue;
+        }
+        let align = to.normalize_or_zero().dot(aim);
+        if align >= min_align && best.is_none_or(|(ba, _, _)| align > ba) {
+            best = Some((align, j, lead));
+        }
+    }
+    best.map(|(_, j, lead)| (j, lead))
+}
+
+/// Post-release look-ahead of a committed runner: where he is 1 s after the release, sprinting
+/// from his position toward his end-point.
+pub(crate) fn runner_release_point(p: &PlayerState, end: Vec2) -> Vec2 {
+    let to = end - p.pos;
+    let reach = Fp::from_int(RUN_RELEASE_SPEED_MPS as i32).mul(LOOKAHEAD_S);
+    p.pos + to.normalize_or_zero().scale(to.len().min(reach))
 }
 
 /// Shape, role behaviours and committed movement for an AI outfielder in open play.
@@ -3689,10 +5041,15 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             m.flags.get(idx).copied().unwrap_or(0),
         )
     };
-    let (chaser, chaser_pt, mate_targets, mate_target_ticks) = {
+    let (chaser, chaser_pt, mate_targets, mate_target_ticks, mate_res_yield) = {
         let mems = state.ai_memory.borrow();
         let m = &mems[side.index()];
-        (m.chaser, m.chaser_pt, m.target.clone(), m.target_tick.clone())
+        (m.chaser, m.chaser_pt, m.target.clone(), m.target_tick.clone(), m.res_yield.clone())
+    };
+    // Attacking support, runs and decision hysteresis memory (round 4 work area 3).
+    let mut um = {
+        let mems = state.ai_memory.borrow();
+        UMem::read(&mems[side.index()], idx)
     };
     let me = idx as u8;
     let slot = ctx.slot(slot_k);
@@ -3713,6 +5070,8 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
     let mut reserved_run = false;
     let mut yielding = false;
     let mut alpha_pm = 120 + style.discipline / 5;
+    // A committed runner holding at the onside limit (stutter, never reversing while onside).
+    let mut run_hold = false;
 
     if is_defensive_phase(phase) && !we_own {
         let pred_ball = predict_ball_xy_at_ticks(state, 5);
@@ -3853,16 +5212,21 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         }
     } else {
         // --- Attacking shape refinements (rest-defence fixo, support triangle, pockets, runs) ---
+        um.touched = true;
         let mut att_target = anchor;
-        let rest_role = match role {
-            Some(SlotRole::Fixo) => true,
-            Some(_) if is_5v5 => {
-                // Formations without a fixo: the most defensive slot keeps rest defence.
-                let min_depth = ctx.slots.iter().map(|s| s.attack_depth).min().unwrap_or(0);
-                slot.is_some_and(|s| s.attack_depth == min_depth)
-                    && ctx.slots.iter().position(|s| s.attack_depth == min_depth) == Some(slot_k as usize)
-            }
-            _ => false,
+        let (rest_role, runner_role) = attack_roles(&ctx, slot_k, p);
+        // One run decision per team per tick (lazily, by the first supporter processed).
+        update_run_arbiter(state, side);
+        update_near_support(state, side);
+        let (run_role, run_end, run_release, near_off) = {
+            let mems = state.ai_memory.borrow();
+            let m = &mems[side.index()];
+            (
+                m.run_role.get(idx).copied().unwrap_or(RUN_NONE),
+                m.run_end.get(idx).copied().unwrap_or(anchor),
+                m.run_release,
+                m.near_idx.iter().position(|&j| j == idx as u8).and_then(|k| m.near_off.get(k).copied()),
+            )
         };
         let opp_goal_x = Fp::from_milli(attack_sign * half_len.to_milli());
         if is_5v5 && rest_role && p.run_boost_ticks == 0 {
@@ -3905,84 +5269,47 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
                 att_target = ball_xy + check_dir.scale(Fp::from_milli(if is_5v5 { 9_500 } else { 11_800 }));
             }
         }
-        // Pocket search around blockers & cover shadows; the committed target keeps its choice stable.
-        if !rest_role {
-            let mut best_pocket = att_target;
-            let mut best_score = Fp::from_int(-999);
-            let cand_offsets = [
-                Vec2::ZERO,
-                Vec2::from_milli(attack_sign * 2_800, 2_600),
-                Vec2::from_milli(attack_sign * 2_800, -2_600),
-                Vec2::from_milli(-attack_sign * 1_800, if idx.is_multiple_of(2) { 3_400 } else { -3_400 }),
-                Vec2::from_milli(attack_sign * 3_600, 0),
-            ];
-            let min_mate_sep = Fp::from_milli(if is_5v5 { 6_600 } else { 5_500 });
-            for (c_i, off) in cand_offsets.iter().enumerate() {
-                let cand = att_target + *off;
-                let d_ball = cand.dist(ball_xy);
-                if d_ball < Fp::from_milli(5_000) {
-                    continue;
-                }
-                let lane_dir = (cand - ball_xy).normalize_or_zero();
-                let mut nearest_opp = Fp::from_int(30);
-                let mut lane_shadow_pen = Fp::ZERO;
-                for opp in &state.players[side.opponent().index()] {
-                    if !opp.sent_off {
-                        nearest_opp = nearest_opp.min(cand.dist(opp.pos));
-                        let rel = opp.pos - ball_xy;
-                        let proj = rel.dot(lane_dir);
-                        if proj > Fp::from_milli(800) && proj < d_ball - Fp::from_milli(600) {
-                            let perp = (rel - lane_dir.scale(proj)).len();
-                            if perp < Fp::from_milli(1_850) {
-                                lane_shadow_pen = lane_shadow_pen.max(Fp::from_milli(2_850) - perp);
-                            }
-                        }
-                    }
-                }
-                let mut mate_crowd_pen = Fp::ZERO;
-                for (m_i, mate) in state.players[side.index()].iter().enumerate().skip(1) {
-                    if m_i != idx && !mate.sent_off {
-                        let dm = cand.dist(mate.pos);
-                        if dm < min_mate_sep {
-                            mate_crowd_pen += min_mate_sep - dm;
-                        }
-                    }
-                }
-                // Prefer the anchor and whichever pocket we were already heading to.
-                let mut bias = if c_i == 0 { Fp::from_milli(950) } else { Fp::ZERO };
-                if cand.dist(prev_target) < Fp::from_milli(1_500) {
-                    bias += Fp::from_milli(900);
-                }
-                let sc = nearest_opp + bias - lane_shadow_pen.mul(Fp::from_int(2)) - mate_crowd_pen;
-                if sc > best_score {
-                    best_score = sc;
-                    best_pocket = cand;
-                }
+        // Scored support candidates (round 4 work area 3; replaces the five fixed pockets): the
+        // slot, the PES ring around the carrier, the nearest opponent Voronoi vertex and the
+        // offside-line point, scored Control x Value x LaneOpen and committed with hysteresis.
+        let mut scored = false;
+        let near_focus = support_focus(state, side).filter(|&(ci, _)| ci != idx);
+        if let (Some(off), Some((_, c))) = (near_off, near_focus) {
+            // Near support: one of the two players closest to the carrier comes to an open lane
+            // (a support run: class 2, he may sprint to it).
+            att_target = c + off;
+            um.set_kind(SUP_NEAR, state.tick);
+            um.sup_pt = att_target;
+            scored = true;
+            reserved_run = true;
+        } else if !rest_role {
+            if let Some(t) = support_candidate_target(
+                state,
+                side,
+                idx,
+                att_target,
+                &mut um,
+                &mate_targets,
+                &mate_target_ticks,
+                chaser,
+                is_5v5,
+            ) {
+                att_target = t;
+                scored = true;
             }
-            att_target = best_pocket;
         }
         // Onside channel runs: strikers lead the line and pin the last defender; counter-attacks
         // send every forward/wide player in behind without waiting for the passer.
-        let passer_ready = match state.ball.owner {
-            Some((o_side, o_idx)) if o_side == side => {
-                let carrier = &state.players[o_side.index()][o_idx];
-                let c_fwd = Vec2::from_bam(carrier.facing_bam, Fp::ONE);
-                c_fwd.x.mul(Fp::from_int(attack_sign as i32)) > Fp::from_milli(-150)
-            }
-            _ => true,
-        };
+        let passer_ready = passer_ready_schmitt(state, side);
         // Exclusivity: GRF support-field spacing and one runner per destination (possession only).
         let in_possession = we_own
             || (state.ball.owner.is_none() && state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side));
-        if in_possession {
+        if in_possession && !scored {
+            // GRF spacing is the fallback for players without a scored candidate.
             att_target = support_spacing(state, side, idx, att_target, is_5v5);
         }
-        let runner_role = matches!(
-            role,
-            Some(SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger | SlotRole::Ala | SlotRole::WideMid)
-        ) || p.role == PlayerRole::Forward;
         let counter = phase == AI_PHASE_COUNTER_ATTACK;
-        if p.run_boost_ticks > 0 || (runner_role && !rest_role && (passer_ready || counter) && !opp_owns) {
+        if p.run_boost_ticks > 0 || (runner_role && !rest_role && !scored && (passer_ready || counter) && !opp_owns) {
             let onside_limit_x = compute_onside_limit_x(state, side);
             let run_push = Fp::from_milli(if p.run_boost_ticks > 0 {
                 if is_5v5 { 7_800 } else { 11_500 }
@@ -4004,8 +5331,48 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             }
             reserved_run = true;
         }
-        if in_possession {
-            att_target = reserve_destination(state, side, idx, att_target, &mate_targets, &mate_target_ticks, chaser, is_5v5);
+        // Committed runs (arbiter roles): the end-point beyond the line, held at the onside limit
+        // until released (our pass toward him, or the CPU pass decision that selected him).
+        let is_runner = run_role != RUN_NONE && !opp_owns;
+        // A near supporter keeps his destination too (the others yield to him).
+        let holds_destination = is_runner || um.sup_kind == SUP_NEAR;
+        if is_runner {
+            let onside_x = compute_onside_limit_x(state, side);
+            let on = |x: Fp| if attack_sign > 0 { x.min(onside_x) } else { x.max(onside_x) };
+            let released = matches!(run_role, RUN_PENETRATE | RUN_CALLED) && run_released(state, side, idx, run_release);
+            let pass_to_me = state.ball.pass_in_flight.as_ref().is_some_and(|pf| pf.team == side && pf.intended_receiver_idx == idx);
+            att_target = if pass_to_me {
+                // The CPU-controlled receiver reaches this path (not the receive intent): meet the
+                // ball, do not keep running to the end-point.
+                best_ball_intercept_for_player(state, side, idx).0
+            } else if released || !state.rules.offsides_enabled {
+                run_end
+            } else {
+                Vec2::new(on(run_end.x), run_end.y)
+            };
+            run_hold = !released && matches!(run_role, RUN_PENETRATE | RUN_CALLED | RUN_DECOY);
+            force_sprint = force_sprint || released;
+            reserved_run = true;
+        }
+        um.res_yield = AI_NONE;
+        if in_possession && !holds_destination {
+            let (t, yielded_to) = reserve_destination(
+                state,
+                side,
+                idx,
+                att_target,
+                &mate_targets,
+                &mate_target_ticks,
+                &mate_res_yield,
+                chaser,
+                is_5v5,
+            );
+            att_target = t;
+            um.res_yield = yielded_to;
+        }
+        if we_own && scored && !is_runner {
+            // Re-check the lane on the FINAL target (after spacing, reservation and the run push).
+            att_target = final_lane_nudge(state, side, att_target, &mut um);
         }
         raw = att_target;
     }
@@ -4054,14 +5421,22 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         // Back-line players hold the line height while defending: they yield only by target, and
         // sideways (same depth) whenever that clears the radius.
         let holds_line = is_defensive_phase(phase) && role.is_some_and(|r| r.is_back_line());
-        let yielded = yield_target(a, b, raw, p.pos, r, l, half_len_fp, half_wid_fp).or_else(|| {
-            (!holds_line).then(|| yield_target(a, b, p.pos, p.pos, r, l, half_len_fp, half_wid_fp)).flatten()
+        let sticky = um.yield_sign;
+        let yielded = yield_target_sided(a, b, raw, p.pos, r, l, half_len_fp, half_wid_fp, sticky).or_else(|| {
+            (!holds_line)
+                .then(|| yield_target_sided(a, b, p.pos, p.pos, r, l, half_len_fp, half_wid_fp, sticky))
+                .flatten()
         });
-        if let Some(t) = yielded {
+        if let Some((t, sg)) = yielded {
             let sideways = Vec2::new(raw.x, t.y);
             raw = if holds_line && closest_on_segment(a, b, sideways).dist(sideways) >= r { sideways } else { t };
             yielding = true;
+            um.yield_sign = sg;
+        } else {
+            um.yield_sign = 0;
         }
+    } else {
+        um.yield_sign = 0;
     }
     // Keeper-defender arbitration: while the keeper is committed to the loose ball, his line to the
     // claim point is reserved; defenders inside the corridor step aside laterally.
@@ -4069,24 +5444,40 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         let gk = &state.players[side.index()][0];
         let brain = &state.gk_brain[side.index()];
         let claim = if brain.target == Vec2::ZERO { ball_xy } else { brain.target };
-        if let Some(t) = keeper_corridor_yield(gk.pos, claim, raw, p.pos, is_5v5) {
+        if let Some((t, sg)) = keeper_corridor_yield(gk.pos, claim, raw, p.pos, is_5v5, um.gk_yield_sign) {
             raw = t;
             yielding = true;
+            um.gk_yield_sign = sg;
+        } else {
+            um.gk_yield_sign = 0;
         }
+    } else {
+        um.gk_yield_sign = 0;
     }
 
     raw.x = raw.x.clamp(-(half_len_fp - Fp::from_milli(1_500)), half_len_fp - Fp::from_milli(1_500));
     raw.y = raw.y.clamp(-(half_wid_fp - Fp::from_milli(1_500)), half_wid_fp - Fp::from_milli(1_500));
 
-    // Commit: low-pass the target so it cannot flip tick to tick (discipline -> faster tracking).
+    // Commit: filter the target so it cannot flip tick to tick (discipline -> faster tracking).
+    // Round 4: a 0.4 m re-target deadband (a raw target that moves by less than a body radius does
+    // not move the player) and an alpha-beta filter (role alpha, beta 0.02 ~ critically damped)
+    // that tracks a moving slot without the first-order lag [peer-reviewed stability region; estimate].
     let continuous = prev_tick != 0 && prev_tick.wrapping_add(1) == state.tick;
+    let raw = if continuous && raw.dist(um.tgt_raw) < RETARGET_DEADBAND { um.tgt_raw } else { raw };
+    um.tgt_raw = raw;
     let target = if continuous {
-        prev_target.lerp(raw, Fp::from_milli(alpha_pm.clamp(80, 900)))
+        let pred = prev_target + um.tgt_vel;
+        let resid = raw - pred;
+        um.tgt_vel = (um.tgt_vel + resid.scale(TARGET_BETA)).clamp_len(TARGET_VEL_CAP);
+        pred + resid.scale(Fp::from_milli(alpha_pm.clamp(80, 900)))
     } else {
+        um.tgt_vel = Vec2::ZERO;
         raw
     };
 
-    // Arrive: proportional speed inside the slow radius, dead-zone set by positioning.
+    // Arrive: proportional speed inside the slow radius (braking-consistent, d_slow = v^2 / 2a),
+    // dead-zone set by positioning (160-510 mm, already the report's 0.4-0.5 m target radius band
+    // for an average player; a hard 0.4 m floor left yielders short of the yield radius).
     let delta = target - p.pos;
     let dist = delta.len();
     let dead = Fp::from_milli(160 + (1_000 - style.discipline) * 35 / 100);
@@ -4121,12 +5512,32 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
                 if perp_vec.len() < Fp::from_milli(1_050) {
                     let bend = Vec2::new(-mv_n.y, mv_n.x);
                     let side_dot = perp_vec.dot(bend);
-                    let bend_sign = if side_dot >= Fp::ZERO { Fp::NEG_ONE } else { Fp::ONE };
+                    // Sticky bend for the run (round 4): a bend chosen within the last
+                    // BEND_HOLD_TICKS keeps its side, so a blocker almost dead ahead cannot flip it.
+                    let fresh: i8 = if side_dot >= Fp::ZERO { -1 } else { 1 };
+                    let held = um.bend_sign != 0 && state.tick.wrapping_sub(um.bend_tick) <= BEND_HOLD_TICKS;
+                    let sg = if held { um.bend_sign } else { fresh };
+                    um.bend_sign = sg;
+                    um.bend_tick = state.tick;
+                    let bend_sign = Fp::from_int(i32::from(sg));
                     move_vec = (mv_n.scale(Fp::from_milli(700)) + bend.scale(bend_sign.mul(Fp::from_milli(520))))
                         .normalize_or_zero()
                         .scale(move_vec.len());
                     break;
                 }
+            }
+        }
+    }
+
+    // Held runner at the line: stutter at <= 3 m/s and never step back while onside (FIFA 13's fix
+    // of runners reversing to stay onside [official]); an offside runner may drift back onside.
+    if run_hold && !yielding {
+        let onside_x = compute_onside_limit_x(state, side);
+        let gap = (onside_x - p.pos.x).mul(Fp::from_int(attack_sign as i32));
+        if gap < RUN_STUTTER_ZONE {
+            move_vec = move_vec.clamp_len(RUN_STUTTER_FRAC);
+            if gap > Fp::ZERO && move_vec.x.mul(Fp::from_int(attack_sign as i32)) < Fp::ZERO {
+                move_vec.x = Fp::ZERO;
             }
         }
     }
@@ -4177,6 +5588,7 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         if let Some(c) = m.move_class.get_mut(idx) {
             *c = class;
         }
+        um.write(m, idx);
     }
 
     AiMoveIntent {
@@ -4228,9 +5640,16 @@ fn support_spacing(state: &MatchState, side: TeamSide, idx: usize, target: Vec2,
     target + push.clamp_len(cap)
 }
 
+/// Hysteresis of the destination reservation: the pair's stored assignment holds unless the
+/// player keeping the destination becomes 1.5 m farther from it than the yielder [estimate].
+const RES_YIELD_MARGIN: Fp = Fp::from_milli(1_500);
+
 /// One runner per destination (Konami US 8,616,946): if a teammate's committed target lies within
 /// 6 m (5 m in 5v5) of ours, the player who is farther from that destination (ties: higher index)
 /// moves his target out to that distance. The carrier and the chaser hold no destination.
+/// Round 4: an assignment with memory (`res_yield`, who yielded to whom last tick): whoever
+/// yielded last tick keeps yielding unless the other is farther by [`RES_YIELD_MARGIN`], so a
+/// near-tie no longer swaps who moves. Returns the target and the teammate yielded to (`AI_NONE`).
 #[allow(clippy::too_many_arguments)]
 fn reserve_destination(
     state: &MatchState,
@@ -4239,9 +5658,11 @@ fn reserve_destination(
     mut target: Vec2,
     mate_targets: &[Vec2],
     mate_target_ticks: &[u32],
+    res_yield: &[u8],
     chaser: u8,
     is_5v5: bool,
-) -> Vec2 {
+) -> (Vec2, u8) {
+    let mut yielded_to = AI_NONE;
     let res = Fp::from_milli(if is_5v5 { 5_000 } else { 6_000 });
     let players = &state.players[side.index()];
     let me = &players[idx];
@@ -4264,9 +5685,21 @@ fn reserve_destination(
             }
             let d_mate = mate.pos.dist(rj);
             let d_me = me.pos.dist(rj);
-            if d_me < d_mate || (d_me == d_mate && idx < j) {
+            let i_yielded = res_yield.get(idx).copied() == Some(j as u8);
+            let mate_yielded = res_yield.get(j).copied() == Some(idx as u8);
+            let keep = if i_yielded {
+                // I yielded last tick: keep yielding unless I am clearly (1.5 m) nearer.
+                d_me + RES_YIELD_MARGIN < d_mate
+            } else if mate_yielded {
+                // He yielded to me last tick: I keep the destination unless clearly farther.
+                d_me <= d_mate + RES_YIELD_MARGIN
+            } else {
+                d_me < d_mate || (d_me == d_mate && idx < j)
+            };
+            if keep {
                 continue;
             }
+            yielded_to = j as u8;
             let away = target - rj;
             let dir = if away.len() > Fp::from_milli(200) {
                 away.normalize_or_zero()
@@ -4285,13 +5718,15 @@ fn reserve_destination(
             break;
         }
     }
-    target
+    (target, yielded_to)
 }
 
 /// While the keeper is committed, the corridor from the keeper to his claim point (extended 1.5 m
 /// past it, half-width 1.8 m / 1.5 m in 5v5) is reserved: a defender whose target or position is
 /// inside steps aside laterally to 1.2 m outside the corridor, on the side he is already on.
-fn keeper_corridor_yield(gk: Vec2, claim: Vec2, target: Vec2, me: Vec2, is_5v5: bool) -> Option<Vec2> {
+/// Round 4: the side is sticky for the episode (`sticky` = the sign chosen earlier, `0` = free),
+/// so a defender near the keeper->claim line cannot flip sides; returns the target and the side.
+fn keeper_corridor_yield(gk: Vec2, claim: Vec2, target: Vec2, me: Vec2, is_5v5: bool, sticky: i8) -> Option<(Vec2, i8)> {
     let half_w = Fp::from_milli(if is_5v5 { 1_500 } else { 1_800 });
     let dir = (claim - gk).normalize_or_zero();
     if dir == Vec2::ZERO {
@@ -4308,10 +5743,17 @@ fn keeper_corridor_yield(gk: Vec2, claim: Vec2, target: Vec2, me: Vec2, is_5v5: 
         return None;
     }
     let lat_me = (me - gk).dot(perp);
-    let sgn = if lat_me >= Fp::ZERO { Fp::ONE } else { Fp::NEG_ONE };
+    let sg: i8 = if sticky != 0 {
+        sticky
+    } else if lat_me >= Fp::ZERO {
+        1
+    } else {
+        -1
+    };
+    let sgn = Fp::from_int(i32::from(sg));
     let base = if inside(target) { target } else { me };
     let along = (base - gk).dot(dir).clamp(Fp::ZERO, len);
-    Some(gk + dir.scale(along) + perp.scale(sgn.mul(half_w + Fp::from_milli(1_200))))
+    Some((gk + dir.scale(along) + perp.scale(sgn.mul(half_w + Fp::from_milli(1_200))), sg))
 }
 
 /// Continuous loose-ball intercept for an outfield chaser: linearly interpolates the zero crossing

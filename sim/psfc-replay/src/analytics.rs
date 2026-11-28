@@ -66,6 +66,8 @@ const SUPPORT_MAX_M: f64 = 30.0;
 const LANE_CLEAR_M: f64 = 1.5;
 const FORWARD_OPTION_M: f64 = 3.0;
 const RUN_BEHIND_MPS: f64 = 5.0;
+/// Round 4: a committed run ended before this many ticks counts as abandoned (work area 5).
+const RUN_ABANDON_TICKS: u32 = 60;
 /// A runner who crossed the line must drop this far behind it again before a new run can count.
 const RUN_REARM_M: f64 = 1.0;
 const CLUSTER_PAIR_M: f64 = 4.0;
@@ -508,6 +510,20 @@ struct SideAcc {
     sup_runs: u64,
     /// Per slot: 0 = not armed, 1 = armed (at/behind the line), 2 = crossed (re-arm 1 m behind).
     run_state: Vec<u8>,
+    /// Round 4 (work area 3): committed runs seen last open-play tick, per slot `(role, since)`
+    /// from the sim's `TeamAiMemory::run_role` / `run_since`, and abandoned runs counted.
+    run_prev: Vec<(u8, u32)>,
+    sup_run_abandon: u64,
+    /// Intended receiver of this side's pass in flight on the previous open-play tick.
+    prev_pass_to: Option<usize>,
+    /// Releases of committed runners (CPU pass decision or a pass launched toward the runner),
+    /// the last CPU release stamp seen, and the release passes pending / launched / completed.
+    sup_releases: u64,
+    rel_last_stamp: u32,
+    rel_last_cpu: Option<(usize, u32)>,
+    rel_pending: Option<usize>,
+    rel_passes: u64,
+    rel_completed: u64,
     /// Last open-play outfield-carrier sample: (carrier idx, tick, open-lane mask of teammates).
     last_carrier: Option<(usize, u32, u32)>,
     /// Pass in progress: (passer idx, open-lane mask at the last carrier sample).
@@ -803,6 +819,13 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     a.trans_shape_static_excluded += u64::from(!ep.static_done);
                 }
                 a.run_state.iter_mut().for_each(|r| *r = 0);
+                // A stoppage ends committed runs without counting them as abandoned.
+                a.run_prev.iter_mut().for_each(|r| *r = (0, 0));
+                // A release pass ended by a stoppage (offside, out of play) is not completed.
+                if a.rel_pending.take().is_some() {
+                    a.rel_passes += 1;
+                }
+                a.prev_pass_to = None;
                 a.last_carrier = None;
                 a.pending_pass = None;
             }
@@ -967,17 +990,88 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 a.run_state = vec![0; players.len()];
             }
             let own_carrier = carrier.filter(|&(cs, _)| cs == side).map(|(_, ci)| ci);
-            // Runs in behind: while this side owns the ball (any player, GK included).
-            match (own_carrier, second_last_proj(st, opp, sign)) {
-                (Some(ci), Some(line)) => {
+            // Run abandon (round 4): a committed run (sim run role) that ends, or is replaced,
+            // within RUN_ABANDON_TICKS of its start while the opponent does not own the ball and
+            // the runner neither owns the ball nor is the receiver of our pass in flight.
+            {
+                let mems = st.ai_memory.borrow();
+                let m = &mems[s];
+                if a.run_prev.len() != players.len() {
+                    a.run_prev = vec![(0, 0); players.len()];
+                }
+                // A loose ball with no pass of ours in flight counts as possession lost.
+                let opp_owns = carrier.is_some_and(|(cs, _)| cs != side)
+                    || (carrier.is_none() && st.ball.pass_in_flight.as_ref().is_none_or(|pf| pf.team != side));
+                let pass_to = st.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side).map(|pf| pf.intended_receiver_idx);
+                for j in 0..players.len() {
+                    let now = (m.run_role.get(j).copied().unwrap_or(0), m.run_since.get(j).copied().unwrap_or(0));
+                    let (prole, psince) = a.run_prev[j];
+                    if prole != 0 && now != (prole, psince) {
+                        let age = st.tick.wrapping_add(1).wrapping_sub(psince);
+                        let received = own_carrier == Some(j) || pass_to == Some(j);
+                        if age < RUN_ABANDON_TICKS && !opp_owns && !received {
+                            a.sup_run_abandon += 1;
+                        }
+                    }
+                    a.run_prev[j] = now;
+                }
+            }
+            let pass_to = st.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side).map(|pf| pf.intended_receiver_idx);
+            // Releases (work area 3): a CPU pass decision selecting a committed runner, or a pass
+            // launched toward a penetrate / called runner that no CPU release preceded.
+            {
+                let mems = st.ai_memory.borrow();
+                let m = &mems[s];
+                if m.run_release != 0 && m.run_release_tick != a.rel_last_stamp {
+                    a.rel_last_stamp = m.run_release_tick;
+                    a.rel_last_cpu = Some((m.run_release as usize, st.tick));
+                    a.sup_releases += 1;
+                }
+                if let Some(pf) = st.ball.pass_in_flight.as_ref().filter(|pf| pf.team == side && a.prev_pass_to != Some(pf.intended_receiver_idx)) {
+                    let r = pf.intended_receiver_idx;
+                    let role = m.run_role.get(r).copied().unwrap_or(0);
+                    let cpu_released = a.rel_last_cpu.is_some_and(|(ri, t)| ri == r && st.tick.saturating_sub(t) <= 60);
+                    // A ground or through pass (recent_kick_kind 1 / 2): a lofted switch that
+                    // happens to find a committed runner does not release a held run.
+                    let kind = players.get(pf.passer_idx).map_or(0, |k| k.recent_kick_kind);
+                    if cpu_released || ((role == 1 || role == 5) && (kind == 1 || kind == 2)) {
+                        if !cpu_released {
+                            a.sup_releases += 1;
+                        }
+                        a.rel_pending = Some(r);
+                    }
+                }
+            }
+            if let Some(r) = a.rel_pending {
+                if let Some((cs, ci)) = carrier {
+                    a.rel_passes += 1;
+                    a.rel_completed += u64::from(cs == side && ci == r);
+                    a.rel_pending = None;
+                }
+            }
+            // Runs in behind: while this side owns the ball (any player, GK included), and while
+            // our pass is in flight for its intended receiver, whose reception tick also counts.
+            match (own_carrier.is_some() || pass_to.is_some(), second_last_proj(st, opp, sign)) {
+                (true, Some(line)) => {
                     for (j, p) in players.iter().enumerate() {
-                        if j == 0 || j == ci || p.sent_off {
+                        if j == 0 || p.sent_off {
                             a.run_state[j] = 0;
+                            continue;
+                        }
+                        if own_carrier.is_none() && pass_to != Some(j) {
                             continue;
                         }
                         let proj = f(p.pos.x) * sign;
                         let v = v2(p.vel);
                         let sp = (v.0 * v.0 + v.1 * v.1).sqrt();
+                        if own_carrier == Some(j) {
+                            // Reception tick of the pass he was running onto.
+                            if a.prev_pass_to == Some(j) && a.run_state[j] == 1 && proj > line && sp > RUN_BEHIND_MPS {
+                                a.sup_runs += 1;
+                            }
+                            a.run_state[j] = 0;
+                            continue;
+                        }
                         match a.run_state[j] {
                             0 if proj <= line => a.run_state[j] = 1,
                             1 if proj > line => {
@@ -993,6 +1087,7 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 }
                 _ => a.run_state.iter_mut().for_each(|r| *r = 0),
             }
+            a.prev_pass_to = pass_to;
             let Some(ci) = own_carrier.filter(|&ci| ci != 0) else {
                 continue;
             };
@@ -1928,6 +2023,11 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
         }
         put_mean(m, "support.nearest_option_dist_m", a.sup_nearest, 1.0);
         m.insert("support.runs_in_behind_per_10min".into(), per10(a.sup_runs));
+        m.insert("support.run_abandon_per_10min".into(), per10(a.sup_run_abandon));
+        m.insert("support.releases_per_10min".into(), per10(a.sup_releases));
+        if a.rel_passes > 0 {
+            m.insert("support.release_pass_completed_pct".into(), pct(a.rel_completed, a.rel_passes));
+        }
         m.insert(
             "support.passes_completed_tracked".into(),
             a.passes_completed as f64,
@@ -2158,7 +2258,10 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ("support.open_options_mean / open_options_p10 / ticks_with_le1_option_pct", "Number of open options per carrier tick: mean, 10th percentile (nearest rank) across carrier ticks, and % of carrier ticks with 0 or 1 open option."),
         ("support.nearest_option_dist_m", "Mean distance carrier -> nearest open option, over carrier ticks with at least one open option."),
         ("support.forward_options_mean", "Mean number of open options at least 3 m ahead of the carrier along the attacking axis ((x_mate - x_carrier) * attack_sign >= 3)."),
-        ("support.runs_in_behind_per_10min", "Per outfielder other than the owner, on open-play ticks while his side owns the ball (any owner incl. GK), against the line L = second-last opponent's x along the attacking axis on that tick: a run counts when the player was at or behind L on an earlier such tick (armed) and is now ahead of L with |vel| > 5 m/s. After crossing (counted or not) he must drop more than 1 m behind L to be armed again; losing possession or a stoppage disarms everyone. Count per 10 open-play minutes."),
+        ("support.runs_in_behind_per_10min", "Per outfielder other than the owner, on open-play ticks while his side owns the ball (any owner incl. GK), against the line L = second-last opponent's x along the attacking axis on that tick: a run counts when the player was at or behind L on an earlier such tick (armed) and is now ahead of L with |vel| > 5 m/s. Since the work-area-3 second pass, the ticks of the side's own pass in flight also count for the pass's intended receiver (the other players' states are held), and so does the reception tick on which that receiver becomes the owner. After crossing (counted or not) he must drop more than 1 m behind L to be armed again; losing possession or a stoppage disarms everyone. Count per 10 open-play minutes."),
+        ("support.run_abandon_per_10min", "Round 4 (work area 3). Committed runs abandoned per 10 open-play minutes: a run role in the sim's TeamAiMemory (run_role / run_since: penetrate, support-from-behind, box, decoy, called) that ends or is replaced fewer than 60 ticks after it began, on an open-play tick on which the opponent does not own the ball, the ball is not loose (no owner and no pass of the side in flight), and the runner neither owns it nor is the intended receiver of the side's pass in flight. Runs ended by a stoppage (non-open-play tick), by possession loss, or by receiving the ball are not abandons (FIFA 12's 'change their minds three or four times' failure)."),
+        ("support.releases_per_10min", "Round 4 (work area 3). Releases of committed runners per 10 open-play minutes: a CPU pass decision selecting a committed runner (TeamAiMemory::run_release with a new run_release_tick), or a ground or through pass of the side (the passer's recent_kick_kind 1 or 2; lofted switches excluded) launched toward a penetrate or called runner (run_role 1 or 5) that no CPU release of the same runner preceded within 60 ticks."),
+        ("support.release_pass_completed_pct", "% of passes launched toward a released / committed runner (as counted for releases_per_10min) whose next open-play owner is that runner; an opponent owning it, another teammate collecting it, or a stoppage (offside, out of play) before any owner is a failure."),
         ("support.cluster_pct", "% of carrier ticks where two outfield teammates other than the carrier are within 4 m of each other and both within 15 m of the carrier."),
         ("support.width_m / support.depth_m", "y-extent / x-extent of the side's on-pitch outfielders (carrier included) on carrier ticks, mean."),
         ("support.carrier_pct_of_open_play", "Carrier ticks as % of the side's open-play ticks (sample size of the support metrics)."),
