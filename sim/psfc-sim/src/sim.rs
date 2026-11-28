@@ -116,6 +116,7 @@ impl MatchSimulation {
                     overlap_ticks: 0,
                     yellow_cards: 0,
                     sent_off: false,
+                    steer_debug: crate::state::SteerDebug::default(),
                 });
                 stats.push(PlayerMatchStats {
                     footballer_id: p.footballer_id.clone(),
@@ -196,6 +197,7 @@ impl MatchSimulation {
                 shootout_score: None,
                 gk_brain: [crate::state::GoalkeeperBrain::default(); 2],
                 ai_memory: Default::default(),
+                steer_memory: Default::default(),
                 pending_events: Vec::new(),
                 recorded_events: Vec::new(),
             },
@@ -336,6 +338,8 @@ impl MatchSimulation {
         // Taken here, both sides are seen with the classes refined during the previous tick, and the
         // velocity stage stays independent of the stepping order.
         let avoid_frame = crate::avoidance::build_frame(&self.state);
+        // Steering memory (WA1): size it for this frame and age the per-pair passing sides.
+        crate::avoidance::begin_tick(&mut self.state.steer_memory, &avoid_frame);
 
         let home_in = match self.state.rules.home_controller {
             SideController::Human => external_inputs[0],
@@ -3811,6 +3815,7 @@ impl MatchSimulation {
                         _ => move_dir.scale(top_speed),
                     };
                     let human_driven = is_controlled && !side_is_cpu;
+                    let dbg_desired = desired_vel;
                     // Predictive local avoidance on the DESIRED velocity, before any motion limit:
                     // AI outfielders get the full sampled reciprocal selection, human-controlled
                     // players only a bounded lateral adjustment, the ball carrier is never steered.
@@ -3822,17 +3827,31 @@ impl MatchSimulation {
                         if human_driven {
                             crate::avoidance::human_adjust(avoid_frame, a_id, desired_vel, top_speed)
                         } else {
-                            crate::avoidance::select_velocity(avoid_frame, a_id, desired_vel, top_speed)
+                            crate::avoidance::select_velocity_mem(
+                                avoid_frame,
+                                &mut self.state.steer_memory,
+                                current_tick,
+                                a_id,
+                                desired_vel,
+                                top_speed,
+                            )
                         }
                     } else {
                         desired_vel
                     };
-                    // Movement model (outfield): low-pass the velocity COMMAND of AI/CPU-driven
-                    // players so it cannot flip sign tick to tick. Human-controlled players and
-                    // ball carriers are never filtered (input latency unchanged).
+                    let dbg_selected = desired_vel;
+                    // Movement model (outfield): second-order steering filter on the velocity COMMAND
+                    // of AI/CPU-driven players (the CPU ball carrier with the shorter smoothing
+                    // time), so it cannot flip sign tick to tick. Human-controlled players are
+                    // never filtered (input latency unchanged). The intended receiver of a pass in
+                    // flight is filtered with the short time while the ball is still far, and not
+                    // at all within ai::RECEIVER_UNFILTERED_MM of the ball, where he must meet the ball's line
+                    // exactly (filtering him there cost 5v5 pass completion).
+                    let receiver_close = my_pass_target.is_some()
+                        && p.pos.dist(ball_xy_now) < Fp::from_milli(crate::ai::RECEIVER_UNFILTERED_MM);
                     let desired_vel = if !is_gk
                         && !human_driven
-                        && !has_ball
+                        && !receiver_close
                         && matches!(p.action, PlayerActionState::Normal)
                     {
                         let mut mems = self.state.ai_memory.borrow_mut();
@@ -3842,10 +3861,20 @@ impl MatchSimulation {
                             idx,
                             current_tick,
                             &p.attributes,
+                            // Short lag while the avoidance stage is steering (it changed the
+                            // command): the dodge must not be delayed into contact.
+                            has_ball || my_pass_target.is_some() || dbg_selected != dbg_desired,
                             desired_vel,
                         )
                     } else {
                         desired_vel
+                    };
+                    // Diagnostics only (never hashed or read back): the side-flip cause split.
+                    p.steer_debug = crate::state::SteerDebug {
+                        tick: current_tick,
+                        desired: dbg_desired,
+                        selected: dbg_selected,
+                        filtered: desired_vel,
                     };
                     let vel_before = p.vel;
 

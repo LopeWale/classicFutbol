@@ -11,13 +11,16 @@ Tests: `sim/psfc-sim/tests/avoidance.rs`.
 ## Pipeline per tick
 
 ```
+tick
+  build_frame(state)            snapshot pos/vel/class of all 22 players, once, before the CPU
+                                input generators and before anyone moves
+  avoidance::begin_tick         size SteerMemory, age the per-pair passing sides
 step_all_players
-  build_frame(state)            snapshot pos/vel/class of all 22 players, once, before anyone moves
   for each player (id order):
-    AI intent / stick -> desired_vel           (unchanged)
-    avoidance on desired_vel                   AI: select_velocity   human: human_adjust
+    AI intent / stick -> desired_vel           (chaser intercept anti-dither, carrier evade dwell)
+    avoidance on desired_vel                   AI: select_velocity_mem   human: human_adjust
                                                carrier, GK, scripted actions: untouched
-    filter_velocity_command (AI, unchanged)    low-pass of the command
+    filter_velocity_command (AI/CPU, not human) second-order direction filter + speed low-pass
     motion limits                              AI off-ball: avoidance::motion_step (two-regime a(v))
                                                others: unchanged base_accel + limit_turn_rate
     contact_constrain                          drop only the closing component into a touching body
@@ -69,9 +72,24 @@ Q32.32.
 - Inside a comfort disc: closing or passing through counts as an immediate hit; separating costs by
   time to exit. (Detour's `-tmin/2` rewarded running straight through a teammate.)
 - Side preference: keep the neighbour on the side it already lies on relative to the approach
-  velocity, ties keep it on the left. Both agents make the complementary choice, it is stable as
-  the pair diverges, and no per-pair state is needed. (Detour's area test with current velocities
-  flipped sides every tick in a symmetric head-on.)
+  velocity, ties keep it on the left. Both agents make the complementary choice and it is stable as
+  the pair diverges. (Detour's area test with current velocities flipped sides every tick in a
+  symmetric head-on.)
+- Steering memory (round 5, WA1; `state::SteerMemory`, serialized and hashed, indexed by frame id):
+  - lateral-sign flip penalty `weightFlip 0.75`: a candidate whose lateral component versus the
+    heading (dead band 0.05 m/s) has the opposite sign to the previous tick's selection pays 0.75;
+  - exact cost ties break on the squared distance to the previous selection, never on evaluation
+    order;
+  - committed lateral sign: once the sampler steers to a side it holds it for 10 ticks (an
+    opposite-side candidate pays 3.0) unless the current velocity hits a comfort disc within 0.3 s
+    or the bodies touch;
+  - per-pair passing side: HRVO determinant `det(p_j - p_i, v_i - v_j)` at first contact (current
+    velocities, so both agents of the pair read the same value; exact ties take the canonical `+`
+    side, which both agents agree on because the determinant is swap-invariant), cleared when the
+    pair is past nearest approach or after 60 ticks without interaction. Its penalty
+    `W_SIDE_MEM_MILLI` is **0** in this build: at 0.75 it measured slightly worse (more sampler
+    flips, more teammate contact) than without it, so only the bookkeeping runs.
+- `select_velocity` (no memory) is kept for tests and tools; the sim calls `select_velocity_mem`.
 - Comfort distance: 1.0 m between teammates, 0.85 m between opponents (markers and challengers may
   reach tackling range), plus `2 ticks x |v_rel|` (max 0.3 m) for the limiter lag.
 - Giving way (any higher-class neighbour): `w_des x 0.4`, `w_toi x 2`, the report's `w_priority`.
@@ -125,7 +143,12 @@ hashed) gets a 15 mm lateral nudge along the contact tangent (FC 26 "moved to th
 | Neighbours | 8, by (dist^2, id) | - | Detour default 6 (official), report 6-8 |
 | Frame-offset instances | 4 / 8 / 12 | frames | EA patent examples (official) |
 | Samples | 17 x 3 = 51 | - | estimate (report), Detour 75 |
-| velBias / w_des / w_cur / w_side / w_toi | 0.4 / 2.0 / 0.75 / 0.75 / 2.5 | - | Detour defaults (official) |
+| velBias / w_des / w_cur / w_side / w_toi | 0.6 / 2.0 / 1.25 / 0.75 / 2.5 | - | Detour defaults 0.4 / 2.0 / 0.75 / 0.75 / 2.5 [code]; velBias and w_cur raised in round 5 [estimate] |
+| Flip penalty / lateral dead band | 0.75 / 0.05 m/s | - | estimate on the Detour scale |
+| Lateral dwell / dwell penalty / override | 10 ticks / 3.0 / TTC < 0.3 s or touching | - | estimate; Hespanha dwell caveat [peer-reviewed] |
+| Per-pair side memory weight / idle clear | 0 (0.75 tried) / 60 ticks | - | HRVO det test [code]; weight measured |
+| Steering filter T (direction) | 0.15 s; 0.09 s for carrier, receiver, < 2.5 m/s, or while avoiding | s | Juckett closed form [code]; T estimate |
+| Steering filter speed low-pass | k = 0.25 + 0.002 agility per tick | - | previous first-order filter |
 | Equal-class share | 0.7 | - | estimate, tuned (RVO 0.5) |
 | Yield multipliers w_des / w_toi | 0.4 / 2.0 | - | estimate, tuned (report "w_priority") |
 | Human gate / forward floor / lateral cap | 1.5 m/s / 90% / 30% | - | estimate |
@@ -169,8 +192,8 @@ those bounds sit inside seed noise, and any change to player motion reshuffles t
 
 ## Left out
 
-- Area I's `crate::ai::move_priority`: the fallback classifier stands in; swap it in at
-  `avoidance::priority_class` (one call site).
+- (Resolved) `avoidance::priority_class` calls `crate::ai::move_priority`; there is no fallback
+  classifier any more.
 - The report's full high-speed taper (about 1 m/s^2 above 6.25 m/s, 3.3-4.1 s to top speed): it
   made AI defenders lag their anchors (11v11 settled DEF 4.5 m over 8 seeds) because
   `ai::estimate_ticks_to_point` still assumes the fast model. Adopt it together with an
@@ -178,7 +201,22 @@ those bounds sit inside seed noise, and any change to player motion reshuffles t
 - A braking gate for AI ball carriers (sprint-to-dribble fast stop only for Agility/Dribbling
   >= 80) was tried and removed: it shifted possession dynamics enough to push 5v5 settled anchor
   distances well outside the team-shape bounds. Human carrier response is unchanged.
-- Per-pair side-bit hysteresis (stateless side rule instead), foot-plant budget, per-player mass
+- Per-pair side-bit hysteresis is implemented (round 5) but weighted 0 (see above); foot-plant budget, per-player mass
   from height, keeper arbiter, a jockey max-speed mode, spam penalty for repeated challenges.
 - The renderer still reads the push-out displacement as position; blending it as a small root
   offset over a few frames (Detour arrangement) is renderer work.
+
+## Round 5 (WA1): steering filter and decision-side anti-dither
+
+`ai::filter_velocity_command` replaces the first-order low-pass with a critically damped
+second-order filter on the command direction (closed-form Juckett coefficients precomputed for
+`dt = 1/60`, see the constants in ai.rs) and keeps a first-order low-pass on the speed (without it
+`move.speed_oscillation_pct` rose by a third). It now also runs for the CPU ball carrier (short `T`) and for the
+intended receiver of a pass while the ball is more than 5 m away (short `T`; unfiltered closer),
+never for the human-controlled player. Decision side:
+`chase_intent` keeps the previous intercept point unless the new one moved more than
+`min(0.4 m, 15% of the distance)`, with 1.5 / 1.9 m hysteresis on the attack-the-ball mode; the
+CPU carrier's evade side (`evade_stride`) holds for 18 ticks and then needs a 0.2 score margin.
+Diagnostics: `PlayerState::steer_debug` (desired / selected / filtered velocity) is
+`#[serde(skip)]`, not hashed and never read by the sim; `psfc-replay analyze` uses it for
+`move.side_flips_cause.*`. Measurements: `docs/steering-oscillation.md`.

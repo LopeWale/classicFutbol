@@ -18,7 +18,7 @@
 use crate::config::TeamSide;
 use crate::math::{angle_diff_bam, turn_toward_bam, Fp, Vec2};
 use crate::snapshot::PlayerAttributes;
-use crate::state::{MatchPhase, MatchState, PlayerActionState};
+use crate::state::{MatchPhase, MatchState, PlayerActionState, SteerMemory};
 
 // ---------------------------------------------------------------------------------------------
 // Parameters (units in the names; evidence labels in docs/avoidance-and-contact.md)
@@ -49,12 +49,34 @@ pub const MAX_NEIGHBOURS: usize = 8;
 pub const PREDICT_FRAMES: [i64; 3] = [4, 8, 12];
 /// Sampling depth of the adaptive pattern (`17` samples per level).
 pub const SAMPLE_DEPTH: usize = 3;
-/// DetourCrowd defaults.
-pub const VEL_BIAS_MILLI: i64 = 400;
+/// DetourCrowd sampler weights. Detour ships `velBias 0.4` (0.5 in the demo presets) and
+/// `weightCurVel 0.75` [code]; WA1 raises both (`0.6`, `1.25`) so a single tick cannot jump between
+/// mirror-image samples as easily [estimate]. `weightDesVel 2.0`, `weightSide 0.75` and
+/// `weightToi 2.5` stay at the Detour defaults [code].
+pub const VEL_BIAS_MILLI: i64 = 600;
 pub const W_DES_MILLI: i64 = 2_000;
-pub const W_CUR_MILLI: i64 = 750;
+pub const W_CUR_MILLI: i64 = 1_250;
 pub const W_SIDE_MILLI: i64 = 750;
 pub const W_TOI_MILLI: i64 = 2_500;
+/// WA1 lateral-sign flip penalty: a candidate whose lateral component (versus the heading) has the
+/// opposite sign to the previous tick's selection costs `weightFlip` (Detour scale: equal to
+/// `weightSide`, below `weightDesVel` and `weightToi`, so safety still wins) [estimate on the Detour
+/// scale, code]. Lateral components within `FLIP_EPS` count as no side [estimate].
+pub const W_FLIP_MILLI: i64 = 750;
+pub const FLIP_EPS_MM_S: i64 = 50;
+/// WA1 per-pair passing side (HRVO `det(p_j - p_i, v_pref_i - v_pref_j)` at first contact [code]):
+/// candidates passing the remembered neighbour on the other side cost `weightSideMem` [estimate].
+/// The memory clears when the pair separates (nearest-approach time < 0, OpenSteer [code]) or after
+/// `SIDE_MEM_IDLE_TICKS` ticks without interaction [estimate].
+pub const W_SIDE_MEM_MILLI: i64 = 0;
+pub const SIDE_MEM_IDLE_TICKS: u8 = 60;
+/// WA1 committed lateral sign: once the sampler steers to one side it holds that side for
+/// `DWELL_TICKS` (half a stride at 3-9 m/s) unless the time to collision on the current velocity
+/// falls below `DWELL_OVERRIDE_TTC_MS` or the bodies already touch (Hespanha's dwell caveat
+/// [peer-reviewed]; values [estimate]). Holding = an opposite-side candidate costs `W_DWELL`.
+pub const DWELL_TICKS: u8 = 10;
+pub const W_DWELL_MILLI: i64 = 3_000;
+pub const DWELL_OVERRIDE_TTC_MS: i64 = 300;
 /// Push-out: slop, relaxation, iterations, per-tick cap.
 pub const PUSH_SLOP_MM: i64 = 10;
 pub const PUSH_RELAX_MILLI: i64 = 600;
@@ -212,6 +234,8 @@ pub fn priority_classes(state: &MatchState) -> [Vec<u8>; 2] {
 
 #[derive(Clone, Copy)]
 struct Circle {
+    /// Frame id of the neighbour (per-pair side memory index).
+    id: usize,
     pos: Vec2,
     vel: Vec2,
     r: Fp,
@@ -328,6 +352,7 @@ fn gather(frame: &Frame, id: usize, v_des: Vec2) -> (Vec<Circle>, bool) {
             .mul(Fp::from_ratio(LAG_TICKS, 60))
             .min(Fp::from_milli(300));
         out.push(Circle {
+            id: j,
             pos: o.pos,
             vel: o.vel,
             r: pair_radius(&me, &o) + margin,
@@ -371,7 +396,35 @@ fn threatened(me: &Agent, circles: &[Circle], v: Vec2) -> bool {
     false
 }
 
-/// Detour `processSample`: cost of candidate velocity `vc`.
+/// Steering memory of one agent for this tick's selection (WA1 hysteresis terms).
+struct SteerCtx {
+    /// Unit heading the lateral components are measured against (zero = no lateral terms).
+    heading: Vec2,
+    /// Lateral sign of the previous tick's selection (`0` = none).
+    lat_sign: i8,
+    /// Committed lateral sign while the dwell holds (`0` = none or overridden).
+    dwell_sign: i8,
+    /// Remembered passing side per circle (`0` none, `1` det > 0, `-1` det < 0).
+    sides: Vec<i8>,
+    /// Previous selected velocity (deterministic tie-break).
+    prev_sel: Vec2,
+}
+
+/// Sign of the lateral component of `v` versus the unit `heading` (`0` inside the dead band).
+#[inline]
+fn lat_sign_of(heading: Vec2, v: Vec2) -> i8 {
+    let l = cross(heading, v);
+    if l > Fp::from_milli(FLIP_EPS_MM_S) {
+        1
+    } else if l < Fp::from_milli(-FLIP_EPS_MM_S) {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Detour `processSample`: cost of candidate velocity `vc` (`None` = pruned, cannot beat `best`).
+#[allow(clippy::too_many_arguments)]
 fn sample_cost(
     me: &Agent,
     circles: &[Circle],
@@ -380,18 +433,40 @@ fn sample_cost(
     inv_vmax: Fp,
     best: Fp,
     (w_des, w_toi): (Fp, Fp),
-) -> Fp {
+    ctx: Option<&SteerCtx>,
+) -> Option<Fp> {
     let horizon = Fp::from_milli(HORIZON_MS);
     let vpen = w_des.mul((vc - v_des).len().mul(inv_vmax));
     let vcpen = Fp::from_milli(W_CUR_MILLI).mul((vc - me.vel).len().mul(inv_vmax));
-    let base = vpen + vcpen;
-    if base >= best {
-        return best;
+    let mut base = vpen + vcpen;
+    if let Some(cx) = ctx {
+        let ls = lat_sign_of(cx.heading, vc);
+        if ls != 0 && cx.lat_sign != 0 && ls != cx.lat_sign {
+            base += Fp::from_milli(W_FLIP_MILLI);
+        }
+        if ls != 0 && cx.dwell_sign != 0 && ls != cx.dwell_sign {
+            base += Fp::from_milli(W_DWELL_MILLI);
+        }
+    }
+    if base > best {
+        return None;
     }
     let mut tmin = horizon;
     let mut side = Fp::ZERO;
-    for c in circles {
+    let mut mem_n = 0_i64;
+    let mut mem_bad = 0_i64;
+    for (k, c) in circles.iter().enumerate() {
         let vab = rel_vel(me, c, vc);
+        if let Some(cx) = ctx {
+            let want = cx.sides.get(k).copied().unwrap_or(0);
+            if want != 0 {
+                mem_n += 1;
+                let d = cross(c.pos - me.pos, vab);
+                if (d > Fp::from_milli(10) && want < 0) || (d < Fp::from_milli(-10) && want > 0) {
+                    mem_bad += 1;
+                }
+            }
+        }
         let s1 = c.dp.dot(vab).mul(Fp::HALF) + Fp::HALF;
         let s2 = c.np.dot(vab).mul(Fp::from_int(2));
         side += s1.min(s2).clamp(Fp::ZERO, Fp::ONE);
@@ -419,8 +494,13 @@ fn sample_cost(
         side = side.div(Fp::from_int(circles.len() as i32));
     }
     let spen = Fp::from_milli(W_SIDE_MILLI).mul(side);
+    let mpen = if mem_n > 0 {
+        Fp::from_milli(W_SIDE_MEM_MILLI).mul(Fp::from_ratio(mem_bad, mem_n))
+    } else {
+        Fp::ZERO
+    };
     let tpen = w_toi.div(Fp::from_milli(100) + tmin.div(horizon));
-    base + spen + tpen
+    Some(base + spen + mpen + tpen)
 }
 
 /// Sample pattern `(bam offset from the desired heading, radius permille)`: centre, ring of 8 at
@@ -445,7 +525,7 @@ const PATTERN: [(i32, i64); 17] = [
     (-28_672, 500),
 ];
 
-fn solve(me: &Agent, circles: &[Circle], v_des: Vec2, v_max: Fp) -> Vec2 {
+fn solve(me: &Agent, circles: &[Circle], v_des: Vec2, v_max: Fp, ctx: Option<&SteerCtx>) -> Vec2 {
     let inv_vmax = Fp::ONE.div(v_max);
     // Giving way to a higher class: the desired-velocity weight is scaled down (report: w_priority).
     let yielding = circles.iter().any(|c| c.full);
@@ -478,6 +558,10 @@ fn solve(me: &Agent, circles: &[Circle], v_des: Vec2, v_max: Fp) -> Vec2 {
     let mut res = v_des.scale(Fp::from_milli(VEL_BIAS_MILLI));
     let mut cr = v_max.mul(Fp::from_milli(1_000 - VEL_BIAS_MILLI));
     let mut best = Fp::from_int(1_000_000);
+    // Exact ties break on the distance to the previous selection (ClearPath: pass on the side
+    // closest to the current velocity), never on evaluation order.
+    let tie_ref = ctx.map_or(me.vel, |c| c.prev_sel);
+    let mut best_d2 = Fp::from_int(1_000_000);
     for _ in 0..SAMPLE_DEPTH {
         let mut bvel = res;
         for u in &units {
@@ -485,9 +569,13 @@ fn solve(me: &Agent, circles: &[Circle], v_des: Vec2, v_max: Fp) -> Vec2 {
             if vc.len_sq() > vmax_sq {
                 continue;
             }
-            let pen = sample_cost(me, circles, vc, v_des, inv_vmax, best, weights);
-            if pen < best {
+            let Some(pen) = sample_cost(me, circles, vc, v_des, inv_vmax, best, weights, ctx) else {
+                continue;
+            };
+            let d2 = (vc - tie_ref).len_sq();
+            if pen < best || (pen == best && d2 < best_d2) {
                 best = pen;
+                best_d2 = d2;
                 bvel = vc;
             }
         }
@@ -511,7 +599,129 @@ pub fn select_velocity(frame: &Frame, id: usize, v_des: Vec2, v_max: Fp) -> Vec2
         return v_des;
     }
     let v_max = v_max.max(v_des.len()).max(Fp::from_milli(1_000));
-    solve(&me, &circles, v_des, v_max)
+    solve(&me, &circles, v_des, v_max, None)
+}
+
+/// Age the per-pair side memory once per tick (before any selection): every remembered pair that
+/// is not refreshed by an interaction this tick is one tick older; at `SIDE_MEM_IDLE_TICKS` it is
+/// forgotten. Also sizes the tables for this frame.
+pub fn begin_tick(mem: &mut SteerMemory, frame: &Frame) {
+    mem.ensure_len(frame.agents.len());
+    for e in &mut mem.pair {
+        if *e & 3 == 0 {
+            *e = 0;
+            continue;
+        }
+        let idle = (*e >> 2) + 1;
+        *e = if idle >= SIDE_MEM_IDLE_TICKS {
+            0
+        } else {
+            (*e & 3) | (idle << 2)
+        };
+    }
+}
+
+/// [`select_velocity`] with the WA1 steering memory (call [`begin_tick`] first on every tick):
+/// lateral-sign flip penalty against the previous selection, deterministic tie-break, per-pair
+/// remembered passing side and a committed lateral-sign dwell with a safety override. The memory
+/// row of `id` is updated with this tick's selection.
+pub fn select_velocity_mem(
+    frame: &Frame,
+    mem: &mut SteerMemory,
+    tick: u32,
+    id: usize,
+    v_des: Vec2,
+    v_max: Fp,
+) -> Vec2 {
+    let n = frame.agents.len();
+    let Some(me) = frame.agents.get(id).copied() else {
+        return v_des;
+    };
+    if mem.sel_tick.len() != n || mem.pair.len() != n * n {
+        mem.ensure_len(n);
+    }
+    if me.class == CLASS_LOCKED || !me.active {
+        mem.sel_tick[id] = 0;
+        mem.lat_sign[id] = 0;
+        mem.dwell_sign[id] = 0;
+        mem.dwell_left[id] = 0;
+        return v_des;
+    }
+    let continuous = mem.sel_tick[id] != 0 && mem.sel_tick[id].wrapping_add(1) == tick;
+    if !continuous {
+        mem.lat_sign[id] = 0;
+        mem.dwell_sign[id] = 0;
+        mem.dwell_left[id] = 0;
+        mem.prev_sel[id] = me.vel;
+    }
+    let heading = if me.vel.len() > Fp::from_milli(300) {
+        me.vel.normalize_or_zero()
+    } else {
+        v_des.normalize_or_zero()
+    };
+    let (circles, _) = gather(frame, id, v_des);
+    // Per-pair passing side: refreshed by every interaction, set once at first contact, cleared as
+    // soon as the pair is past its nearest approach (and no longer touching).
+    let mut sides = Vec::with_capacity(circles.len());
+    for c in &circles {
+        let k = id * n + c.id;
+        let rel = c.pos - me.pos;
+        let w = me.vel - c.vel;
+        let receding = rel.dot(w) < Fp::ZERO && rel.len() > Fp::from_milli(2 * BODY_RADIUS_MM);
+        if receding {
+            mem.pair[k] = 0;
+            sides.push(0);
+            continue;
+        }
+        let mut e = mem.pair[k] & 3;
+        if e == 0 {
+            let det = cross(rel, me.vel - c.vel);
+            // Exact symmetry: the determinant is invariant under swapping the pair (both vectors
+            // change sign), so both agents read the same tie and the canonical side is agreed.
+            e = if det < Fp::from_milli(-10) { 2 } else { 1 };
+        }
+        mem.pair[k] = e;
+        sides.push(if e == 1 { 1 } else { -1 });
+    }
+    let dwell_active = mem.dwell_left[id] > 0;
+    mem.dwell_left[id] = mem.dwell_left[id].saturating_sub(1);
+    let out = if circles.is_empty() || !threatened(&me, &circles, v_des) {
+        v_des
+    } else {
+        // Dwell safety override: bodies touching, or the current velocity hits inside 0.3 s.
+        let body = Fp::from_milli(2 * BODY_RADIUS_MM);
+        let ttc_cap = Fp::from_milli(DWELL_OVERRIDE_TTC_MS);
+        let danger = circles.iter().any(|c| {
+            let rel = c.pos - me.pos;
+            rel.len() < body
+                || sweep(rel, c.r, me.vel - c.vel)
+                    .is_some_and(|(t0, _)| t0 >= Fp::ZERO && t0 < ttc_cap)
+        });
+        let ctx = SteerCtx {
+            heading,
+            lat_sign: mem.lat_sign[id],
+            dwell_sign: if dwell_active && !danger {
+                mem.dwell_sign[id]
+            } else {
+                0
+            },
+            sides,
+            prev_sel: mem.prev_sel[id],
+        };
+        let v_max = v_max.max(v_des.len()).max(Fp::from_milli(1_000));
+        let sel = solve(&me, &circles, v_des, v_max, Some(&ctx));
+        let ls = lat_sign_of(heading, sel);
+        if ls != 0 && (!dwell_active || ls != mem.dwell_sign[id]) {
+            mem.dwell_sign[id] = ls;
+            mem.dwell_left[id] = DWELL_TICKS;
+        }
+        sel
+    };
+    // `0` inside the +-FLIP_EPS band: a near-straight previous selection carries no side.
+    mem.lat_sign[id] = lat_sign_of(heading, out);
+    mem.prev_sel[id] = out;
+    mem.sel_tick[id] = tick;
+    out
 }
 
 /// Bounded avoidance for a human-controlled player: only while already moving (`>= 1.5 m/s`) and
@@ -533,7 +743,7 @@ pub fn human_adjust(frame: &Frame, id: usize, v_cmd: Vec2, v_max: Fp) -> Vec2 {
     if !imminent || circles.is_empty() || !threatened(&me, &circles, v_cmd) {
         return v_cmd;
     }
-    let sel = solve(&me, &circles, v_cmd, v_max.max(cmd_sp));
+    let sel = solve(&me, &circles, v_cmd, v_max.max(cmd_sp), None);
     let u = v_cmd.normalize_or_zero();
     let along = sel.dot(u);
     let fwd = along.clamp(cmd_sp.mul(Fp::from_milli(HUMAN_MIN_FORWARD_MILLI)), cmd_sp);

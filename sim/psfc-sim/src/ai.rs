@@ -1733,7 +1733,7 @@ pub fn generate_cpu_input(
                     .clamp(Fp::from_milli(-3_000), Fp::from_milli(6_000));
                 cand.dot(desired).mul(Fp::from_milli(1_400)) + wall_margin.mul(Fp::from_milli(220))
             };
-            let lateral = if score_side(perp_a) >= score_side(perp_b) {
+            let lateral = if evade_side(state, side, ctrl_idx, score_side(perp_a), score_side(perp_b)) {
                 perp_a
             } else {
                 perp_b
@@ -3538,17 +3538,63 @@ pub fn move_priority(state: &MatchState, side: TeamSide, idx: usize) -> u8 {
     m.move_class.get(idx).copied().map_or(2, |c| c.max(1))
 }
 
+/// Chaser intercept anti-dither (UvA Trilearn `WorldModelPredict`: keep the previous intercept
+/// unless the new one moved materially [code]): a new intercept point closer than
+/// `min(0.4 m, 15% of the distance to it)` to the previous tick's accepted point is not taken
+/// (0.4 m = one body radius, the WA1 re-target deadband [estimate]); the 15% bound keeps the
+/// heading error under ~9 degrees as the chaser closes in.
+const CHASE_DEADBAND_MM: i64 = 400;
+const CHASE_DEADBAND_REL_MILLI: i64 = 150;
+/// Attack-the-ball mode (aim 3 ticks ahead) enters within 1.5 m of a low ball and, with
+/// hysteresis, leaves beyond 1.9 m [estimate], so the chase point does not toggle between the
+/// two predictors at the boundary.
+const CHASE_NEAR_ENTER_MM: i64 = 1_500;
+const CHASE_NEAR_EXIT_MM: i64 = 1_900;
+
 /// Loose-ball chase for the elected AI chaser: slide along the ball path (continuous intercept),
-/// attack the ball itself once on top of it.
+/// attack the ball itself once on top of it. The accepted point is remembered per player
+/// (`steer_chase_*`, hashed) so it only moves when the new intercept moved materially; a second
+/// call on the same tick returns the same point.
 fn chase_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMoveIntent {
     let p = &state.players[side.index()][idx];
     let is_5v5 = state.format.players_per_side <= 6;
-    let chase_pt = if p.pos.dist(state.ball.pos.xy()) <= Fp::from_milli(1_500)
-        && state.ball.pos.z <= Fp::from_milli(900)
-    {
-        predict_ball_xy_at_ticks(state, 3)
+    let tick = state.tick;
+    let count = state.players[side.index()].len();
+    let (prev_pt, prev_tick, prev_near) = {
+        let mut mems = state.ai_memory.borrow_mut();
+        let m = &mut mems[side.index()];
+        m.ensure_len(count);
+        (m.steer_chase_pt[idx], m.steer_chase_tick[idx], m.steer_chase_near[idx] != 0)
+    };
+    let chase_pt = if prev_tick == tick && tick != 0 {
+        prev_pt
     } else {
-        smooth_ball_intercept(p, &sample_ball_3d_waypoints(state), is_5v5)
+        let continuous = prev_tick != 0 && prev_tick.wrapping_add(1) == tick;
+        let near_lim = if continuous && prev_near {
+            CHASE_NEAR_EXIT_MM
+        } else {
+            CHASE_NEAR_ENTER_MM
+        };
+        let near = p.pos.dist(state.ball.pos.xy()) <= Fp::from_milli(near_lim)
+            && state.ball.pos.z <= Fp::from_milli(900);
+        let raw = if near {
+            predict_ball_xy_at_ticks(state, 3)
+        } else {
+            smooth_ball_intercept(p, &sample_ball_3d_waypoints(state), is_5v5)
+        };
+        let band = Fp::from_milli(CHASE_DEADBAND_MM)
+            .min(raw.dist(p.pos).mul(Fp::from_milli(CHASE_DEADBAND_REL_MILLI)));
+        let pt = if continuous && near == prev_near && raw.dist(prev_pt) <= band {
+            prev_pt
+        } else {
+            raw
+        };
+        let mut mems = state.ai_memory.borrow_mut();
+        let m = &mut mems[side.index()];
+        m.steer_chase_pt[idx] = pt;
+        m.steer_chase_tick[idx] = tick;
+        m.steer_chase_near[idx] = u8::from(near);
+        pt
     };
     AiMoveIntent {
         move_dir: (chase_pt - p.pos).normalize_or_zero(),
@@ -4291,6 +4337,49 @@ pub fn smooth_ball_intercept(p: &PlayerState, waypoints: &[Vec3; 21], is_5v5: bo
     waypoints[20].xy()
 }
 
+/// CPU carrier evade-side hysteresis (WA1 decision side): once the carrier steps to one side of
+/// the nearest opponent he keeps that side for at least `EVADE_DWELL_TICKS` (0.3 s, the WA1
+/// incumbent dwell), and afterwards switches only when the other side scores `EVADE_MARGIN`
+/// better (hysteresis band, control practice; values [estimate]). Memory lapses after
+/// `EVADE_FORGET_TICKS` without an evade, or when the carrier changes.
+const EVADE_DWELL_TICKS: u32 = 18;
+const EVADE_MARGIN_MILLI: i64 = 200;
+const EVADE_FORGET_TICKS: u32 = 10;
+
+/// `true` = evade on the `a` side. Idempotent within a tick (a second call returns the same side).
+fn evade_side(state: &MatchState, side: TeamSide, carrier: usize, score_a: Fp, score_b: Fp) -> bool {
+    let tick = state.tick;
+    let mut mems = state.ai_memory.borrow_mut();
+    let m = &mut mems[side.index()];
+    let fresh = m.steer_evade_sign != 0
+        && m.steer_evade_idx as usize == carrier
+        && m.steer_evade_tick != 0
+        && tick.wrapping_sub(m.steer_evade_tick) <= EVADE_FORGET_TICKS;
+    let raw_a = score_a >= score_b;
+    let pick_a = if !fresh {
+        raw_a
+    } else if m.steer_evade_tick == tick {
+        m.steer_evade_sign > 0
+    } else {
+        let held_a = m.steer_evade_sign > 0;
+        let held_for = tick.wrapping_sub(m.steer_evade_since);
+        let (held, other) = if held_a { (score_a, score_b) } else { (score_b, score_a) };
+        if held_for < EVADE_DWELL_TICKS || other < held + Fp::from_milli(EVADE_MARGIN_MILLI) {
+            held_a
+        } else {
+            !held_a
+        }
+    };
+    let sign: i8 = if pick_a { 1 } else { -1 };
+    if !fresh || sign != m.steer_evade_sign {
+        m.steer_evade_since = tick;
+    }
+    m.steer_evade_sign = sign;
+    m.steer_evade_idx = carrier as u8;
+    m.steer_evade_tick = tick;
+    pick_a
+}
+
 // -------------------------------------------------------------------------------------------------
 // Movement model helpers used by the motion integration in `sim.rs`.
 // -------------------------------------------------------------------------------------------------
@@ -4301,15 +4390,71 @@ pub fn agility(a: &crate::snapshot::PlayerAttributes) -> i64 {
     (a.acceleration as i64 + a.dribbling as i64) / 2
 }
 
-/// First-order low-pass of an AI/CPU player's velocity command: `cmd += k * (desired - cmd)` with
-/// `k = 0.25 + 0.002 * agility` (agility 85 -> 0.42, ~2-tick time constant). Resets to the
-/// raw command whenever the filter was not run on the previous tick.
+/// Closed-form per-tick coefficients of a critically damped spring (Juckett "Damped Springs";
+/// charmbracelet/harmonica `spring.go`), precomputed offline for `dt = 1/60 s` so no `exp` runs
+/// at 60 Hz. With smoothing time `T` (= the lag when tracking constant motion), `w = 2 / T`:
+///
+/// ```text
+/// e = exp(-w dt)    te = dt e    tew = te w
+/// pos_pos = tew + e    pos_vel = te    vel_pos = -w tew    vel_vel = e - tew
+/// ```
+///
+/// - `T = 0.15 s` (off-ball movers): `w = 13.3333`, `e = 0.800737` ->
+///   `0.978679, 0.013346 s, -2.372555 /s, 0.622796`.
+/// - `T = 0.09 s` (CPU ball carrier): `w = 22.2222`, `e = 0.690479` ->
+///   `0.946211, 0.011508 s, -5.682951 /s, 0.434746`.
+///
+/// `dt < 0.5 T` holds for both, the validity bound of the critically damped approximation.
+struct SpringCoefs {
+    pos_pos: Fp,
+    pos_vel: Fp,
+    vel_pos: Fp,
+    vel_vel: Fp,
+}
+
+const STEER_SPRING_T150: SpringCoefs = SpringCoefs {
+    pos_pos: Fp::from_ratio(978_679, 1_000_000),
+    pos_vel: Fp::from_ratio(13_346, 1_000_000),
+    vel_pos: Fp::from_ratio(-2_372_555, 1_000_000),
+    vel_vel: Fp::from_ratio(622_796, 1_000_000),
+};
+/// The intended receiver of a pass is not filtered at all within this distance of the ball (he
+/// must meet its line exactly); farther out he gets the short smoothing time [estimate].
+pub const RECEIVER_UNFILTERED_MM: i64 = 5_000;
+/// Below this commanded speed (arriving, jockeying, jogging into a slot) the short smoothing time
+/// is used: the long lag would carry a slow mover past his target and back [estimate].
+const STEER_FAST_BELOW_MM_S: i64 = 2_500;
+const STEER_SPRING_T090: SpringCoefs = SpringCoefs {
+    pos_pos: Fp::from_ratio(946_211, 1_000_000),
+    pos_vel: Fp::from_ratio(11_508, 1_000_000),
+    vel_pos: Fp::from_ratio(-5_682_951, 1_000_000),
+    vel_vel: Fp::from_ratio(434_746, 1_000_000),
+};
+
+/// Steering-command filter of an AI/CPU-driven player (WA1). The command is split into direction
+/// and speed:
+///
+/// - DIRECTION: a critically damped second-order filter (unit vector `x` with rate `r`,
+///   equilibrium = the desired unit direction `u`), smoothing time `T = 0.15 s`; `0.09 s` for the
+///   CPU ball carrier, the intended receiver of a pass and any command slower than 2.5 m/s
+///   (arriving / jockeying), where the long lag would carry the player past his target [code for
+///   the closed form; T estimate]. It never overshoots its equilibrium, and its rate state absorbs
+///   a one-tick reversal of the desired direction that a first-order low-pass would pass on.
+///   While the filtered direction vector is shorter than 0.2 (mid-reversal) the speed is scaled
+///   down with it, so a reversal brakes through zero instead of swinging.
+/// - SPEED: the previous first-order low-pass, `k = 0.25 + 0.002 * agility` per tick (~2-tick time
+///   constant), which keeps arrive-ramp speed noise out of the speed profile.
+///
+/// The acceleration and turn-rate caps after it stay the hard limits. Resets to the raw command
+/// whenever the filter was not run on the previous tick; a (near-)zero command keeps the direction
+/// state and only ramps the speed down.
 pub fn filter_velocity_command(
     mem: &mut TeamAiMemory,
     count: usize,
     idx: usize,
     tick: u32,
     attrs: &crate::snapshot::PlayerAttributes,
+    fast: bool,
     desired: Vec2,
 ) -> Vec2 {
     mem.ensure_len(count);
@@ -4317,15 +4462,46 @@ pub fn filter_velocity_command(
         return desired;
     }
     let continuous = mem.cmd_tick[idx] != 0 && mem.cmd_tick[idx].wrapping_add(1) == tick;
-    let out = if continuous {
-        let k = (250 + agility(attrs) * 2).clamp(250, 450);
-        mem.cmd_vel[idx].lerp(desired, Fp::from_milli(k))
-    } else {
-        desired
-    };
-    mem.cmd_vel[idx] = out;
     mem.cmd_tick[idx] = tick;
-    out
+    let speed = desired.len();
+    let moving = speed >= Fp::from_milli(50);
+    let u = desired.normalize_or_zero();
+    if !continuous {
+        mem.cmd_vel[idx] = if moving { u } else { Vec2::ZERO };
+        mem.steer_cmd_rate[idx] = Vec2::ZERO;
+        mem.steer_cmd_speed[idx] = speed;
+        return desired;
+    }
+    let k = Fp::from_milli((250 + agility(attrs) * 2).clamp(250, 450));
+    let sp = mem.steer_cmd_speed[idx].lerp(speed, k);
+    mem.steer_cmd_speed[idx] = sp;
+    if mem.cmd_vel[idx] == Vec2::ZERO {
+        if moving {
+            mem.cmd_vel[idx] = u;
+            mem.steer_cmd_rate[idx] = Vec2::ZERO;
+        }
+        return u.scale(sp);
+    }
+    if moving {
+        let c = if fast || speed < Fp::from_milli(STEER_FAST_BELOW_MM_S) {
+            &STEER_SPRING_T090
+        } else {
+            &STEER_SPRING_T150
+        };
+        let e = mem.cmd_vel[idx] - u;
+        let r = mem.steer_cmd_rate[idx];
+        mem.cmd_vel[idx] = u + e.scale(c.pos_pos) + r.scale(c.pos_vel);
+        mem.steer_cmd_rate[idx] = e.scale(c.vel_pos) + r.scale(c.vel_vel);
+    } else {
+        mem.steer_cmd_rate[idx] = Vec2::ZERO;
+    }
+    let x = mem.cmd_vel[idx];
+    let m = x.len();
+    if m < Fp::from_milli(1) {
+        return Vec2::ZERO;
+    }
+    let keep = m.mul(Fp::from_int(5)).min(Fp::ONE);
+    x.normalize_or_zero().scale(sp.mul(keep))
 }
 
 /// Caps the per-tick heading change of a moving player to a lateral acceleration of

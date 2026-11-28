@@ -72,6 +72,12 @@ const CLUSTER_PAIR_M: f64 = 4.0;
 const CLUSTER_CARRIER_M: f64 = 15.0;
 const SPEED_BAND_MPS: f64 = 3.0;
 const HEADING_FLIP_MIN_DEG: f64 = 1.0;
+/// Schmitt-band side flips (WA1 instrumentation): band on the lateral component (m/s) and the
+/// number of consecutive samples a new side must persist before the debounced side changes.
+const SIDE_FLIP_SCHMITT_EPS: f64 = 0.05;
+const SIDE_FLIP_SCHMITT_DWELL: u8 = 4;
+/// Side-flip cause buckets (`move.side_flips_cause.<name>`), in pipeline order.
+const FLIP_CAUSES: [&str; 4] = ["desired", "sampler", "filter", "limiter"];
 /// A Pass event is attributed to the open-play carrier sampled at most this many ticks before it.
 const PASS_CARRIER_LOOKBACK_TICKS: u32 = 2;
 
@@ -514,6 +520,9 @@ struct SideAcc {
     flips_band: [u64; 2],
     ticks_band: [u64; 2],
     heading_flips: u64,
+    // WA1 instrumentation: Schmitt-band side flips and the raw side flips split by cause.
+    flips_schmitt: u64,
+    flips_cause: [u64; 4],
 }
 
 /// An active defensive-transition episode of the side that lost the ball.
@@ -539,6 +548,14 @@ struct PrevPlayer {
     lat: Option<f64>,
     /// Signed heading change (deg) of the last heading sample, if that tick had one.
     theta: Option<f64>,
+    /// Signed lateral component (m/s, versus the previous tick's velocity) of the steering stages
+    /// `[desired, selected, filtered]` on the last heading sample (psfc_sim `steer_debug`).
+    lat_stage: [Option<f64>; 3],
+    /// Schmitt-band side detector: debounced side (`-1`, `0`, `1`), the side currently trying to
+    /// take over and for how many consecutive samples.
+    sch_side: i8,
+    sch_cand: i8,
+    sch_run: u8,
 }
 
 fn close_excursion(a: &mut SideAcc) {
@@ -1326,6 +1343,8 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 let mut dspeed = None;
                 let mut lat = None;
                 let mut theta = None;
+                let mut lat_stage = [None; 3];
+                let (mut sch_side, mut sch_cand, mut sch_run) = (0_i8, 0_i8, 0_u8);
                 if i != 0 && z > AIRBORNE_Z {
                     airborne += 1;
                 }
@@ -1373,17 +1392,60 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                         }
                         // Side flip: the signed lateral component flips versus the previous sample.
                         let l = cross / sp0;
-                        if let Some(pl) = pp.lat {
-                            if pl.abs() > SIDE_FLIP_EPS
-                                && l.abs() > SIDE_FLIP_EPS
-                                && pl.signum() != l.signum()
+                        // Steering-stage laterals versus the same reference (previous velocity).
+                        let dbg = p.steer_debug;
+                        if dbg.tick == st.tick {
+                            for (k, v) in [dbg.desired, dbg.selected, dbg.filtered]
+                                .into_iter()
+                                .enumerate()
                             {
-                                a.side_flips += 1;
-                                a.flips_class[class] += 1;
-                                a.flips_band[band] += 1;
+                                let v = v2(v);
+                                lat_stage[k] = Some((pp.vel.0 * v.1 - pp.vel.1 * v.0) / sp0);
                             }
                         }
+                        let flipped = |a: Option<f64>, b: Option<f64>| match (a, b) {
+                            (Some(a), Some(b)) => {
+                                a.abs() > SIDE_FLIP_EPS
+                                    && b.abs() > SIDE_FLIP_EPS
+                                    && a.signum() != b.signum()
+                            }
+                            _ => false,
+                        };
+                        if flipped(pp.lat, Some(l)) {
+                            a.side_flips += 1;
+                            a.flips_class[class] += 1;
+                            a.flips_band[band] += 1;
+                            // Cause: the earliest steering stage whose own lateral flipped too;
+                            // none of them (or no fresh diagnostics) = the motion limits/contact.
+                            let cause = (0..3)
+                                .find(|&k| flipped(pp.lat_stage[k], lat_stage[k]))
+                                .unwrap_or(3);
+                            a.flips_cause[cause] += 1;
+                        }
                         lat = Some(l);
+                        // Schmitt variant: the debounced side changes only after the lateral has
+                        // stayed beyond the opposite +-0.05 m/s band for 4 consecutive samples.
+                        sch_side = pp.sch_side;
+                        let sgn = if l > SIDE_FLIP_SCHMITT_EPS {
+                            1
+                        } else if l < -SIDE_FLIP_SCHMITT_EPS {
+                            -1
+                        } else {
+                            0
+                        };
+                        // Any sample not beyond the opposite band breaks the run.
+                        if sgn != 0 && sgn != sch_side {
+                            sch_run = if pp.sch_cand == sgn { pp.sch_run.saturating_add(1) } else { 1 };
+                            sch_cand = sgn;
+                            if sch_run >= SIDE_FLIP_SCHMITT_DWELL {
+                                if sch_side != 0 {
+                                    a.flips_schmitt += 1;
+                                }
+                                sch_side = sgn;
+                                sch_cand = 0;
+                                sch_run = 0;
+                            }
+                        }
                         let th = cross.atan2(dot).to_degrees();
                         if let Some(pth) = pp.theta {
                             if pth.abs() > HEADING_FLIP_MIN_DEG
@@ -1438,6 +1500,10 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     recent_kick_ticks: p.recent_kick_ticks,
                     lat,
                     theta,
+                    lat_stage,
+                    sch_side,
+                    sch_cand,
+                    sch_run,
                 });
             }
             a.max_airborne = a.max_airborne.max(airborne);
@@ -1907,6 +1973,16 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
             "move.heading_sign_flips_per_player_min".into(),
             per_pmin(a.heading_flips, a.player_ticks),
         );
+        m.insert(
+            "move.side_flips_schmitt_per_player_min".into(),
+            per_pmin(a.flips_schmitt, a.player_ticks),
+        );
+        for (c, name) in FLIP_CAUSES.iter().enumerate() {
+            m.insert(
+                format!("move.side_flips_cause.{name}_per_player_min"),
+                per_pmin(a.flips_cause[c], a.player_ticks),
+            );
+        }
     }
 
     let mut match_metrics = Metrics::new();
@@ -2090,6 +2166,8 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ("move.side_flips_by_class.<c>_per_player_min / _share_pct", "Round 4. Side flips (move.side_flips_per_player_min) split by psfc_sim::ai::move_priority(state, side, idx) on the tick of the flip (0 carrier / elected chaser / committed keeper, 1 engager or human-controlled, 2 tactical mover, 3 idle / cruising / yielding; outside a fresh plan everyone but the carrier reads 2). per_player_min = flips in class c / player-minutes spent in class c (all consecutive open-play player-tick pairs whose current tick is in class c); share_pct = % of all the side's flips that occurred in class c."),
         ("move.class_time_pct.<c>", "% of consecutive open-play player-tick pairs whose current tick has move_priority c (the exposure behind the per-class rates)."),
         ("move.side_flips_speed_lt3_per_player_min / _ge3_per_player_min", "Side flips split by the current tick's speed |vel_t| < 3 m/s or >= 3 m/s, each divided by the player-minutes spent in that speed band."),
+        ("move.side_flips_schmitt_per_player_min", "Round 5 (WA1). Schmitt-band variant of move.side_flips_per_player_min over the same samples: a per-player debounced side (left/right of the previous heading) changes only after the lateral component l_t has stayed beyond the opposite +-0.05 m/s band for 4 consecutive samples; each change from one side to the other counts one flip (the first side taken after a gap does not count; the state resets when a tick has no heading sample). Ignores sub-quantum tick-to-tick noise and counts weaving whose half-period is >= 4 ticks. Count / player-minutes."),
+        ("move.side_flips_cause.<cause>_per_player_min", "Round 5 (WA1). Raw side flips (move.side_flips_per_player_min) split by the earliest steering stage whose own lateral component (versus the same previous-tick velocity) flipped sign with the same 0.02 m/s dead band on the same tick pair: desired = the desired velocity before local avoidance flipped (decision side: intent, target, input); sampler = the avoidance-selected velocity flipped while the desired one did not; filter = only the filtered command flipped; limiter = none of the three flipped (motion limits, turn limiter, contact constraint; also flips without fresh psfc_sim PlayerState::steer_debug diagnostics, e.g. scripted actions). Each divided by all player-minutes, so the four sum to the raw rate."),
         ("move.heading_sign_flips_per_player_min", "Over the heading-histogram samples (speed > 1 m/s on both ticks): signed heading change theta_t = atan2(cross(vel_t-1, vel_t), dot(vel_t-1, vel_t)) in degrees. A heading sign flip is a sample where |theta_t| > 1 deg and the previous consecutive sample's |theta_t-1| > 1 deg with opposite signs (left-right-left steering wobble, independent of the 0.02 m/s lateral dead band of side flips). Count / player-minutes."),
         ("aerial.headers (+ _shot/_clear/_pass)", "Outfielder with z > 0.14 m whose recent_kick_ticks rose versus the previous tick (a new contact); split by recent_kick_kind: 4/5 shot, 3 clearance/lob, else pass/flick."),
     ];
