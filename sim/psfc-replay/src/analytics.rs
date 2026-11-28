@@ -60,6 +60,11 @@ const TRANS_CAP_TICKS: u32 = 15 * TICKS_PER_SECOND;
 const TRANS_SHAPE_RADIUS_M: f64 = 5.0;
 const TRANS_RECOVERY_TICKS: u32 = 5 * TICKS_PER_SECOND;
 const TRANS_SPRINT_MPS: f64 = 6.0;
+/// Round 4 (area T): sprint band 25.2 km/h = 7.0 m/s (Bortnik et al. 2022), above the sim's 70%
+/// cruise cap (~6.3 m/s), so capped jogging no longer reads as sprinting.
+const TRANS_SPRINT7_MPS: f64 = 7.0;
+/// Mark-steal window: a mark change counts while the old target is within 1.35x the marking zone.
+const MARK_STEAL_ZONE_X: f64 = 1.35;
 const TRANS_COUNTERPRESS_TICKS: u32 = 6 * TICKS_PER_SECOND;
 const SUPPORT_MIN_M: f64 = 6.0;
 const SUPPORT_MAX_M: f64 = 30.0;
@@ -496,7 +501,16 @@ struct SideAcc {
     trans_fwd_sprint: u64,
     trans_mid_speed: Mean,
     trans_mid_sprint: u64,
+    trans_fwd_sprint7: u64,
+    trans_mid_sprint7: u64,
     trans_fwd_high: Mean,
+    /// Mean outfield stamina (permille) on the last open-play tick of the match.
+    stamina_end: Option<f64>,
+    /// Mark changes while the previous target is still within 1.35x the zone, and the
+    /// outfielder-ticks of defending (opponent owns the ball) they are counted over.
+    mark_steals: u64,
+    mark_def_ticks: u64,
+    prev_marks: Vec<u8>,
     trans_counterpress: u64,
     // Round 4: attacking support (this side has an outfield carrier).
     sup_ticks: u64,
@@ -950,14 +964,17 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                     let v = v2(players[i].vel);
                     let sp = (v.0 * v.0 + v.1 * v.1).sqrt();
                     let sprint = u64::from(sp > TRANS_SPRINT_MPS);
+                    let sprint7 = u64::from(sp > TRANS_SPRINT7_MPS);
                     match players[i].role {
                         PlayerRole::Forward => {
                             a.trans_fwd_speed.add(sp);
                             a.trans_fwd_sprint += sprint;
+                            a.trans_fwd_sprint7 += sprint7;
                         }
                         PlayerRole::Midfielder => {
                             a.trans_mid_speed.add(sp);
                             a.trans_mid_sprint += sprint;
+                            a.trans_mid_sprint7 += sprint7;
                         }
                         _ => {}
                     }
@@ -1241,6 +1258,41 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                         a.engager3 += 1;
                     }
                 }
+            }
+            // Round 4 (area T): mark steals and end-of-match stamina.
+            {
+                let outfield_stam: Vec<f64> = players
+                    .iter()
+                    .skip(1)
+                    .filter(|p| !p.sent_off)
+                    .map(|p| f64::from(p.stamina_permille))
+                    .collect();
+                if !outfield_stam.is_empty() {
+                    a.stamina_end = Some(outfield_stam.iter().sum::<f64>() / outfield_stam.len() as f64);
+                }
+                let marks: Vec<u8> = st.ai_memory.borrow()[s].mark_of.clone();
+                if let Some((cs, _)) = carrier.filter(|&(cs, _)| cs != side) {
+                    let opps = &st.players[cs.index()];
+                    let zone = if five { 7.0 } else { 9.0 } * MARK_STEAL_ZONE_X;
+                    for (i, p) in players.iter().enumerate().skip(1) {
+                        if p.sent_off {
+                            continue;
+                        }
+                        a.mark_def_ticks += 1;
+                        let (old, new) = (
+                            a.prev_marks.get(i).copied().unwrap_or(u8::MAX),
+                            marks.get(i).copied().unwrap_or(u8::MAX),
+                        );
+                        if old != u8::MAX && new != u8::MAX && old != new {
+                            if let Some(o) = opps.get(old as usize).filter(|o| !o.sent_off) {
+                                if dist(v2(p.pos), v2(o.pos)) <= zone {
+                                    a.mark_steals += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                a.prev_marks = marks;
             }
             // Cruise compliance: outfielders not carrying, > 8 m from the ball and not among the
             // side's two outfielders closest to the ball.
@@ -1884,6 +1936,12 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
             "coord.cruise_over72_pct".into(),
             pct(a.cruise_over, a.cruise_n),
         );
+        if a.mark_def_ticks > 0 {
+            m.insert(
+                "coord.mark_steal_per_defender_min".into(),
+                a.mark_steals as f64 * f64::from(TICKS_PER_SECOND) * 60.0 / a.mark_def_ticks as f64,
+            );
+        }
 
         m.insert(
             "move.side_flips_per_player_min".into(),
@@ -1987,6 +2045,10 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 "trans.forward_sprint_share_0_5s".into(),
                 pct(a.trans_fwd_sprint, a.trans_fwd_speed.n),
             );
+            m.insert(
+                "trans.forward_sprint_share_0_5s_7mps".into(),
+                pct(a.trans_fwd_sprint7, a.trans_fwd_speed.n),
+            );
         }
         if a.trans_mid_speed.n > 0 {
             m.insert(
@@ -1997,6 +2059,13 @@ pub fn analyze_seed(cfg: &AnalyzeConfig, seed: u64) -> Result<SeedReport, String
                 "trans.mid_sprint_share_0_5s".into(),
                 pct(a.trans_mid_sprint, a.trans_mid_speed.n),
             );
+            m.insert(
+                "trans.mid_sprint_share_0_5s_7mps".into(),
+                pct(a.trans_mid_sprint7, a.trans_mid_speed.n),
+            );
+        }
+        if let Some(v) = a.stamina_end {
+            m.insert("trans.outfield_stamina_end_permille".into(), v);
         }
         put_mean(m, "trans.forwards_staying_high_mean", a.trans_fwd_high, 1.0);
 
@@ -2252,6 +2321,9 @@ pub fn metric_definitions() -> BTreeMap<String, String> {
         ("trans.pct_outfield_behind_ball_at_3s / _at_6s", "% of the side's on-pitch outfielders strictly goal-side of the ball at exactly t0 + 3 s (180 ticks) and t0 + 6 s (360 ticks), over episodes still running at that tick (no stoppage, not regained)."),
         ("trans.forward_recovery_speed_mps_0_5s / forward_sprint_share_0_5s", "Over episode ticks t0 .. t0 + 5 s (exclusive) and the side's on-pitch players with PlayerRole::Forward: mean |vel| (m/s), and % of those player-ticks with |vel| > 6 m/s."),
         ("trans.mid_recovery_speed_mps_0_5s / mid_sprint_share_0_5s", "Same for PlayerRole::Midfielder."),
+        ("trans.forward_sprint_share_0_5s_7mps / mid_sprint_share_0_5s_7mps", "Round 4 (area T). Same as forward_sprint_share_0_5s / mid_sprint_share_0_5s with the threshold at 7.0 m/s (25.2 km/h, the literature's sprint band) instead of 6 m/s, which coincides with the sim's 70% class-3 cruise cap and so counted capped jogging as sprinting."),
+        ("trans.outfield_stamina_end_permille", "Round 4 (area T). Mean stamina_permille of the side's on-pitch outfielders on the last open-play tick of the match (the cost guard for pressing / recovery-sprint urgency)."),
+        ("coord.mark_steal_per_defender_min", "Round 4 (area T). Changes of a defender's mark target (TeamAiMemory::mark_of goes from opponent A to a different opponent B, both not AI_NONE) while A is still within 1.35 x the marking zone (9 m in 11v11, 7 m in 5v5) of the defender's position, per defender-minute; defender-minutes count on-pitch outfielder ticks of open play while the opponent owns the ball. The FIFA 12 'steal' failure mode."),
         ("trans.forwards_staying_high_mean", "Mean number of the side's on-pitch Forwards ahead of the ball ((x - ball.x) * attack_sign > 0) at t0 + 6 s, over episodes still running then (rest offence kept high)."),
         ("trans.counterpress_pct", "% of turnovers after which the side owns the ball again within 6 s (t0 + 360 ticks) with no stoppage in between."),
         ("general.support", "Round 4. Support metrics are sampled on open-play ticks where an outfielder (slot != 0) of the side is ball.owner (carrier ticks). Open lane to a teammate: no on-pitch opponent (GK included) within 1.5 m of the segment carrier -> teammate. Offside: mirrors the sim's is_player_offside_at_pass: offsides_enabled, teammate (not the GK) past the offside-zone line (halfway in 11v11, +half_length/3 in 5v5 Rush), more than 0.15 m ahead of the ball and more than 0.2 m ahead of the second-last on-pitch opponent (GK included), all along the attacking axis (this is the task's 'ahead of the second-last opponent' rule with the sim's own zone, ball and tolerance conditions, so it matches what the referee would flag). Open option: an outfield teammate 6-30 m from the carrier with an open lane and not offside."),

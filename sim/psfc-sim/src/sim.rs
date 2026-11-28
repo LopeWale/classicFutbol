@@ -854,6 +854,10 @@ impl MatchSimulation {
                     if idx == current_ctrl || p.sent_off || p.contain_cooldown > 0 || p.contain_stamina == 0 {
                         continue;
                     }
+                    // Round 4, area T: never pull a back-liner who owns a runner in behind.
+                    if crate::ai::owns_runner(&self.state, side, idx) {
+                        continue;
+                    }
                     let u = self.defensive_switch_utility(side, idx);
                     if u > best_u {
                         best_u = u;
@@ -2916,6 +2920,8 @@ impl MatchSimulation {
                     None
                 };
 
+                // Round 4, area T: pressing engagers drain stamina x2.5 while counter-pressing.
+                let press_drain_pm = crate::ai::stamina_drain_mult_pm(&self.state, side, idx);
                 let my_intercept_ticks = if is_controlled && !is_gk && self.state.ball.owner.is_none() {
                     best_ball_intercept_for_player(&self.state, side, idx).1
                 } else {
@@ -3706,11 +3712,34 @@ impl MatchSimulation {
                     // No long-term stamina depletion in 5v5 (`min 580`), rapid recovery when jogging/walking!
                     let moving = move_dir.len() > Fp::from_milli(120);
                     let min_stamina = if is_5v5 { 580 } else { 150 };
-                    if eff_sprint_throttle > 200 && moving {
+                    if eff_sprint_throttle > 200 && moving && is_5v5 {
                         let base_drain = (125_u32.saturating_sub(p.attributes.stamina as u32)).max(25);
-                        let drain_mod =
-                            ((base_drain as i64 * eff_sprint_throttle) / 1_000).max(8) as u32;
+                        let drain_mod = ((base_drain as i64 * eff_sprint_throttle) / 1_000 * press_drain_pm / 1_000)
+                            .max(8) as u32;
                         if (current_tick * drain_mod) % 420 < drain_mod {
+                            p.stamina_permille = (p.stamina_permille - 1).max(min_stamina);
+                        }
+                    } else if eff_sprint_throttle > 200 && moving {
+                        // 11v11 long-term stamina (round 4, area T fix). The 5v5 rate above (one
+                        // permille per ~10 sprint ticks) has 5v5's fast jog recovery to balance it;
+                        // 11v11 recovers only when standing, so the same rate emptied outfielders to
+                        // the 150 floor within ten minutes. The 11v11 rate is that rate x
+                        // STAM11_RATE_PM / 1000, scaled by the stamina left above the 150 floor, so it
+                        // decays like FIFA's long-term stamina: outfielders end a 10-minute match near
+                        // 890 permille and a High-work-rate midfielder a 90-minute one near 450
+                        // (measured; docs/transition-and-defending.md section 9). Rate resolution:
+                        // one permille per 42 000 / drain_mod ticks.
+                        const STAM11_RATE_PM: i64 = 66;
+                        const STAM11_FLOOR: i64 = 150;
+                        let base_drain = (125_u32.saturating_sub(p.attributes.stamina as u32)).max(25) as i64;
+                        let left_pm = ((p.stamina_permille as i64 - STAM11_FLOOR) * 1_000 / (1_000 - STAM11_FLOOR)).max(0);
+                        let drain_mod = (base_drain * eff_sprint_throttle / 1_000 * press_drain_pm / 1_000 * 100
+                            * STAM11_RATE_PM
+                            / 1_000
+                            * left_pm
+                            / 1_000)
+                            .max(1) as u32;
+                        if (current_tick.wrapping_mul(drain_mod)) % 42_000 < drain_mod {
                             p.stamina_permille = (p.stamina_permille - 1).max(min_stamina);
                         }
                     } else if is_5v5 {

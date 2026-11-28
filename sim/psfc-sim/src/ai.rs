@@ -1475,16 +1475,37 @@ pub fn compute_outfield_ai_intent(
 
     // 2b. FIFA 22 / EA FC 27 Teammate Contain (`RB / R1` held by human on defense):
     //     Conservative `1.48m` contain gap in Tactical mode so user must switch & time manual Stand Tackle!
+    //     Round 4, area T: the contain mate is registered in the team plan as the second engager
+    //     (excluded from presser / cover / mark election, AI presser demoted to cover), his target
+    //     is low-passed through the plan's target memory and his move class is 1.
     if state.teammate_contain_idx[side.index()] == Some(idx)
         && state.ball.owner.map(|(s, _)| s) != Some(side)
     {
+        update_team_plan(state, side);
         let own_goal = Vec2::new(Fp::from_milli(-attack_sign * half_len.to_milli()), Fp::ZERO);
         let pred_ball = predict_ball_xy_at_ticks(state, 5);
         let is_legacy = state.control_settings[side.index()].defending_mode
             == crate::input::DefendingMode::Legacy;
         let hold_gap = Fp::from_milli(if is_legacy { 650 } else { 1_480 });
-        let contain_pt = pred_ball + (own_goal - pred_ball).normalize_or_zero().scale(hold_gap);
-        note_intent_target(state, side, idx, contain_pt, false); // target memory (no snap on return)
+        let raw = pred_ball + (own_goal - pred_ball).normalize_or_zero().scale(hold_gap);
+        let contain_pt = {
+            let mut mems = state.ai_memory.borrow_mut();
+            let m = &mut mems[side.index()];
+            let t = match (m.target.get(idx).copied(), m.target_tick.get(idx).copied()) {
+                (Some(prev), Some(tt)) if tt != 0 && tt.wrapping_add(1) == state.tick => {
+                    prev.lerp(raw, Fp::from_milli(650))
+                }
+                _ => raw,
+            };
+            if idx < m.target.len() {
+                m.target[idx] = t;
+                m.target_tick[idx] = state.tick;
+            }
+            if let Some(c) = m.move_class.get_mut(idx) {
+                *c = 1;
+            }
+            t
+        };
         let delta = contain_pt - p.pos;
         let dist = delta.len();
         return AiMoveIntent {
@@ -2558,6 +2579,9 @@ pub struct PlayerStyle {
     pub work_rate: i64,
     /// `tackling` (+ a little `positioning`): tackle timing confidence.
     pub tackle_confidence: i64,
+    /// FIFA 11 defensive work rate on `0..=100` (`PlayerAttributes::work_rates`): whether the
+    /// player is threatened on a turnover, how long he bursts and how deep his defensive slot sits.
+    pub def_work_rate: i64,
 }
 
 pub fn player_style(p: &PlayerState) -> PlayerStyle {
@@ -2570,7 +2594,187 @@ pub fn player_style(p: &PlayerState) -> PlayerStyle {
         work_rate: ((a.stamina as i64 * 10) * (300 + (p.stamina_permille as i64) * 7 / 10) / 1_000)
             .clamp(0, 1_000),
         tackle_confidence: (a.tackling as i64 * 8 + pos * 2).clamp(0, 1_000),
+        def_work_rate: a.work_rates(p.role).1 as i64,
     }
+}
+
+// -------------------------------------------------------------------------------------------------
+// Round 4, area T: transition urgency, work-rate recovery runs and off-ball defending
+// (`docs/transition-and-defending.md`; parameters from `docs/05-fifa-pes-off-ball-teammate-
+// intelligence.md` Work areas 2 and 4, evidence label in each comment).
+// -------------------------------------------------------------------------------------------------
+
+/// Defensive work-rate bands on the 0..100 scale: Low <= 37 < Medium < 63 <= High (FIFA's Low 25 /
+/// Medium 50 / High 75 centres) [official FIFA 11 attribute; band edges estimate].
+const DWR_LOW_MAX: i64 = 37;
+const DWR_HIGH_MIN: i64 = 63;
+/// Reaction before the press-or-fall-back decision: Hard 6 / Normal 9 / Easy 12 ticks [estimate].
+const CP_REACT_TICKS: [u16; 3] = [12, 9, 6];
+/// Superiority radius around the ball for the counter-press decision (10 m; 5v5 7 m) [peer-reviewed
+/// Bauer & Anzer 2021; 5v5 scaling estimate].
+const CP_SUPERIORITY_MM: [i64; 2] = [10_000, 7_000];
+/// Own outfielders behind the ball needed to counter-press: >= 4 (11v11), >= 2 (5v5)
+/// [peer-reviewed; 5v5 estimate].
+const CP_BEHIND_MIN: [usize; 2] = [4, 2];
+/// Counter-press window 180 ticks x style (Press 1.2 / Possession 1.0 / Counter 0.6) x work rate,
+/// floor 90. The report's 300 / floor 180 [peer-reviewed 5 s; official FIFA 19 7 s] was measured
+/// worse here (11v11, 16 seeds, stamina fixed: behind-ball at 3 s / 6 s -2 pt, line_x_std +0.6 m):
+/// the compressed counter-press block keeps non-pressers high for too long [sim-calibrated].
+const CP_WINDOW_TICKS: i64 = 180;
+const CP_WINDOW_FLOOR: i64 = 90;
+/// Team work rate that maps to a 1.0 window factor (typical full-stamina squad) [estimate].
+const CP_WORK_REF: i64 = 750;
+/// A pass longer than this beats the counter-press and ends it (16 m) [peer-reviewed].
+const CP_BEATEN_PASS_MM: i64 = 16_000;
+/// RETREAT (the 4.5 m deeper block) hands over to DEFEND after 75 ticks. The report's "until shape,
+/// cap 540-600 ticks" [peer-reviewed 9-10 s] kept the deeper block for most of the defending time
+/// and was measured worse (line_x_std 6.72 vs 6.12 m, 11v11, 16 seeds); the recovery runs carry the
+/// re-forming instead [sim-calibrated].
+const RETREAT_TICKS: u16 = 75;
+/// Stamina drain multiplier on pressing engagers while counter-pressing: x2.5 [official FIFA 21 2.2-3].
+const PRESS_DRAIN_PM: i64 = 2_500;
+/// Recovery trigger: the player is ahead of the ball and more than 30 ticks from his target
+/// (replaces `2.5 m + recovery x 2.5 mm`) [estimate 30-45; audit].
+const RECOVERY_TRIGGER_TICKS: u32 = 30;
+/// ... or, whatever the distance, when the ball travels toward our goal faster than 2.5 m/s (a
+/// counter: the deficit only grows); then also players not yet 3 m goal-side latch. Measured on
+/// 11v11 (16 seeds): 4 m/s -> 2.5 m/s and the goal-side latch moved behind-ball at 3 s 67.5 -> 70.4%
+/// and forwards staying high 1.68 -> 1.51 [estimate, sim-calibrated].
+const COUNTER_BALL_MM_S: i64 = 2_500;
+/// Recovery sprint ends 3 m goal-side of the ball [peer-reviewed shape]; ending it level with the
+/// ball left forwards hovering across it as the counter moved on, so forwards use 3 m too [estimate].
+const RECOVERY_EXIT_MM: i64 = 3_000;
+/// Recovery burst caps (ticks) by defensive work rate: Low 210 / Medium 240 / High 240, inside the
+/// 180-240 (3-4 s, ~26 m) range [peer-reviewed Ju et al. 2023]; the low end left Low-DWR forwards
+/// short of the ball [sim-calibrated].
+const BURST_CAP_TICKS: [u16; 3] = [210, 240, 240];
+/// After a capped burst a player still ahead of the ball may start a new one after 45 ticks in the
+/// high-speed band (repeated-sprint bouts) [estimate].
+const BURST_REST_TICKS: u16 = 45;
+/// A Low-work-rate player is threatened only within this distance ahead of the ball [estimate].
+const LOW_DWR_REACH_MM: i64 = 40_000;
+/// High-speed band ceiling 7 m/s (5.5-7 m/s band) [peer-reviewed speed band].
+const HIGH_BAND_MM_S: i64 = 7_000;
+/// High-intensity running threshold 5.5 m/s (19.8 km/h) and the 60 s window of the fatigue
+/// integrator; above the peak the burst cap is multiplied by 0.65 and the band by 0.8
+/// [peer-reviewed Ju et al. 2022, 20-53% post-peak drop]. The peak is 300 m, not the real-football
+/// ~70 m: sim outfielders run 2-4x more at high intensity (measured 100-290 m in 11v11, round 4),
+/// so 70 m (or 200 m) would mark most players as fatigued all match [estimate, sim-calibrated].
+const HI_SPEED_MM_S: i64 = 5_500;
+const HI_WINDOW_TICKS: u32 = 3_600;
+const HI_PEAK_MM: u32 = 300_000;
+const FATIGUE_PM: i64 = 650;
+const FATIGUE_BAND_PM: i64 = 800;
+/// Forward holding line goal-side of the ball by work rate: Low 8 m / Medium 10 m / High 12 m
+/// (5v5: 2 / 3.5 / 5 m), and the shallowest block depth (permille of the block) each may drop to:
+/// Low 400 / Medium 300 / High 150 [community FIFA 23 zones; line about 10 m estimate; 11v11 depths
+/// deepened from 4/7/10 m after the stamina fix, 16 seeds: forwards staying high 1.80 -> 1.68].
+const FWD_HOLD_MM: [[i64; 3]; 2] = [[8_000, 10_000, 12_000], [2_000, 3_500, 5_000]];
+const FWD_FLOOR_PM: [i64; 3] = [400, 300, 150];
+/// Presser lateral shift toward the most dangerous lane (cover shadow): 0.75 m [estimate 0.5-1 m].
+const SHADOW_SHIFT_MM: i64 = 750;
+/// Zonal holders block the best lane when within 12 m of the ball, on a 3 m leash from the slot
+/// [official eFootball two-tier rule; distances estimate].
+const LANE_BLOCK_BALL_MM: i64 = 12_000;
+const LANE_BLOCK_LEASH_MM: i64 = 3_000;
+/// Mark arbiter: incumbent bonus 3 m, dwell 24 ticks [official FIFA 14; values estimate 20-28].
+const MARK_INCUMBENT_MM: i64 = 3_000;
+const MARK_DWELL_TICKS: u16 = 24;
+/// Runner handover (Konami US8597094): cover within La = 3 m of the runner-to-goal line; intercept
+/// line only when the carrier faces the marked man within theta_a = 25 deg (cos = 0.906)
+/// [patent; La, theta_a estimate].
+const COVER_LA_MM: i64 = 3_000;
+const COS_THETA_A_PM: i64 = 906;
+/// A runner in behind is tracked up to this distance from his marker [estimate].
+const RUNNER_TRACK_MM: i64 = 15_000;
+/// Shared line: back-liners lag-track one team value at 120 permille per tick [estimate].
+const LINE_LAG_PM: i64 = 120;
+/// Presser zone handover: released beyond 12 m lateral from his slot or 8 m beyond his line
+/// [official FIFA 12 Barca rule; width estimate].
+const ZONE_HANDOVER_LAT_MM: i64 = 12_000;
+const ZONE_HANDOVER_DEPTH_MM: i64 = 8_000;
+/// Press triggers [official FIFA 19 "pressure on heavy touch"]: ball more than 1.6 m off the
+/// carrier (heavy touch), carrier facing his own goal, carrier within 5 m of the touchline; the
+/// trigger holds 45 ticks [radius and hold estimate].
+const HEAVY_TOUCH_MM: i64 = 1_600;
+const TOUCHLINE_TRAP_MM: i64 = 5_000;
+const PRESS_TRIGGER_HOLD: u16 = 45;
+/// Second man: shadow 3.5 m behind-side of the presser, never inside 3 m of the carrier
+/// [official FIFA 12 "cover off"; distance estimate 3-4 m].
+const SECOND_MAN_MM: i64 = 3_500;
+/// Non-engagers keep at least this gap from the carrier so at most two players engage (2.5 m is
+/// the engager radius of `coord.engagers3`) [audit; estimate].
+const NON_ENGAGER_GAP_MM: i64 = 2_900;
+
+/// `Some(idx)` for a plan index field that names an outfielder (`AI_NONE` and `0` mean none).
+#[inline]
+const fn plan_idx(v: u8) -> Option<usize> {
+    if v == AI_NONE || v == 0 { None } else { Some(v as usize) }
+}
+
+/// Work-rate band: 0 Low, 1 Medium, 2 High.
+#[inline]
+const fn dwr_band(dwr: i64) -> usize {
+    if dwr <= DWR_LOW_MAX {
+        0
+    } else if dwr >= DWR_HIGH_MIN {
+        2
+    } else {
+        1
+    }
+}
+
+/// How a front-line slot (striker, pivo, winger) sits in the defensive block.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrontMode {
+    /// Not a front slot, or attacking: the slot as the block places it.
+    Plain,
+    /// The rest offence: outlet up to 6 m beyond the ball, never past halfway (11v11).
+    Outlet,
+    /// Work-rate band of the holder: holding line goal-side of the ball and depth floor.
+    Hold(usize),
+}
+
+/// Front mode of slot `k` from the plan's assignment (`slot_of`) and rest offence.
+fn front_mode(ctx: &ShapeCtx, state: &MatchState, slot_of: &[u8], rest_offence: u8, k: usize) -> FrontMode {
+    let Some(slot) = ctx.slots.get(k) else { return FrontMode::Plain };
+    if !matches!(slot.role, SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger) {
+        return FrontMode::Plain;
+    }
+    let players = &state.players[ctx.side.index()];
+    let holder = (1..players.len()).find(|&i| slot_of.get(i).copied() == Some(k as u8) && !players[i].sent_off);
+    match holder {
+        Some(h) if Some(h) == plan_idx(rest_offence) => FrontMode::Outlet,
+        Some(h) => FrontMode::Hold(dwr_band(player_style(&players[h]).def_work_rate)),
+        None => FrontMode::Hold(0),
+    }
+}
+
+/// Stamina drain multiplier (permille) for `players[side][idx]` in the sim's sprint-drain path
+/// (`sim.rs` `step_all_players`, "5v5 Rush Short-Term Stamina"): x2.5 for the presser and the two
+/// lane-closers while the side counter-presses, 1.0 otherwise.
+pub fn stamina_drain_mult_pm(state: &MatchState, side: TeamSide, idx: usize) -> i64 {
+    let Ok(mems) = state.ai_memory.try_borrow() else { return 1_000 };
+    let m = &mems[side.index()];
+    if !plan_is_fresh(state, m) || m.phase != AI_PHASE_COUNTER_PRESS || idx == 0 {
+        return 1_000;
+    }
+    let pressing = [m.presser, m.second_presser, m.third_presser, m.chaser]
+        .iter()
+        .any(|&v| plan_idx(v) == Some(idx));
+    if pressing { PRESS_DRAIN_PM } else { 1_000 }
+}
+
+/// `true` when `players[side][idx]` is a back-liner currently tracking a marked runner in behind
+/// (he must not be pulled out as the teammate-contain mate).
+pub fn owns_runner(state: &MatchState, side: TeamSide, idx: usize) -> bool {
+    let Ok(mems) = state.ai_memory.try_borrow() else { return false };
+    let m = &mems[side.index()];
+    let Some(o) = m.mark_of.get(idx).copied().and_then(plan_idx) else { return false };
+    let ctx = ShapeCtx::new(state, side);
+    let back = ctx.slot(m.slot_of.get(idx).copied().unwrap_or(AI_NONE)).is_some_and(|s| s.role.is_back_line());
+    let opps = &state.players[side.opponent().index()];
+    back && o < opps.len() && plan_is_fresh(state, m) && m.line_prog != 0 && ctx.prog(opps[o].pos.x) < m.line_prog
 }
 
 /// Derives the team style: averages of outfield `stamina+pace+tackling` (press), `passing+dribbling`
@@ -2769,6 +2973,25 @@ fn defend_block(ctx: &ShapeCtx, state: &MatchState, ref_ball: Vec2, retreat: boo
         .min()
         .unwrap_or(ctx.len);
     line = line.min((deepest_opp - 800).max(off_zone));
+    // Run-tracking policy by style, FC 25's line bands [official, unitless]: Counter = Deep (the line
+    // drops with any runner in behind), Possession = Balanced (only when the runner's 1 s look-ahead
+    // beats it by 2 m), Press = High (rarely: by 6 m). Runners: opponents running at our goal faster
+    // than 3.5 m/s from within 2 m in front of the line to 10 m beyond it [trigger estimate].
+    let beat_mm = match ctx.style {
+        TeamStyle::Counter => 0,
+        TeamStyle::Possession => 2_000,
+        TeamStyle::Press => 6_000,
+    };
+    for o in state.players[ctx.side.opponent().index()].iter().skip(1).filter(|o| !o.sent_off) {
+        let v_goal = -o.vel.x.to_milli() * ctx.sign;
+        let o_p = ctx.prog(o.pos.x);
+        if v_goal > 3_500 && o_p >= line - 2_000 && o_p <= line + 10_000 {
+            let look = o_p - v_goal;
+            if look < line - beat_mm {
+                line = line.min(look + beat_mm);
+            }
+        }
+    }
     // Drop off an unpressured carrier facing our goal (judged by team positioning).
     if let Some((os, oi)) = state.ball.owner {
         if os != ctx.side {
@@ -2834,8 +3057,24 @@ fn attack_block(ctx: &ShapeCtx, state: &MatchState, ref_ball: Vec2, counter_pres
             front_cap: front,
         };
     }
+    // Rest defence (Forcher et al. 2023): the back line holds 5-10 m goal-side of the deepest
+    // opposing forward (7 m; 5v5 4 m) and, with the ball in the final third, no further than 45 m
+    // (5v5 18 m) from our goal line [peer-reviewed geometry; offsets estimate].
+    let opp_fwd = state.players[ctx.side.opponent().index()]
+        .iter()
+        .skip(1)
+        .filter(|o| !o.sent_off)
+        .map(|o| ctx.prog(o.pos.x))
+        .min()
+        .unwrap_or(ctx.len);
+    let rest_cap = (opp_fwd - if ctx.is_5v5 { 4_000 } else { 7_000 }).min(if ball_p > ctx.len * 2 / 3 {
+        if ctx.is_5v5 { 18_000 } else { 45_000 }
+    } else {
+        i64::MAX
+    });
     let line = (min_line + (ball_p - pivot) * ATT_LINE_RATE_PM / 1_000)
         .min(ball_p - rest_gap)
+        .min(rest_cap)
         .clamp(min_line.min(ball_p - 3_000).max(3_000), max_line);
     let len = (front - line).clamp(len_lo, len_hi);
     Block {
@@ -2851,7 +3090,11 @@ fn attack_block(ctx: &ShapeCtx, state: &MatchState, ref_ball: Vec2, counter_pres
 
 /// World position of `slot` inside `blk`. Ball-side full-backs overlap, far-side full-backs tuck in
 /// as rest defence; strikers are pinned to the last defender (offside line).
-fn slot_pos(ctx: &ShapeCtx, blk: &Block, slot: &ShapeSlot, attacking: bool) -> Vec2 {
+///
+/// Defending front slots (striker, pivo, winger) follow `front`: the rest offence keeps the
+/// 11v11 outlet (up to 6 m beyond the ball, never past halfway); every other holder drops to a
+/// work-rate holding line goal-side of the ball, never deeper than his band's floor in the block.
+fn slot_pos(ctx: &ShapeCtx, blk: &Block, slot: &ShapeSlot, attacking: bool, front: FrontMode) -> Vec2 {
     let (mut depth, mut y) = if attacking {
         (slot.attack_depth, slot.attack_y)
     } else {
@@ -2861,7 +3104,9 @@ fn slot_pos(ctx: &ShapeCtx, blk: &Block, slot: &ShapeSlot, attacking: bool) -> V
         if (y >= 0) == (blk.ref_yf >= 0) {
             depth += 150;
         } else {
-            depth = 260;
+            // Rest defence 3+1 (round 4, area T): the far-side full-back sits near the CB line
+            // (depth 90, was 260); measured -0.4 m on line_x_std_m (11v11, 8 seeds).
+            depth = 90;
             y = y * 65 / 100;
         }
     }
@@ -2869,11 +3114,25 @@ fn slot_pos(ctx: &ShapeCtx, blk: &Block, slot: &ShapeSlot, attacking: bool) -> V
     if attacking && matches!(slot.role, SlotRole::Striker | SlotRole::Pivo) {
         prog = prog.min(blk.front_cap);
     }
-    if !attacking && slot.role == SlotRole::Striker && !ctx.is_5v5 {
-        // 11v11 striker stays as the outlet: up to 6 m beyond the ball, never past halfway.
-        prog = prog.max((blk.ref_prog + 6_000).min(ctx.len / 2));
+    if !attacking {
+        match front {
+            FrontMode::Outlet if !ctx.is_5v5 => {
+                // 11v11 rest offence stays as the outlet: up to 6 m beyond the ball, never past halfway.
+                prog = prog.max((blk.ref_prog + 6_000).min(ctx.len / 2));
+            }
+            FrontMode::Hold(band) => {
+                let hold = FWD_HOLD_MM[usize::from(ctx.is_5v5)][band];
+                let floor = blk.line + blk.len * FWD_FLOOR_PM[band] / 1_000;
+                prog = prog.min(blk.ref_prog - hold).max(floor.min(prog));
+            }
+            _ => {}
+        }
     }
-    let lim_y = ctx.half_wid - 1_500;
+    let mut lim_y = ctx.half_wid - 1_500;
+    if attacking && matches!(slot.role, SlotRole::CentreBack | SlotRole::Fixo) && blk.front_cap != i64::MAX {
+        // Rest defence about 28 m wide (5v5 16 m) [peer-reviewed Forcher et al. 2023].
+        lim_y = lim_y.min(if ctx.is_5v5 { 8_000 } else { 14_000 });
+    }
     let yf = ((ctx.half_wid * y / 1_000) * blk.width_pm / 1_000 + blk.ref_yf * blk.shift_pm / 1_000)
         .clamp(-lim_y, lim_y);
     ctx.world(prog.clamp(1_500, ctx.len - 1_500), yf)
@@ -3055,7 +3314,12 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
     };
     let ref_ball = mem.ref_ball;
 
-    // 2. Phase with transitions: counter-press vs retreat decided by numbers around the ball.
+    // 2. Phase with transitions (round 4, area T): on a loss the team reacts as if counter-pressing,
+    //    then after a 6-12 tick reaction decides press-or-fall-back from superiority within 10 m and
+    //    the count behind the ball (Bauer & Anzer 2021). The counter-press lasts 300 ticks x style x
+    //    work rate (floor 180) and ends early on a regain, a stoppage, a pass > 16 m that beats it or
+    //    the ball escaping back past the origin; RETREAT then runs until the shape is reached or 570
+    //    ticks.
     let team_work = {
         let mut s = 0;
         let mut c = 0;
@@ -3065,21 +3329,28 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
         }
         s / c.max(1)
     };
+    let f5 = usize::from(is_5v5);
     let owner_ours = state.ball.owner.map(|(s, _)| s == side);
     let mut phase = mem.phase;
     let mut ph_ticks = mem.phase_ticks.saturating_add(1);
-    let cp_window = (match ctx.style {
-        TeamStyle::Press => 150,
-        TeamStyle::Possession => 110,
-        TeamStyle::Counter => 55,
-    } * team_work
-        / 1_000)
-        .max(40) as u16;
+    let style_pm: i64 = match ctx.style {
+        TeamStyle::Press => 1_200,
+        TeamStyle::Possession => 1_000,
+        TeamStyle::Counter => 600,
+    };
+    let work_pm = (team_work * 1_000 / CP_WORK_REF).clamp(700, 1_200);
+    let cp_window = (CP_WINDOW_TICKS * style_pm / 1_000 * work_pm / 1_000).max(CP_WINDOW_FLOOR) as u16;
+    let react = CP_REACT_TICKS[match side_difficulty(state, side) {
+        CpuDifficulty::Easy => 0,
+        CpuDifficulty::Normal => 1,
+        CpuDifficulty::Hard => 2,
+    }];
     let ca_window: u16 = match ctx.style {
         TeamStyle::Counter => 150,
         TeamStyle::Press => 100,
         TeamStyle::Possession => 60,
     };
+    let ball_p_now = ctx.prog(ball_xy.x);
     match owner_ours {
         Some(true) => {
             if fresh {
@@ -3097,32 +3368,34 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             if fresh {
                 phase = AI_PHASE_DEFEND;
             } else if !is_defensive_phase(phase) {
-                let r = Fp::from_milli(if is_5v5 { 8_000 } else { 12_000 });
-                let ours = players
-                    .iter()
-                    .skip(1)
-                    .filter(|p| !p.sent_off && p.pos.dist(ball_xy) <= r)
-                    .count();
-                let theirs = opps
-                    .iter()
-                    .skip(1)
-                    .filter(|p| !p.sent_off && p.pos.dist(ball_xy) <= r)
-                    .count();
-                let ball_p = ctx.prog(ball_xy.x);
-                let press_ok = ours >= theirs && ball_p > ctx.len * 35 / 100 && team_work > 450;
-                phase = if press_ok { AI_PHASE_COUNTER_PRESS } else { AI_PHASE_RETREAT };
+                phase = AI_PHASE_COUNTER_PRESS;
                 ph_ticks = 0;
                 mem.phase_origin = ball_xy;
+                mem.cp_decided = false;
             } else if phase == AI_PHASE_COUNTER_PRESS {
                 let escape = if is_5v5 { 9_000 } else { 14_000 };
-                if ctx.prog(ball_xy.x) < ctx.prog(mem.phase_origin.x) - escape {
+                if !continuous || ball_p_now < ctx.prog(mem.phase_origin.x) - escape || ph_ticks > cp_window {
                     phase = AI_PHASE_RETREAT;
                     ph_ticks = 0;
-                } else if ph_ticks > cp_window {
-                    phase = AI_PHASE_DEFEND;
-                    ph_ticks = 0;
+                } else if !mem.cp_decided && ph_ticks >= react {
+                    mem.cp_decided = true;
+                    let r = Fp::from_milli(CP_SUPERIORITY_MM[f5]);
+                    let near = |ps: &[PlayerState]| ps.iter().skip(1).filter(|p| !p.sent_off && p.pos.dist(ball_xy) <= r).count();
+                    let behind = players
+                        .iter()
+                        .skip(1)
+                        .filter(|p| !p.sent_off && ctx.prog(p.pos.x) < ball_p_now)
+                        .count();
+                    let press_ok = near(players) >= near(opps)
+                        && behind >= CP_BEHIND_MIN[f5]
+                        && ball_p_now > ctx.len * 35 / 100
+                        && team_work > 450;
+                    if !press_ok {
+                        phase = AI_PHASE_RETREAT;
+                        ph_ticks = 0;
+                    }
                 }
-            } else if phase == AI_PHASE_RETREAT && ph_ticks > 75 {
+            } else if phase == AI_PHASE_RETREAT && ph_ticks > RETREAT_TICKS {
                 phase = AI_PHASE_DEFEND;
                 ph_ticks = 0;
             }
@@ -3131,16 +3404,89 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             if fresh {
                 let bal = state.possession_balance_permille * if side == TeamSide::Home { 1 } else { -1 };
                 phase = if bal >= 0 { AI_PHASE_ATTACK } else { AI_PHASE_DEFEND };
+            } else if phase == AI_PHASE_COUNTER_PRESS {
+                // A pass longer than 16 m beats the counter-press: fall back.
+                let beaten = state
+                    .ball
+                    .pass_in_flight
+                    .as_ref()
+                    .is_some_and(|pf| pf.team != side && pf.target_pos.dist(ball_xy) > Fp::from_milli(CP_BEATEN_PASS_MM));
+                if beaten || !continuous {
+                    phase = AI_PHASE_RETREAT;
+                    ph_ticks = 0;
+                }
             }
         }
     }
+
+    // 2b. High-intensity distance (fatigue integrator) and press triggers.
+    for (i, p) in players.iter().enumerate() {
+        let sp = p.vel.len().to_milli();
+        let hi = mem.hi_dist_mm[i];
+        let add = if sp > HI_SPEED_MM_S { (sp / 60) as u32 } else { 0 };
+        mem.hi_dist_mm[i] = hi - hi / HI_WINDOW_TICKS + add;
+    }
+    let carrier_idx = state.ball.owner.and_then(|(os, oi)| (os != side).then_some(oi));
+    let trigger_now = carrier_idx.is_some_and(|ci| {
+        let c = &opps[ci];
+        let heavy = state.ball.pos.xy().dist(c.pos) > Fp::from_milli(HEAVY_TOUCH_MM);
+        let fwd = Vec2::from_bam(c.facing_bam, Fp::ONE);
+        // The carrier attacks our goal (-sign); facing +sign means facing his own goal.
+        let back_to_goal = fwd.x.to_milli() * ctx.sign > 500;
+        let touchline = c.pos.y.abs() > state.format.half_width() - Fp::from_milli(TOUCHLINE_TRAP_MM);
+        heavy || back_to_goal || touchline
+    });
+    mem.press_trigger_ticks = if trigger_now && matches!(phase, AI_PHASE_DEFEND | AI_PHASE_RETREAT) {
+        PRESS_TRIGGER_HOLD
+    } else {
+        mem.press_trigger_ticks.saturating_sub(1)
+    };
+
+    // 2c. Rest offence: exactly one Low-work-rate front-slot forward stays high (the incumbent keeps
+    //     it while eligible; otherwise the lowest work rate, then the most advanced slot).
+    {
+        let eligible = |i: usize| -> Option<(i64, i64)> {
+            let p = &players[i];
+            let s = ctx.slot(mem.slot_of[i])?;
+            let dwr = player_style(p).def_work_rate;
+            (!p.sent_off && matches!(s.role, SlotRole::Striker | SlotRole::Pivo) && dwr_band(dwr) == 0)
+                .then_some((dwr, -s.attack_depth))
+        };
+        let inc = plan_idx(mem.rest_offence).filter(|&i| i < n && eligible(i).is_some());
+        mem.rest_offence = match inc {
+            Some(i) => i as u8,
+            None => (1..n)
+                .filter_map(|i| eligible(i).map(|(d, a)| (d, a, i)))
+                .min()
+                .map_or(AI_NONE, |(_, _, i)| i as u8),
+        };
+    }
+    let rest_offence = mem.rest_offence;
+
     mem.phase = phase;
     mem.phase_ticks = ph_ticks;
 
     // 3. Slots against this phase's anchors.
     let (blk, attacking) = phase_block(&ctx, state, ref_ball, phase);
-    let anchors: Vec<Vec2> = ctx.slots.iter().map(|s| slot_pos(&ctx, &blk, s, attacking)).collect();
+    let anchors: Vec<Vec2> = ctx
+        .slots
+        .iter()
+        .enumerate()
+        .map(|(k, s)| slot_pos(&ctx, &blk, s, attacking, front_mode(&ctx, state, &mem.slot_of, rest_offence, k)))
+        .collect();
     assign_slots(&ctx, state, mem, &anchors);
+
+    // 3a. Shared back line (one value per team, lag-tracked by the back-liners).
+    if is_defensive_phase(phase) {
+        let target = defend_block(&ctx, state, ref_ball, phase == AI_PHASE_RETREAT).line;
+        mem.line_prog = if mem.line_prog == 0 || !continuous {
+            target
+        } else {
+            mem.line_prog + (target - mem.line_prog) * LINE_LAG_PM / 1_000
+        };
+    } else {
+        mem.line_prog = 0;
+    }
 
     // 3b. Exclusivity layer: elect the one loose-ball chaser (agent2d margins + GRF ratio hysteresis).
     let cpu_side = side_is_cpu(state, side);
@@ -3162,15 +3508,33 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
     // ball, so there is no presser on it: the presser role is for a carrier.
     let loose_exclusive = state.ball.owner.is_none() && (chaser != 0 || mem.keeper_claim);
 
-    // 4. One presser (+ a second presser while counter-pressing) and one cover, with hysteresis.
-    //    As before, an AI presser is committed only when clearly faster than the controlled player;
-    //    when one is, a CPU-controlled player stands off (cover / mark / slot) so at most two players
-    //    engage. The chaser is never the presser, and a human-controlled player is never planned for.
+    // 4. One presser, the counter-press lane-closers (or the second man on a press trigger) and one
+    //    cover, with hysteresis. As before, an AI presser is committed only when clearly faster than
+    //    the controlled player; when one is, a CPU-controlled player stands off (cover / mark / slot)
+    //    so at most two players engage. The chaser is never the presser, and a human-controlled
+    //    player is never planned for. The human's teammate-contain mate is the second engager: he is
+    //    excluded from every election and the AI presser is demoted to cover while contain is held.
     let opp_owns = owner_ours == Some(false);
     let defensive = is_defensive_phase(phase) && owner_ours != Some(true);
     let def_blk = defend_block(&ctx, state, ref_ball, false);
+    let contain = (!cpu_side && opp_owns)
+        .then(|| state.teammate_contain_idx[side.index()])
+        .flatten()
+        .filter(|&c| c > 0 && c < n && c != controlled && !players[c].sent_off);
+    mem.contain_mate = contain.map_or(AI_NONE, |c| c as u8);
+    let def_anchor: Vec<Vec2> = (0..n)
+        .map(|i| match ctx.slot(mem.slot_of[i]) {
+            Some(s) => {
+                let fm = front_mode(&ctx, state, &mem.slot_of, rest_offence, mem.slot_of[i] as usize);
+                slot_pos(&ctx, &def_blk, &s, false, fm)
+            }
+            None => players[i].pos,
+        })
+        .collect();
     let mut new_presser = AI_NONE;
     let mut new_second = AI_NONE;
+    let mut new_third = AI_NONE;
+    let mut demoted = AI_NONE;
     if defensive {
         let waypoints = if state.ball.owner.is_some() {
             [state.ball.pos; 21]
@@ -3193,6 +3557,8 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             (false, true) => 20_000,
         });
         let ball_p = ctx.prog(ball_xy.x);
+        let ball_yf = ctx.yf(ball_xy.y);
+        let middle_third = ball_p > ctx.len / 3 && ball_p < ctx.len * 2 / 3;
         let press_cost = |i: usize| -> u32 {
             let p = &players[i];
             let st = player_style(p);
@@ -3201,6 +3567,17 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             // Centre-backs hold the line instead of chasing a ball far in front of it.
             if slot.is_some_and(|s| s.role.is_back_line()) && ball_p > def_blk.line + 8_000 {
                 c += 14;
+            }
+            // Prefer a midfielder as presser in the middle third [official FIFA 12-13; estimate].
+            if middle_third
+                && slot.is_some_and(|s| matches!(s.role, SlotRole::CentralMid | SlotRole::Holding | SlotRole::WideMid))
+            {
+                c -= 3;
+            }
+            // Zone handover: a presser far outside his zone costs 2 ticks per metre beyond 12 m.
+            let lat = (ctx.yf(def_anchor[i].y) - ball_yf).abs();
+            if lat > ZONE_HANDOVER_LAT_MM {
+                c += (lat - ZONE_HANDOVER_LAT_MM) / 500;
             }
             c -= (st.aggression - 500) / 100;
             c += (500 - st.work_rate).max(0) / 100;
@@ -3213,10 +3590,21 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
         } else {
             u32::MAX / 4
         };
+        // Zone handover: outside the counter-press, the incumbent is released once the carrier is
+        // beyond 12 m laterally from his slot or 8 m beyond his line (back-liners excepted).
+        let released = plan_idx(mem.presser).filter(|&cur| {
+            cur < n
+                && phase != AI_PHASE_COUNTER_PRESS
+                && ((ctx.yf(def_anchor[cur].y) - ball_yf).abs() > ZONE_HANDOVER_LAT_MM
+                    || (!ctx.slot(mem.slot_of[cur]).is_some_and(|s| s.role.is_back_line())
+                        && ball_p < ctx.prog(def_anchor[cur].x) - ZONE_HANDOVER_DEPTH_MM))
+        });
         let mut ranked: Vec<(u32, usize)> = (1..n)
             .filter(|&i| {
                 i != controlled
                     && i as u8 != chaser
+                    && Some(i) != contain
+                    && Some(i) != released
                     && !loose_exclusive
                     && !players[i].sent_off
                     && players[i].pos.dist(ball_xy) <= radius
@@ -3239,10 +3627,27 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             if chosen_ticks + ctrl_margin < ctrl_ticks || (cur_valid && chosen == cur && chosen_ticks < ctrl_ticks + 3) {
                 new_presser = chosen as u8;
             }
-            if phase == AI_PHASE_COUNTER_PRESS && opp_owns {
+            if contain.is_some() && new_presser != AI_NONE {
+                // The human and his contain mate are the two engagers: the AI presser covers.
+                demoted = new_presser;
+                new_presser = AI_NONE;
+            }
+            let free = |i: usize| -> bool {
+                i != chosen
+                    && i as u8 != new_presser
+                    && i as u8 != demoted
+                    && !ctx.slot(mem.slot_of[i]).is_some_and(|s| s.role.is_back_line())
+            };
+            if phase == AI_PHASE_COUNTER_PRESS && opp_owns && contain.is_none() {
+                // Two lane-closers (the rest-defence back line never joins the counter-press).
+                let mut closers = ranked.iter().filter(|&&(c, i)| c < 70 && free(i)).map(|&(_, i)| i);
+                new_second = closers.next().map_or(AI_NONE, |i| i as u8);
+                new_third = closers.next().map_or(AI_NONE, |i| i as u8);
+            } else if mem.press_trigger_ticks > 0 && opp_owns && contain.is_none() {
+                // Press trigger outside the counter-press: a second man shadows the presser.
                 new_second = ranked
                     .iter()
-                    .find(|&&(c, i)| i != chosen && c < 70 && i as u8 != new_presser)
+                    .find(|&&(c, i)| c < 50 && free(i))
                     .map_or(AI_NONE, |&(_, i)| i as u8);
             }
         }
@@ -3254,6 +3659,28 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
     }
     mem.presser = new_presser;
     mem.second_presser = new_second;
+    mem.third_presser = new_third;
+
+    // 4b. Lanes for the closers: the two best receiver lanes from the carrier (incumbent lanes are
+    //     kept while still among the candidates), assigned to minimise the closers' total distance.
+    if let Some(ci) = carrier_idx.filter(|_| new_second != AI_NONE && phase == AI_PHASE_COUNTER_PRESS) {
+        let lanes = best_lanes(&ctx, state, side, ci, &mem.closer_lane);
+        let pos = |k: u8| plan_idx(k).map(|i| players[i].pos);
+        let lane_pt = |o: usize| opps[ci].pos.lerp(opps[o].pos, Fp::HALF);
+        mem.closer_lane = match (lanes.first().copied(), lanes.get(1).copied(), pos(new_second), pos(new_third)) {
+            (Some(a), Some(b), Some(p2), Some(p3)) => {
+                if p2.dist(lane_pt(a)) + p3.dist(lane_pt(b)) <= p2.dist(lane_pt(b)) + p3.dist(lane_pt(a)) {
+                    [a as u8, b as u8]
+                } else {
+                    [b as u8, a as u8]
+                }
+            }
+            (Some(a), _, _, _) => [a as u8, AI_NONE],
+            _ => [AI_NONE; 2],
+        };
+    } else {
+        mem.closer_lane = [AI_NONE; 2];
+    }
 
     let mut new_cover = AI_NONE;
     // On a loose ball the chaser (or keeper) is the only player with a job on it: everyone else, the
@@ -3278,6 +3705,8 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
                 || i as u8 == chaser
                 || i as u8 == new_presser
                 || i as u8 == new_second
+                || i as u8 == new_third
+                || Some(i) == contain
             {
                 continue;
             }
@@ -3295,6 +3724,9 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             }
         }
         new_cover = best.map_or(AI_NONE, |(_, i)| i as u8);
+        if demoted != AI_NONE {
+            new_cover = demoted;
+        }
         // A CPU-controlled player standing off an AI presser is the cover (the second engager),
         // so standing off never pulls an extra AI player out of the shape.
         if cpu_side
@@ -3304,6 +3736,7 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
             && !players[controlled].sent_off
             && controlled as u8 != new_presser
             && controlled as u8 != new_second
+            && controlled as u8 != new_third
             && controlled as u8 != chaser
         {
             new_cover = controlled as u8;
@@ -3316,88 +3749,183 @@ fn update_team_plan(state: &MatchState, side: TeamSide) {
     }
     mem.cover = new_cover;
 
-    // 5. Goal-side marking with hysteresis (defend / retreat only; forwards do not mark).
-    let carrier_idx = state.ball.owner.and_then(|(os, oi)| (os != side).then_some(oi));
-    let mut taken = vec![false; opps.len()];
-    let mut order: Vec<usize> = (1..n).collect();
-    order.sort_by_key(|&i| (ctx.slot(mem.slot_of[i]).map_or(9_999, |s| s.defend_depth), i));
+    // 5. Marking by one arbiter (round 4, area T; FIFA 14 "most dangerous player"): incumbents first
+    //    (kept for a 24-tick dwell, then only beaten by a candidate 3 m closer), then the free
+    //    opponents in danger order to the nearest free defender. A back-liner keeps a runner in
+    //    behind until a deeper teammate covers the runner-to-goal line (Konami's La check).
+    //    Defend / retreat: everyone but the rest offence and Low-work-rate front slots; counter-press:
+    //    the back line and the holding slot (the rest-defence core).
     let zone = Fp::from_milli(if is_5v5 { 7_000 } else { 9_000 });
     let front_p = def_blk.line + def_blk.len + 2_000;
-    for &i in &order {
-        let p = &players[i];
-        let slot = ctx.slot(mem.slot_of[i]);
-        let eligible = matches!(phase, AI_PHASE_DEFEND | AI_PHASE_RETREAT)
-            && !p.sent_off
-            && (i != controlled || (cpu_side && new_presser != AI_NONE))
-            && i as u8 != chaser
-            && i as u8 != new_presser
-            && i as u8 != new_cover
-            && slot.is_some_and(|s| !matches!(s.role, SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger));
-        if !eligible {
-            mem.mark_of[i] = AI_NONE;
-            mem.mark_ticks[i] = 0;
+    let own_goal = ctx.world(0, 0);
+    let eligible: Vec<bool> = (0..n)
+        .map(|i| {
+            let p = &players[i];
+            let slot = ctx.slot(mem.slot_of[i]);
+            let front = slot.is_some_and(|s| matches!(s.role, SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger));
+            let core = slot.is_some_and(|s| s.role.is_back_line() || s.role == SlotRole::Holding);
+            let phase_ok = match phase {
+                AI_PHASE_DEFEND | AI_PHASE_RETREAT => {
+                    !front || (dwr_band(player_style(p).def_work_rate) > 0 && Some(i) != plan_idx(rest_offence))
+                }
+                AI_PHASE_COUNTER_PRESS => core,
+                _ => false,
+            };
+            i > 0
+                && slot.is_some()
+                && phase_ok
+                && !p.sent_off
+                && (i != controlled || (cpu_side && new_presser != AI_NONE))
+                && i as u8 != chaser
+                && i as u8 != new_presser
+                && i as u8 != new_cover
+                && i as u8 != new_second
+                && i as u8 != new_third
+                && Some(i) != contain
+        })
+        .collect();
+    let opp_ok = |o: usize| -> bool {
+        o < opps.len() && o != 0 && !opps[o].sent_off && Some(o) != carrier_idx && ctx.prog(opps[o].pos.x) <= front_p
+    };
+    // Konami cover check: a teammate other than `me` within La of the opponent-to-goal line and
+    // closer to goal than the opponent.
+    let covered = |o: usize, me: usize| -> bool {
+        let op = opps[o].pos;
+        let op_p = ctx.prog(op.x);
+        players.iter().enumerate().skip(1).any(|(j, t)| {
+            j != me
+                && !t.sent_off
+                && ctx.prog(t.pos.x) < op_p
+                && closest_on_segment(op, own_goal, t.pos).dist(t.pos) <= Fp::from_milli(COVER_LA_MM)
+        })
+    };
+    let line_p = mem.line_prog;
+    let mut taken = vec![false; opps.len()];
+    let mut new_mark = vec![AI_NONE; n];
+    let mut new_ticks = vec![0_u16; n];
+    // (a) Incumbents.
+    for i in 1..n {
+        if !eligible[i] {
             continue;
         }
-        let anchor = slot.map_or(p.pos, |s| slot_pos(&ctx, &def_blk, &s, false));
-        let valid = |o: usize, r: Fp| -> bool {
-            o < opps.len()
-                && o != 0
-                && !opps[o].sent_off
-                && Some(o) != carrier_idx
-                && !taken[o]
-                && ctx.prog(opps[o].pos.x) <= front_p
-                && anchor.dist(opps[o].pos) <= r
+        let Some(o) = plan_idx(mem.mark_of[i]).filter(|&o| opp_ok(o) && !taken[o]) else { continue };
+        let d_anchor = def_anchor[i].dist(opps[o].pos);
+        let back = ctx.slot(mem.slot_of[i]).is_some_and(|s| s.role.is_back_line());
+        let runner = back && line_p != 0 && ctx.prog(opps[o].pos.x) < line_p;
+        let keep = if runner {
+            players[i].pos.dist(opps[o].pos) <= Fp::from_milli(RUNNER_TRACK_MM) && !covered(o, i)
+        } else {
+            d_anchor <= zone.mul(Fp::from_milli(1_350))
         };
+        if keep {
+            new_mark[i] = o as u8;
+            new_ticks[i] = mem.mark_ticks[i].saturating_add(1);
+            taken[o] = true;
+        }
+    }
+    // (b) Free opponents by danger: value (closeness to our goal of the 1 s look-ahead point, central
+    //     bonus) x reachability (closeness to the ball).
+    let mut free_opps: Vec<(i64, usize)> = (1..opps.len())
+        .filter(|&o| opp_ok(o) && !taken[o])
+        .map(|o| {
+            let look = opps[o].pos + opps[o].vel;
+            let value = (1_000 - ctx.prog(look.x) * 1_000 / ctx.len).clamp(0, 1_000)
+                + if ctx.yf(look.y).abs() < ctx.half_wid / 3 { 200 } else { 0 };
+            let reach = 15_000_000 / (15_000 + look.dist(ball_xy).to_milli());
+            (-(value * reach / 1_000), o)
+        })
+        .collect();
+    free_opps.sort_unstable();
+    for &(_, o) in &free_opps {
         let mut best: Option<(Fp, usize)> = None;
-        for (o, opp) in opps.iter().enumerate().skip(1) {
-            if valid(o, zone) {
-                let d = anchor.dist(opp.pos);
-                if best.is_none_or(|(bd, _)| d < bd) {
+        for i in 1..n {
+            if !eligible[i] || new_mark[i] != AI_NONE {
+                continue;
+            }
+            let d = def_anchor[i].dist(opps[o].pos);
+            if d <= zone && best.is_none_or(|(bd, _)| d < bd) {
+                best = Some((d, i));
+            }
+        }
+        if let Some((_, i)) = best {
+            new_mark[i] = o as u8;
+            new_ticks[i] = 0;
+            taken[o] = true;
+        }
+    }
+    // (c) After the dwell, an incumbent may switch to a still-free opponent 3 m closer.
+    for i in 1..n {
+        let Some(cur) = plan_idx(new_mark[i]) else { continue };
+        if new_ticks[i] < MARK_DWELL_TICKS || new_ticks[i] == 0 {
+            continue;
+        }
+        let cd = def_anchor[i].dist(opps[cur].pos);
+        let mut best: Option<(Fp, usize)> = None;
+        for o in 1..opps.len() {
+            if opp_ok(o) && !taken[o] {
+                let d = def_anchor[i].dist(opps[o].pos);
+                if d <= zone && d + Fp::from_milli(MARK_INCUMBENT_MM) < cd && best.is_none_or(|(bd, _)| d < bd) {
                     best = Some((d, o));
                 }
             }
         }
-        let prev = mem.mark_of[i] as usize;
-        let prev_ok = mem.mark_of[i] != AI_NONE && valid(prev, zone.mul(Fp::from_milli(1_350)));
-        let chosen = if prev_ok {
-            let pd = anchor.dist(opps[prev].pos);
-            match best {
-                Some((bd, bo)) if bo != prev && mem.mark_ticks[i] >= diff.hold && bd + Fp::from_milli(3_000) < pd => Some(bo),
-                _ => Some(prev),
-            }
-        } else {
-            best.map(|(_, o)| o)
-        };
-        match chosen {
-            Some(o) => {
-                if o == prev && prev_ok {
-                    mem.mark_ticks[i] = mem.mark_ticks[i].saturating_add(1);
-                } else {
-                    mem.mark_ticks[i] = 0;
-                }
-                mem.mark_of[i] = o as u8;
-                taken[o] = true;
-            }
-            None => {
-                mem.mark_of[i] = AI_NONE;
-                mem.mark_ticks[i] = 0;
-            }
+        if let Some((_, o)) = best {
+            taken[cur] = false;
+            taken[o] = true;
+            new_mark[i] = o as u8;
+            new_ticks[i] = 0;
         }
     }
+    mem.mark_of = new_mark;
+    mem.mark_ticks = new_ticks;
     assign_move_classes(state, side, mem, controlled, cpu_side);
     mem.plan_tick = tick.wrapping_add(1);
+}
+
+/// The best (up to two) receiver lanes from opponent carrier `ci` for the counter-press closers:
+/// receivers within 25 m ranked by distance minus half their progress toward our goal; a lane in
+/// `prev` stays while it is within 3 m of the best score.
+fn best_lanes(ctx: &ShapeCtx, state: &MatchState, side: TeamSide, ci: usize, prev: &[u8; 2]) -> Vec<usize> {
+    let opps = &state.players[side.opponent().index()];
+    let c = opps[ci].pos;
+    let c_p = ctx.prog(c.x);
+    let mut cands: Vec<(i64, usize)> = opps
+        .iter()
+        .enumerate()
+        .skip(1)
+        .filter(|&(o, op)| {
+            o != ci
+                && !op.sent_off
+                && op.pos.dist(c) <= Fp::from_milli(25_000)
+                // Only lanes toward our goal (receivers no more than 3 m behind the carrier): a
+                // closer on a back-pass lane stood ahead of the ball.
+                && ctx.prog(op.pos.x) <= c_p + 3_000
+        })
+        .map(|(o, op)| {
+            let mut score = op.pos.dist(c).to_milli() - (c_p - ctx.prog(op.pos.x)) / 2;
+            if prev.contains(&(o as u8)) {
+                score -= 3_000;
+            }
+            (score, o)
+        })
+        .collect();
+    cands.sort_unstable();
+    cands.into_iter().take(2).map(|(_, o)| o).collect()
 }
 
 /// Defensive-shape anchor `players[side][idx]` currently owns (public for metrics and tests).
 pub fn defensive_shape_anchor(state: &MatchState, side: TeamSide, idx: usize) -> Vec2 {
     let ctx = ShapeCtx::new(state, side);
-    let (slot, ref_ball) = {
+    let (slot, ref_ball, slot_of, rest) = {
         let mems = state.ai_memory.borrow();
         let m = &mems[side.index()];
-        (m.slot_of.get(idx).copied().unwrap_or(AI_NONE), m.ref_ball)
+        (m.slot_of.get(idx).copied().unwrap_or(AI_NONE), m.ref_ball, m.slot_of.clone(), m.rest_offence)
     };
     match ctx.slot(slot) {
-        Some(s) => slot_pos(&ctx, &defend_block(&ctx, state, ref_ball, false), &s, false),
+        Some(s) => {
+            let fm = front_mode(&ctx, state, &slot_of, rest, slot as usize);
+            slot_pos(&ctx, &defend_block(&ctx, state, ref_ball, false), &s, false, fm)
+        }
         None => world_anchor_for_player(state, side, idx, Fp::ZERO),
     }
 }
@@ -3417,15 +3945,16 @@ pub fn team_phase(state: &MatchState, side: TeamSide) -> u8 {
 /// refinements, spacing and yield (public for metrics and tests).
 pub fn shape_slot_anchor(state: &MatchState, side: TeamSide, idx: usize) -> Vec2 {
     let ctx = ShapeCtx::new(state, side);
-    let (slot, ref_ball, phase) = {
+    let (slot, ref_ball, phase, slot_of, rest) = {
         let mems = state.ai_memory.borrow();
         let m = &mems[side.index()];
-        (m.slot_of.get(idx).copied().unwrap_or(AI_NONE), m.ref_ball, m.phase)
+        (m.slot_of.get(idx).copied().unwrap_or(AI_NONE), m.ref_ball, m.phase, m.slot_of.clone(), m.rest_offence)
     };
     match ctx.slot(slot) {
         Some(s) => {
             let (blk, attacking) = phase_block(&ctx, state, ref_ball, phase);
-            slot_pos(&ctx, &blk, &s, attacking)
+            let fm = front_mode(&ctx, state, &slot_of, rest, slot as usize);
+            slot_pos(&ctx, &blk, &s, attacking, fm)
         }
         None => world_anchor_for_player(state, side, idx, Fp::ZERO),
     }
@@ -3601,7 +4130,8 @@ fn elect_chaser(
 
 /// Baseline movement priority class per player for this tick (refined per player by
 /// `outfield_shape_intent`): 0 = carrier / elected chaser / committed or ball-holding keeper,
-/// 1 = presser, second presser, cover and the human-controlled player, 2 = everyone else.
+/// 1 = presser, lane-closers / second man, cover, the human's contain mate and the human-controlled
+/// player, 2 = everyone else.
 fn assign_move_classes(state: &MatchState, side: TeamSide, mem: &mut TeamAiMemory, controlled: usize, cpu_side: bool) {
     let n = state.players[side.index()].len();
     for i in 0..n {
@@ -3611,6 +4141,8 @@ fn assign_move_classes(state: &MatchState, side: TeamSide, mem: &mut TeamAiMemor
             if keeper_committed(state, side) { 0 } else { 2 }
         } else if i as u8 == mem.presser
             || i as u8 == mem.second_presser
+            || i as u8 == mem.third_presser
+            || i as u8 == mem.contain_mate
             || i as u8 == mem.cover
             || (!cpu_side && i == controlled)
         {
@@ -5060,6 +5592,22 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         let mems = state.ai_memory.borrow();
         UMem::read(&mems[side.index()], idx)
     };
+    // Round 4, area T plan read-outs.
+    let (third, closer_lane, rest_offence, line_prog, press_trigger, rec_prev, burst_prev, hi_dist, slot_of) = {
+        let mems = state.ai_memory.borrow();
+        let m = &mems[side.index()];
+        (
+            m.third_presser,
+            m.closer_lane,
+            m.rest_offence,
+            m.line_prog,
+            m.press_trigger_ticks,
+            m.rec_flags.get(idx).copied().unwrap_or(0),
+            m.burst_ticks.get(idx).copied().unwrap_or(0),
+            m.hi_dist_mm.get(idx).copied().unwrap_or(0),
+            m.slot_of.clone(),
+        )
+    };
     let me = idx as u8;
     let slot = ctx.slot(slot_k);
     let role = slot.map(|s| s.role);
@@ -5068,11 +5616,11 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
     let we_own = state.ball.owner.is_some_and(|(os, _)| os == side);
     let (blk, attacking) = phase_block(&ctx, state, ref_ball, phase);
     let anchor = match slot {
-        Some(s) => slot_pos(&ctx, &blk, &s, attacking),
+        Some(s) => slot_pos(&ctx, &blk, &s, attacking, front_mode(&ctx, state, &slot_of, rest_offence, slot_k as usize)),
         None => world_anchor_for_player(state, side, idx, Fp::ZERO),
     };
 
-    let mut raw = anchor;
+    let mut raw: Vec2;
     let mut press_role = false;
     let mut force_sprint = false;
     let mut counter_run = false;
@@ -5081,35 +5629,92 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
     let mut alpha_pm = 120 + style.discipline / 5;
     // A committed runner holding at the onside limit (stutter, never reversing while onside).
     let mut run_hold = false;
+    // Round 4, area T: recovery urgency (high-speed band, latched recovery sprint and its burst).
+    let mut high_band = false;
+    let mut rec_now = false;
+    let mut burst_now: u16 = 0;
+    let mut trigger_sprint = false;
+    let fatigue_pm = if hi_dist > HI_PEAK_MM { FATIGUE_PM } else { 1_000 };
+    let continuous_prev = prev_tick != 0 && prev_tick.wrapping_add(1) == state.tick;
+    let opp_side = side.opponent().index();
 
     if is_defensive_phase(phase) && !we_own {
         let pred_ball = predict_ball_xy_at_ticks(state, 5);
         let goal_dir = (own_goal - pred_ball).normalize_or_zero();
+        // Most dangerous receiver lane from the carrier (cover shadows and lane blocks): the receiver
+        // with the best value (closeness to our goal of his 1 s look-ahead) x reach (near the carrier).
+        let lanes: Vec<(i64, Vec2, Vec2)> = match opp_carrier {
+            Some(ci) => {
+                let c_pos = state.players[opp_side][ci].pos;
+                let mut v: Vec<(i64, Vec2, Vec2)> = state.players[opp_side]
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .filter(|&(o, op)| o != ci && !op.sent_off && op.pos.dist(c_pos) <= Fp::from_milli(30_000))
+                    .map(|(_, op)| {
+                        let look = op.pos + op.vel;
+                        let value = (1_000 - ctx.prog(look.x) * 1_000 / ctx.len).clamp(0, 1_000) + 200;
+                        let reach = 15_000_000 / (15_000 + look.dist(c_pos).to_milli());
+                        (-(value * reach / 1_000), c_pos, op.pos)
+                    })
+                    .collect();
+                v.sort_by_key(|l| l.0);
+                v
+            }
+            None => Vec::new(),
+        };
+        let shadow_shift = |base: Vec2| -> Vec2 {
+            // Cover shadow: shift the contain point up to 0.75 m toward the best lane's side.
+            match lanes.first() {
+                Some(&(_, c, r)) => {
+                    let perp = Vec2::new(-goal_dir.y, goal_dir.x);
+                    let sgn = if perp.dot(r - c) >= Fp::ZERO { Fp::ONE } else { Fp::NEG_ONE };
+                    base + perp.scale(sgn.mul(Fp::from_milli(SHADOW_SHIFT_MM)))
+                }
+                None => base,
+            }
+        };
         if phase == AI_PHASE_COUNTER_PRESS && me == presser {
             // Counter-press: hunt the ball tight while the window lasts.
             let gap = 950 + (1_000 - p.stamina_permille as i64).max(0) / 3;
-            raw = pred_ball + goal_dir.scale(Fp::from_milli(gap));
+            raw = shadow_shift(pred_ball + goal_dir.scale(Fp::from_milli(gap)));
             press_role = true;
             force_sprint = true;
             alpha_pm = 650;
-        } else if phase == AI_PHASE_COUNTER_PRESS && me == second {
-            // Second presser cuts the carrier's nearest passing lane instead of doubling the ball.
+        } else if phase == AI_PHASE_COUNTER_PRESS && (me == second || me == third) {
+            // Lane-closers shut the two best receiver lanes (nearest point on the lane, at least 3 m
+            // from the carrier and no more than 70% along it), at the high-speed band.
+            let k = usize::from(me == third);
             let mut lane = pred_ball + goal_dir.scale(Fp::from_milli(3_000));
-            if let Some(ci) = opp_carrier {
-                let c_pos = state.players[side.opponent().index()][ci].pos;
-                let mut best_d = Fp::from_milli(16_000);
-                for (o_i, o) in state.players[side.opponent().index()].iter().enumerate().skip(1) {
-                    if o_i != ci && !o.sent_off {
-                        let d = o.pos.dist(c_pos);
-                        if d < best_d {
-                            best_d = d;
-                            lane = c_pos.lerp(o.pos, Fp::from_milli(450));
-                        }
-                    }
-                }
+            if let (Some(ci), Some(o)) = (opp_carrier, plan_idx(closer_lane[k])) {
+                let c_pos = state.players[opp_side][ci].pos;
+                let r_pos = state.players[opp_side].get(o).map_or(c_pos, |r| r.pos);
+                let len = c_pos.dist(r_pos);
+                let lo = Fp::from_milli(3_000).min(len);
+                let hi = len.mul(Fp::from_milli(700)).max(lo);
+                let dir = (r_pos - c_pos).normalize_or_zero();
+                let along = (p.pos - c_pos).dot(dir).clamp(lo, hi);
+                lane = c_pos + dir.scale(along);
             }
             raw = lane;
-            force_sprint = p.pos.dist(raw) > Fp::from_milli(2_500);
+            high_band = p.pos.dist(raw) > Fp::from_milli(2_500);
+            alpha_pm = 500;
+        } else if me == second && phase != AI_PHASE_COUNTER_PRESS {
+            // Second man on a press trigger: shadow 3.5 m behind-side of the presser, toward the best
+            // lane, never a tackler and never inside 3 m of the carrier.
+            let presser_pos = if presser != AI_NONE {
+                state.players[side.index()][presser as usize].pos
+            } else {
+                state.players[side.index()][state.controlled_idx[side.index()]].pos
+            };
+            let perp = Vec2::new(-goal_dir.y, goal_dir.x);
+            let sgn = match lanes.first() {
+                Some(&(_, c, r)) if perp.dot(r - c) < Fp::ZERO => Fp::NEG_ONE,
+                _ => Fp::ONE,
+            };
+            let off = (goal_dir.scale(Fp::from_milli(700)) + perp.scale(sgn.mul(Fp::from_milli(700)))).normalize_or_zero();
+            raw = presser_pos + off.scale(Fp::from_milli(SECOND_MAN_MM));
+            high_band = p.pos.dist(raw) > Fp::from_milli(2_500);
             alpha_pm = 500;
         } else if me == presser && phase != AI_PHASE_COUNTER_PRESS {
             // ONE presser contains goal-side; gap set by aggression, stamina decay & difficulty.
@@ -5122,9 +5727,10 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
                 + (1_000 - p.stamina_permille as i64).max(0) / 2
                 + diff_adj)
                 .clamp(1_050, 2_100);
-            raw = pred_ball + goal_dir.scale(Fp::from_milli(gap));
+            raw = shadow_shift(pred_ball + goal_dir.scale(Fp::from_milli(gap)));
             press_role = true;
             alpha_pm = 600;
+            trigger_sprint = press_trigger > 0;
         } else if me == cover {
             // Cover: goal-side behind whoever presses, never higher than the back line + 2 m.
             let depth = Fp::from_milli(if is_5v5 { 4_500 } else { 6_500 });
@@ -5143,20 +5749,65 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             }
             raw = c;
             alpha_pm = 380;
-        } else if phase != AI_PHASE_COUNTER_PRESS {
-            let back_or_screen = role.is_some_and(|r| r.is_back_line() || r == SlotRole::Holding);
+        } else {
+            // Every other defender, in every defensive phase (the counter-press included).
+            let back_line = role.is_some_and(|r| r.is_back_line());
+            let back_or_screen = back_line || role == Some(SlotRole::Holding);
+            let is_front = role.is_some_and(|r| matches!(r, SlotRole::Striker | SlotRole::Pivo | SlotRole::Winger))
+                || p.role == PlayerRole::Forward;
+            let is_rest = plan_idx(rest_offence) == Some(idx);
+            let band = dwr_band(style.def_work_rate);
+            let ball_p = ctx.prog(ball_xy.x);
             let opp_wide_cutback_threat = opp_owns
                 && (ball_xy.x - own_goal_x).abs() <= Fp::from_milli(if is_5v5 { 13_500 } else { 18_000 })
                 && ball_xy.y.abs() > goal_half_w + Fp::from_milli(1_600);
-            // Judgement error on line stepping: positioning x difficulty, drifting smoothly.
-            let err_mm = smooth_noise_pm(state.tick, 150, side.index() as u32 * 31 + 7, idx as u32)
-                * (100 - p.attributes.positioning as i64).max(0)
-                * 30
-                / 1_000
-                * diff.err_pm
-                / 1_000;
-            let err_mm = if back_or_screen { err_mm } else { err_mm * 6 / 10 };
-            raw = ctx.world(ctx.prog(anchor.x) + err_mm, ctx.yf(anchor.y));
+            // Back-liners hold the defend-block slot on the shared line in every defensive phase (the
+            // rest-defence core never joins the counter-press).
+            let (anchor, blk) = match (back_line && phase == AI_PHASE_COUNTER_PRESS, slot) {
+                (true, Some(s)) => {
+                    let dblk = defend_block(&ctx, state, ref_ball, false);
+                    (slot_pos(&ctx, &dblk, &s, false, FrontMode::Plain), dblk)
+                }
+                _ => (anchor, blk),
+            };
+            let anchor_p = ctx.prog(anchor.x);
+            let mut tgt_p = if back_line && line_prog != 0 {
+                // Shared line: one team value, the same judgement error for the whole back line.
+                let err_mm = smooth_noise_pm(state.tick, 150, side.index() as u32 * 31 + 7, 0)
+                    * (100 - avg_positioning_pm(state, side) / 10).max(0)
+                    * 30
+                    / 1_000
+                    * diff.err_pm
+                    / 1_000;
+                line_prog + (anchor_p - blk.line) + err_mm
+            } else {
+                // Judgement error on stepping: positioning x difficulty, drifting smoothly (60%).
+                let err_mm = smooth_noise_pm(state.tick, 150, side.index() as u32 * 31 + 7, idx as u32)
+                    * (100 - p.attributes.positioning as i64).max(0)
+                    * 30
+                    / 1_000
+                    * diff.err_pm
+                    / 1_000;
+                anchor_p + if back_or_screen { err_mm } else { err_mm * 6 / 10 }
+            };
+            if phase == AI_PHASE_COUNTER_PRESS && !is_rest {
+                // Counter-press: whoever is ahead of the ball gets goal-side of it (forwards to their
+                // work-rate holding line).
+                let hold = if is_front { FWD_HOLD_MM[usize::from(is_5v5)][band] } else { RECOVERY_EXIT_MM };
+                tgt_p = tgt_p.min(ball_p - hold);
+            }
+            let mut tgt_yf = ctx.yf(anchor.y);
+            // Cover tuck: the ball-far full-back tucks in once the carrier is at or past our line.
+            if role == Some(SlotRole::FullBack)
+                && opp_owns
+                && line_prog != 0
+                && ball_p <= line_prog + 1_000
+                && (tgt_yf >= 0) != (ctx.yf(ball_xy.y) >= 0)
+            {
+                tgt_yf = tgt_yf * 6 / 10;
+            }
+            raw = ctx.world(tgt_p, tgt_yf);
+            let zonal_pt = raw;
             if opp_wide_cutback_threat && back_or_screen {
                 // Inside-box cutback zone marking: drop into the penalty-spot lane, mark box receivers.
                 let cutback_hub = Vec2::new(
@@ -5165,7 +5816,7 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
                 );
                 let mut cutback_mark: Option<Vec2> = None;
                 let mut best_d = Fp::from_milli(11_000);
-                for (o_idx, opp) in state.players[side.opponent().index()].iter().enumerate().skip(1) {
+                for (o_idx, opp) in state.players[opp_side].iter().enumerate().skip(1) {
                     if Some(o_idx) == opp_carrier || opp.sent_off {
                         continue;
                     }
@@ -5184,39 +5835,100 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
                     }
                 }
                 raw = cutback_mark.unwrap_or(cutback_hub);
-            } else if mark != AI_NONE {
-                let opp = &state.players[side.opponent().index()][mark as usize];
+            } else if let Some(mo) = plan_idx(mark).filter(|&o| o < state.players[opp_side].len()) {
+                let opp = &state.players[opp_side][mo];
                 let to_goal = (own_goal - opp.pos).normalize_or_zero();
                 let to_ball = (ball_xy - opp.pos).normalize_or_zero();
-                let shadow = (to_goal.scale(Fp::from_milli(650)) + to_ball.scale(Fp::from_milli(350))).normalize_or_zero();
+                // Konami intercept line: only when the carrier faces the marked man within theta_a and
+                // a teammate covers the marked man's line to goal; otherwise the goal-side shadow.
+                let covered = state.players[side.index()].iter().enumerate().skip(1).any(|(j, t)| {
+                    j != idx
+                        && !t.sent_off
+                        && ctx.prog(t.pos.x) < ctx.prog(opp.pos.x)
+                        && closest_on_segment(opp.pos, own_goal, t.pos).dist(t.pos) <= Fp::from_milli(COVER_LA_MM)
+                });
+                let faced = opp_carrier.is_some_and(|ci| {
+                    let c = &state.players[opp_side][ci];
+                    let f = Vec2::from_bam(c.facing_bam, Fp::ONE);
+                    f.dot((opp.pos - c.pos).normalize_or_zero()) > Fp::from_milli(COS_THETA_A_PM)
+                });
+                let shadow = if faced && covered {
+                    to_ball
+                } else {
+                    (to_goal.scale(Fp::from_milli(650)) + to_ball.scale(Fp::from_milli(350))).normalize_or_zero()
+                };
                 let mark_pt = opp.pos + shadow.scale(Fp::from_milli(1_350));
-                let w = match role {
-                    Some(SlotRole::CentreBack | SlotRole::Fixo | SlotRole::Holding) => 520,
-                    _ => 600,
+                let runner = back_line && line_prog != 0 && ctx.prog(opp.pos.x) < line_prog;
+                let w = if runner {
+                    // A runner in behind is tracked regardless of the block anchor.
+                    900
+                } else {
+                    match role {
+                        Some(SlotRole::CentreBack | SlotRole::Fixo | SlotRole::Holding) => 520,
+                        _ => 600,
+                    }
                 };
                 let mut t = raw.lerp(mark_pt, Fp::from_milli(w));
-                if back_or_screen {
-                    // Back line holds its height: marking may not drag it more than 4 m deep / 3 m high.
+                if back_or_screen && !runner {
+                    // The back line holds its shared height: marking may not drag it more than
+                    // 2.5 m deep / 1.2 m high (holding screen: 4 m / 3 m).
                     let line = ctx.prog(raw.x);
-                    t = ctx.world(ctx.prog(t.x).clamp(line - 4_000, line + 3_000), ctx.yf(t.y));
+                    let (lo, hi) = if back_line { (2_500, 1_200) } else { (4_000, 3_000) };
+                    t = ctx.world(ctx.prog(t.x).clamp(line - lo, line + hi), ctx.yf(t.y));
                 }
                 raw = t;
-            }
-            // Recovery run: goal-wrong-side players sprint back; slower players commit earlier.
-            if opp_owns {
-                let me_p = ctx.prog(p.pos.x);
-                let ball_p = ctx.prog(ball_xy.x);
-                let deficit = me_p - ctx.prog(raw.x);
-                let thresh = if is_5v5 { 1_000 } else { 2_500 } + style.recovery * 5 / 2;
-                if me_p > ball_p + 1_000 && deficit > thresh {
-                    force_sprint = true;
+            } else if !back_line && !is_rest && zonal_pt.dist(ball_xy) <= Fp::from_milli(LANE_BLOCK_BALL_MM) {
+                // Zonal holder near the ball: stand on the best lane within a 3 m leash of the slot.
+                let leash = Fp::from_milli(LANE_BLOCK_LEASH_MM);
+                if let Some(pt) = lanes
+                    .iter()
+                    .map(|&(_, c, r)| closest_on_segment(c, r, zonal_pt))
+                    .find(|q| q.dist(zonal_pt) <= leash && q.dist(ball_xy) >= Fp::from_milli(NON_ENGAGER_GAP_MM))
+                {
+                    raw = pt;
                 }
             }
-            if phase == AI_PHASE_RETREAT
-                && ctx.prog(p.pos.x) > ctx.prog(ball_xy.x)
-                && p.pos.dist(raw) > Fp::from_milli(if is_5v5 { 5_000 } else { 8_000 })
-            {
-                force_sprint = true;
+            // Urgency by deficit d = progress ahead of the ball: ahead and more than 30 ticks from the
+            // target (or the ball runs at our goal > 4 m/s) -> latched recovery sprint until 3 m
+            // goal-side, kept in the high-speed band while the counter runs; bursts capped by work
+            // rate and fatigue (back line uncapped), then the band; far from the target -> the
+            // `dist_sprint` rule below; goal-side near the slot -> 70% cruise (class 3).
+            let d = ctx.prog(p.pos.x) - ball_p;
+            let threatened = !is_rest && (band > 0 || d <= LOW_DWR_REACH_MM);
+            let exit = -RECOVERY_EXIT_MM;
+            let was_rec = (rec_prev & 1) != 0 && continuous_prev;
+            let ball_to_goal = -state.ball.vel.x.to_milli() * attack_sign;
+            // On a loose ball (a pass in flight) only players more than 15 m from it latch on the
+            // counter: nearer, a run along the ball path is a second chaser (exclusivity layer).
+            let counter_on = ball_to_goal > COUNTER_BALL_MM_S && (opp_owns || my_dist > Fp::from_milli(15_000));
+            let rec = threatened
+                && if was_rec {
+                    // While the ball still travels at our goal the run is kept (goal-side tracking).
+                    d > exit || counter_on
+                } else {
+                    // A counter running at us also catches players not yet 3 m goal-side.
+                    (counter_on && d > exit)
+                        || (d > 1_000 && estimate_ticks_to_point(p, raw, is_5v5) > RECOVERY_TRIGGER_TICKS)
+                };
+            // Back-liners caught upfield are exempt from the burst cap: full-backs sprint the most in
+            // defensive transitions (Bortnik et al. 2024) and a capped one leaves the line uneven.
+            let cap = if back_line { u16::MAX / 2 } else { (BURST_CAP_TICKS[band] as i64 * fatigue_pm / 1_000) as u16 };
+            if rec && d <= exit {
+                // Goal-side already: track the counter in the high-speed band, no sprint.
+                rec_now = true;
+                burst_now = burst_prev;
+                high_band = true;
+            } else if rec {
+                rec_now = true;
+                burst_now = if was_rec { burst_prev.saturating_add(1) } else { 1 };
+                if burst_now > cap.saturating_add(BURST_REST_TICKS) {
+                    burst_now = 1;
+                }
+                if burst_now <= cap {
+                    force_sprint = true;
+                } else {
+                    high_band = true;
+                }
             }
         }
     } else {
@@ -5387,12 +6099,17 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
     }
 
     // Anti-swarm spacing (engager cap): only the committed presser engages inside the contain gap;
-    // everyone else (the second presser and the cover included) keeps a goal-side gap of 2.2 m
-    // (3 m for the cover) from the carrier, so at most two players ever engage him.
+    // everyone else (the lane-closers, the second man and the cover included) keeps a goal-side gap
+    // of 2.9 m (3 m for the cover and the second man) from the carrier, outside the 2.5 m engager
+    // radius, so at most two players (presser or human plus the contain mate) ever engage him.
     if let Some(ci) = opp_carrier {
         if !press_role {
             let c_pos = state.players[side.opponent().index()][ci].pos;
-            let min_gap = Fp::from_milli(if me == cover { 3_000 } else { 2_200 });
+            let min_gap = Fp::from_milli(if me == cover || me == second || me == third {
+                3_000
+            } else {
+                NON_ENGAGER_GAP_MM
+            });
             let off = raw - c_pos;
             if me == cover && p.pos.dist(c_pos) < Fp::from_milli(4_500) {
                 alpha_pm = alpha_pm.max(650);
@@ -5572,8 +6289,14 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
     let sprint_hi = Fp::from_milli(if is_5v5 { 3_900 } else { 5_200 });
     let was_sprint = (prev_flags & FLAG_SPRINT) != 0 && continuous;
     let dist_sprint = if was_sprint { dist > sprint_hi.mul(Fp::from_milli(550)) } else { dist > sprint_hi };
-    let press_sprint = press_role && dist > Fp::from_milli(1_400) && (p.stamina_permille as i64) > 400 + (1_000 - style.work_rate) / 4;
+    let press_sprint = press_role
+        && dist > Fp::from_milli(1_400)
+        && (trigger_sprint || (p.stamina_permille as i64) > 400 + (1_000 - style.work_rate) / 4);
     let counter_sprint = counter_run && dist > Fp::from_milli(3_000);
+    // Round 4, area T: the report's high-speed band for defenders behind the ball but 10-12 m from
+    // their slot was measured to slow the re-forming (11v11, 8 seeds: line_x_std 7.45 vs 6.67 m,
+    // behind-ball at 6 s -1.5 pt), so far-from-target players keep sprinting (`dist_sprint`, the
+    // pre-round-4 rule); the band is used after a capped recovery burst and by the lane-closers.
     let mut sprint = (p.run_boost_ticks > 0 && !opp_owns) || force_sprint || press_sprint || counter_sprint || dist_sprint;
     let was_jockey = (prev_flags & FLAG_JOCKEY) != 0 && continuous;
     let jockey_r = Fp::from_milli(if was_jockey { 3_200 } else { 2_600 });
@@ -5581,8 +6304,11 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
 
     // Movement priority class and off-ball cruise speed: an uninvolved (class 3) player moves at
     // <= 70% of his top (sprint) speed and never sprints; only engagers and triggered runs sprint.
-    let engaged = press_role || me == cover || me == second;
+    // A recovery sprinter or a high-speed-band runner is class 2 (triggered), never class 3, even
+    // while yielding (round 4, area T).
+    let engaged = press_role || me == cover || me == second || me == third;
     let triggered = force_sprint
+        || high_band
         || counter_run
         || reserved_run
         || p.run_boost_ticks > 0
@@ -5592,7 +6318,7 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         || dist_sprint;
     let class = if engaged {
         1
-    } else if !yielding && triggered {
+    } else if force_sprint || high_band || (!yielding && triggered) {
         2
     } else {
         3
@@ -5601,6 +6327,18 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
         sprint = false;
         let sprint_mult = if is_5v5 { 1_205 } else { 1_220 };
         move_vec = move_vec.clamp_len(Fp::from_milli(CRUISE_TOP_SPEED_PM * sprint_mult / 1_000));
+    } else if high_band && !force_sprint && !press_sprint {
+        // High-speed band: sprint gait capped at a real 7 m/s (x 0.8 after a high-intensity peak),
+        // relative to the stamina-scaled sprint top speed of sim.rs step_all_players, so a tired
+        // player still reaches the band where his legs allow it.
+        sprint = true;
+        let sprint_mult = if is_5v5 { 1_205 } else { 1_220 };
+        let top_mm_s = (5_450 + (p.attributes.pace as i64) * 26) * (760 + (p.stamina_permille as i64) * 240 / 1_000) / 1_000
+            * sprint_mult
+            / 1_000;
+        let band_fat = if fatigue_pm < 1_000 { FATIGUE_BAND_PM } else { 1_000 };
+        let band_pm = (HIGH_BAND_MM_S * band_fat / top_mm_s.max(1)).min(1_000);
+        move_vec = move_vec.clamp_len(Fp::from_milli(band_pm));
     }
 
     {
@@ -5615,6 +6353,12 @@ fn outfield_shape_intent(state: &MatchState, side: TeamSide, idx: usize) -> AiMo
             *c = class;
         }
         um.write(m, idx);
+        if let Some(r) = m.rec_flags.get_mut(idx) {
+            *r = u8::from(rec_now);
+        }
+        if let Some(b) = m.burst_ticks.get_mut(idx) {
+            *b = burst_now;
+        }
     }
 
     AiMoveIntent {

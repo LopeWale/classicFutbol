@@ -607,6 +607,49 @@ pub struct TeamAiMemory {
     pub near_idx: Vec<u8>,
     #[serde(default)]
     pub near_off: Vec<Vec2>,
+    // ---- Round 4, area T (transition urgency and off-ball defending, `docs/transition-and-defending.md`).
+    /// The press-or-fall-back decision for the current counter-press has been taken (it is made
+    /// after a 6-12 tick reaction; until then the team reacts as if counter-pressing).
+    #[serde(default)]
+    pub cp_decided: bool,
+    /// Second counter-press lane-closer (`second_presser` is the first); `AI_NONE` = none.
+    #[serde(default = "ai_none_u8")]
+    pub third_presser: u8,
+    /// Opponent receiver whose lane each closer shuts (`[second_presser, third_presser]`).
+    #[serde(default = "ai_none_pair")]
+    pub closer_lane: [u8; 2],
+    /// The human's teammate-contain mate registered as the second engager (`AI_NONE` = none).
+    #[serde(default = "ai_none_u8")]
+    pub contain_mate: u8,
+    /// The one Low-defensive-work-rate forward kept high as the rest offence (`AI_NONE` = none).
+    #[serde(default = "ai_none_u8")]
+    pub rest_offence: u8,
+    /// Shared back-line height (mm of progress from our goal line) the back-liners lag-track;
+    /// `0` = not yet set.
+    #[serde(default)]
+    pub line_prog: i64,
+    /// Ticks left of an active press trigger (heavy touch, carrier facing his own goal, carrier
+    /// pinned on the touchline): the presser sprints and a second man shadows him.
+    #[serde(default)]
+    pub press_trigger_ticks: u16,
+    /// Per player: bit 0 = recovery sprint latched (ahead of the ball, running goal-side).
+    #[serde(default)]
+    pub rec_flags: Vec<u8>,
+    /// Per player: ticks of the current recovery burst (sprint capped at 180-240 ticks).
+    #[serde(default)]
+    pub burst_ticks: Vec<u16>,
+    /// Per player: recent high-intensity distance (mm), a leaky integrator with a 60 s time
+    /// constant over ticks above 5.5 m/s (the fatigue multiplier's input).
+    #[serde(default)]
+    pub hi_dist_mm: Vec<u32>,
+}
+
+const fn ai_none_u8() -> u8 {
+    AI_NONE
+}
+
+const fn ai_none_pair() -> [u8; 2] {
+    [AI_NONE; 2]
 }
 
 impl TeamAiMemory {
@@ -690,6 +733,15 @@ impl TeamAiMemory {
             self.run_role = vec![0; n];
             self.run_since = vec![0; n];
             self.run_end = vec![Vec2::ZERO; n];
+        }
+        if self.rec_flags.len() != n {
+            self.rec_flags = vec![0; n];
+        }
+        if self.burst_ticks.len() != n {
+            self.burst_ticks = vec![0; n];
+        }
+        if self.hi_dist_mm.len() != n {
+            self.hi_dist_mm = vec![0; n];
         }
     }
 
@@ -815,6 +867,21 @@ impl TeamAiMemory {
         for o in &self.near_off {
             h.i64(o.x.raw());
             h.i64(o.y.raw());
+        }
+        h.u8(u8::from(self.cp_decided));
+        h.u8(self.third_presser);
+        h.bytes(&self.closer_lane);
+        h.u8(self.contain_mate);
+        h.u8(self.rest_offence);
+        h.i64(self.line_prog);
+        h.u16(self.press_trigger_ticks);
+        h.u32(self.rec_flags.len() as u32);
+        h.bytes(&self.rec_flags);
+        for t in &self.burst_ticks {
+            h.u16(*t);
+        }
+        for d in &self.hi_dist_mm {
+            h.u32(*d);
         }
     }
 }
